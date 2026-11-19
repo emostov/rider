@@ -117,3 +117,16 @@ Channel `work/spike8g`.
 - `vb tasks create work/spike8g --file plang.json --idempotency-key spike8g-1 --as lead-fable-5-2 --json`: exit 0. Each returned task has `"key": null`, and the tasks come back in plan order (154, 156, 158, 160 for keys a, b, c, d). Running it again with the same file and key: exit 0, and the same ids come back in the same order.
 - `vb tasks work/spike8g --limit 500 --json | jq -r '.tasks[] | select(.message.labels.role == null) | .message.id'` (the default state is open) printed the role-less tasks that were waiting (156) and ready (160). It did not print the canceled 158, or 154, which has `role`. With no open tasks it printed nothing.
 - Light retried as implement: claim `--ready --label role=light --as light-1-sonnet-5-5` (exit 0), `fail` (exit 0), `vb label 166 role=implement --as lead-fable-5-2` (exit 0), `vb tasks reopen 166 --as lead-fable-5-2` (exit 0). Then `claim --ready --label role=implement --wait 2s --as implement-1-opus-5-5` took 166 with `role=implement` (exit 0).
+
+## Claim by id, renew, release, listing, lost claims
+
+Recorded on a scratch board, `vb serve --dir <temp> --port 4177 --no-open --no-inspect`, never the board on 4100. Channel `work/scratch`, a two-task plan (`a`, then `b` with `needs: [{"key":"a"}]`; ids 2 and 4) and a single task `c` (id 12), all created as the owner.
+
+- `vb tasks claim 2 --lease 1h --as opus-1 --json`: exit 0, `{task, claim: {epoch, until}}` (`claim-by-id.json`). `claim.epoch` and `claim.until` equal `task.task.epoch` and `task.task.claim.until`; `task.task.claim.actor` is `local:user:zeke+opus-1`.
+- `vb tasks renew 12 --lease 1h --as opus-1 --json`: exit 0, the same `{task, claim}` shape with `until` an hour from the renewal (`renew.json`). Without `--lease`, renew set `until` 15 minutes from now, not the claim's own lease, so a renewal always passes `--lease`.
+- `vb tasks work/ --state open --json`: exit 0, `{tasks: [{message, replies, last}], cursor}` (`tasks-open.json`). Every `message.task` carries `state`, `epoch`, `needs` (ids as strings) and `claim` (`{actor, until}` when claimed, otherwise null). Across every fixture, `claim` is present exactly when the state is `claimed`.
+- A subtree: `work/scratch/` lists `work/scratch` and `work/scratch/deep`; `work/scratch` lists only that channel; `work` (no such channel) prints an empty list, exit 0; `work/nonexistent/` exits 1 with reason `channel_not_found`.
+- Paging: `--limit` above 500 exits with reason `invalid_arguments` ("expected number to be <=500"). With `-n 1` the `cursor` is the last task's id and `--after <cursor>` gives the next page; on a page that is not full the `cursor` is the board's event cursor.
+- `vb tasks release 2 --as opus-1 --json`: exit 0, `{task, outcome: "released"}`, state `ready`, `claim` null, epoch unchanged (`release.json`).
+- `vb tasks complete 2 --as opus-1 --json -- done` after the release: exit 1, stdout empty, stderr `reason: "claim_not_held"` (`claim-not-held.stderr.txt`). `vb tasks renew` of a task the profile does not hold gives the same reason.
+- Claimed again, then `vb tasks cancel 2 --json -- scratch` as the owner, then the same complete: exit 1, stderr `reason: "claim_lost"`, with `data.error.code` `claim_lost` and status 409 (`claim-lost.stderr.txt`). A renewal of the canceled task afterwards gave `claim_not_held`.

@@ -292,6 +292,9 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            needs: Vec::new(),
+            epoch: 0,
+            claim: None,
         }
     }
 

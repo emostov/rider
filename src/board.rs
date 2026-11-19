@@ -54,14 +54,42 @@ const VERBS: [&str; 5] = ["read", "tasks", "label", "reply", "post"];
 const GLOBAL_ARGS_LEN: usize = 5;
 /// The longest decimal ID that fits a `u64`.
 const ID_DIGITS_MAX: usize = 20;
+/// Upper bound on the tasks one task waits for.
+pub const NEEDS_MAX: usize = 64;
+/// Upper bound on the open tasks one listing returns; a subtree with more is an error.
+pub const TASKS_PAGE_MAX: usize = 200;
+/// The page `vb` is asked for: one more than the bound, so a subtree over it is seen.
+const TASKS_PAGE_ASKED: usize = TASKS_PAGE_MAX + 1;
+/// The reasons a fenced write gives when its claim is over or was never held.
+const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
+/// The length of a time as the board prints it: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+const TIMESTAMP_LEN: usize = 24;
 
-#[derive(Debug, Clone)]
+/// A moment the board printed, in milliseconds since the Unix epoch, UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp(pub u64);
+
+/// Who holds a task's claim, and until when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    /// The board's actor, such as `local:user:zeke+opus-1`.
+    pub holder: String,
+    pub until: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskView {
     pub id: TaskId,
     pub text: String,
     pub state: TaskState,
     /// At most `LABELS_MAX` entries.
     pub labels: Vec<(String, String)>,
+    /// The tasks this one waits for; at most `NEEDS_MAX`.
+    pub needs: Vec<TaskId>,
+    /// How many times the task has been claimed.
+    pub epoch: u64,
+    /// Present exactly when the task is claimed.
+    pub claim: Option<Claim>,
 }
 
 #[derive(Debug)]
@@ -74,6 +102,14 @@ pub enum BoardError {
     },
     Parse(String),
     TooManyLabels,
+    /// A task waits for more than `NEEDS_MAX` tasks.
+    TooManyNeeds,
+    /// A subtree holds more than `TASKS_PAGE_MAX` open tasks.
+    TooManyTasks,
+    /// The board refused a write on task `id` because this profile's claim on it is over.
+    ClaimLost {
+        id: TaskId,
+    },
     /// `vb` printed more than `OUTPUT_BYTES_MAX` bytes on one stream.
     OutputTooLarge,
     /// Reading from or writing to `vb` failed.
@@ -111,6 +147,11 @@ impl fmt::Display for BoardError {
                 )
             }
             BoardError::TooManyLabels => write!(f, "the task has more than {LABELS_MAX} labels"),
+            BoardError::TooManyNeeds => write!(f, "the task waits for more than {NEEDS_MAX} tasks"),
+            BoardError::TooManyTasks => {
+                write!(f, "more than {TASKS_PAGE_MAX} open tasks in one listing")
+            }
+            BoardError::ClaimLost { id } => write!(f, "the claim on task {} was lost", id.0),
             BoardError::OutputTooLarge => {
                 write!(
                     f,
@@ -153,6 +194,14 @@ pub trait Board {
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError>;
     fn fail(&self, id: TaskId, reason: &str) -> Result<(), BoardError>;
     fn block(&self, id: TaskId, reason: &str, kind: &str) -> Result<(), BoardError>;
+    /// Claims task `id` for a lease, and returns it as claimed.
+    fn claim_task(&self, id: TaskId) -> Result<TaskView, BoardError>;
+    /// Extends the lease on task `id` from now. A claim that is over is `ClaimLost`.
+    fn renew(&self, id: TaskId) -> Result<TaskView, BoardError>;
+    /// Hands task `id` back, so it is ready again. A claim that is over is `ClaimLost`.
+    fn release(&self, id: TaskId) -> Result<(), BoardError>;
+    /// The open tasks in `subtree`, a channel prefix ending in `/`, and every channel below it.
+    fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -172,6 +221,18 @@ enum Command<'a> {
         channel: &'a str,
         role_label: &'a str,
         wait_seconds: u32,
+    },
+    ClaimId {
+        id: TaskId,
+    },
+    Renew {
+        id: TaskId,
+    },
+    Release {
+        id: TaskId,
+    },
+    List {
+        subtree: &'a str,
     },
     Label {
         id: TaskId,
@@ -299,6 +360,26 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             }
             (words, None)
         }
+        Command::ClaimId { id } => {
+            let id = id.0.to_string();
+            (
+                to_strings(&["tasks", "claim", &id, "--lease", CLAIM_LEASE]),
+                None,
+            )
+        }
+        Command::Renew { id } => {
+            let id = id.0.to_string();
+            (
+                to_strings(&["tasks", "renew", &id, "--lease", CLAIM_LEASE]),
+                None,
+            )
+        }
+        Command::Release { id } => (to_strings(&["tasks", "release", &id.0.to_string()]), None),
+        Command::List { subtree } => {
+            let limit = TASKS_PAGE_ASKED.to_string();
+            let words = to_strings(&["tasks", subtree, "--state", "open", "--limit", &limit]);
+            (words, None)
+        }
         Command::Label { id, key, value } => {
             let pair = format!("{key}={value}");
             (to_strings(&["label", &id.0.to_string(), &pair]), None)
@@ -367,6 +448,10 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
     let (call, wait_seconds) = match *command {
         Command::Read { .. } => ("read", 0),
         Command::Claim { wait_seconds, .. } => ("tasks claim", wait_seconds),
+        Command::ClaimId { .. } => ("tasks claim", 0),
+        Command::Renew { .. } => ("tasks renew", 0),
+        Command::Release { .. } => ("tasks release", 0),
+        Command::List { .. } => ("tasks", 0),
         Command::Label { .. } => ("label", 0),
         Command::Reply { .. } => ("reply", 0),
         Command::Post { .. } => ("post", 0),
@@ -386,7 +471,12 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
 /// The outcome a successful run of `command` reports, and the task it acts on, for writes.
 fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
     match *command {
-        Command::Read { .. } | Command::Claim { .. } => None,
+        Command::Read { .. }
+        | Command::Claim { .. }
+        | Command::ClaimId { .. }
+        | Command::Renew { .. }
+        | Command::List { .. } => None,
+        Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
         Command::Reply { id, .. } | Command::Post { id, .. } => Some(("posted", id)),
         Command::Complete { id, .. } => Some(("completed", id)),
@@ -452,6 +542,126 @@ fn parse_labels(message: &Map<String, Value>) -> Result<Vec<(String, String)>, B
     Ok(result)
 }
 
+/// The days from 1970-01-01 to a date in or after 1970, by the proleptic Gregorian calendar.
+fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
+    assert!(year >= 1970 && (1..=12).contains(&month) && (1..=31).contains(&day));
+    // Counted from March, so the leap day falls at the end of a year.
+    let year = if month <= 2 { year - 1 } else { year };
+    let (era, year_of_era) = (year / 400, year % 400);
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    assert!(days < (10_000 - 1970) * 366, "a four-digit year");
+    days
+}
+
+/// A time as the board prints it, `YYYY-MM-DDTHH:MM:SS.mmmZ`, from 1970 on.
+pub fn parse_timestamp(text: &str) -> Result<Timestamp, BoardError> {
+    let bad = || BoardError::Parse(format!("time {text:?} is not YYYY-MM-DDTHH:MM:SS.mmmZ"));
+    let bytes = text.as_bytes();
+    if bytes.len() != TIMESTAMP_LEN || !text.is_ascii() {
+        return Err(bad());
+    }
+    let separators = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+    ];
+    let shaped = separators.iter().all(|&(at, byte)| bytes[at] == byte) && bytes[23] == b'Z';
+    let number = |from: usize, to: usize| -> Option<u64> {
+        let digits = &text[from..to];
+        digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| digits.parse().ok())?
+    };
+    let fields = [
+        (0, 4),
+        (5, 7),
+        (8, 10),
+        (11, 13),
+        (14, 16),
+        (17, 19),
+        (20, 23),
+    ];
+    let mut values = [0u64; 7];
+    for (value, &(from, to)) in values.iter_mut().zip(fields.iter()) {
+        *value = number(from, to).filter(|_| shaped).ok_or_else(bad)?;
+    }
+    let [year, month, day, hour, minute, second, millis] = values;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let in_range = year >= 1970
+        && (1..=12).contains(&month)
+        && day >= 1
+        && usize::try_from(month - 1).is_ok_and(|index| day <= month_days[index])
+        && hour < 24
+        && minute < 60
+        && second < 60;
+    if !in_range {
+        return Err(bad());
+    }
+    let days = days_since_epoch(year, month, day);
+    let seconds = ((days * 24 + hour) * 60 + minute) * 60 + second;
+    let stamp = Timestamp(seconds * 1000 + millis);
+    assert!(millis < 1000 && stamp.0 >= seconds);
+    Ok(stamp)
+}
+
+/// The IDs a task waits for, from `task.needs`.
+fn parse_needs(task: &Map<String, Value>) -> Result<Vec<TaskId>, BoardError> {
+    let needs = task.get("needs").and_then(Value::as_array);
+    let needs = needs.ok_or_else(|| BoardError::Parse("no task.needs array".into()))?;
+    if needs.len() > NEEDS_MAX {
+        return Err(BoardError::TooManyNeeds);
+    }
+    let mut result: Vec<TaskId> = Vec::with_capacity(needs.len());
+    for need in needs.iter().take(NEEDS_MAX) {
+        let need = need.as_str();
+        let need = need.ok_or_else(|| BoardError::Parse("a need is not a string".into()))?;
+        result.push(parse_id_text(need)?);
+    }
+    assert_eq!(result.len(), needs.len(), "no need was dropped");
+    Ok(result)
+}
+
+/// The holder and end of `task.claim`, or `None` when it is null.
+fn parse_task_claim(task: &Map<String, Value>) -> Result<Option<Claim>, BoardError> {
+    let claim = task
+        .get("claim")
+        .ok_or_else(|| BoardError::Parse("no task.claim".into()))?;
+    if claim.is_null() {
+        return Ok(None);
+    }
+    let holder = claim.get("actor").and_then(Value::as_str);
+    let holder = holder.filter(|holder| !holder.is_empty());
+    let holder = holder.ok_or_else(|| BoardError::Parse("no task.claim.actor".into()))?;
+    let until = claim.get("until").and_then(Value::as_str);
+    let until = until.ok_or_else(|| BoardError::Parse("no task.claim.until".into()))?;
+    let claim = Claim {
+        holder: holder.to_string(),
+        until: parse_timestamp(until)?,
+    };
+    assert!(!claim.holder.is_empty());
+    Ok(Some(claim))
+}
+
 /// A task from a message object, as `read` prints under `message` and `claim` under `task`.
 fn parse_message(message: &Map<String, Value>) -> Result<TaskView, BoardError> {
     let id = parse_id(message, "id")?;
@@ -459,21 +669,33 @@ fn parse_message(message: &Map<String, Value>) -> Result<TaskView, BoardError> {
     let text = text
         .ok_or_else(|| BoardError::Parse("no text".into()))?
         .to_string();
-    let state = message
-        .get("task")
-        .and_then(|task| task.get("state"))
-        .and_then(Value::as_str);
+    let task = message.get("task").and_then(Value::as_object);
+    let task = task.ok_or_else(|| BoardError::Parse("not a task: no task object".into()))?;
+    let state = task.get("state").and_then(Value::as_str);
     let state = state.ok_or_else(|| BoardError::Parse("not a task: no task.state".into()))?;
     let state = TaskState::from_board(state)
         .ok_or_else(|| BoardError::Parse(format!("unknown task state {state:?}")))?;
-    let labels = parse_labels(message)?;
-    assert!(text.len() < OUTPUT_BYTES_MAX);
-    Ok(TaskView {
+    let epoch = task.get("epoch").and_then(Value::as_u64);
+    let epoch = epoch.ok_or_else(|| BoardError::Parse("no whole task.epoch".into()))?;
+    let claim = parse_task_claim(task)?;
+    if claim.is_some() != (state == TaskState::Claimed) {
+        return Err(BoardError::Parse(format!(
+            "a {state:?} task {} a claim",
+            if claim.is_some() { "with" } else { "without" }
+        )));
+    }
+    let view = TaskView {
         id,
         text,
         state,
-        labels,
-    })
+        labels: parse_labels(message)?,
+        needs: parse_needs(task)?,
+        epoch,
+        claim,
+    };
+    assert!(view.text.len() < OUTPUT_BYTES_MAX);
+    assert_eq!(view.claim.is_some(), view.state == TaskState::Claimed);
+    Ok(view)
 }
 
 /// A task from the output of `vb read <id> --json`: `{message, replies, cursor, schedules}`.
@@ -507,6 +729,49 @@ pub fn parse_claim(json: &str) -> Result<Option<TaskId>, BoardError> {
         )));
     }
     Ok(Some(view.id))
+}
+
+/// The task held under a lease, from the output of `vb tasks claim <id>` or `vb tasks renew`:
+/// `{task, claim: {epoch, until}}`, where the lease must match the task's own claim.
+pub fn parse_lease(json: &str) -> Result<TaskView, BoardError> {
+    let object = parse_object(json)?;
+    let task = object.get("task").and_then(Value::as_object);
+    let task = task.ok_or_else(|| BoardError::Parse("no task object".into()))?;
+    let view = parse_message(task)?;
+    let lease = object.get("claim").and_then(Value::as_object);
+    let lease = lease.ok_or_else(|| BoardError::Parse("no claim object".into()))?;
+    let epoch = lease.get("epoch").and_then(Value::as_u64);
+    let epoch = epoch.ok_or_else(|| BoardError::Parse("no whole claim.epoch".into()))?;
+    let until = lease.get("until").and_then(Value::as_str);
+    let until = until.ok_or_else(|| BoardError::Parse("no claim.until".into()))?;
+    let until = parse_timestamp(until)?;
+    let held_until = view.claim.as_ref().map(|claim| claim.until);
+    if epoch != view.epoch || held_until != Some(until) {
+        return Err(BoardError::Parse(format!(
+            "the lease (epoch {epoch}) does not match task {} (epoch {})",
+            view.id.0, view.epoch
+        )));
+    }
+    assert_eq!(view.state, TaskState::Claimed);
+    Ok(view)
+}
+
+/// The tasks from the output of `vb tasks <subtree> --json`: `{tasks: [{message, ...}], cursor}`.
+pub fn parse_task_list(json: &str) -> Result<Vec<TaskView>, BoardError> {
+    let object = parse_object(json)?;
+    let tasks = object.get("tasks").and_then(Value::as_array);
+    let tasks = tasks.ok_or_else(|| BoardError::Parse("no tasks array".into()))?;
+    if tasks.len() > TASKS_PAGE_MAX {
+        return Err(BoardError::TooManyTasks);
+    }
+    let mut views: Vec<TaskView> = Vec::with_capacity(tasks.len());
+    for entry in tasks.iter().take(TASKS_PAGE_MAX) {
+        let message = entry.get("message").and_then(Value::as_object);
+        let message = message.ok_or_else(|| BoardError::Parse("no message object".into()))?;
+        views.push(parse_message(message)?);
+    }
+    assert_eq!(views.len(), tasks.len(), "no task was dropped");
+    Ok(views)
 }
 
 /// The `reason` of a failed run, from the JSON it printed: `{status: "error", reason, message}`.
@@ -565,6 +830,40 @@ fn claim_outcome(output: &Output) -> Result<Option<TaskId>, BoardError> {
     })
 }
 
+/// The error for a failed run on task `id`: `ClaimLost` when the board refused it for the
+/// claim, otherwise how `vb` exited.
+fn failed_on(id: TaskId, output: &Output) -> BoardError {
+    assert!(output.code != Some(0), "only a failed run has an error");
+    // A signal is never the board's answer, whatever was printed before it.
+    if output.code.is_some() {
+        let reason =
+            parse_failure_reason(&output.stderr).or_else(|| parse_failure_reason(&output.stdout));
+        if reason.is_some_and(|reason| CLAIM_LOST_REASONS.contains(&reason.as_str())) {
+            return BoardError::ClaimLost { id };
+        }
+    }
+    BoardError::Exit {
+        code: output.code,
+        stderr: output.stderr.clone(),
+    }
+}
+
+/// The task a lease's run holds, from `vb tasks claim <id>` or `vb tasks renew`.
+fn lease_outcome(id: TaskId, output: &Output) -> Result<TaskView, BoardError> {
+    if output.code != Some(0) {
+        return Err(failed_on(id, output));
+    }
+    let view = parse_lease(&output.stdout)?;
+    if view.id != id {
+        return Err(BoardError::Parse(format!(
+            "asked for {id:?}, held {:?}",
+            view.id
+        )));
+    }
+    assert_eq!(view.state, TaskState::Claimed);
+    Ok(view)
+}
+
 /// Whether a write's run succeeded with the outcome `command` expects, on its task.
 fn write_outcome(command: &Command, output: &Output) -> Result<(), BoardError> {
     let expected = expected_write(command);
@@ -572,10 +871,7 @@ fn write_outcome(command: &Command, output: &Output) -> Result<(), BoardError> {
         expected.ok_or_else(|| BoardError::Parse("not a write".into()))?;
     assert!(!expected_outcome.is_empty());
     if output.code != Some(0) {
-        return Err(BoardError::Exit {
-            code: output.code,
-            stderr: output.stderr.clone(),
-        });
+        return Err(failed_on(expected_id, output));
     }
     let (outcome, id) = parse_write(&output.stdout)?;
     if outcome != expected_outcome || id != expected_id {
@@ -823,6 +1119,48 @@ impl Board for VbCli {
         assert!(!kind.is_empty(), "a block always has a kind");
         self.write(&Command::Block { id, reason, kind })
     }
+
+    fn claim_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
+        assert!(!self.url.is_empty() && !self.profile.is_empty());
+        let output = self.run(&Command::ClaimId { id })?;
+        let view = lease_outcome(id, &output)?;
+        assert_eq!(view.id, id);
+        Ok(view)
+    }
+
+    fn renew(&self, id: TaskId) -> Result<TaskView, BoardError> {
+        assert!(!self.url.is_empty() && !self.profile.is_empty());
+        let output = self.run(&Command::Renew { id })?;
+        let view = lease_outcome(id, &output)?;
+        assert_eq!(view.id, id);
+        Ok(view)
+    }
+
+    fn release(&self, id: TaskId) -> Result<(), BoardError> {
+        assert!(!self.url.is_empty() && !self.profile.is_empty());
+        self.write(&Command::Release { id })
+    }
+
+    fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError> {
+        assert!(
+            subtree.ends_with('/'),
+            "a subtree is a channel prefix ending in /"
+        );
+        assert!(
+            !subtree.starts_with('-'),
+            "a subtree is never read as an option"
+        );
+        let output = self.run(&Command::List { subtree })?;
+        if output.code != Some(0) {
+            return Err(BoardError::Exit {
+                code: output.code,
+                stderr: output.stderr,
+            });
+        }
+        let views = parse_task_list(&output.stdout)?;
+        assert!(views.len() <= TASKS_PAGE_MAX);
+        Ok(views)
+    }
 }
 
 /// A board held in memory, for tests in this crate.
@@ -932,6 +1270,28 @@ pub mod testing {
         fn block(&self, id: TaskId, reason: &str, kind: &str) -> Result<(), BoardError> {
             self.record(format!("block {} {kind} {reason}", id.0))
         }
+
+        fn claim_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
+            self.record(format!("claim_task {}", id.0))?;
+            self.read_task(id)
+        }
+
+        fn renew(&self, id: TaskId) -> Result<TaskView, BoardError> {
+            self.record(format!("renew {}", id.0))?;
+            self.read_task(id)
+        }
+
+        fn release(&self, id: TaskId) -> Result<(), BoardError> {
+            self.record(format!("release {}", id.0))
+        }
+
+        fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError> {
+            self.record(format!("list_open {subtree}"))?;
+            let closed = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
+            let tasks = self.tasks.borrow();
+            let open = tasks.iter().filter(|task| !closed.contains(&task.state));
+            Ok(open.cloned().collect())
+        }
     }
 }
 
@@ -971,7 +1331,7 @@ mod tests {
             .collect();
         let json = format!(
             "{{\"message\":{{\"id\":\"7\",\"text\":\"t\",\"labels\":{{{}}},\
-             \"task\":{{\"state\":\"ready\"}}}}}}",
+             \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}}}}}}",
             labels.join(",")
         );
         assert!(matches!(
@@ -1230,7 +1590,7 @@ mod tests {
         let json = |id: &str| {
             format!(
                 "{{\"message\":{{\"id\":\"{id}\",\"text\":\"t\",\"labels\":{{}},\
-                 \"task\":{{\"state\":\"ready\"}}}}}}"
+                 \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}}}}}}"
             )
         };
         assert_eq!(parse_task_view(&json("17")).unwrap().id, TaskId(17));
@@ -1246,6 +1606,188 @@ mod tests {
             parse_task_view(&json("")),
             Err(BoardError::Parse(_))
         ));
+    }
+
+    const HOLDER: &str = "local:user:zeke+opus-1";
+
+    fn recorded(id: u64, text: &str, labels: &[(&str, &str)], state: TaskState) -> TaskView {
+        TaskView {
+            id: TaskId(id),
+            text: text.to_string(),
+            state,
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            needs: Vec::new(),
+            epoch: 1,
+            claim: None,
+        }
+    }
+
+    fn held(mut view: TaskView, until: u64) -> TaskView {
+        view.claim = Some(Claim {
+            holder: HOLDER.to_string(),
+            until: Timestamp(until),
+        });
+        view
+    }
+
+    #[test]
+    fn parses_a_recorded_claim_by_id() {
+        let claim = include_str!("../fixtures/board/claim-by-id.json");
+        let labels = [("board.task", "claimed"), ("role", "implement")];
+        let expected = held(
+            recorded(2, "task a", &labels, TaskState::Claimed),
+            1_795_136_047_105,
+        );
+        assert_eq!(parse_lease(claim).unwrap(), expected);
+        let view = lease_outcome(TaskId(2), &output(Some(0), claim, "")).unwrap();
+        assert_eq!(view, expected);
+        let other = lease_outcome(TaskId(3), &output(Some(0), claim, ""));
+        assert!(matches!(other, Err(BoardError::Parse(_))), "{other:?}");
+    }
+
+    #[test]
+    fn parses_a_recorded_renewal() {
+        let renew = include_str!("../fixtures/board/renew.json");
+        let expected = held(
+            recorded(
+                12,
+                "task c",
+                &[("board.task", "claimed")],
+                TaskState::Claimed,
+            ),
+            1_795_136_077_438,
+        );
+        assert_eq!(parse_lease(renew).unwrap(), expected);
+        let mismatched = renew.replace(r#""claim":{"epoch":1"#, r#""claim":{"epoch":2"#);
+        assert!(matches!(
+            parse_lease(&mismatched),
+            Err(BoardError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn a_recorded_release_is_a_write_on_its_task() {
+        let release = include_str!("../fixtures/board/release.json");
+        let id = TaskId(2);
+        let done = write_outcome(&Command::Release { id }, &output(Some(0), release, ""));
+        assert!(matches!(done, Ok(())), "{done:?}");
+        let (outcome, id) = parse_write(release).unwrap();
+        assert_eq!((outcome.as_str(), id), ("released", TaskId(2)));
+        let labels = [("board.task", "ready"), ("role", "implement")];
+        let object = parse_object(release).unwrap();
+        let task = object.get("task").and_then(Value::as_object).unwrap();
+        let view = parse_message(task).unwrap();
+        assert_eq!(view, recorded(2, "task a", &labels, TaskState::Ready));
+    }
+
+    #[test]
+    fn parses_a_recorded_listing_with_needs_epochs_and_claims() {
+        let list = include_str!("../fixtures/board/tasks-open.json");
+        let claimed = [("board.task", "claimed"), ("role", "implement")];
+        let a = held(
+            recorded(2, "task a", &claimed, TaskState::Claimed),
+            1_795_133_349_261,
+        );
+        let waiting = [("board.task", "waiting"), ("role", "implement")];
+        let mut b = recorded(4, "task b", &waiting, TaskState::Waiting);
+        b.needs = vec![TaskId(2)];
+        b.epoch = 0;
+        assert_eq!(parse_task_list(list).unwrap(), vec![a, b]);
+    }
+
+    #[test]
+    fn a_listing_over_the_page_bound_is_too_many_tasks() {
+        let task = r#"{"message":{"id":"7","text":"t","labels":{},"task":{"state":"ready",
+            "epoch":0,"needs":[],"claim":null}}}"#;
+        let page = |count: usize| format!(r#"{{"tasks":[{}]}}"#, vec![task; count].join(","));
+        assert_eq!(
+            parse_task_list(&page(TASKS_PAGE_MAX)).unwrap().len(),
+            TASKS_PAGE_MAX
+        );
+        let over = parse_task_list(&page(TASKS_PAGE_MAX + 1));
+        assert!(matches!(over, Err(BoardError::TooManyTasks)), "{over:?}");
+    }
+
+    #[test]
+    fn a_fenced_write_refused_for_the_claim_is_a_lost_claim() {
+        let id = TaskId(2);
+        let complete = Command::Complete { id, result: "done" };
+        let recorded = [
+            include_str!("../fixtures/board/claim-lost.stderr.txt"),
+            include_str!("../fixtures/board/claim-not-held.stderr.txt"),
+        ];
+        for stderr in recorded {
+            let written = write_outcome(&complete, &output(Some(1), "", stderr));
+            assert!(matches!(
+                written,
+                Err(BoardError::ClaimLost { id: TaskId(2) })
+            ));
+            let renewed = lease_outcome(id, &output(Some(1), "", stderr));
+            assert!(matches!(
+                renewed,
+                Err(BoardError::ClaimLost { id: TaskId(2) })
+            ));
+            let released = write_outcome(&Command::Release { id }, &output(Some(1), "", stderr));
+            assert!(matches!(
+                released,
+                Err(BoardError::ClaimLost { id: TaskId(2) })
+            ));
+            let killed = write_outcome(&complete, &output(None, "", stderr));
+            assert!(matches!(killed, Err(BoardError::Exit { code: None, .. })));
+        }
+        let forbidden = r#"{"status":"error","reason":"forbidden","message":"no"}"#;
+        let other = write_outcome(&complete, &output(Some(1), "", forbidden));
+        assert!(matches!(other, Err(BoardError::Exit { code: Some(1), .. })));
+    }
+
+    #[test]
+    fn times_parse_only_in_the_boards_own_shape() {
+        let parse = |text: &str| parse_timestamp(text).ok();
+        assert_eq!(parse("1970-01-01T00:00:00.000Z"), Some(Timestamp(0)));
+        assert_eq!(
+            parse("2026-11-19T20:38:37.720Z"),
+            Some(Timestamp(1_795_120_717_720))
+        );
+        assert_eq!(
+            parse("2024-02-29T23:59:59.999Z"),
+            Some(Timestamp(1_709_251_199_999))
+        );
+        let malformed = [
+            "2026-11-19T20:38:37Z",
+            "2026-11-19T20:38:37.720+00:00",
+            "2026-13-19T20:38:37.720Z",
+            "2025-02-29T20:38:37.720Z",
+            "2026-11-19T24:00:00.000Z",
+            "1969-12-31T23:59:59.999Z",
+            "2026-11-19 20:38:37.720Z",
+            "2026-11-+9T20:38:37.720Z",
+            "2026-11-1éT20:38:37.72Z",
+        ];
+        for text in malformed {
+            assert_eq!(parse(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn builds_lease_and_listing_commands_as_recorded() {
+        let id = TaskId(2);
+        expect(
+            Command::ClaimId { id },
+            &["tasks", "claim", "2", "--lease", "1h"],
+        );
+        expect(
+            Command::Renew { id },
+            &["tasks", "renew", "2", "--lease", "1h"],
+        );
+        expect(Command::Release { id }, &["tasks", "release", "2"]);
+        let list = Command::List { subtree: "work/" };
+        expect(
+            list,
+            &["tasks", "work/", "--state", "open", "--limit", "201"],
+        );
     }
 
     #[test]

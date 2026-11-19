@@ -457,6 +457,9 @@ mod tests {
             text: "Earlier work.".to_string(),
             state: TaskState::Completed,
             labels: labels.into_iter().collect(),
+            needs: Vec::new(),
+            epoch: 1,
+            claim: None,
         }
     }
 

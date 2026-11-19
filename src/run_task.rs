@@ -641,6 +641,9 @@ mod tests {
             text: TEXT.to_string(),
             state,
             labels: labels.collect(),
+            needs: Vec::new(),
+            epoch: 1,
+            claim: None,
         }
     }
 

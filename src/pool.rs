@@ -383,6 +383,22 @@ mod tests {
         fn block(&self, _: TaskId, _: &str, _: &str) -> Result<(), BoardError> {
             panic!("the pool never blocks a task itself")
         }
+
+        fn claim_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
+            panic!("the pool never claims task {} by id", id.0)
+        }
+
+        fn renew(&self, id: TaskId) -> Result<TaskView, BoardError> {
+            panic!("the pool never renews task {}", id.0)
+        }
+
+        fn release(&self, id: TaskId) -> Result<(), BoardError> {
+            panic!("the pool never releases task {}", id.0)
+        }
+
+        fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError> {
+            panic!("the pool never lists {subtree}")
+        }
     }
 
     #[test]
