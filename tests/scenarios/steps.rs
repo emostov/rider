@@ -172,22 +172,25 @@ pub fn when_the_tasks_settle(world: &World, tasks: &[&str]) -> Vec<String> {
 }
 
 /// When the pool is told `stop`; returns its exit code once it has exited.
+// The pool stays in the world until it has exited, so a panic here still lets Drop kill it.
 pub fn when_the_pool_is_stopped(world: &mut World) -> Option<i32> {
-    let mut pool = world.pool.take().expect("the pool was started");
+    let pool = world.pool.as_mut().expect("the pool was started");
     let mut stdin = pool.stdin.take().expect("the pool's standard input");
     stdin.write_all(b"stop\n").expect("write stop");
     drop(stdin);
     let deadline = Instant::now() + Duration::from_secs(POOL_STOP_SECONDS_MAX);
-    loop {
+    let status = loop {
         if let Some(status) = pool.child.try_wait().expect("poll the pool") {
-            return status.code();
+            break status;
         }
-        if Instant::now() >= deadline {
-            world.pool = Some(pool);
-            panic!("the pool did not stop within {POOL_STOP_SECONDS_MAX} seconds");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "the pool did not stop within {POOL_STOP_SECONDS_MAX} seconds"
+        );
         thread::sleep(Duration::from_millis(POLL_MILLIS));
-    }
+    };
+    world.pool = None;
+    status.code()
 }
 
 /// When the pool runs until `tasks` settle and is then stopped; returns the states and exit.
@@ -348,15 +351,20 @@ pub fn then_the_branch_has_the_agents_commit(world: &World, id: &str, attempt: u
     branch
 }
 
-/// Then the task's worktree directory no longer exists and git no longer lists it.
+/// Then the task's worktree directory no longer exists.
 pub fn then_the_worktree_is_removed(world: &World, id: &str) {
     let dir = worktree_dir(world, id);
     assert!(!dir.exists(), "worktree {} still exists", dir.display());
+}
+
+/// Then git lists exactly one worktree, the repository itself.
+pub fn then_only_the_repository_is_a_worktree(world: &World) {
     let listed = world.git_ok(&["worktree", "list", "--porcelain"]);
-    assert!(
-        !listed.contains(dir.to_str().expect("UTF-8 path")),
-        "git lists {listed}"
-    );
+    let worktrees: Vec<&str> = listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .collect();
+    assert_eq!(worktrees, vec![world.repo_label()], "git lists {listed}");
 }
 
 impl World {

@@ -29,6 +29,7 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
     assert_eq!(exit, Some(0));
     let branch = then_the_branch_has_the_agents_commit(&world, &task, 0);
     then_the_worktree_is_removed(&world, &task);
+    then_only_the_repository_is_a_worktree(&world);
     let record = json!({
         "branch": branch,
         "head": branch_head(&world, &branch),
@@ -68,4 +69,5 @@ fn a_stacked_task_is_cut_from_its_base_tasks_branch() {
     );
     let stacked_parent = world.git_ok(&["rev-parse", &format!("refs/heads/{stacked_branch}^")]);
     assert_eq!(stacked_parent, base_head);
+    then_only_the_repository_is_a_worktree(&world);
 }
