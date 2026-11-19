@@ -3,8 +3,9 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command as Process, Stdio};
+use std::process::{Child, ChildStdin, Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
@@ -33,6 +34,14 @@ pub const WAIT_SECONDS_MAX: u32 = 3600;
 pub const RESULT_CHARS_MAX: usize = 500;
 /// The most characters the board accepts in one message's text; it rejects anything longer.
 pub const MESSAGE_CHARS_MAX: usize = 10_000;
+/// Upper bound on how long one `vb` run may take, beyond any wait a claim asks for.
+pub const BOARD_CALL_SECONDS_MAX: u32 = 30;
+/// How often a running `vb` is checked for having exited.
+const POLL_MILLIS: u64 = 20;
+const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
+/// Upper bound on the exit checks of one `vb` run: one per poll for the longest claim.
+const POLLS_MAX: u64 =
+    (BOARD_CALL_SECONDS_MAX as u64 + WAIT_SECONDS_MAX as u64) * 1000 / POLL_MILLIS + 1;
 /// Upper bound on the arguments of one `vb` run.
 const ARGS_MAX: usize = 24;
 /// How long a claim holds its task before the board may give it to someone else.
@@ -72,6 +81,11 @@ pub enum BoardError {
     /// A message of `chars` characters, over `MESSAGE_CHARS_MAX`, was refused before `vb` ran.
     MessageTooLong {
         chars: usize,
+    },
+    /// `vb` ran past its time limit and was killed; `call` is its verb, such as `tasks claim`.
+    TimedOut {
+        call: &'static str,
+        seconds: u32,
     },
 }
 
@@ -114,6 +128,12 @@ impl fmt::Display for BoardError {
                 f,
                 "a message of {chars} characters is over the board's {MESSAGE_CHARS_MAX}"
             ),
+            BoardError::TimedOut { call, seconds } => {
+                write!(
+                    f,
+                    "vb {call} did not finish within {seconds}s and was killed"
+                )
+            }
         }
     }
 }
@@ -340,6 +360,27 @@ fn command_stdin<'a>(command: &Command<'a>) -> Option<&'a str> {
     };
     assert!(stdin.is_none() || matches!(command, Command::Reply { .. }));
     stdin
+}
+
+/// The name `command` goes by in a timeout, and how many seconds its run may take.
+fn command_limit(command: &Command) -> (&'static str, u32) {
+    let (call, wait_seconds) = match *command {
+        Command::Read { .. } => ("read", 0),
+        Command::Claim { wait_seconds, .. } => ("tasks claim", wait_seconds),
+        Command::Label { .. } => ("label", 0),
+        Command::Reply { .. } => ("reply", 0),
+        Command::Post { .. } => ("post", 0),
+        Command::Complete { .. } => ("tasks complete", 0),
+        Command::Fail { .. } => ("tasks fail", 0),
+        Command::Block { .. } => ("tasks block", 0),
+    };
+    assert!(
+        wait_seconds <= WAIT_SECONDS_MAX,
+        "a claim waits at most an hour"
+    );
+    let seconds = BOARD_CALL_SECONDS_MAX + wait_seconds;
+    assert!(seconds >= BOARD_CALL_SECONDS_MAX);
+    (call, seconds)
 }
 
 /// The outcome a successful run of `command` reports, and the task it acts on, for writes.
@@ -587,9 +628,34 @@ fn feed(mut stdin: ChildStdin, text: String) -> Result<(), BoardError> {
     Ok(())
 }
 
-/// Feeds `input` to `child`, reads both of its streams to the end, then waits for it. Each
-/// stream but stdout has its own thread, so no full pipe can stall `vb`.
-fn collect(child: &mut Child, input: Option<String>) -> Result<Output, BoardError> {
+/// Waits for `child` to exit, polling until `limit` has passed. `None` means it is still running.
+fn wait_within(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>, BoardError> {
+    assert!(limit > Duration::ZERO);
+    let deadline = Instant::now() + limit;
+    for _ in 0..POLLS_MAX {
+        let status = child.try_wait();
+        let status = status.map_err(|error| BoardError::Io(format!("waiting: {error}")))?;
+        if status.is_some() {
+            return Ok(status);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+    }
+    Ok(None)
+}
+
+/// Feeds `input` to `child` and reads both of its streams, each on its own thread so no full
+/// pipe can stall `vb`, then waits for it to exit within `seconds`.
+fn collect(
+    child: &mut Child,
+    input: Option<String>,
+    call: &'static str,
+    seconds: u32,
+) -> Result<Output, BoardError> {
+    assert!(seconds >= BOARD_CALL_SECONDS_MAX);
     let mut stdout = child
         .stdout
         .take()
@@ -607,15 +673,15 @@ fn collect(child: &mut Child, input: Option<String>) -> Result<Output, BoardErro
             ));
         }
     };
-    let reader = start_worker("stderr", move || read_bounded(&mut stderr, "stderr"))?;
-    let stdout = read_bounded(&mut stdout, "stdout");
-    if stdout.is_err() {
-        // Killing can fail only when the child already exited, which is the goal anyway.
-        let _ = child.kill();
-    }
-    let status = child.wait();
-    let status = status.map_err(|error| BoardError::Io(format!("waiting: {error}")))?;
-    let stderr = finish_worker(reader, "stderr");
+    let errors = start_worker("stderr", move || read_bounded(&mut stderr, "stderr"))?;
+    let reader = start_worker("stdout", move || read_bounded(&mut stdout, "stdout"))?;
+    let Some(status) = wait_within(child, Duration::from_secs(u64::from(seconds)))? else {
+        // The workers are left to finish on their own: a process `vb` started may still hold
+        // the pipes open after `vb` itself is killed.
+        return Err(BoardError::TimedOut { call, seconds });
+    };
+    let stdout = finish_worker(reader, "stdout");
+    let stderr = finish_worker(errors, "stderr");
     let written = writer.map(|writer| finish_worker(writer, "stdin"));
     let output = Output {
         code: status.code(),
@@ -651,9 +717,11 @@ impl VbCli {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| BoardError::Spawn(format!("{}: {error}", self.vb.display())))?;
-        let output = collect(&mut child, input);
+        let (call, seconds) = command_limit(command);
+        let output = collect(&mut child, input, call, seconds);
         if output.is_err() {
-            // A thread could not start, or a stream broke: do not leave `vb` running.
+            // A thread could not start, a stream broke, or time ran out: do not leave `vb`
+            // running.
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -870,6 +938,7 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_a_recorded_task() {
@@ -1177,5 +1246,56 @@ mod tests {
             parse_task_view(&json("")),
             Err(BoardError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn a_vb_that_never_exits_is_killed_at_the_limit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rider-board-hang-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let vb = dir.join("vb");
+        let pid_file = dir.join("pid");
+        let script = format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 3600\n",
+            pid_file.display()
+        );
+        fs::write(&vb, script).unwrap();
+        fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
+        let board = VbCli {
+            vb,
+            url: "http://127.0.0.1:1".into(),
+            profile: "tester".into(),
+        };
+        let started = Instant::now();
+        let result = board.read_task(TaskId(7));
+        let took = started.elapsed();
+        assert!(
+            matches!(
+                result,
+                Err(BoardError::TimedOut {
+                    call: "read",
+                    seconds: BOARD_CALL_SECONDS_MAX
+                })
+            ),
+            "{result:?}"
+        );
+        let limit = Duration::from_secs(u64::from(BOARD_CALL_SECONDS_MAX));
+        assert!(
+            took >= limit && took < limit + Duration::from_secs(5),
+            "{took:?}"
+        );
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let alive = Process::new("kill")
+            .args(["-0", pid.trim()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !alive.success(),
+            "the stand-in vb {} is still running",
+            pid.trim()
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
