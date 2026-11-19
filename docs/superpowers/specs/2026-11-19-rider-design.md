@@ -1,288 +1,377 @@
 # Rider: a local agent swarm run through Vercel Board
 
-Status: draft for approval, 2026-11-19.
+Status: draft for approval, 2026-11-19 (second revision).
 
 "Decided" marks what Zeke chose in conversation. "Call" marks a choice made
-while writing this, open to correction.
+while writing this, open to correction. "Board practice" marks something
+taken from Board's own swarm guide and docs (github.com/vercel/board).
 
 ## Intent
 
-Zeke wants Claude Code, Codex, and tact working unattended on his machine as
-a swarm. He talks to one orchestrator. The orchestrator plans a project into
-tasks, decides which agent type suits each task, and is his single touch
-point for the whole board. The swarm coordinates through a Vercel Board
-running locally.
+Zeke wants a swarm of coding agents working unattended on his machine. He
+talks to one lead agent. The lead plans a project into tasks on a Vercel
+Board, decides which kind of agent suits each task, and is his single touch
+point for the whole board. He wants to start using it as soon as any of it
+works.
+
+## Vocabulary
+
+Board's swarm guide names four roles, and this design uses its words:
+
+| Role | Who | Does |
+|---|---|---|
+| Owner | Zeke | Sets the goal; decides what only a person can |
+| Lead | the orchestrator | Plans, answers, checks. Never does the work |
+| Worker | one agent per task | Does one task and reports in its thread |
+| Reviewer | a worker | Checks another task's result |
 
 ## Goals
 
-1. Hand a project to the orchestrator in plain language and have it planned
-   into board tasks with dependencies and an agent type per task. (Decided)
-2. Tasks start on their own when their dependencies finish. The board holds
-   the dependency graph; nothing else decides readiness. (Decided)
-3. The system spawns agents of the right type per task, on demand.
+1. Hand a project to the lead in plain language and have it planned into
+   board tasks with dependencies and a role per task. (Decided)
+2. Tasks become ready on their own when the tasks they need complete. The
+   board holds the dependency graph; nothing else decides readiness.
    (Decided)
+3. Rider spawns the right agent for each task, on demand, with the model
+   that role calls for. (Decided)
 4. Work lands on branches that stack, one branch per task, ready to become
-   one PR or a stack of PRs. A project with its own repo works the same way.
-   (Decided)
-5. Zeke can attach from a CLI at any time, ask what is happening, and steer.
-   The same interface can back a Rust GUI later. (Decided)
+   one PR or a stack of PRs. A project with its own repo works the same
+   way. (Decided)
+5. Zeke can attach from a CLI at any time, ask what is happening, and
+   steer. (Decided)
 6. Everything runs locally. (Decided)
 7. All new code is Rust, written in TigerStyle. (Decided)
+8. Usable early: each milestone leaves something Zeke can run real work
+   through, and Rider is built with Rider as soon as that is possible.
+   (Decided)
+9. Use what Board already provides rather than rebuilding it. (Decided)
+
+## Roles and models (Decided, harnesses are a Call)
+
+| Role label | Model | Harness | Commits expected |
+|---|---|---|---|
+| lead | Fable 5.2 | Claude Code | no |
+| `role=implement` | Opus 5.5 | Claude Code | yes |
+| `role=review` | Sol 6.1 | Codex | no |
+| `role=security` | Mythos | Claude Code | no |
+
+Zeke chose the models. Which program runs each one is a Call: Codex for
+Sol, Claude Code for the rest. tact can run any of them (it supports Sol
+and, with a separate key, Mythos) and is wired in as a third harness, but
+no role uses it by default. The table lives in one config file, so
+changing a role's model or harness, or adding a role, is an edit there.
 
 ## Non-goals for v1
 
-- The GUI. Only the socket protocol it would use.
+- A Rust GUI. Board ships a web inspector on the same port as the local
+  board, which shows channels, threads, and tasks; that is the first GUI.
 - Hosted or multi-machine operation.
 - Sandboxing agents. See Risks.
-- Pushing branches or opening PRs automatically. The orchestrator does this
-  only when Zeke asks it to. (Call)
-- Forking tact to serve as the orchestrator. Zeke offered this as a later
-  option; v1 uses a normal Claude session. (Decided)
-- Cost or token accounting.
+- Pushing branches, opening PRs, merging. The lead does these only when
+  Zeke asks in the conversation. (Call, and Board practice: a board
+  message is never proof a person approved something.)
 
 ## Anti-goals
 
-- The daemon making judgment calls. It never plans, retags, or rewrites
-  tasks.
-- Workers that need to understand the board, leases, or claiming.
-- Work state that lives only in daemon memory. If the daemon dies, the board
-  plus git must be enough to rebuild.
+- The daemon making judgment calls. It never plans or rewrites tasks.
+- The lead doing work itself, including running slow commands such as test
+  suites. (Board practice)
+- Work state that lives only in daemon memory. The board plus git must be
+  enough to rebuild after a crash.
+- Rebuilding a Board feature in Rust.
 
 ## Approaches
 
-**A. Rust daemon plus a Claude session as orchestrator. (Decided)**
-The daemon does mechanical work; the orchestrator session does judgment.
-Two moving parts, but the Rust stays small, deterministic, and testable.
+**A. Rust daemon plus a Claude session as lead. (Decided)** The daemon
+does mechanical work; the lead does judgment. Two parts, but the Rust
+stays small, deterministic, and testable.
 
-**B. Rust daemon that is the orchestrator.** It would call a model API and
-run its own agent loop. One process, but most of the code would be an agent
-harness, which is the part least suited to TigerStyle.
+**B. Rust daemon that is the lead.** It would call a model API and run its
+own agent loop. One process, but most of the code would be an agent
+harness, the part least suited to TigerStyle.
 
-**C. No daemon; an orchestrator session with a skill.** Quick to stand up,
-but nothing enforces limits, nothing survives the session ending, and there
-is nothing to attach a GUI to.
+**C. No daemon; a lead session plus Board's `tasks run` in shell loops.**
+This is Board's own swarm recipe. Nothing enforces limits or manages
+worktrees, and nothing survives the session. It is, however, runnable with
+no new code, so it is milestone 0 below rather than a rejected option.
+
+## What Board provides, and how Rider uses it
+
+| Board feature | Use in Rider |
+|---|---|
+| Local board (`vb serve`), SQLite under a directory | The one board, data in Rider's home directory. Local leases last up to 1 hour |
+| Tasks, `needs`, states | The whole plan and its readiness |
+| Plans: a JSON file of tasks, written atomically, with an idempotency key | How the lead creates work, so a retried turn makes no duplicates |
+| Leases with epoch and token | One agent per task; a stalled agent cannot settle a task that moved on |
+| Caller-chosen claim token | The daemon derives each token from a secret and the task id, so after a restart it can resume the claims it held |
+| `fail` and `reopen` | A failed task is reopened in place; its dependents keep waiting |
+| `block --kind` and `unblock` | Worker questions (`needs_input`) and owner decisions (`awaiting_approval`) |
+| `--for <profile>` | Pinning a task to one worker when the lead wants that |
+| `tasks needs` | Rewiring dependencies when the plan changes |
+| Profiles | Every agent writes under its own name: `lead`, `opus-1`, `sol-1`, `mythos-1` |
+| Event feed with cursors (SSE over HTTP) | How the daemon follows the board without polling |
+| Schemas | Structured task results and review findings, validated by the board |
+| Attachments | Log tails on failures, proof output on results |
+| Inspector | Zeke's visual view of everything, from day one |
+| The `board` skill | Installed for every agent, so they already know the CLI |
+| Tailnet serving, grants, `--from` | Backlog: remote use and friends' agents |
+| SPEC.md and the conformance kit | Backlog: a board of our own |
 
 ## Parts
 
 ```
-          you
-           | rider chat / status / logs
-           v
-   +----------------+   wake-ups (resume with a message)   +--------------+
-   |    riderd    | -----------------------------------> | orchestrator |
-   |  (Rust daemon) | <----------------------------------- | (claude -p)  |
-   +----------------+   rider CLI (process control)      +--------------+
-     |    |     |                                                 |
-     |    |     +--- spawns: claude | codex | tact                | plans:
-     |    +--------- git worktrees and branches                   | tasks, needs,
-     +-------------- claims, renews, completes  --->  BOARD  <----+ agent tags
+           Zeke
+            |  rider chat / status / logs        inspector (browser)
+            v                                          |
+   +---------------+   wake-ups (resume + message)   +------+
+   |    riderd     | ------------------------------> | lead |
+   | (Rust daemon) | <------------------------------ |      |
+   +---------------+   rider CLI (process control)   +------+
+     |    |    |                                        |
+     |    |    +-- spawns workers per role              |  plans, answers,
+     |    +------- git worktrees and branches           |  checks
+     |                                                  v
+     +-- event feed, claim, renew, settle -------->  BOARD  <--- workers:
+                                                              read, reply, block
 ```
 
 ### The board
 
-One local board, served by Board's local mode, for all projects. (Call)
-Each project is a channel. A task is a Board task: a thread with managed
-state, dependencies, and labels.
+One local board for all projects. (Call) Channels (Board practice: one
+channel per piece of work):
 
-Labels the system uses (Call):
+- `work/<project>` holds a project's tasks.
+- `decisions` holds questions for Zeke, as blocked tasks.
+
+Labels Rider uses (Call):
 
 | Label | Set by | Meaning |
 |---|---|---|
-| `agent` | orchestrator | `claude`, `codex`, or `tact` |
-| `repo` | orchestrator | absolute path of the target git repo |
-| `base` | orchestrator | task id whose branch this task stacks on, or absent to use the project's base branch |
-| `onto` | orchestrator | task id whose existing branch this task works on directly, instead of getting a branch of its own (restacks and fix-ups) |
-| `branch` | daemon | branch name the task works on |
+| `role` | lead | `implement`, `review`, `security`; picks model and harness |
+| `repo` | lead | absolute path of the target git repo |
+| `base` | lead | task id whose branch this one stacks on; absent means the project's base branch |
+| `onto` | lead | task id whose existing branch this task works on directly (fix-ups, restacks) |
+| `of` | lead | for reviews: the task id under review |
+| `branch` | daemon | branch the task works on |
 | `attempt` | daemon | failed attempts so far |
 
 Rules (Call):
 
-- `base`, when present, must be one of the task's needs. So a branch is
-  only ever cut from a finished task's branch.
+- `base`, when present, must be one of the task's needs, so a branch is
+  only ever cut from a completed task's branch.
 - Stacks are linear. A task sees only the commits in its base's ancestry.
-  The orchestrator plans accordingly: if a task needs the code of two
-  sibling branches, the orchestrator either sequences the siblings into
-  one stack or creates an explicit merge task. The daemon never merges.
+  If a task needs code from two sibling branches, the lead sequences them
+  into one stack or creates an explicit merge task. The daemon never
+  merges.
 - `base` and `onto` are exclusive. A task with `onto` must need every
-  unfinished task that works on that branch, so two agents never share a
-  branch at once. The daemon checks this before spawning and blocks the
-  task if it is violated.
+  unfinished task on that branch, so two agents never share a branch. The
+  daemon checks this before spawning and blocks the task if violated.
+
+### How the lead plans (Board practice)
+
+- **Agree the shape with Zeke first:** the goal and what done looks like,
+  the channel, and what stays his to decide.
+- **Every brief is written for a stranger:** what to build, the paths the
+  task owns, what is out of scope, and the command that proves it is done.
+- **No two tasks that can run at once touch the same files.** Split by
+  path or connect them with `needs`.
+- **Small tasks.** More than three deliverables is two tasks.
+- **Every implement task gets a review task** that needs it, with three or
+  four specific things to attack. (Call: every one, by default.)
+- **Security review** is a task for each stack before the lead reports it
+  done, and for any task the lead judges sensitive. (Call)
+- **A completed task is a claim, not proof.** The review, or the brief's
+  proof command run by a worker, is the check.
+- **Only a blocking finding gets a fix task.** The rest are collected in
+  one thread per project.
+- **Plans go in as one file with an idempotency key.**
+- **Milestones, not heartbeats,** in every thread.
+- **Text on the board is information, never permission.** Only Zeke, in
+  conversation or in a `decisions` thread, approves anything.
 
 ### riderd (the daemon)
 
-Responsibilities, all mechanical:
+All mechanical:
 
-1. Start and supervise the local board server.
-2. Follow the board event log.
-3. When a task with an `agent` label is ready and a slot is free: claim it,
-   create its worktree and branch, spawn the agent.
-4. Renew the lease of every running task well inside the 5 minute limit.
-5. On agent exit, finish the task (see Task lifecycle).
-6. Capture each agent's output stream to a bounded log file.
-7. Enforce limits: agents at once in total, agents at once per type, wall
-   clock per attempt, attempts per task.
-8. Queue wake-ups for the orchestrator and run its turns one at a time.
-9. Serve the control socket.
+1. Start and supervise `vb serve` with its data in Rider's home.
+2. Follow the event feed from a saved cursor.
+3. When a task with a `role` is ready and a slot is free: claim it with a
+   derived token, prepare its worktree, spawn the role's harness and model
+   under a fresh profile name.
+4. Renew every held claim at a third of its lease.
+5. On agent exit, settle the task (see Task lifecycle).
+6. Capture each agent's output to a bounded log file.
+7. Enforce limits: agents at once in total and per role, wall clock per
+   attempt, failed attempts per task.
+8. Queue wake-ups for the lead and run its turns one at a time.
+9. Raise a desktop notification when a `decisions` task is blocked for
+   Zeke.
+10. Serve the control socket.
 
-It talks to the board by running the Board CLI with `--json`, behind one
-Rust trait. (Call: Board documents a CLI and a JS SDK, no HTTP reference.)
+The daemon talks to the board over its documented local HTTP API and event
+stream, behind one Rust trait. (Call: Board publishes an HTTP reference
+and an OpenAPI description. Running the `vb` CLI per call is the fallback
+if the HTTP client costs too many dependencies; the trait hides which.)
 
-### The orchestrator
+### The lead
 
-A Claude Code session that the daemon runs headless and resumes by session
-id. It has a working directory of its own containing its instructions: how
-to plan, the label scheme, how to choose an agent type, how to stack, and
-what each wake-up means.
+A Claude Code session on Fable that the daemon runs headless and resumes
+by session id. Its working directory holds its instructions: the planning
+practices above, the label scheme, the role table, and the turn order.
 
-It writes to the board directly with the Board CLI, and uses the `rider`
-CLI for process control. It does not loop. It runs one turn per wake-up:
+It does not loop or wait. The daemon wakes it with one message containing
+the events since its last turn and the cursor they end at. Each turn, in
+Board's recommended order:
 
-| Wake-up | Typical response |
-|---|---|
-| Zeke sent a message | answer, plan, or replan |
-| Task failed or hit its attempt limit | retry, retag for another agent, split, or ask Zeke |
-| Task blocked by its agent | resolve or ask Zeke |
-| A branch moved under branches stacked on it | create a restack task |
-| A channel has no open tasks left | summarize for Zeke |
+1. Answer blocked workers first: reply in the thread, then unblock.
+2. Read each finished task's result before relying on it.
+3. Turn blocking review findings into fix tasks; note the rest.
+4. Handle failures: reopen, reopen under a different role or model, split,
+   or put a decision to Zeke.
+5. Keep the queue full: create the next tasks with their needs.
+6. End the turn.
 
-Wake-ups that arrive during a turn are queued and delivered together in the
-next one. The queue is bounded; when full, the oldest of the same kind for
-the same task is dropped, because the board still holds the truth.
+Wake-ups: a message from Zeke; a task completed, failed, or blocked; an
+answer from Zeke in `decisions`; a branch that moved under branches
+stacked on it; a channel with nothing left open. Wake-ups arriving during
+a turn are delivered together in the next one. The queue is bounded; when
+full, older wake-ups for the same task are dropped, since the board still
+holds the truth and the lead re-reads it.
+
+The lead writes to the board with the Board CLI as profile `lead`, and
+uses the `rider` CLI for process control.
+
+**Questions for Zeke.** If he is attached, the lead asks in the chat. If
+not, it creates a task in `decisions` written for someone who has not
+followed the work (the question, a recommendation, what waits on it, the
+options and their costs) and blocks it as `awaiting_approval`. Work that
+does not depend on it carries on. When Zeke answers in the thread or in
+chat, the lead completes the task with the answer, so `decisions` is the
+record of what was decided.
 
 ### Workers
 
-A worker is one agent process for one attempt at one task. The daemon gives
-it a prompt containing the task text, the thread so far, and the rules; a
-working directory that is the task's worktree; and three commands (Call):
+A worker is one agent process for one attempt at one task. It gets:
 
-- `rider task note "<text>"` posts progress to the task thread.
-- `rider task block "<reason>"` marks the task blocked and ends the attempt.
-- `rider task noop "<why>"` records that the task needed no changes.
-- `rider task context` prints the task and the threads of the tasks it needs.
+- a working directory: the task's worktree;
+- `BOARD_URL`, `BOARD_PROFILE` (its own name), and `BOARD_TASK`;
+- the `board` skill;
+- a prompt adapted from Board's worker instructions.
 
-Workers never touch the board directly. This keeps the three agent types
-interchangeable and keeps Board's experimental CLI out of their prompts.
+The prompt, in short: read the brief and the whole thread; reply with a
+plan before starting; reply after each meaningful step with the command
+and its result; stay inside the brief and the owned paths; commit your
+work; when the proof command passes, post the result and proof and exit.
+To ask a question, post it with a recommendation, block the task as
+`needs_input`, and stop.
 
-How each is launched (flags to be confirmed in the first plan step):
+Workers do not claim, renew, complete, or fail tasks. The daemon does
+those, because only it can check the worktree first. (Call)
 
-| Agent | Headless form | Output |
+Reviewers get a worktree checked out at the head of the branch under
+review and are told not to change it. They post each finding as a
+structured message (severity, file, line, claim, how to reproduce), say
+which are blocking, and exit.
+
+Launch forms, flags to be confirmed in milestone 0:
+
+| Harness | Headless form | Output |
 |---|---|---|
-| claude | `claude -p` with stream JSON output | JSONL |
-| codex | `codex exec` with JSON output | JSONL |
-| tact | `tact run` | JSONL |
-
-Adding a fourth agent type should mean adding one table entry of this kind.
+| Claude Code | `claude -p --model <model>` with stream JSON output | JSONL |
+| Codex | `codex exec --model <model>` with JSON output | JSONL |
+| tact | `tact --model <model> run` | JSONL |
 
 ### The `rider` CLI
 
 One binary; the daemon is `rider daemon`. (Call)
 
 ```
-rider up | down               start or stop the daemon
-rider chat ["message"]        talk to the orchestrator; streams its reply
-rider status                  tasks by state, running agents, queue depth
-rider agents                  running agents: task, type, age, last output
+rider up | down               start or stop the daemon (and the board)
+rider chat ["message"]        talk to the lead; streams its reply
+rider status                  tasks by state, running agents, open decisions
+rider agents                  running agents: task, role, model, age, last output
 rider logs <task> [-f]        an agent's output
 rider kill <task>             stop an agent; its task fails
 rider limits [set k=v]        show or change limits
-rider inbox                   messages the orchestrator left for you
-rider task retry <task> [--agent <type>]   for the orchestrator
-rider task abandon <task> "<reason>"       for the orchestrator
-rider task note|block|noop|context         for workers
+rider open                    open the board inspector in the browser
 ```
 
-Example of what `rider status` shows:
+What `rider status` shows:
 
 ```
-board  local  1 running / 4 max     orchestrator: idle     inbox: 1 unread
+board  http://127.0.0.1:4100   2 running / 4 max   lead: idle   decisions: 1 open
 
-auth-refactor   /Users/zeke/code/app          base main
-  done     T12  claude  extract token store            rider/T12-token-store
-  running  T13  codex   migrate callers        14m     rider/T13-callers       <- T12
-  waiting  T14  tact    add expiry tests               needs T13              <- T13
-  waiting  T15  claude  remove old path                needs T14              <- T14
-  blocked  T16  codex   update docs                    "which docs site?"
+work/auth-refactor   /Users/zeke/code/app   base main
+  completed  #12  implement  opus-1    extract token store          rider/12-token-store
+  completed  #13  review     sol-1     review token store           of #12
+  claimed    #14  implement  opus-2    migrate callers       14m    rider/14-callers   <- #12
+  waiting    #15  review               review caller migration      needs #14
+  waiting    #16  security             security pass on the stack   needs #15
+  blocked    #17  implement            update docs                  needs_input: "which docs site?"
 ```
 
-The CLI talks to the daemon over a Unix socket in the rider home
-directory, using newline-delimited JSON: request and response, plus
-subscriptions for streams. The GUI would use the same socket. (Call)
+The CLI talks to the daemon over a Unix socket in Rider's home, using
+newline-delimited JSON: request and response, plus subscriptions for
+streams. A later GUI would use the same socket. (Call)
 
 ## Task lifecycle
 
 ```
-orchestrator creates task (agent, repo, base, needs)
+lead creates tasks from a plan file (role, repo, base/onto, needs)
         |
-   board: waiting --needs finished--> ready
+   board: waiting --needs completed--> ready
         |
-   daemon: slot free? claim -> worktree + branch -> spawn agent
+   daemon: slot free? claim -> worktree + branch -> spawn worker
         |
-   agent works; daemon renews lease; agent posts notes
+   worker reads thread, posts plan and milestones; daemon renews
         |
-   +-- exit 0, clean tree, and head moved or noop --> complete (last message, branch, head)
-   +-- exit 0, dirty tree or nothing done ----------> held: "no committed work"
-   +-- non-zero exit / killed / timeout ------------> held: reason + log tail
-   +-- `rider task block` ------------------------> held: the agent's question
+   +-- exit 0, tree clean, and (head moved, or role expects no commits)
+   |        -> complete, with a structured result
+   +-- exit 0 otherwise ------------------> fail "no committed work"
+   +-- non-zero exit / killed / timeout --> fail, log tail attached
+   +-- worker blocked the task -----------> stays blocked (needs_input)
 ```
 
-"Head moved" means the branch head differs from where it was when this
-attempt started.
-
-**Held tasks.** (Call) All three unhappy endings put the task in the
-board's blocked state with a reason and a kind (`failed` or `question`),
-rather than the board's failed state, which may be final. The daemon never
-retries by itself. Each held task wakes the orchestrator, which either:
-
-- runs `rider task retry <task>`, optionally with `--agent` to switch
-  type, which makes the task ready again; or
-- runs `rider task abandon <task>`, which fails it on the board for good.
-
-Both are mechanical commands the daemon carries out on request; the
-judgment stays with the orchestrator. How "ready again" maps onto Board
-operations is settled by the spike.
-
-**Attempts.** Only `failed` endings count. Answering a question does not.
-Switching agent type resets the count. Past the limit the daemon refuses
-`retry` without a type switch and says so.
-
-A retry reuses the task's worktree and branch as the last agent left
-them, uncommitted changes included, and the prompt says so.
+- **Result.** On completion the daemon posts a structured result to the
+  thread (branch, head commit, commits added, the worker's last message)
+  and uses the worker's last message as the task's result text.
+- **Failure.** (Board practice) The task goes to the board's failed state.
+  Its dependents keep waiting. The daemon never retries by itself. The
+  lead reopens it, optionally after changing its role, or cancels it.
+- **Attempts.** Only failed attempts count. Past the limit the daemon
+  blocks the task with kind `attempts_exhausted` instead of spawning, and
+  the lead must change something or go to Zeke.
+- **Retry.** A reopened task reuses its worktree and branch as the last
+  agent left them, uncommitted changes included, and the prompt says so.
+  The new worker reads the whole thread, as Board recommends.
+- **"Head moved"** means the branch head differs from where it was when
+  the attempt started.
 
 ## Branches and worktrees
 
-- Worktree: `<rider home>/worktrees/<channel>/<task id>`.
-- Branch: `rider/<task id>-<slug>`, cut from the head of the `base`
-  task's branch, or from the project's base branch when `base` is absent.
+- Worktree: `<rider home>/worktrees/<project>/<task id>`.
+- Branch: `rider/<task id>-<slug>`, cut from the head of the `base` task's
+  branch, or from the project's base branch when `base` is absent.
 - Completed tasks keep their branch. The worktree is removed on completion
   and recreated if needed.
 - A branch moves after children were cut from it only when an `onto` task
-  (a fix-up) completes on it. The daemon then notices that the parent head
-  is no longer an ancestor of each child and wakes the orchestrator.
-- Restacking is the orchestrator's decision and a worker's job: the
-  orchestrator creates one `onto` task per child branch, each needing the
-  fix-up and the restack of the branch below it. The worker rebases in
-  that branch's worktree. If the rebase turns out to be unnecessary it
-  reports `noop`.
-- A project with its own repo is the same thing with a different `repo` and
-  base branch.
-
-## Reaching Zeke when he is not attached
-
-(Call) The orchestrator posts anything meant for Zeke, such as questions
-and summaries, to an `inbox` channel on the board, so it survives restarts
-like all other state. `rider status` shows the unread count,
-`rider inbox` lists and marks read, `rider chat` shows unread messages
-first, and the daemon raises a desktop notification for each new one.
+  completes on it. The daemon notices that the parent head is no longer an
+  ancestor of each child and wakes the lead.
+- Restacking is the lead's decision and a worker's job: one `onto` task
+  per child branch, each needing the fix-up and the restack of the branch
+  below it.
+- A project with its own repo is the same thing with a different `repo`.
 
 ## Failure and restart
 
-- **Daemon dies.** Agents it spawned are killed with it (Call: process
-  group). Leases lapse within 5 minutes. On start the daemon reads the
-  board, finds tasks it had claimed, and re-spawns into the existing
-  worktrees, counting an attempt.
-- **Orchestrator turn fails.** The wake-ups for that turn go back on the
-  queue; after repeated failures the daemon stops waking it and reports the
-  fault in `rider status`.
+- **Daemon dies.** Its agents die with it (Call: process group). On start
+  it reads the board and its saved cursor, re-derives the tokens for
+  claims it held, and for each either resumes the claim and re-spawns into
+  the existing worktree, or, if the lease already lapsed, lets the task
+  return to ready and claims it normally. A restart does not count as a
+  failed attempt.
+- **Lead turn fails.** Its wake-ups go back on the queue. After repeated
+  failures the daemon stops waking it and says so in `rider status`.
 - **Board server dies.** The daemon restarts it and pauses spawning until
   it answers.
 - **Agent hangs.** The wall clock limit kills it.
@@ -290,53 +379,89 @@ first, and the daemon raises a desktop notification for each new one.
 ## TigerStyle in practice
 
 - The daemon core is one state machine: `step(state, event) -> actions`,
-  with no I/O inside it. Board, git, processes, clock, and socket sit
-  behind traits at the edge.
-- Every collection has a fixed capacity declared as a named constant:
-  running agents, tracked tasks, wake-up queue, socket clients, log bytes.
-  Reaching a capacity is a handled case, not a panic or a growth.
-- Assertions on every invariant at function entry and exit, kept on in
-  release builds. Examples: a running agent always holds a live lease; a
-  task is never claimed twice; running count never exceeds the limit.
+  with no I/O inside. Board, git, processes, clock, and socket sit behind
+  traits at the edge.
+- Every collection has a fixed capacity declared as a named constant.
+  Reaching one is a handled case, never a panic or a growth.
+- Assertions on every invariant at function entry and exit, on in release
+  builds. Examples: every running agent holds a live claim; a task is
+  never claimed twice; running count never exceeds its limit.
 - Deterministic simulation tests: a seeded run drives the core with fake
-  board, git, processes, and clock, injecting agent crashes, lost leases,
-  board outages, and daemon restarts, and checks the invariants after every
+  board, git, processes, and clock, injecting agent crashes, lost claims,
+  board outages, and daemon restarts, checking invariants after every
   step. (Call)
-- No async runtime: threads and bounded channels feed the single core
-  thread. Dependencies kept to the minimum, each one justified. (Call)
-- Explicit limits on every loop and every wait; no unbounded retries.
+- No async runtime: threads and bounded channels feed one core thread.
+  Dependencies kept to the minimum, each justified in writing. (Call)
+- Explicit limits on every loop and wait; no unbounded retries.
 
-Default limits (Call): 4 agents at once, 2 per type, 60 minutes per
-attempt, 3 attempts per task, 256 tracked tasks, 64 queued wake-ups.
+Default limits (Call): 4 agents at once; per role 2 implement, 2 review,
+1 security; 60 minutes per attempt; 3 failed attempts per task; 256
+tracked tasks; 64 queued wake-ups.
+
+## Milestones
+
+Each one is usable on real work.
+
+**0. Board's own recipe, no new code.** Install Board and its skill; run
+`vb serve`; write the lead's instructions, the worker and reviewer
+prompts, the role table, and the result and finding schemas; run the lead
+by hand in a Claude session and workers through `vb tasks run` with the
+three models. This proves the CLI behaviour, the headless flags, the
+prompts, and the label scheme, and Zeke can use it the same day. Worktrees
+are made by hand or by the lead at this stage.
+
+**1. The daemon's core.** Event feed, claim, worktree, spawn by role,
+renew, settle, limits, logs, `rider up/down/status/agents/logs/kill`. The
+lead is still a session Zeke runs himself. From here Rider's own tasks run
+through Rider.
+
+**2. The lead under the daemon.** Wake-ups, `rider chat`, decisions and
+notifications, restart recovery.
+
+**3. Hardening.** Fault injection in the simulator widened; stack-moved
+detection; limits tuning.
+
+## Backlog (recorded, not designed)
+
+- **tk for every agent.** Each agent signs its commits with tk and uses tk
+  for SSH. Fits where the daemon builds a worker's environment: one
+  identity per profile.
+- **Running remotely.** Board can already serve a local board to a tailnet
+  with callers identified by Tailscale, which is the likely first step.
+- **Collaborating with friends' agents.** Board has grants per channel and
+  lets a worker take tasks from named other owners (`--from`), which is
+  the trust boundary to design around: a task's text is instructions to
+  whoever claims it.
+- **A board of our own,** copying Vercel's. Board publishes a spec and a
+  conformance kit, and the daemon reaches the board through one trait, so
+  a Rust board that passes the kit can replace it.
+- **Rust GUI** on the control socket.
+- **tact fork as the lead.**
+- **Sandboxing workers.**
 
 ## Risks
 
-- **Agents run unsandboxed with skipped permission prompts.** Unattended
-  work needs each agent to run without asking for approval, and tact has no
-  sandbox at all. A worktree only separates files by convention; an agent
-  can still touch anything Zeke's user can. v1 accepts this. (Call, and
-  the one most worth Zeke's attention.)
-- **Board is one day old and experimental.** Its CLI was read from docs,
-  not run. The first plan step is a spike that installs it, serves a board
-  locally, and exercises create with needs, claim, renew, complete, fail,
-  block, label, and the event tail, recording the real JSON. The Board
-  trait is the only code that should change if the CLI does.
-- **Local mode may not match hosted behaviour** for leases and
-  dependencies. The same spike checks this.
-- **The spike is a gate.** (Call) The design needs dependency-driven
-  readiness, claim and renew, an event tail, labels, and a blocked state.
-  If local Board lacks any of them, work stops and the findings go back to
-  Zeke. The daemon does not quietly emulate missing board features, since
-  that would move work state off the board.
-- **tact's exit codes are undocumented.** The daemon must not rely on exit
-  status alone; hence the committed-work check.
+- **Agents run unsandboxed with permission prompts skipped.** Unattended
+  work requires it, and tact has no sandbox at all. A worktree separates
+  files only by convention; an agent can touch anything Zeke's user can.
+  v1 accepts this. (Call, and the one most worth Zeke's attention.)
+- **Board is two days old and experimental.** Its docs and source were
+  read; nothing has been run. Milestone 0 is the check, and it is a gate:
+  if local Board lacks something this design relies on, work stops and the
+  findings go to Zeke rather than the daemon quietly emulating it.
+- **Board needs Node.** The daemon supervises one Node process. Accepted
+  until there is a board of our own.
+- **Local scheduled messages are lost on board restart,** so the design
+  does not rely on Board schedules.
+- **Model names.** "Sol 6.1" and "Mythos" must match what Codex and Claude
+  Code accept on this machine; milestone 0 confirms the exact ids.
+- **tact's exit codes are undocumented,** so no harness is trusted on exit
+  status alone; hence the worktree check.
 
 ## Left to the builder
 
 - Crate layout, error types, socket message shapes, log format.
-- Exact agent flags and prompt wording, within the rules above.
-- The orchestrator's instruction file, beyond the wake-up table and label
-  scheme.
-- How the board server is located and where its data lives, once the spike
-  shows what local mode requires.
-- The slug rule for branch names.
+- Exact agent flags and prompt wording, within the practices above.
+- The two schemas' exact fields.
+- HTTP versus CLI behind the board trait, once milestone 0 shows the cost.
+- The slug rule for branch names; profile numbering.
