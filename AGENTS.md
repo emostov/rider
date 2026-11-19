@@ -16,7 +16,7 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 - No recursion, no `unsafe`, no async runtime. Threads and bounded channels only.
 - Functions are at most 70 lines; lines are at most 100 columns.
 - Errors are enums, handled at every call site. No `unwrap()` or `expect()` outside tests. No `thiserror` or `anyhow`.
-- `serde_json` is the only dependency. A new one needs a written reason in `Cargo.toml`.
+- TigerStyle's rule against dependencies does not apply. Use a well-maintained crate when it saves writing and maintaining code of our own.
 - Use checked arithmetic (`checked_add`, `try_from`) on lengths, indices, and counts from external input, not `as` casts or bare `+`.
 - A lint suppression uses `#[expect(lint, reason = "...")]` naming the specific false positive, not a bare `#[allow]`.
 

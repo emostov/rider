@@ -1,6 +1,7 @@
 # Rider: a local agent swarm run through Vercel Board
 
-Status: draft for approval, 2026-11-19 (second revision).
+Status: second revision, 2026-11-19, corrected after milestone 0. Where this document and
+`2026-11-19-rider-daemon-design.md` differ on the daemon, the daemon design wins.
 
 "Decided" marks what Zeke chose in conversation. "Call" marks a choice made
 while writing this, open to correction. "Board practice" marks something
@@ -105,7 +106,7 @@ no new code, so it is milestone 0 below rather than a rejected option.
 | Tasks, `needs`, states | The whole plan and its readiness |
 | Plans: a JSON file of tasks, written atomically, with an idempotency key | How the lead creates work, so a retried turn makes no duplicates |
 | Leases with epoch and token | One agent per task; a stalled agent cannot settle a task that moved on |
-| Caller-chosen claim token | The daemon derives each token from a secret and the task id, so after a restart it can resume the claims it held |
+| Claim tokens kept by the `vb` CLI | The board issues each claim's token and the CLI stores it per board, task and profile, so after a restart the daemon can renew the claims it held |
 | `fail` and `reopen` | A failed task is reopened in place; its dependents keep waiting |
 | `block --kind` and `unblock` | Worker questions (`needs_input`) and owner decisions (`awaiting_approval`) |
 | `--for <profile>` | Pinning a task to one worker when the lead wants that |
@@ -151,11 +152,13 @@ Labels Rider uses (Call):
 |---|---|---|
 | `role` | lead | `implement`, `light`, `review`, `polish`, `security`; picks model and harness |
 | `repo` | lead | absolute path of the target git repo |
-| `base` | lead | task id whose branch this one stacks on; absent means the project's base branch |
+| `base` | lead | task id whose branch this one stacks on |
+| `from` | lead | the agreed base branch to cut from; required when `base` and `onto` are absent |
 | `onto` | lead | task id whose existing branch this task works on directly (fix-ups, restacks) |
 | `of` | lead | for reviews: the task id under review |
 | `branch` | daemon | branch the task works on |
 | `attempt` | daemon | failed attempts so far |
+| `start` | daemon | the commit the task's branch was at when the task first started |
 
 Rules (Call):
 
@@ -166,8 +169,9 @@ Rules (Call):
   into one stack or creates an explicit merge task. The daemon never
   merges.
 - `base` and `onto` are exclusive. A task with `onto` must need every
-  unfinished task on that branch, so two agents never share a branch. The
-  daemon checks this before spawning and blocks the task if violated.
+  unfinished task on that branch, so two agents never share a branch. Milestone 0 leaves this
+  rule and the `base` rule to the lead; the daemon checks them before spawning from
+  milestone 1 (issue #4).
 
 ### How the lead plans (Board practice)
 
@@ -224,10 +228,9 @@ All mechanical:
    Zeke.
 10. Serve the control socket.
 
-The daemon talks to the board over its documented local HTTP API and event
-stream, behind one Rust trait. (Call: Board publishes an HTTP reference
-and an OpenAPI description. Running the `vb` CLI per call is the fallback
-if the HTTP client costs too many dependencies; the trait hides which.)
+The daemon talks to the board through the `vb` CLI, behind one Rust trait.
+(Decided in the daemon design: the CLI keeps claim tokens where workers and a
+restarted daemon can use them.)
 
 ### The lead
 
@@ -303,7 +306,7 @@ One binary; the daemon is `rider daemon`. (Call)
 
 ```
 rider up | down               start or stop the daemon (and the board)
-rider chat ["message"]        talk to the lead; streams its reply
+rider chat <project> ["message"]   talk to that project's lead; streams its reply
 rider status                  tasks by state, running agents, open decisions
 rider agents                  running agents: task, role, model, age, last output
 rider logs <task> [-f]        an agent's output
@@ -365,7 +368,7 @@ lead creates tasks from a plan file (role, repo, base/onto, needs)
 
 ## Branches and worktrees
 
-- Worktree: `<rider home>/worktrees/<project>/<task id>`.
+- Worktree: `<rider home>/worktrees/<repository directory name>/<task id>`.
 - Branch: `rider/<task id>-<slug>`, cut from the head of the `base` task's
   branch, or from the project's base branch when `base` is absent.
 - Completed tasks keep their branch. The worktree is removed on completion
@@ -407,11 +410,11 @@ lead creates tasks from a plan file (role, repo, base/onto, needs)
   board outages, and daemon restarts, checking invariants after every
   step. (Call)
 - No async runtime: threads and bounded channels feed one core thread.
-  Dependencies kept to the minimum, each justified in writing. (Call)
+  A dependency is used where it saves code of our own. (Decided)
 - Explicit limits on every loop and wait; no unbounded retries.
 
-Default limits (Call): 4 agents at once; per role 2 implement, 2 review,
-1 polish, 1 security; 60 minutes per attempt; 3 failed attempts per task; 256
+Default limits (Call): 4 agents at once; per role 2 implement, 2 light, 2 review,
+1 polish, 1 security; 55 minutes per attempt; 3 failed attempts per task; 256
 tracked tasks; 64 queued wake-ups.
 
 ## Milestones
@@ -435,16 +438,10 @@ before the daemon and before the smaller follow-up fixes. Every later
 behaviour change adds or changes a scenario first. Tracked as issue #14 and
 built through Rider.
 
-**1. The daemon's core.** Event feed, claim, worktree, spawn by role,
-renew, settle, limits, logs, `rider up/down/status/agents/logs/kill`. The
-lead is still a session Zeke runs himself. From here Rider's own tasks run
-through Rider.
-
-**2. The lead under the daemon.** Wake-ups, `rider chat`, decisions and
-notifications, restart recovery.
-
-**3. Hardening.** Fault injection in the simulator widened; stack-moved
-detection; limits tuning.
+**1. The daemon.** One milestone, designed in `2026-11-19-rider-daemon-design.md`: workers
+under the daemon, the control socket and CLI, restart recovery, the lead under
+the daemon with `rider chat`, and the simulator. It replaces what this document
+first split into milestones 1 to 3.
 
 ## v2: working remotely (Decided as the next version, not designed)
 
@@ -510,5 +507,4 @@ and one trait, and every agent already writes under its own profile.
 - Crate layout, error types, socket message shapes, log format.
 - Exact agent flags and prompt wording, within the practices above.
 - The two schemas' exact fields.
-- HTTP versus CLI behind the board trait, once milestone 0 shows the cost.
 - The slug rule for branch names; profile numbering.
