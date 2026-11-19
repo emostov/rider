@@ -1,7 +1,7 @@
 //! The world a scenario runs in: a board, a rider home, a repository, and fake agents.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -88,7 +88,9 @@ pub fn find_tools() -> Option<(PathBuf, PathBuf)> {
             } else {
                 "node"
             };
-            eprintln!("skipping scenario: {missing} not found; {INSTALL_HINT}");
+            // `eprintln!` is captured by the test runner; a skip must be seen.
+            let line = format!("skipping scenario: {missing} not found; {INSTALL_HINT}\n");
+            let _ = std::io::stderr().write_all(line.as_bytes());
             None
         }
     }
@@ -271,7 +273,9 @@ pub fn run_bounded(mut command: Command, input: Option<&str>) -> Output {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().expect("start a command");
     if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
-        std::io::Write::write_all(&mut stdin, text.as_bytes()).expect("write standard input");
+        stdin
+            .write_all(text.as_bytes())
+            .expect("write standard input");
     }
     let (stdout, stderr) = (read_all(child.stdout.take()), read_all(child.stderr.take()));
     let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS_MAX);
