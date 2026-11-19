@@ -1,0 +1,78 @@
+---
+name: ride-swarm
+description: Use when the user asks to ride a swarm, start a swarm, have Rider or "the swarm" implement, build, or fix something (a goal, a milestone, GitHub issues), asks for swarm status ("check my swarm", "how is the swarm doing", "what's running"), or asks to stop the swarm.
+---
+
+# Ride a swarm
+
+Rider runs a swarm of coding agents on this machine: a local board holds tasks, `rider pool
+<project>` runs one agent per ready task in its own git worktree, and a lead plans the goal
+into tasks. When the user rides a swarm from this session, **this session is the lead**.
+
+`<skill>` is the directory that contains this SKILL.md. It holds `lead.md`, the lead's
+instructions, and `schemas/`. The board is reached with `vb`, which needs:
+
+```sh
+export BOARD_URL=http://127.0.0.1:4100/api/board PATH="$HOME/.rider/node/node_modules/.bin:$PATH"
+```
+
+## Swarm status
+
+Run these, then answer in the order below. The board changes while you talk, so never
+answer from memory.
+
+| Question | Command |
+|---|---|
+| Is the board up? | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4100` (`000` is down) |
+| Which pools run? | `pgrep -fl '^rider pool '` (the last word is the project) |
+| Which projects exist? | `vb channels list work/` |
+| A project's tasks, with each result's summary | `vb tasks work/<project> --state all` |
+| Why tasks are blocked | `vb tasks work/<project> --state blocked` |
+| Questions waiting on the user | `vb tasks decisions --state blocked` ("Couldn't find channel" means none) |
+| One task in full | `vb read <id>` |
+
+1. What needs the user: open decisions, and tasks blocked as `rider_error`, `branch_busy`,
+   or `attempts_exhausted`.
+2. What is running: claimed tasks, and whether a pool runs for each project with open tasks.
+   A project with ready tasks and no pool is stalled: say so.
+3. What finished or failed recently. For a finished `review` or `security` task, say
+   whether its summary reports anything blocking, and whether a fix task exists for it.
+
+Old blocked tasks the user did not mention are theirs to keep or cancel: list them, and ask.
+
+## Ride a swarm
+
+1. **Install what is missing.** Check each with `command -v`; install only what is absent,
+   and tell the user what you installed.
+   - `rider`: `cargo install --locked --git https://github.com/emostov/rider rider`
+   - `vb` (the Board CLI): `npm install --prefix ~/.rider/node @vercel/board`
+   - `claude`, `codex`, `jq`, Node 22, and Rust cannot be installed for the user: name the
+     missing ones and stop. `claude` and `codex` must be signed in.
+2. **Agree the shape.** Ask in one question only for what the request and the repository do
+   not already say: the project name (channel `work/<project>`), the repository, the base
+   branch, the goal and how the user will know it is done, and how finished work reaches the
+   base branch. Rider never merges: either the lead merges reviewed work locally
+   (`git -C <repo> merge --no-ff <branch>` on a clean checkout, `git merge --abort` and a
+   restack task on conflict, never push), or the user merges when asked in `decisions`.
+3. **Board.** If it is down, start `rider serve` as a background command and check again.
+   `vb schemas list` must list `rider-result@1` and `rider-finding@1`; register a missing
+   one with `vb schemas create rider-result@1 --file <skill>/schemas/rider-result.json`
+   (or `rider-finding`).
+4. **Pool.** If none runs for the project, ask the user to run `rider pool <project>` in a
+   terminal they keep open. It stops when its standard input closes, so it cannot run as
+   your background command.
+5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
+   `lead-fable-5-2`. Do its "Each turn" steps, but run step 9's `vb wait` as a background
+   command so the user can keep talking to you, and take the next turn when it returns.
+   Answer the user before anything else.
+
+## Stop the swarm
+
+Ask the user to type `stop` in the pool's terminal. Running agents finish and their tasks
+settle; nothing new is claimed. The board keeps running.
+
+## Common mistakes
+
+- Doing a worker's job as the lead: editing the repository, building, or running tests.
+  Make it a task.
+- Starting a second pool for a project. Check `pgrep` first.

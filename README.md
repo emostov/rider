@@ -45,24 +45,25 @@ own.
 
 ## Getting started
 
-Clone this repository, open your agent in it, and paste:
+Install the `ride-swarm` skill:
 
-```
-Set up Rider from this checkout by following docs/manual.md: check the
-prerequisites, install the Board CLI and its skill, run `cargo install --path .`,
-start the board with `rider serve` in the background, and register the two
-schemas in schemas/. Then tell me the commands to start the worker pool and the
-lead in my own terminals. Do not start any agents yourself.
+```bash
+npx skills add emostov/rider --skill ride-swarm -g
 ```
 
-Then tell the lead what you want:
+Then open Claude Code in any repository and say what you want:
 
 ```
-You are the lead for project `demo`. The repository is /abs/path/to/repo, base
-branch `main`. Goal: <what you want built, and how you will know it is done>.
-Plan it with a review of each implementing task, a polish pass, and one
-security review of the stack. I have agreed the goal and the channel
-`work/demo`; decide everything else yourself. Workers are already running.
+Ride a swarm to add a --json flag to the export command, with tests.
+```
+
+That session becomes the lead. It installs `rider` and the Board CLI if they
+are missing, starts the board, asks you to run `rider pool <project>` in a
+terminal of your own, agrees the goal with you, and plans it. Later, from any
+session:
+
+```
+Check my swarm.
 ```
 
 Watch the swarm work in the board's inspector at <http://127.0.0.1:4100>.
