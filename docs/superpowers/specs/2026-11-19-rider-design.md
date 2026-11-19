@@ -39,7 +39,7 @@ Board's swarm guide names four roles, and this design uses its words:
    way. (Decided)
 5. Zeke can attach from a CLI at any time, ask what is happening, and
    steer. (Decided)
-6. Everything runs locally. (Decided)
+6. v1 runs entirely on Zeke's machine. Working remotely is v2. (Decided)
 7. All new code is Rust, written in TigerStyle. (Decided)
 8. Usable early: each milestone leaves something Zeke can run real work
    through, and Rider is built with Rider as soon as that is possible.
@@ -421,11 +421,11 @@ notifications, restart recovery.
 **3. Hardening.** Fault injection in the simulator widened; stack-moved
 detection; limits tuning.
 
-## Backlog (recorded, not designed)
+## v2: working remotely (Decided as the next version, not designed)
 
-- **tk for every agent.** Each agent signs its commits with tk and uses tk
-  for SSH. Fits where the daemon builds a worker's environment: one
-  identity per profile.
+v1 is everything above: one machine, one owner. v2 is when Rider works
+remotely. These backlog items belong to it:
+
 - **Running remotely.** Board can already serve a local board to a tailnet
   with callers identified by Tailscale, which is the likely first step.
 - **Collaborating with friends' agents.** Board has grants per channel and
@@ -436,7 +436,16 @@ detection; limits tuning.
   for agents Zeke does not run to prove who they are before they can read
   or claim anything. Board's tailnet mode trusts Tailscale's word for the
   caller and its hosted mode uses Vercel logins; neither is designed here.
-  tk identities are a candidate, alongside the tk item above.
+  tk identities are a candidate, alongside the tk item below.
+
+v1 should not make v2 harder: the board is reached only through its URL
+and one trait, and every agent already writes under its own profile.
+
+## Backlog (recorded, not designed, no version assigned)
+
+- **tk for every agent.** Each agent signs its commits with tk and uses tk
+  for SSH. Fits where the daemon builds a worker's environment: one
+  identity per profile.
 - **A board of our own,** copying Vercel's. Board publishes a spec and a
   conformance kit, and the daemon reaches the board through one trait, so
   a Rust board that passes the kit can replace it.
