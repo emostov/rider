@@ -1,4 +1,4 @@
-# Foreman: a local agent swarm run through Vercel Board
+# Rider: a local agent swarm run through Vercel Board
 
 Status: draft for approval, 2026-11-19.
 
@@ -66,12 +66,12 @@ is nothing to attach a GUI to.
 
 ```
           you
-           | foreman chat / status / logs
+           | rider chat / status / logs
            v
    +----------------+   wake-ups (resume with a message)   +--------------+
-   |    foremand    | -----------------------------------> | orchestrator |
+   |    riderd    | -----------------------------------> | orchestrator |
    |  (Rust daemon) | <----------------------------------- | (claude -p)  |
-   +----------------+   foreman CLI (process control)      +--------------+
+   +----------------+   rider CLI (process control)      +--------------+
      |    |     |                                                 |
      |    |     +--- spawns: claude | codex | tact                | plans:
      |    +--------- git worktrees and branches                   | tasks, needs,
@@ -108,7 +108,7 @@ Rules (Call):
   branch at once. The daemon checks this before spawning and blocks the
   task if it is violated.
 
-### foremand (the daemon)
+### riderd (the daemon)
 
 Responsibilities, all mechanical:
 
@@ -134,7 +134,7 @@ id. It has a working directory of its own containing its instructions: how
 to plan, the label scheme, how to choose an agent type, how to stack, and
 what each wake-up means.
 
-It writes to the board directly with the Board CLI, and uses the `foreman`
+It writes to the board directly with the Board CLI, and uses the `rider`
 CLI for process control. It does not loop. It runs one turn per wake-up:
 
 | Wake-up | Typical response |
@@ -155,10 +155,10 @@ A worker is one agent process for one attempt at one task. The daemon gives
 it a prompt containing the task text, the thread so far, and the rules; a
 working directory that is the task's worktree; and three commands (Call):
 
-- `foreman task note "<text>"` posts progress to the task thread.
-- `foreman task block "<reason>"` marks the task blocked and ends the attempt.
-- `foreman task noop "<why>"` records that the task needed no changes.
-- `foreman task context` prints the task and the threads of the tasks it needs.
+- `rider task note "<text>"` posts progress to the task thread.
+- `rider task block "<reason>"` marks the task blocked and ends the attempt.
+- `rider task noop "<why>"` records that the task needed no changes.
+- `rider task context` prints the task and the threads of the tasks it needs.
 
 Workers never touch the board directly. This keeps the three agent types
 interchangeable and keeps Board's experimental CLI out of their prompts.
@@ -173,38 +173,38 @@ How each is launched (flags to be confirmed in the first plan step):
 
 Adding a fourth agent type should mean adding one table entry of this kind.
 
-### The `foreman` CLI
+### The `rider` CLI
 
-One binary; the daemon is `foreman daemon`. (Call)
+One binary; the daemon is `rider daemon`. (Call)
 
 ```
-foreman up | down               start or stop the daemon
-foreman chat ["message"]        talk to the orchestrator; streams its reply
-foreman status                  tasks by state, running agents, queue depth
-foreman agents                  running agents: task, type, age, last output
-foreman logs <task> [-f]        an agent's output
-foreman kill <task>             stop an agent; its task fails
-foreman limits [set k=v]        show or change limits
-foreman inbox                   messages the orchestrator left for you
-foreman task retry <task> [--agent <type>]   for the orchestrator
-foreman task abandon <task> "<reason>"       for the orchestrator
-foreman task note|block|noop|context         for workers
+rider up | down               start or stop the daemon
+rider chat ["message"]        talk to the orchestrator; streams its reply
+rider status                  tasks by state, running agents, queue depth
+rider agents                  running agents: task, type, age, last output
+rider logs <task> [-f]        an agent's output
+rider kill <task>             stop an agent; its task fails
+rider limits [set k=v]        show or change limits
+rider inbox                   messages the orchestrator left for you
+rider task retry <task> [--agent <type>]   for the orchestrator
+rider task abandon <task> "<reason>"       for the orchestrator
+rider task note|block|noop|context         for workers
 ```
 
-Example of what `foreman status` shows:
+Example of what `rider status` shows:
 
 ```
 board  local  1 running / 4 max     orchestrator: idle     inbox: 1 unread
 
 auth-refactor   /Users/zeke/code/app          base main
-  done     T12  claude  extract token store            foreman/T12-token-store
-  running  T13  codex   migrate callers        14m     foreman/T13-callers       <- T12
+  done     T12  claude  extract token store            rider/T12-token-store
+  running  T13  codex   migrate callers        14m     rider/T13-callers       <- T12
   waiting  T14  tact    add expiry tests               needs T13              <- T13
   waiting  T15  claude  remove old path                needs T14              <- T14
   blocked  T16  codex   update docs                    "which docs site?"
 ```
 
-The CLI talks to the daemon over a Unix socket in the foreman home
+The CLI talks to the daemon over a Unix socket in the rider home
 directory, using newline-delimited JSON: request and response, plus
 subscriptions for streams. The GUI would use the same socket. (Call)
 
@@ -222,7 +222,7 @@ orchestrator creates task (agent, repo, base, needs)
    +-- exit 0, clean tree, and head moved or noop --> complete (last message, branch, head)
    +-- exit 0, dirty tree or nothing done ----------> held: "no committed work"
    +-- non-zero exit / killed / timeout ------------> held: reason + log tail
-   +-- `foreman task block` ------------------------> held: the agent's question
+   +-- `rider task block` ------------------------> held: the agent's question
 ```
 
 "Head moved" means the branch head differs from where it was when this
@@ -233,9 +233,9 @@ board's blocked state with a reason and a kind (`failed` or `question`),
 rather than the board's failed state, which may be final. The daemon never
 retries by itself. Each held task wakes the orchestrator, which either:
 
-- runs `foreman task retry <task>`, optionally with `--agent` to switch
+- runs `rider task retry <task>`, optionally with `--agent` to switch
   type, which makes the task ready again; or
-- runs `foreman task abandon <task>`, which fails it on the board for good.
+- runs `rider task abandon <task>`, which fails it on the board for good.
 
 Both are mechanical commands the daemon carries out on request; the
 judgment stays with the orchestrator. How "ready again" maps onto Board
@@ -250,8 +250,8 @@ them, uncommitted changes included, and the prompt says so.
 
 ## Branches and worktrees
 
-- Worktree: `<foreman home>/worktrees/<channel>/<task id>`.
-- Branch: `foreman/<task id>-<slug>`, cut from the head of the `base`
+- Worktree: `<rider home>/worktrees/<channel>/<task id>`.
+- Branch: `rider/<task id>-<slug>`, cut from the head of the `base`
   task's branch, or from the project's base branch when `base` is absent.
 - Completed tasks keep their branch. The worktree is removed on completion
   and recreated if needed.
@@ -270,8 +270,8 @@ them, uncommitted changes included, and the prompt says so.
 
 (Call) The orchestrator posts anything meant for Zeke, such as questions
 and summaries, to an `inbox` channel on the board, so it survives restarts
-like all other state. `foreman status` shows the unread count,
-`foreman inbox` lists and marks read, `foreman chat` shows unread messages
+like all other state. `rider status` shows the unread count,
+`rider inbox` lists and marks read, `rider chat` shows unread messages
 first, and the daemon raises a desktop notification for each new one.
 
 ## Failure and restart
@@ -282,7 +282,7 @@ first, and the daemon raises a desktop notification for each new one.
   worktrees, counting an attempt.
 - **Orchestrator turn fails.** The wake-ups for that turn go back on the
   queue; after repeated failures the daemon stops waking it and reports the
-  fault in `foreman status`.
+  fault in `rider status`.
 - **Board server dies.** The daemon restarts it and pauses spawning until
   it answers.
 - **Agent hangs.** The wall clock limit kills it.
