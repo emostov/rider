@@ -6,7 +6,7 @@
 
 **Architecture:** One Rust binary, `rider`, with two subcommands. `rider pool` runs one loop per worker slot: claim a ready task for a role, hand it to `run_task`, settle it. `run_task` reads the task's labels, prepares a git worktree, launches the role's harness, and judges the outcome from the worktree. Everything reaches Board through one `Board` trait whose only implementation shells out to the `vb` CLI. The lead is a Claude Code session Zeke starts by hand in `lead/`.
 
-**Tech Stack:** Rust (stable, edition 2024), `serde_json` as the only dependency, the `git` CLI, Board's `vb` CLI on Node 22, Claude Code 2.1, Codex CLI 0.155, tact 0.8.
+**Tech Stack:** Rust (stable, edition 2024), `serde_json` as the only dependency, the `git` CLI, Board's `vb` CLI on Node 22, Claude Code 2.1, Codex CLI 0.170, tact 0.8.
 
 **Spec:** `docs/superpowers/specs/2026-11-19-rider-design.md`. This plan covers its "Milestone 0" only. Milestones 1 to 3 get their own plans after Task 1's findings.
 
