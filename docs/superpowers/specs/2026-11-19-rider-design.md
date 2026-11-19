@@ -53,6 +53,7 @@ Board's swarm guide names four roles, and this design uses its words:
 | lead | Fable 5.2 | Claude Code | no |
 | `role=implement` | Opus 5.5 | Claude Code | yes |
 | `role=review` | Sol 6.1 | Codex | no |
+| `role=polish` | Sonnet 5.5 | Claude Code | yes |
 | `role=security` | Mythos | Claude Code | no |
 
 Zeke chose the models. Which program runs each one is a Call: Codex for
@@ -108,7 +109,7 @@ no new code, so it is milestone 0 below rather than a rejected option.
 | `block --kind` and `unblock` | Worker questions (`needs_input`) and owner decisions (`awaiting_approval`) |
 | `--for <profile>` | Pinning a task to one worker when the lead wants that |
 | `tasks needs` | Rewiring dependencies when the plan changes |
-| Profiles | Every agent writes under its own name: `lead`, `opus-1`, `sol-1`, `mythos-1` |
+| Profiles | Every agent writes under its own name: `lead`, `opus-1`, `sol-1`, `sonnet-1`, `mythos-1` |
 | Event feed with cursors (SSE over HTTP) | How the daemon follows the board without polling |
 | Schemas | Structured task results and review findings, validated by the board |
 | Attachments | Log tails on failures, proof output on results |
@@ -147,7 +148,7 @@ Labels Rider uses (Call):
 
 | Label | Set by | Meaning |
 |---|---|---|
-| `role` | lead | `implement`, `review`, `security`; picks model and harness |
+| `role` | lead | `implement`, `review`, `polish`, `security`; picks model and harness |
 | `repo` | lead | absolute path of the target git repo |
 | `base` | lead | task id whose branch this one stacks on; absent means the project's base branch |
 | `onto` | lead | task id whose existing branch this task works on directly (fix-ups, restacks) |
@@ -178,8 +179,16 @@ Rules (Call):
 - **Small tasks.** More than three deliverables is two tasks.
 - **Every implement task gets a review task** that needs it, with three or
   four specific things to attack. (Call: every one, by default.)
+- **Polish** is a task per branch, run after that branch's review
+  findings are fixed: tidy naming, comments, dead code, and formatting
+  without changing behaviour. It works `onto` the branch it polishes, so
+  it is subject to the same one-agent-per-branch rule and can trigger a
+  restack of branches above it. To keep restacks rare, the lead polishes a
+  stack from the bottom up once its reviews are settled. (Call: when
+  polish runs. Zeke chose the model.)
 - **Security review** is a task for each stack before the lead reports it
-  done, and for any task the lead judges sensitive. (Call)
+  done, and for any task the lead judges sensitive. It runs after polish,
+  so it sees the code that will ship. (Call)
 - **A completed task is a claim, not proof.** The review, or the brief's
   proof command run by a worker, is the check.
 - **Only a blocking finding gets a fix task.** The rest are collected in
@@ -395,7 +404,7 @@ lead creates tasks from a plan file (role, repo, base/onto, needs)
 - Explicit limits on every loop and wait; no unbounded retries.
 
 Default limits (Call): 4 agents at once; per role 2 implement, 2 review,
-1 security; 60 minutes per attempt; 3 failed attempts per task; 256
+1 polish, 1 security; 60 minutes per attempt; 3 failed attempts per task; 256
 tracked tasks; 64 queued wake-ups.
 
 ## Milestones
