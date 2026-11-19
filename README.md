@@ -1,0 +1,211 @@
+# Rider
+
+Rider runs a swarm of coding agents on your own machine through a local Vercel Board. You talk
+to one lead agent, which plans a goal into board tasks with dependencies and a role for each.
+`rider pool` claims each ready task, starts the agent its role calls for in a git worktree of
+its own, and settles the task on the board when the agent exits.
+
+## Status
+
+This is milestone 0. What works:
+
+- `rider serve` runs the local board.
+- `rider pool <project>` runs worker slots on the channel `work/<project>`. Each slot claims a
+  ready task by its `role` label, makes a worktree and a branch, runs one agent, and then
+  completes, fails, or blocks the task. At most 4 agents run at once.
+- The lead's instructions (`lead/CLAUDE.md`), the worker prompts (`prompts/`), and the result
+  and finding schemas (`schemas/`).
+
+What does not exist yet: the daemon, `rider up`, `rider chat`, `rider status`, `rider agents`,
+`rider logs`, and `rider kill`. The lead is a Claude Code session that you start yourself.
+Nothing notices when a branch moves under a stacked child branch; the lead has to restack it.
+The first end-to-end run, and what went wrong in it, is in
+[docs/milestone-0-run.md](docs/milestone-0-run.md).
+
+## Safety
+
+Agents run unsandboxed, with permission prompts skipped. Unattended work requires it. A
+worktree separates files only by convention: an agent can read and change anything your user
+can. Point Rider only at repositories you are prepared to have changed.
+
+Rider never pushes, opens pull requests, or merges. Work stays on local branches named
+`rider/<task id>-<slug>`.
+
+## Prerequisites
+
+- Rust (stable), to build `rider`.
+- Node 22, for the Board CLI.
+- `claude` (Claude Code) and `codex` (Codex CLI) on `PATH`, each signed in. The roles use the
+  models in the table below; each must be available to your account.
+- The Board CLI, installed where Rider looks for it, and its skill:
+
+  ```sh
+  npm install --prefix ~/.rider/node @vercel/board
+  npx skills add vercel/board --skill board -g
+  ```
+
+- `jq`, which the lead uses to read board output.
+
+Build and install Rider from this checkout:
+
+```sh
+cargo install --path .
+```
+
+## Quickstart
+
+Use three terminals.
+
+**Terminal 1: the board.**
+
+```sh
+rider serve
+```
+
+`rider serve` holds this terminal. The first time, register the two schemas from this
+checkout in another terminal:
+
+```sh
+export BOARD_URL=http://127.0.0.1:4100/api/board PATH="$HOME/.rider/node/node_modules/.bin:$PATH"
+vb schemas create rider-result@1 --file schemas/rider-result.json
+vb schemas create rider-finding@1 --file schemas/rider-finding.json
+```
+
+The `vb` commands under "Watching" need the same two `export` settings.
+
+**Terminal 2: the workers.** `demo` is the project name; tasks go in the channel `work/demo`.
+
+```sh
+rider pool demo
+```
+
+**Terminal 3: the lead.**
+
+```sh
+cd lead && claude
+```
+
+The lead runs on Fable 5.2 (set in `lead/.claude/settings.json`) and follows
+`lead/CLAUDE.md`. Tell it the project, the repository, the base branch, and the goal, and say
+what it may decide alone. For example:
+
+> You are the lead for project `demo`. The repository is `/abs/path/to/repo`, base branch
+> `main`. Goal: add a `wordcount` shell script that prints the number of words on standard
+> input, with a `test.sh` that proves it; then, stacked on that, add a `--lines` flag. Plan
+> it with a review of each implementing task, a polish pass, and one security review of the
+> stack. I have agreed the goal and the channel `work/demo`; decide everything else yourself.
+> Workers are already running.
+
+The lead writes tasks to the board and waits on it. Questions it cannot answer alone go in
+the `decisions` channel, or to you in its session.
+
+## Roles
+
+The `role` label on a task picks the agent. A task is claimable only once it has `role`.
+
+| `role` label | Model | Harness | Shown as | Commits |
+|---|---|---|---|---|
+| `implement` | Opus 5.5 | Claude Code | Implement <n> (Opus 5.5) | yes |
+| `light` | Sonnet 5.5 | Claude Code | Light <n> (Sonnet 5.5) | yes |
+| `review` | Sol 6.1 | Codex | Review <n> (Sol 6.1) | no |
+| `polish` | Sonnet 5.5 | Claude Code | Polish <n> (Sonnet 5.5) | yes |
+| `security` | Mythos 5.2 | Claude Code | Security <n> (Mythos 5.2) | no |
+
+The lead is Fable 5.2 in Claude Code, with the board profile `lead-fable-5-2`. Each worker's
+board profile is `<role>-<n>-<model>`, such as `implement-1-opus-5-5`. The table is defined
+once, in `src/roles.rs`.
+
+## Labels
+
+| Label | Set by | Value |
+|---|---|---|
+| `role` | lead, required, set last | `implement`, `light`, `review`, `polish`, or `security` |
+| `repo` | lead, required | absolute path of the target git repository |
+| `base` | lead | id of the task whose branch this one is cut from |
+| `from` | lead, required when `base` and `onto` are absent | the agreed base branch to cut from |
+| `onto` | lead | id of a task whose existing branch this task works on directly |
+| `of` | lead, required for `review` and `security` | id of the task under review |
+| `branch` | Rider | the branch the task works on |
+| `attempt` | Rider | failed attempts so far |
+| `start` | Rider | the commit the task's branch was at when the task first started |
+
+The lead sets `from` to the base branch you agreed on every task that has neither `base` nor
+`onto`. A task without any of the three is cut from `origin/HEAD`, and is blocked as
+`invalid_brief` in a repository that has none. The full rules, including what Rider checks
+before it starts a worker, are in `lead/CLAUDE.md`.
+
+## Watching
+
+- The board's web inspector: <http://127.0.0.1:4100>.
+- Every task of a project, in any state:
+
+  ```sh
+  vb tasks work/demo --state all
+  ```
+
+- One task's brief, labels, and thread, including who claimed and replied:
+
+  ```sh
+  vb read <id>
+  ```
+
+- The pool terminal prints one line when a slot claims a task and one when it settles it.
+
+## Stopping
+
+- In the pool terminal, type `stop` and press Enter, or press Ctrl-D. Each slot finishes the
+  task it is running and claims no more; the pool exits when they have all finished.
+- The pool stops when its standard input closes, so run it in a terminal. Started with its
+  standard input closed (from a script, or with `< /dev/null`), it stops at once.
+- Ctrl-C kills `rider` at once. Agents already running are left to finish on their own and
+  their tasks are not settled. Each claim is a one-hour lease, so those tasks return to ready
+  within the hour.
+
+## Where things live
+
+| Path | What |
+|---|---|
+| `~/.rider/board` | the local board's database |
+| `~/.rider/worktrees/<repository directory name>/<task id>` | a task's worktree, removed when the task completes; its branch stays |
+| `~/.rider/logs/<task id>/<n>.jsonl` | the agent's output stream for attempt `n` |
+| `~/.rider/prompts` | the worker prompts, overwritten from the binary each time `rider pool` starts |
+| `~/.rider/node` | the Board CLI |
+
+Set `RIDER_HOME` to use a directory other than `~/.rider`.
+
+## Troubleshooting
+
+These come from the first end-to-end run (see `docs/milestone-0-run.md`).
+
+- **`vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
+  its first task. This is normal before the lead has planned anything.
+- **A ready task sits unclaimed for minutes while slots are free.** In the run, idle slots
+  held every place at the gate while they polled, and ready tasks waited up to nine and a half
+  minutes. It is a delay, not a deadlock. A fix that claims without waiting was committed after
+  the run and has not yet been through an end-to-end run; to pick it up, reinstall with
+  `cargo install --path .` and restart the pool.
+- **Claude Code prints "Ignoring 2 permissions.allow entries ... this workspace has not been
+  trusted".** Run `claude` once interactively in `lead/` and accept the trust dialog.
+- **A failed task's log tail is cut short.** Rider keeps its reply within the board's message
+  limit, so the thread holds only the end of the log. The reply names the whole log:
+  `~/.rider/logs/<task id>/<attempt>.jsonl`.
+- **A reopened task repeats its mistake after you replied a correction.** The lead's and your
+  replies in the task's thread amend its brief, and the latest wins, so make the reply a
+  complete, specific instruction. If the correction changes what the task is, change the
+  brief itself, then reopen:
+
+  ```sh
+  printf '%s\n' "<first line>" "" "<corrected brief>" | vb edit <id> - --as lead-fable-5-2
+  vb tasks reopen <id> --as lead-fable-5-2
+  ```
+
+- **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
+  `vb label`, then `vb tasks unblock <id> --as lead-fable-5-2`.
+- **A Codex log starts with "Reading additional input from stdin...".** This is harmless.
+
+## More
+
+- Design: [docs/superpowers/specs/2026-11-19-rider-design.md](docs/superpowers/specs/2026-11-19-rider-design.md)
+- How Board and each agent CLI behave: [docs/board-observed.md](docs/board-observed.md),
+  [docs/harness-observed.md](docs/harness-observed.md)
+- Rules for changing Rider: [AGENTS.md](AGENTS.md)

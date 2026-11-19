@@ -33,7 +33,7 @@ Deliberately not in this milestone: the daemon, the control socket, `rider chat/
   | `role=implement` | Opus 5.5 (`claude-opus-5-5`) | Claude Code | yes | 2 |
   | `role=review` | Sol 6.1 (`gpt-6.1-sol`) | Codex | no | 2 |
   | `role=polish` | Sonnet 5.5 (`claude-sonnet-5-5`) | Claude Code | yes | 1 |
-  | `role=security` | Mythos (id confirmed in Task 2) | Claude Code | no | 1 |
+  | `role=security` | Mythos 5.2 (`claude-mythos-5-2`) | Claude Code | no | 1 |
 
   The lead is Fable 5.2 (`claude-fable-5-2`) in Claude Code.
 - At most 4 agents run at once in total.

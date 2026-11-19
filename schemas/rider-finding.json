@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["severity", "file", "line", "claim", "reproduce"],
+  "properties": {
+    "severity": {
+      "enum": ["blocking", "non-blocking"],
+      "description": "blocking: the change is unsafe or wrong for what depends on it"
+    },
+    "file": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path relative to the repository root"
+    },
+    "line": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "The line the claim is about, or null for the whole file"
+    },
+    "claim": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What is wrong, in one or two sentences"
+    },
+    "reproduce": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The command or steps that show it"
+    }
+  }
+}

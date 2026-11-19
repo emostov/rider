@@ -52,9 +52,10 @@ Board's swarm guide names four roles, and this design uses its words:
 |---|---|---|---|
 | lead | Fable 5.2 | Claude Code | no |
 | `role=implement` | Opus 5.5 | Claude Code | yes |
+| `role=light` | Sonnet 5.5 | Claude Code | yes |
 | `role=review` | Sol 6.1 | Codex | no |
 | `role=polish` | Sonnet 5.5 | Claude Code | yes |
-| `role=security` | Mythos | Claude Code | no |
+| `role=security` | Mythos 5.2 | Claude Code | no |
 
 Zeke chose the models. Which program runs each one is a Call: Codex for
 Sol, Claude Code for the rest. tact can run any of them (it supports Sol
@@ -109,7 +110,7 @@ no new code, so it is milestone 0 below rather than a rejected option.
 | `block --kind` and `unblock` | Worker questions (`needs_input`) and owner decisions (`awaiting_approval`) |
 | `--for <profile>` | Pinning a task to one worker when the lead wants that |
 | `tasks needs` | Rewiring dependencies when the plan changes |
-| Profiles | Every agent writes under its own name: `lead`, `opus-1`, `sol-1`, `sonnet-1`, `mythos-1` |
+| Profiles | Every agent writes under its own name, role then model: `lead-fable-5-2`, `implement-1-opus-5-5`, `review-1-sol-6-1`, `polish-1-sonnet-5-5`, `security-1-mythos-5-2`. Rider shows them as `Implement 1 (Opus 5.5)`; Board itself allows only letters, digits, and hyphens |
 | Event feed with cursors (SSE over HTTP) | How the daemon follows the board without polling |
 | Schemas | Structured task results and review findings, validated by the board |
 | Attachments | Log tails on failures, proof output on results |
@@ -148,7 +149,7 @@ Labels Rider uses (Call):
 
 | Label | Set by | Meaning |
 |---|---|---|
-| `role` | lead | `implement`, `review`, `polish`, `security`; picks model and harness |
+| `role` | lead | `implement`, `light`, `review`, `polish`, `security`; picks model and harness |
 | `repo` | lead | absolute path of the target git repo |
 | `base` | lead | task id whose branch this one stacks on; absent means the project's base branch |
 | `onto` | lead | task id whose existing branch this task works on directly (fix-ups, restacks) |
@@ -177,6 +178,12 @@ Rules (Call):
 - **No two tasks that can run at once touch the same files.** Split by
   path or connect them with `needs`.
 - **Small tasks.** More than three deliverables is two tasks.
+- **Light implementation.** `role=light` is a cheaper implementer on
+  Sonnet 5.5 with the same prompt and rules as `implement`. The lead uses
+  it only when the brief already says exactly what to change and how to
+  prove it (restacks, renames, a reviewer's specific fix, a spelled-out
+  test), and reopens a failed light task as `implement`. (Decided: a
+  cheaper implementer on Sonnet. Call: when the lead uses it.)
 - **Every implement task gets a review task** that needs it, with three or
   four specific things to attack. (Call: every one, by default.)
 - **Polish** is a task per branch, run after that branch's review
@@ -419,6 +426,15 @@ three models. This proves the CLI behaviour, the headless flags, the
 prompts, and the label scheme, and Zeke can use it the same day. Worktrees
 are made by hand or by the lead at this stage.
 
+**0.5. Black-box scenario tests. (Decided: this comes first.)** Repeatable
+end-to-end tests written as Given / When / Then that run the real `rider`
+binary against a real local board and a scratch repository, with scripted
+fake agents on `PATH`, at no cost and with no network. They are the
+regression net for everything after, including a rewrite, and they come
+before the daemon and before the smaller follow-up fixes. Every later
+behaviour change adds or changes a scenario first. Tracked as issue #14 and
+built through Rider.
+
 **1. The daemon's core.** Event feed, claim, worktree, spawn by role,
 renew, settle, limits, logs, `rider up/down/status/agents/logs/kill`. The
 lead is still a session Zeke runs himself. From here Rider's own tasks run
@@ -455,6 +471,14 @@ and one trait, and every agent already writes under its own profile.
 - **tk for every agent.** Each agent signs its commits with tk and uses tk
   for SSH. Fits where the daemon builds a worker's environment: one
   identity per profile.
+- **Shared base memory.** A way for Claude and the other agents to work
+  from the same base memory: what is known about the project, its
+  conventions, and past decisions. Today each harness keeps its own
+  (Claude Code's memory directory and `CLAUDE.md`, Codex's and tact's
+  `AGENTS.md`, tact's own long-term memory), and only the repo's
+  `AGENTS.md` is common to all three. Not designed. Candidates: one
+  memory store Rider owns and hands to every worker at launch, or a board
+  channel that holds it.
 - **A board of our own,** copying Vercel's. Board publishes a spec and a
   conformance kit, and the daemon reaches the board through one trait, so
   a Rust board that passes the kit can replace it.
