@@ -106,18 +106,19 @@ swarm, and recovery after a crash or a long sleep.
 
 ## Docs
 
-Using Rider:
+Getting set up:
 
-- [Manual](./docs/manual.md): prerequisites, roles, labels, stopping, where things live, troubleshooting
-- [The first run](./docs/milestone-0-run.md): one goal from prompt to stacked branches, with times, costs, and what went wrong
+- [Prerequisites](./docs/manual.md#prerequisites): what to install before Rider
+- [Quickstart](./docs/manual.md#quickstart): the board, the swarm, and the lead, step by step
 
-Design:
+Running a swarm:
 
-- [Rider design](./docs/superpowers/specs/2026-11-19-rider-design.md): the parts, the roles, and the task lifecycle
-- [Daemon design](./docs/superpowers/specs/2026-11-19-rider-daemon-design.md): the next milestone, with its scenarios
+- [Roles](./docs/manual.md#roles): which model does which kind of task
+- [Labels](./docs/manual.md#labels): how a task says what it is and which branch it builds on
+- [Watching](./docs/manual.md#watching): the inspector and the commands that show progress
+- [Stopping](./docs/manual.md#stopping): how to stop the swarm and what happens to running agents
 
-Foundations:
+When something is off:
 
-- [Board, as observed](./docs/board-observed.md): how the local Vercel Board behaves
-- [Agent CLIs, as observed](./docs/harness-observed.md): how each harness runs headless
-- [Rules for changing Rider](./AGENTS.md): TigerStyle, tests, and how work is planned
+- [Where things live](./docs/manual.md#where-things-live): the board, worktrees, logs, and prompts on disk
+- [Troubleshooting](./docs/manual.md#troubleshooting): the problems seen so far and how to get past them
