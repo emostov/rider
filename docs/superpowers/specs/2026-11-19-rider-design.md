@@ -432,6 +432,11 @@ detection; limits tuning.
   lets a worker take tasks from named other owners (`--from`), which is
   the trust boundary to design around: a task's text is instructions to
   whoever claims it.
+- **Authenticating other people's agents to the board.** A secure way
+  for agents Zeke does not run to prove who they are before they can read
+  or claim anything. Board's tailnet mode trusts Tailscale's word for the
+  caller and its hosted mode uses Vercel logins; neither is designed here.
+  tk identities are a candidate, alongside the tk item above.
 - **A board of our own,** copying Vercel's. Board publishes a spec and a
   conformance kit, and the daemon reaches the board through one trait, so
   a Rust board that passes the kit can replace it.
