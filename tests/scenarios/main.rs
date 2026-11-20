@@ -117,3 +117,45 @@ fn a_qa_agent_that_commits_fails_and_leaves_the_tested_branch_alone() {
     let branch = then_the_branch_has_the_agents_commit(&world, &built, 0);
     assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
 }
+
+#[test]
+fn a_fix_task_with_resume_continues_the_claude_session_of_its_onto_task() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = |text: &str, after: &str| {
+        NewTask::new(text)
+            .label("repo", world.repo_label())
+            .label("onto", &built)
+            .needs(after)
+            .role("implement")
+    };
+    let resumed = when_the_lead_creates(&world, &fix("Fix the work.", &built).label("resume", "1"));
+    let fresh = when_the_lead_creates(&world, &fix("Fix the work again.", &resumed));
+
+    let tasks = [built.as_str(), resumed.as_str(), fresh.as_str()];
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &tasks);
+
+    assert_eq!(states, vec!["completed".to_string(); 3]);
+    assert_eq!(exit, Some(0));
+    let fresh_options: Vec<String> = [
+        "-p",
+        "--model",
+        "claude-opus-5-5",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+    ]
+    .map(String::from)
+    .into();
+    let mut resumed_options = fresh_options.clone();
+    resumed_options.extend(["--resume".to_string(), fake_agent::session(&built, 0)]);
+    assert_eq!(fake_agent::options(&world.root, &built, 0), fresh_options);
+    assert_eq!(
+        fake_agent::options(&world.root, &resumed, 0),
+        resumed_options
+    );
+    assert_eq!(fake_agent::options(&world.root, &fresh, 0), fresh_options);
+}

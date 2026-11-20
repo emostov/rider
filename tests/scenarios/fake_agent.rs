@@ -13,6 +13,7 @@ const HOLD_STEPS_PER_SECOND: u64 = 10;
 const RUNS_FILE: &str = "agent-runs.log";
 const BEHAVIOURS_DIR: &str = "agent-behaviours";
 const RELEASES_DIR: &str = "agent-releases";
+const ARGS_DIR: &str = "agent-args";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
@@ -65,6 +66,18 @@ pub fn work_subject(task: &str, attempt: u32) -> String {
     format!("Work for task {task} attempt {attempt}")
 }
 
+/// The session id a fake `claude` reports in attempt `attempt` of `task`.
+pub fn session(task: &str, attempt: u32) -> String {
+    format!("fake-{task}-{attempt}")
+}
+
+/// The options attempt `attempt` of `task` was started with: its arguments before `--`.
+pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}"));
+    let text = fs::read_to_string(&path).expect("read an agent's recorded arguments");
+    text.lines().map(str::to_string).collect()
+}
+
 /// The final message a fake agent reports; it becomes the task's result.
 pub fn summary(task: &str, attempt: u32) -> String {
     format!("Fake agent finished task {task} attempt {attempt}.")
@@ -86,6 +99,10 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
+for arg in "$@"; do
+  [ "$arg" = -- ] && break
+  printf '%s\n' "$arg"
+done > "$world/{ARGS_DIR}/$task-$attempt"
 summary="Fake agent finished task $task attempt $attempt."
 report() {{
   if [ "$harness" = codex ]; then
@@ -96,7 +113,7 @@ report() {{
     usage='"usage":{{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
     echo '{{"type":"turn.completed",'"$usage"'}}'
   else
-    init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"fake","model":"fake"'
+    init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"fake-'"$task-$attempt"'","model":"fake"'
     echo '{{"type":"system",'"$init"'}}'
     echo '{{"type":"result","subtype":"success","is_error":false,"result":"'"$summary"'"}}'
   fi
@@ -132,7 +149,7 @@ pub fn install(world: &Path, agents: &Path) {
     for name in ["claude", "codex"] {
         write_executable(&agents.join(name), &text);
     }
-    for dir in [BEHAVIOURS_DIR, RELEASES_DIR] {
+    for dir in [BEHAVIOURS_DIR, RELEASES_DIR, ARGS_DIR] {
         fs::create_dir_all(world.join(dir)).expect("create an agent directory");
     }
     assert!(agents.join("claude").is_file() && agents.join("codex").is_file());

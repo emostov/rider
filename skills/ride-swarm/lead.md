@@ -69,6 +69,7 @@ worker take it again.
 | `from` | you, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | you | id of a task whose existing branch this task works on directly |
 | `of` | you, required for `review`, `security`, and `qa` | id of the task under review |
+| `resume` | you | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |
@@ -120,7 +121,7 @@ These rules are yours to keep. Rider does not check them:
   yourself. Say what to attack, not the commit range: the reviewer finds the range from the
   reviewed task's `start` label.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the
-  reviewed task>`, needing every unfinished task on that branch, and its own review unless it is purely
+  reviewed task>`, `resume=1` when the reviewed task is `implement` or `light`, needing every unfinished task on that branch, and its own review unless it is purely
   mechanical.
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.

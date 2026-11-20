@@ -23,6 +23,8 @@ claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-sk
 - Final message: the last line, `type == "result"`, `subtype == "success"`, field `result` (string, here `"DONE"`). `is_error` is `false` on success. The same text is also in the last `assistant` event at `message.content[].text`.
 - stderr prints `Warning: no stdin data received in 3s...` when stdin is not redirected. Spawn with stdin set to null (`< /dev/null`) to avoid the 3 s delay.
 - Fixture: `fixtures/harness/claude.jsonl` (opus run, 8.6 KB after redaction). The other three models give the same event shapes.
+- Session id: every event carries `session_id`, the first `system` event (`hook_started`, or `init` without hooks) included.
+- Resume (2026-11-19, Claude Code 2.1.329, `--model haiku`): `claude -p --resume <id> --output-format stream-json --verbose -- "<prompt>"` run from a different directory than the session started in continues the session: it recalled the earlier reply. It still works after the original directory is removed. The `init` event shows the new cwd and the same `session_id`. So a fix task resumes from its own worktree; no same-path worktree is needed.
 
 ## Codex
 

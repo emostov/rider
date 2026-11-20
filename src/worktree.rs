@@ -469,6 +469,7 @@ mod tests {
             onto: None,
             of: None,
             from: Some("main".to_string()),
+            resume: false,
             text: text.to_string(),
         }
     }
