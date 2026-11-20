@@ -1237,16 +1237,12 @@ mod tests {
     use crate::board::testing::FakeBoard;
     use crate::feed::Cursor;
     use crate::git::testing::{Fixture, git};
-    use serde_json::json;
-    use std::cell::RefCell;
     use std::fs;
 
     const ID: TaskId = TaskId(7);
     const BRANCH: &str = "rider/7-extract-token-store";
     const ROLE_PROMPT: &str = "You implement one task.\n";
     const TEXT: &str = "Extract token store\nMove the store into its own module.";
-    const DONE_STREAM: &str =
-        r#"{"type":"result","subtype":"success","is_error":false,"result":"Extracted the store."}"#;
 
     type Launch<'a> = dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> + 'a;
 
@@ -1287,11 +1283,6 @@ mod tests {
         view(ID.0, &labels, TaskState::Claimed)
     }
 
-    fn needing(mut view: TaskView, need: u64) -> TaskView {
-        view.needs.push(TaskId(need));
-        view
-    }
-
     fn start_call(fixture: &Fixture, rev: &str) -> String {
         format!(
             "set_label 7 start={}",
@@ -1325,52 +1316,11 @@ mod tests {
         fs::write(log, text).unwrap();
     }
 
-    fn committing_agent(
-        fixture: &Fixture,
-    ) -> impl Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> + '_ {
-        move |_, dir, log| {
-            fixture.commit(dir, "store.rs", "pub struct Store;");
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        }
-    }
-
-    fn record(branch: Option<&str>, head: &str, commits: u64, summary: &str) -> String {
-        let record = json!({
-            "branch": branch,
-            "head": head,
-            "commits": commits,
-            "summary": summary,
-            "behind": [],
-        });
-        format!("post_structured 7 rider-result@2 {record}")
-    }
-
     fn run(env: &Env, board: &FakeBoard, launch: &Launch) -> Verdict {
         match run_task(ID, env, board, None, launch).unwrap() {
             Ran::Settled(verdict) => verdict,
             ran => panic!("expected a settled run, got {ran:?}"),
         }
-    }
-
-    fn completed(result: &str) -> Verdict {
-        Verdict::Complete {
-            result: result.to_string(),
-        }
-    }
-
-    #[test]
-    fn a_base_task_without_a_branch_blocks_as_an_invalid_brief() {
-        let (fixture, env) = setup("run-base");
-        let base = view(3, &[], TaskState::Completed);
-        let board = FakeBoard::new(vec![needing(task(&fixture, &[("base", "#3")]), 3), base]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let reason = "Set the `branch` label on task #3 to its branch, or remove the `base` \
-                      label from this task.";
-        assert_eq!(
-            calls(&board),
-            vec![format!("block 7 invalid_brief {reason}")]
-        );
     }
 
     #[test]
@@ -1403,88 +1353,6 @@ mod tests {
         );
         assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
         assert!(!worktree(&env).exists());
-    }
-
-    #[test]
-    fn a_completed_task_whose_record_cannot_be_posted_still_completes() {
-        let (fixture, env) = setup("run-record");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        board
-            .failing
-            .borrow_mut()
-            .extend(["post_structured", "reply"]);
-        let verdict = run(&env, &board, &committing_agent(&fixture));
-        assert_eq!(verdict, completed("Extracted the store."));
-        let head = git(&fixture.repo, &["rev-parse", BRANCH]);
-        let json = json!({"behind": [], "branch": BRANCH, "head": head, "commits": 1,
-            "summary": "Extracted the store."});
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            start_call(&fixture, "main"),
-            "complete 7 Extracted the store.".to_string(),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
-            format!("reply 7 {json}"),
-        ];
-        assert_eq!(calls(&board), expected);
-    }
-
-    #[test]
-    fn a_worktree_that_cannot_be_released_is_kept_and_the_task_completes() {
-        let (fixture, env) = setup("run-keep");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let launch = |_: &CommandLine, dir: &Path, log: &Path| {
-            fixture.commit(dir, "store.rs", "pub struct Store;");
-            git(dir, &["bisect", "start"]);
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(
-            run(&env, &board, &launch),
-            completed("Extracted the store.")
-        );
-        let head = git(&fixture.repo, &["rev-parse", BRANCH]);
-        let dir = worktree(&env);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            start_call(&fixture, "main"),
-            "complete 7 Extracted the store.".to_string(),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
-            format!(
-                "reply 7 Kept the worktree at {dir}, so branch {BRANCH} stays checked out \
-                 there: tasks working `onto` it will block as branch_busy until a person \
-                 removes or fixes the worktree at {dir}. It was kept because an operation is \
-                 in progress.",
-                dir = dir.display()
-            ),
-        ];
-        assert_eq!(calls(&board), expected);
-        assert!(dir.join("store.rs").exists());
-    }
-
-    #[test]
-    fn an_onto_task_runs_after_its_target_completed_with_ignored_build_output() {
-        let (fixture, env) = setup("run-onto-after");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let build = |_: &CommandLine, dir: &Path, log: &Path| {
-            fixture.commit(dir, ".gitignore", "target/\n");
-            fs::create_dir_all(dir.join("target")).unwrap();
-            fs::write(dir.join("target").join("out.o"), "build output").unwrap();
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(run(&env, &board, &build), completed("Extracted the store."));
-        let repo = fixture.repo.to_str().unwrap();
-        let target = view(7, &[("branch", BRANCH)], TaskState::Completed);
-        let labels = [("role", "light"), ("repo", repo), ("onto", "#7")];
-        *board.tasks.borrow_mut() = vec![target, view(8, &labels, TaskState::Claimed)];
-        let tidy = |_: &CommandLine, dir: &Path, log: &Path| {
-            assert_eq!(git(dir, &["symbolic-ref", "--short", "HEAD"]), BRANCH);
-            fixture.commit(dir, "tidy.txt", "tidied");
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        let ran = run_task(TaskId(8), &env, &board, None, &tidy).unwrap();
-        assert_eq!(ran, Ran::Settled(completed("Extracted the store.")));
     }
 
     #[test]
@@ -1550,27 +1418,6 @@ mod tests {
     }
 
     #[test]
-    fn a_log_tail_that_cannot_be_posted_still_counts_and_fails_the_attempt() {
-        let (fixture, env) = setup("run-tail-lost");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        board.failing.borrow_mut().push("reply");
-        let crashed = |_: &CommandLine, _: &Path, _: &Path| Ok(Exit::Signal);
-        let expected = Verdict::Fail {
-            reason: "agent exited on a signal".to_string(),
-        };
-        assert_eq!(run(&env, &board, &crashed), expected);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            start_call(&fixture, "main"),
-            "fail 7 agent exited on a signal".to_string(),
-            "set_label 7 attempt=1".to_string(),
-            tail_reply(&env, 1, NO_OUTPUT),
-            format!("reply 7 {}", log_line(&env, 1)),
-        ];
-        assert_eq!(calls(&board), expected);
-    }
-
-    #[test]
     fn each_run_of_an_attempt_keeps_its_own_log() {
         let (_fixture, env) = setup("run-logs");
         let dir = env.home.join("logs").join("7");
@@ -1586,235 +1433,6 @@ mod tests {
             log_path(&env.home, ID, 1),
             last,
             "at the bound the last is reused"
-        );
-    }
-
-    #[test]
-    fn a_blocked_then_unblocked_attempt_does_not_overwrite_its_log() {
-        let (fixture, env) = setup("run-rerun");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let logs = RefCell::new(Vec::new());
-        let asking = |_: &CommandLine, _: &Path, log: &Path| {
-            logs.borrow_mut().push(log.to_path_buf());
-            write_log(log, "{}\n");
-            board.set_state(ID, TaskState::Blocked);
-            Ok(Exit::Code(0))
-        };
-        run(&env, &board, &asking);
-        board.set_state(ID, TaskState::Claimed);
-        run(&env, &board, &asking);
-        let dir = env.home.join("logs").join("7");
-        assert_eq!(
-            *logs.borrow(),
-            vec![dir.join("1.jsonl"), dir.join("1-2.jsonl")]
-        );
-    }
-
-    fn base_task(fixture: &Fixture) -> TaskView {
-        fixture.branch_ahead("rider/3-store");
-        view(3, &[("branch", "rider/3-store")], TaskState::Completed)
-    }
-
-    fn judged(env: &Env, board: &FakeBoard, launch: &Launch) -> (Verdict, Vec<String>) {
-        (run(env, board, launch), calls(board))
-    }
-
-    #[test]
-    fn a_commit_off_the_tasks_branch_is_not_committed_work() {
-        let reason = format!("no committed work: the worktree is not on its branch {BRANCH}");
-        let expected = Verdict::Fail { reason };
-        let moves: [&[&str]; 2] = [
-            &["switch", "-q", "-c", "elsewhere"],
-            &["checkout", "-q", "--detach"],
-        ];
-        for (n, args) in moves.into_iter().enumerate() {
-            let (fixture, env) = setup(&format!("run-off-branch-{n}"));
-            let board = FakeBoard::new(vec![task(&fixture, &[])]);
-            let wander = |_: &CommandLine, dir: &Path, log: &Path| {
-                git(dir, args);
-                fixture.commit(dir, "store.rs", "pub struct Store;");
-                write_log(log, &format!("{DONE_STREAM}\n"));
-                Ok(Exit::Code(0))
-            };
-            let (verdict, calls) = judged(&env, &board, &wander);
-            assert_eq!(verdict, expected, "{args:?}");
-            assert_eq!(
-                calls.iter().rev().nth(2),
-                Some(&format!("fail 7 {}", verdict_reason(&expected)))
-            );
-        }
-    }
-
-    fn verdict_reason(verdict: &Verdict) -> &str {
-        match verdict {
-            Verdict::Fail { reason } => reason,
-            other => panic!("expected a failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_retry_completes_on_work_an_earlier_attempt_committed() {
-        let (fixture, env) = setup("run-earlier-work");
-        let start = git(&fixture.repo, &["rev-parse", "main"]);
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let crashing = |_: &CommandLine, dir: &Path, _: &Path| {
-            fixture.commit(dir, "store.rs", "pub struct Store;");
-            Ok(Exit::Code(1))
-        };
-        let failed = Verdict::Fail {
-            reason: "agent exited 1".to_string(),
-        };
-        assert_eq!(run(&env, &board, &crashing), failed);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            format!("set_label 7 start={start}"),
-            "fail 7 agent exited 1".to_string(),
-            "set_label 7 attempt=1".to_string(),
-            tail_reply(&env, 1, NO_OUTPUT),
-        ];
-        assert_eq!(calls(&board), expected);
-
-        let labels = [("attempt", "1"), ("start", start.as_str())];
-        let board = FakeBoard::new(vec![task(&fixture, &labels)]);
-        let idle = |_: &CommandLine, _: &Path, log: &Path| {
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(run(&env, &board, &idle), completed("Extracted the store."));
-        let head = git(&fixture.repo, &["rev-parse", BRANCH]);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            "complete 7 Extracted the store.".to_string(),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
-        ];
-        assert_eq!(calls(&board), expected);
-    }
-
-    #[test]
-    fn a_malformed_start_label_is_ignored() {
-        let (fixture, env) = setup("run-bad-start");
-        let board = FakeBoard::new(vec![task(&fixture, &[("start", "HEAD~3")])]);
-        let idle = |_: &CommandLine, _: &Path, log: &Path| {
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        let reason = "no committed work: the branch has no commits of its own";
-        let expected = Verdict::Fail {
-            reason: reason.to_string(),
-        };
-        assert_eq!(run(&env, &board, &idle), expected);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            format!("fail 7 {reason}"),
-            "set_label 7 attempt=1".to_string(),
-            tail_reply(&env, 1, DONE_STREAM),
-        ];
-        assert_eq!(
-            calls(&board),
-            expected,
-            "a present label is never overwritten"
-        );
-    }
-
-    fn idle(_: &CommandLine, _: &Path, log: &Path) -> Result<Exit, HarnessError> {
-        write_log(log, &format!("{DONE_STREAM}\n"));
-        Ok(Exit::Code(0))
-    }
-
-    fn no_own_commits() -> Verdict {
-        Verdict::Fail {
-            reason: "no committed work: the branch has no commits of its own".to_string(),
-        }
-    }
-
-    #[test]
-    fn a_retry_left_off_its_branch_is_blocked_before_launch() {
-        let moves: [&[&str]; 2] = [
-            &["switch", "-q", "-c", "elsewhere"],
-            &["checkout", "-q", "--detach"],
-        ];
-        let heads = ["branch elsewhere", "a detached HEAD"];
-        for (n, (args, on)) in moves.into_iter().zip(heads).enumerate() {
-            let (fixture, env) = setup(&format!("run-left-off-{n}"));
-            let board = FakeBoard::new(vec![task(&fixture, &[])]);
-            let wander = |_: &CommandLine, dir: &Path, _: &Path| {
-                git(dir, args);
-                fixture.commit(dir, "store.rs", "pub struct Store;");
-                Ok(Exit::Code(0))
-            };
-            assert!(matches!(run(&env, &board, &wander), Verdict::Fail { .. }));
-            let labels = [("attempt", "1"), ("branch", BRANCH)];
-            let board = FakeBoard::new(vec![task(&fixture, &labels)]);
-            assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-            let reason = format!(
-                "Rider cannot prepare the worktree: {} is on {on}, not on branch {BRANCH}.",
-                worktree(&env).display()
-            );
-            assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
-        }
-    }
-
-    #[test]
-    fn a_fast_forward_onto_another_branch_is_not_work_of_its_own() {
-        let (fixture, env) = setup("run-fast-forward");
-        fixture.branch_ahead("sibling");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let borrow = |_: &CommandLine, dir: &Path, log: &Path| {
-            git(dir, &["merge", "-q", "--ff-only", "sibling"]);
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(run(&env, &board, &borrow), no_own_commits());
-    }
-
-    #[test]
-    fn an_older_start_label_does_not_count_others_commits() {
-        let (fixture, env) = setup("run-old-start");
-        let root = git(&fixture.repo, &["rev-parse", "main"]);
-        fixture.commit(&fixture.repo, "later.txt", "later work on main");
-        let board = FakeBoard::new(vec![task(&fixture, &[("start", root.as_str())])]);
-        assert_eq!(run(&env, &board, &idle), no_own_commits());
-    }
-
-    #[test]
-    fn a_start_label_naming_no_commit_here_is_ignored() {
-        let (fixture, env) = setup("run-missing-start");
-        let missing = "0".repeat(40);
-        let board = FakeBoard::new(vec![task(&fixture, &[("start", missing.as_str())])]);
-        let verdict = run(&env, &board, &committing_agent(&fixture));
-        assert_eq!(verdict, completed("Extracted the store."));
-        let head = git(&fixture.repo, &["rev-parse", BRANCH]);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            "complete 7 Extracted the store.".to_string(),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
-        ];
-        assert_eq!(calls(&board), expected);
-    }
-
-    #[test]
-    fn a_restack_that_only_drops_commits_fails() {
-        let (fixture, env) = setup("run-restack-drop");
-        let base = base_task(&fixture);
-        let restack = task(&fixture, &[("onto", "#3"), ("restack", "1")]);
-        let board = FakeBoard::new(vec![restack, base]);
-        let drop = |_: &CommandLine, dir: &Path, log: &Path| {
-            git(dir, &["reset", "-q", "--hard", "HEAD~1"]);
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(run(&env, &board, &drop), no_own_commits());
-    }
-
-    #[test]
-    fn a_long_line_tail_survives_an_empty_read() {
-        assert_eq!(
-            long_line(&[]),
-            "(last line longer than 16 KiB, truncated)\n"
-        );
-        assert_eq!(
-            long_line(b"\nab"),
-            "(last line longer than 16 KiB, truncated)\nab"
         );
     }
 

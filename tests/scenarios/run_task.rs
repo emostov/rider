@@ -436,12 +436,12 @@ fn a_task_based_on_a_task_without_a_branch_is_blocked_as_an_invalid_brief() {
 }
 
 #[test]
-fn a_completed_task_whose_record_and_replies_cannot_be_posted_still_completes() {
+fn a_completed_task_whose_record_cannot_be_posted_replies_with_it_instead() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    given_vb_fails_every(&world, &[r#""reply "*"#, r#""post "[0-9]*"#]);
+    given_vb_fails_every(&world, &[r#""post "[0-9]*"#]);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
 
@@ -450,7 +450,20 @@ fn a_completed_task_whose_record_and_replies_cannot_be_posted_still_completes() 
         task_records(&world, &task, "rider-result"),
         Vec::<Value>::new()
     );
-    then_the_branch_has_the_agents_commit(&world, &task, 0);
+    let branch = then_the_branch_has_the_agents_commit(&world, &task, 0);
+    let record = json!({
+        "branch": branch,
+        "head": branch_head(&world, &branch),
+        "commits": 1,
+        "summary": fake_agent::summary(&task, 0),
+        "behind": [],
+    });
+    let replies = task_replies(&world, &task);
+    let texts = replies.iter().filter_map(|reply| reply["text"].as_str());
+    let records: Vec<Value> = texts
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect();
+    assert_eq!(records, vec![record]);
 }
 
 #[test]
