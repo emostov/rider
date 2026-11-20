@@ -1130,3 +1130,99 @@ pub fn then_the_client_reads_to_the_end(mut client: &UnixStream) -> Vec<Value> {
     }
     panic!("no end of stream within {LAGGED_READS_MAX} reads");
 }
+
+/// How long a scenario waits for `rider wait` to end.
+const WAIT_SECONDS_MAX: u64 = 90;
+/// The exit code of a `rider wait` that timed out.
+pub const WAIT_TIMED_OUT: i32 = 3;
+
+/// When the lead starts `rider wait <project> <args>` in the background.
+pub fn when_rider_wait_starts(world: &World, args: &[&str]) -> std::process::Child {
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command
+        .args(["wait", PROJECT])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    command.spawn().expect("start rider wait")
+}
+
+/// Then `rider wait` ends within `WAIT_SECONDS_MAX`; returns its exit code and output.
+pub fn then_rider_wait_ends(child: std::process::Child) -> crate::world::Output {
+    let (sender, ended) = std::sync::mpsc::sync_channel(1);
+    let pid = child.id();
+    thread::spawn(move || drop(sender.send(child.wait_with_output())));
+    let Ok(output) = ended.recv_timeout(Duration::from_secs(WAIT_SECONDS_MAX)) else {
+        kill_group(pid);
+        panic!("rider wait did not end within {WAIT_SECONDS_MAX} seconds");
+    };
+    let output = output.expect("wait for rider wait");
+    crate::world::Output {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Given the lead has waited once, so the next wait starts from now.
+pub fn given_the_lead_has_waited(world: &World) {
+    let output = when_rider_runs(world, &["wait", PROJECT, "--timeout", "0"]);
+    assert_eq!(output.code, Some(WAIT_TIMED_OUT), "{output:?}");
+}
+
+/// When worker `profile` claims `task`.
+pub fn when_a_worker_claims(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "claim", task, "--lease", "1h"], None);
+    assert_eq!(output.code, Some(0), "claim {task}: {output:?}");
+}
+
+/// When worker `profile` completes the `task` it holds.
+pub fn when_the_worker_completes(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "complete", task, "done"], None);
+    assert_eq!(output.code, Some(0), "complete {task}: {output:?}");
+}
+
+/// The `vb tail` processes started by process `parent`.
+pub fn feeds_of(parent: u32) -> Vec<u32> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "pid=,ppid=,command="])
+        .stdin(Stdio::null());
+    let output = crate::world::run_bounded(command, None);
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let rows = output.stdout.lines().filter_map(|line| {
+        let mut words = line.split_whitespace();
+        let pid: u32 = words.next()?.parse().ok()?;
+        let ppid: u32 = words.next()?.parse().ok()?;
+        let tail = words.any(|word| word == "tail");
+        (ppid == parent && tail).then_some(pid)
+    });
+    rows.collect()
+}
+
+/// When `rider wait` has started following the board's feed; returns its `vb tail` pids.
+pub fn when_the_wait_follows_the_feed(wait: u32) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS_MAX);
+    loop {
+        let feeds = feeds_of(wait);
+        if !feeds.is_empty() {
+            return feeds;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rider wait never started vb tail"
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When process `pid` is sent `signal`, such as `-TERM`.
+pub fn when_the_process_is_sent(pid: u32, signal: &str) {
+    let status = std::process::Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {signal} {pid}");
+}

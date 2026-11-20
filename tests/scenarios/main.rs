@@ -204,6 +204,117 @@ fn a_qa_agent_that_commits_fails_and_leaves_the_tested_branch_alone() {
 }
 
 #[test]
+fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_alone() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    let branch = then_the_branch_has_the_agents_commit(&world, &built, 0);
+    let head = branch_head(&world, &branch);
+    assert_eq!(fake_agent::head(&world.root, &review, 0), (head, None));
+    let runs = agent_runs_for(&world, &review);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].dir, worktree_dir(&world, &review));
+    assert_eq!(task_label(&world, &review, "branch"), None);
+    assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
+    then_the_worktree_is_removed(&world, &review);
+    then_only_the_repository_is_a_worktree(&world);
+}
+
+#[test]
+fn a_task_with_no_repo_label_is_blocked_as_an_invalid_brief_and_no_agent_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = NewTask::new("Add the work.")
+        .label("from", MAIN)
+        .role("implement");
+    let task = when_the_lead_creates(&world, &task);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = "Set the `repo` label to the absolute path of the repository.";
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("invalid_brief".to_string(), reason.to_string()))
+    );
+    assert_eq!(agent_runs(&world), vec![]);
+    assert_eq!(branches(&world), vec![MAIN.to_string()]);
+}
+
+#[test]
+fn an_agent_that_commits_nothing_fails_and_once_reopened_completes_on_the_same_branch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(
+        &world,
+        &task,
+        &[Behaviour::CommitNothing, Behaviour::Commit],
+    );
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+    let text = task_text(&world, &task);
+    let reason = "no committed work: the branch has no commits of its own";
+    assert!(text.contains(reason), "{text}");
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let first = task_label(&world, &task, "branch").expect("the failed task's branch");
+
+    world.vb_lead(&["tasks", "reopen", &task], None);
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(
+        (states, then_the_daemon_exits(&mut world)),
+        (vec!["completed".to_string()], Some(0))
+    );
+    assert_eq!(
+        then_the_branch_has_the_agents_commit(&world, &task, 1),
+        first
+    );
+    assert_eq!(branches(&world), vec![MAIN.to_string(), first]);
+    let runs = agent_runs_for(&world, &task);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].dir, runs[1].dir);
+    then_the_worktree_is_removed(&world, &task);
+    then_only_the_repository_is_a_worktree(&world);
+}
+
+#[test]
+fn an_agent_that_leaves_uncommitted_changes_fails_and_its_worktree_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
+    let text = task_text(&world, &task);
+    let reason = "no committed work: the worktree has uncommitted changes";
+    assert!(text.contains(reason), "{text}");
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let left = worktree_dir(&world, &task).join(format!("uncommitted-{task}.txt"));
+    let left = fs::read_to_string(&left).expect("the uncommitted file is kept");
+    assert_eq!(left, "left behind\n");
+}
+
+#[test]
 fn the_daemon_claims_a_new_task_with_a_role_within_five_seconds() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
@@ -578,7 +689,7 @@ fn a_prompt_file_named_directly_under_the_rider_home_is_accepted() {
 }
 
 #[test]
-fn a_role_can_select_the_tact_harness() {
+fn the_tact_harness_is_refused_naming_the_harness() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -586,8 +697,10 @@ fn a_role_can_select_the_tact_harness() {
 
     let output = when_rider_runs(&world, &["config"]);
 
-    assert_eq!(output.code, Some(0), "{output:?}");
-    assert!(output.stdout.contains("harness = \"tact\""), "{output:?}");
+    assert_ne!(output.code, Some(0), "{output:?}");
+    assert!(output.stderr.contains("tact"), "{output:?}");
+    assert!(output.stderr.contains("claude"), "{output:?}");
+    assert!(output.stderr.contains("codex"), "{output:?}");
 }
 
 #[test]
@@ -2247,4 +2360,144 @@ fn daemon_pid(world: &World) -> u32 {
         .nth(1)
         .and_then(|pid| pid.parse().ok());
     pid.unwrap_or_else(|| panic!("no pid in daemon.lock: {text:?}"))
+}
+
+#[test]
+fn two_tasks_completed_during_one_wait_are_both_named_in_its_message() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let first = when_the_lead_creates(&world, &NewTask::new("Write the first part."));
+    let second = when_the_lead_creates(&world, &NewTask::new("Write the second part."));
+    given_the_lead_has_waited(&world);
+    when_a_worker_claims(&world, "w-1", &first);
+    when_a_worker_claims(&world, "w-2", &second);
+
+    let wait = when_rider_wait_starts(&world, &["--timeout", "1"]);
+    when_the_worker_completes(&world, "w-1", &first);
+    when_the_worker_completes(&world, "w-2", &second);
+    let output = then_rider_wait_ends(wait);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = format!(
+        "completed #{first} Write the first part.\n\
+         completed #{second} Write the second part.\nidle\n"
+    );
+    assert_eq!(output.stdout, expected);
+    let again = when_rider_runs(&world, &["wait", PROJECT, "--timeout", "0"]);
+    assert_eq!(again.stdout, "idle\n", "an event is never named twice");
+}
+
+#[test]
+fn an_event_the_lead_caused_does_not_end_the_wait() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let held = when_the_lead_creates(&world, &NewTask::new("Hold this part back."));
+    let done = when_the_lead_creates(&world, &NewTask::new("Write this part."));
+    given_the_lead_has_waited(&world);
+    when_a_worker_claims(&world, "w-1", &done);
+
+    let wait = when_rider_wait_starts(&world, &["--timeout", "1"]);
+    world.vb_lead(&["tasks", "block", &held, "held by the lead"], None);
+    when_the_worker_completes(&world, "w-1", &done);
+    let output = then_rider_wait_ends(wait);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        format!("completed #{done} Write this part.\n")
+    );
+}
+
+#[test]
+fn a_wait_that_times_out_prints_nothing_and_exits_with_its_own_code() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &NewTask::new("Write the slow part."));
+    given_the_lead_has_waited(&world);
+    when_a_worker_claims(&world, "w-1", &task);
+
+    let output = when_rider_runs(&world, &["wait", PROJECT, "--timeout", "0"]);
+
+    assert_eq!(output.code, Some(WAIT_TIMED_OUT), "{output:?}");
+    assert_eq!(output.stdout, "");
+    assert_eq!(output.stderr, "");
+}
+
+#[test]
+fn a_wait_that_cannot_print_its_message_leaves_the_events_for_the_next_wait() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &NewTask::new("Write the lost part."));
+    given_the_lead_has_waited(&world);
+    when_a_worker_claims(&world, "w-1", &task);
+
+    let mut wait = when_rider_wait_starts(&world, &["--timeout", "1"]);
+    drop(wait.stdout.take());
+    when_the_worker_completes(&world, "w-1", &task);
+    let output = then_rider_wait_ends(wait);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    let again = when_rider_runs(&world, &["wait", PROJECT, "--timeout", "0"]);
+    assert_eq!(
+        again.stdout,
+        format!("completed #{task} Write the lost part.\nidle\n")
+    );
+}
+
+#[test]
+fn a_second_wait_on_one_project_is_refused_while_the_first_runs() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &NewTask::new("Write the shared part."));
+    given_the_lead_has_waited(&world);
+    when_a_worker_claims(&world, "w-1", &task);
+    let first = when_rider_wait_starts(&world, &["--timeout", "1"]);
+    let first_pid = first.id();
+    when_the_wait_follows_the_feed(first_pid);
+
+    let second = when_rider_runs(&world, &["wait", PROJECT, "--timeout", "0"]);
+    when_the_worker_completes(&world, "w-1", &task);
+    let first_output = then_rider_wait_ends(first);
+
+    assert_eq!(second.code, Some(1), "{second:?}");
+    assert_eq!(second.stdout, "");
+    assert!(
+        second
+            .stderr
+            .contains(&format!("is held by pid {first_pid}")),
+        "{second:?}"
+    );
+    assert_eq!(
+        first_output.stdout,
+        format!("completed #{task} Write the shared part.\nidle\n")
+    );
+}
+
+#[test]
+fn a_wait_sent_sigterm_stops_its_feed_before_it_exits() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &NewTask::new("Write the stopped part."));
+    given_the_lead_has_waited(&world);
+    when_a_worker_claims(&world, "w-1", &task);
+    let wait = when_rider_wait_starts(&world, &["--timeout", "1"]);
+    let feeds = when_the_wait_follows_the_feed(wait.id());
+
+    when_the_process_is_sent(wait.id(), "-TERM");
+    let output = then_rider_wait_ends(wait);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert_eq!(output.stdout, "");
+    for feed in feeds {
+        assert!(
+            when_the_process_ends_within(feed, 10),
+            "vb tail {feed} outlived the wait"
+        );
+    }
 }

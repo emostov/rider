@@ -24,7 +24,7 @@ use crate::board::{
     Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
     parse_failure_reason,
 };
-use crate::cli::{board_serve, with_vb_on_path};
+use crate::cli::board_serve;
 use crate::config::Limits;
 use crate::core::{
     self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, AgentRecord, Call, Config, Event, LEASE_MILLIS,
@@ -132,6 +132,8 @@ until read -r group start 2>/dev/null < "$RIDER_AGENT_ACK_FILE" && [ "$group" = 
   [ "$n" -gt 600 ] && exit 1
   sleep 0.05
 done
+PATH="$RIDER_AGENT_VB_DIR${PATH:+:$PATH}"
+export PATH
 exec "$@""#;
 
 /// Where the daemon's files are and how it reaches the board and its agents.
@@ -140,7 +142,6 @@ pub struct Paths {
     pub prompts: PathBuf,
     pub vb: PathBuf,
     pub board_url: String,
-    pub inherited_path: Option<String>,
 }
 
 /// Why the daemon could not start or keep going.
@@ -1091,18 +1092,17 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
         .parent()
         .map(|dir| dir.to_string_lossy().into_owned());
     let vb_dir = vb_dir.unwrap_or_else(|| "/".to_string());
-    let inherited = shared.paths.inherited_path.clone();
     let pid_text = pid_file.to_string_lossy().into_owned();
     let ack = ack_file(&pid_file);
     let ack_text = ack.to_string_lossy().into_owned();
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
-        let cmd = with_vb_on_path(cmd, &vb_dir, inherited.as_deref());
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
         let mut env = cmd.env.clone();
+        env.push(("RIDER_AGENT_VB_DIR".to_string(), vb_dir.clone()));
         env.push(("RIDER_AGENT_PID_FILE".to_string(), pid_text.clone()));
         env.push(("RIDER_AGENT_ACK_FILE".to_string(), ack_text.clone()));
         let wrapped = CommandLine {
@@ -1368,6 +1368,9 @@ impl Board for Guarded<'_> {
         values: &[&str],
     ) -> Result<Listing, BoardError> {
         self.board.list_labelled(channel, key, values)
+    }
+    fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
+        self.board.blocking_findings(id)
     }
 }
 

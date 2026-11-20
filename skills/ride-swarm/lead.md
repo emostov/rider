@@ -20,7 +20,7 @@ asks for it in this conversation.
 
 ## The board
 
-- The Board CLI is `vb`. If it is not on `PATH`, use `~/.rider/node/node_modules/.bin/vb`.
+- The Board CLI is `vb`. If it is not on `PATH`, use `<rider home>/node/node_modules/.bin/vb`.
   `BOARD_URL` is `http://127.0.0.1:4100/api/board`.
 - Write as yourself: pass `--as lead-fable-5-2` on every `vb` command that writes or waits.
 - `work/<project>` holds a project's tasks. `decisions` holds questions for the owner.
@@ -241,12 +241,15 @@ task of its own.
 9. Wait for the board in the background, never in the foreground. Run this as one background
    command (in Claude Code, the Bash tool with `run_in_background`, which notifies the session
    when the command exits):
-   `for i in 1 2 3 4 5 6; do o=$(vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json 2>&1); echo "$o" | jq -e '.reason == "timeout"' >/dev/null 2>&1 || break; done; echo "$o"`
-   The loop repeats the 9-minute wait only when the output's own top-level `reason` is
-   `"timeout"` (nothing happened; an event's `reason` is nested, so it never matches), at most 6
-   times (54 minutes), so a quiet board does not end it early and an error never spins. Any event, even a reply of yours in a finished task's thread,
-   ends it. While it runs, answer the owner. When it ends, read its output and take the next turn; if it ended on
-   an error, report it to the owner. Never run the wait in the foreground and never sleep-poll.
+   `rider wait <project> --as lead-fable-5-2`
+   It blocks until something needs you and prints one line for each thing that happened since
+   the last wait: `completed`, `failed` or `blocked` with the task's id and first line (a
+   completed review also names its blocking-finding count), `answered` for a decision, and
+   `idle` when no task in `work/<project>` is open. Your own events never end it, and it keeps
+   its own cursor, so no event is named twice. After 54 minutes with nothing to report it
+   prints nothing and exits 3: start it again. While it runs, answer the owner. When it ends,
+   read its output and take the next turn; if it ended on an error, report it to the owner.
+   Never run the wait in the foreground and never sleep-poll.
 
 ## What Rider leaves on the board
 
@@ -268,7 +271,7 @@ Worktrees are large, mostly the Rust `target/` directory, so remove one once not
 use it again. Rider removes a task's worktree when the task completes, and keeps it when
 the task fails or blocks so a retry can reuse it. When you cancel a task, or give up on a
 failed or blocked one, remove its worktree: `git -C <repo> worktree remove
-~/.rider/worktrees/<repository directory name>/<task id>`. It refuses when there are
+<rider home>/worktrees/<repository directory name>/<task id>`. It refuses when there are
 modified or untracked files: then tell the owner rather than forcing. Never `--force`,
 never delete the branch. A completed task whose thread says "Kept the worktree" is the
 same case once its changes are understood. `rider clean` (issue #60) will replace this rule.

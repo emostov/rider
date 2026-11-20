@@ -124,7 +124,6 @@ struct LimitsShape {
 enum HarnessName {
     Claude,
     Codex,
-    Tact,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -157,7 +156,6 @@ impl RoleShape {
         let harness = match spec.harness {
             Harness::Claude => HarnessName::Claude,
             Harness::Codex => HarnessName::Codex,
-            Harness::Tact => HarnessName::Tact,
         };
         let prompt = spec.prompt_file.strip_suffix(PROMPT_SUFFIX);
         assert!(prompt.is_some(), "built-in prompts are .md files");
@@ -347,7 +345,6 @@ fn role_spec(
     let harness = match role.harness.ok_or_else(|| missing("harness"))? {
         HarnessName::Claude => Harness::Claude,
         HarnessName::Codex => Harness::Codex,
-        HarnessName::Tact => Harness::Tact,
     };
     let model = role.model.clone().ok_or_else(|| missing("model"))?;
     let spaced = model.contains(char::is_whitespace);
