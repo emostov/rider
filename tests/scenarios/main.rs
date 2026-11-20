@@ -293,7 +293,7 @@ fn five_ready_polish_tasks_never_run_more_than_the_four_polish_slots_at_once() {
         task
     })
     .collect();
-    given_a_rider_toml(&world, "[roles.polish]\nslots = 1\n");
+    given_a_rider_toml(&world, "[roles.polish]\nslots = 4\n");
     given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
     when_the_agent_has_started(&world, &tasks[0]);
     thread::sleep(Duration::from_secs(2));

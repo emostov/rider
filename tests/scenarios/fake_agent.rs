@@ -106,7 +106,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=$(tail -n 1 "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
-printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt"
+printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -194,7 +194,7 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
 
 /// The arguments attempt `attempt` of `task` was started with, one per line.
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
-    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}"));
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
 }
 
