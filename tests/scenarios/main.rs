@@ -46,8 +46,43 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
         "head": branch_head(&world, &branch),
         "commits": 1,
         "summary": fake_agent::summary(&task, 0),
+        "behind": [],
     });
     assert_eq!(task_records(&world, &task, "rider-result"), vec![record]);
+}
+
+#[test]
+fn a_fix_that_moves_a_branch_names_the_stacked_task_left_behind_in_its_result_record() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let base = when_the_lead_creates(&world, &an_implement_task(&world, "Add the base work."));
+    let stacked = NewTask::new("Add the stacked work.")
+        .label("repo", world.repo_label())
+        .label("base", &base)
+        .needs(&base)
+        .role("implement");
+    let stacked = when_the_lead_creates(&world, &stacked);
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the base work.", &base, &stacked, false),
+    );
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&base, &stacked, &fix]);
+
+    assert_eq!(states, vec!["completed", "completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    let branch = task_label(&world, &base, "branch").expect("the base task's branch");
+    assert_eq!(task_label(&world, &fix, "branch"), Some(branch.clone()));
+    let stacked_id: u64 = stacked.parse().expect("a task id");
+    let record = json!({
+        "branch": branch,
+        "head": branch_head(&world, &branch),
+        "commits": 1,
+        "summary": fake_agent::summary(&fix, 0),
+        "behind": [stacked_id],
+    });
+    assert_eq!(task_records(&world, &fix, "rider-result"), vec![record]);
 }
 
 #[test]

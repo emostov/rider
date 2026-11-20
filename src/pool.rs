@@ -467,6 +467,14 @@ mod tests {
         fn list_open(&self, subtree: &str) -> Result<crate::board::Listing, BoardError> {
             panic!("the pool never lists {subtree}")
         }
+
+        fn list_after(
+            &self,
+            subtree: &str,
+            _: TaskId,
+        ) -> Result<crate::board::Listing, BoardError> {
+            panic!("the pool never lists {subtree}")
+        }
     }
 
     #[test]

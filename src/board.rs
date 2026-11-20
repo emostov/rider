@@ -112,7 +112,7 @@ pub struct TaskView {
     pub version: Cursor,
 }
 
-/// An open task as a listing shows it, with the channel it is in.
+/// A task as a listing shows it, with the channel it is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedTask {
     pub view: TaskView,
@@ -126,13 +126,13 @@ pub struct TaskPage {
     pub cursor: Cursor,
 }
 
-/// A subtree's open tasks: the first `TASKS_MAX` in the board's order, and a cursor from
+/// A subtree's listed tasks: the first `TASKS_MAX` in the board's order, and a cursor from
 /// before the first page, so a feed started there replays any change made while paging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
     pub tasks: Vec<ListedTask>,
     pub cursor: Cursor,
-    /// The open tasks past `TASKS_MAX`, which the listing does not return.
+    /// The listed tasks past `TASKS_MAX`, which the listing does not return.
     pub left_out: usize,
 }
 
@@ -148,7 +148,7 @@ pub enum BoardError {
     TooManyLabels,
     /// A task waits for more than `NEEDS_MAX` tasks.
     TooManyNeeds,
-    /// A subtree's open tasks fill more than `LISTING_PAGES_MAX` pages.
+    /// A subtree's listed tasks fill more than `LISTING_PAGES_MAX` pages.
     TooManyTasks,
     /// The board refused a write on task `id` because this profile's claim on it is over.
     ClaimLost {
@@ -200,7 +200,7 @@ impl fmt::Display for BoardError {
             BoardError::TooManyNeeds => write!(f, "the task waits for more than {NEEDS_MAX} tasks"),
             BoardError::TooManyTasks => {
                 let tasks = TASKS_PAGE_MAX * LISTING_PAGES_MAX;
-                write!(f, "more than {tasks} open tasks in one listing")
+                write!(f, "more than {tasks} tasks in one listing")
             }
             BoardError::ClaimLost { id } => write!(f, "the claim on task {} was lost", id.0),
             BoardError::OutputTooLarge => {
@@ -263,6 +263,8 @@ pub trait Board {
     fn release(&self, id: TaskId) -> Result<(), BoardError>;
     /// The open tasks in `subtree`, a channel prefix ending in `/`, and every channel below it.
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError>;
+    /// The tasks in `subtree` in any state whose ids are after `after`.
+    fn list_after(&self, subtree: &str, after: TaskId) -> Result<Listing, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -297,6 +299,7 @@ enum Command<'a> {
     },
     List {
         subtree: &'a str,
+        state: &'static str,
         after: Option<Cursor>,
     },
     Label {
@@ -423,9 +426,13 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
         }
         Command::Release { id } => (to_strings(&["tasks", "release", &id.0.to_string()]), None),
         Command::Cursor { subtree } => (to_strings(&["read", subtree, "--limit", "1"]), None),
-        Command::List { subtree, after } => {
+        Command::List {
+            subtree,
+            state,
+            after,
+        } => {
             let limit = TASKS_PAGE_MAX.to_string();
-            let mut words = to_strings(&["tasks", subtree, "--state", "open", "--limit", &limit]);
+            let mut words = to_strings(&["tasks", subtree, "--state", state, "--limit", &limit]);
             if let Some(after) = after {
                 words.extend(to_strings(&["--after", &after.0.to_string()]));
             }
@@ -1287,6 +1294,22 @@ impl Board for VbCli {
     }
 
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
+        self.list(subtree, "open", None)
+    }
+
+    fn list_after(&self, subtree: &str, after: TaskId) -> Result<Listing, BoardError> {
+        self.list(subtree, "all", Some(Cursor(after.0)))
+    }
+}
+
+impl VbCli {
+    fn list(
+        &self,
+        subtree: &str,
+        state: &'static str,
+        start: Option<Cursor>,
+    ) -> Result<Listing, BoardError> {
+        assert!(state == "open" || state == "all");
         assert!(
             subtree.ends_with('/'),
             "a subtree is a channel prefix ending in /"
@@ -1299,9 +1322,14 @@ impl Board for VbCli {
         let cursor = Cursor(parse_id_text(&read.cursor)?.0);
         let mut tasks: Vec<ListedTask> = Vec::new();
         let mut left_out: usize = 0;
-        let mut after: Option<Cursor> = None;
+        let mut after = start;
         for _ in 0..LISTING_PAGES_MAX {
-            let page = parse_task_list(&self.read(&Command::List { subtree, after })?)?;
+            let list = Command::List {
+                subtree,
+                state,
+                after,
+            };
+            let page = parse_task_list(&self.read(&list)?)?;
             let full = page.tasks.len() == TASKS_PAGE_MAX;
             let first = page.tasks.first().map(|task| task.view.id.0);
             if first
@@ -1472,6 +1500,20 @@ pub mod testing {
             let tasks = self.tasks.borrow();
             let open = tasks.iter().filter(|task| !closed.contains(&task.state));
             let listed = open.map(|view| ListedTask {
+                view: view.clone(),
+                channel: "work/fake".into(),
+            });
+            Ok(Listing {
+                tasks: listed.collect(),
+                cursor: Cursor(0),
+                left_out: 0,
+            })
+        }
+
+        fn list_after(&self, _: &str, after: TaskId) -> Result<Listing, BoardError> {
+            let tasks = self.tasks.borrow();
+            let later = tasks.iter().filter(|task| task.id.0 > after.0);
+            let listed = later.map(|view| ListedTask {
                 view: view.clone(),
                 channel: "work/fake".into(),
             });
@@ -2080,6 +2122,7 @@ printf '],"cursor":"%s"}}\n' $cursor
         expect(cursor, &["read", "work/", "--limit", "1"]);
         let list = Command::List {
             subtree: "work/",
+            state: "open",
             after: Some(Cursor(9)),
         };
         let limit = ["--limit", "200", "--after", "9"];

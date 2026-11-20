@@ -12,6 +12,7 @@ use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
 use crate::brief::{Brief, echo, label, parse_brief};
+use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
@@ -28,6 +29,8 @@ pub const ATTEMPTS_DEFAULT: u8 = 3;
 const _: () = assert!(ATTEMPTS_DEFAULT > 0 && ATTEMPTS_DEFAULT <= ATTEMPTS_MAX);
 /// Upper bound on the bytes read from the end of a failed attempt's log.
 pub const LOG_TAIL_BYTES_MAX: u64 = 16 * 1024;
+/// Upper bound on the stacked tasks checked when a branch moves, as `rider-result@2` allows.
+pub const STACKED_CHECKS_MAX: usize = 64;
 /// The lines of a failed attempt's log replied to its task.
 pub const LOG_TAIL_LINES: usize = 40;
 /// Upper bound on a role's prompt file.
@@ -42,7 +45,7 @@ const ATTEMPT_LABEL: &str = "attempt";
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
-const RESULT_SCHEMA: &str = "rider-result@1";
+const RESULT_SCHEMA: &str = "rider-result@2";
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the Claude session id of its latest completed attempt on one line,
@@ -119,6 +122,7 @@ struct Work {
 
 #[derive(Serialize)]
 struct ResultRecord<'a> {
+    behind: Vec<u64>,
     branch: Option<&'a str>,
     commits: u64,
     head: &'a str,
@@ -793,14 +797,29 @@ fn complete(
     let end = result.char_indices().nth(SUMMARY_CHARS_MAX);
     let summary = &result[..end.map_or(result.len(), |(index, _)| index)];
     assert!(!summary.trim().is_empty() && summary.chars().count() <= SUMMARY_CHARS_MAX);
+    // The fenced write goes first: a retry writes nothing twice, and a lost claim nothing.
+    board.complete(id, summary)?;
+    let behind = match (attempt.brief.onto, attempt.branch()) {
+        (Some(onto), Some(branch)) if work.head != attempt.reference => {
+            stacked_behind(board, &attempt.checkout.dir, onto, branch, &work.head).unwrap_or_else(
+                |error| {
+                    let note = format!(
+                        "Rider could not check the tasks stacked on branch {branch}: {error}."
+                    );
+                    let _ = board.reply(id, &one_line(&note));
+                    Vec::new()
+                },
+            )
+        }
+        _ => Vec::new(),
+    };
     let record = ResultRecord {
+        behind,
         branch: attempt.checkout.branch.as_deref(),
         commits: work.commits,
         head: &work.head,
         summary,
     };
-    // The fenced write goes first: a retry writes nothing twice, and a lost claim nothing.
-    board.complete(id, summary)?;
     if let Err(error) = record_session(attempt, &env.home) {
         let note = format!("Rider could not record the agent's session: {error}.");
         let _ = board.reply(id, &one_line(&note));
@@ -830,6 +849,65 @@ fn complete(
         let _ = board.reply(id, &one_line(&note));
     }
     Ok(())
+}
+
+// A task is stacked on `branch` when its `base` is `onto` or a task labelled with `branch`;
+// one is behind when its own branch does not contain `head`. Tasks stacked on `onto` come
+// after it, so only later tasks are listed.
+fn stacked_behind(
+    board: &dyn Board,
+    dir: &Path,
+    onto: TaskId,
+    branch: &str,
+    head: &str,
+) -> Result<Vec<u64>, String> {
+    assert!(git::is_commit_id(head), "a branch head is a commit id");
+    let listing = board
+        .list_after(SUBTREE, onto)
+        .map_err(|error| error.to_string())?;
+    if listing.left_out > 0 {
+        return Err(format!(
+            "{} tasks after #{} were past the listing's bound",
+            listing.left_out, onto.0
+        ));
+    }
+    let id_of = |value: &str| value.strip_prefix('#').unwrap_or(value).parse::<u64>().ok();
+    let views = || listing.tasks.iter().map(|task| &task.view);
+    let on_branch: Vec<u64> = views()
+        .filter(|view| label(view, BRANCH_LABEL) == Some(branch))
+        .map(|view| view.id.0)
+        .chain([onto.0])
+        .collect();
+    let mut behind: Vec<u64> = Vec::new();
+    let mut checked: usize = 0;
+    for view in views() {
+        let base = label(view, "base").and_then(id_of);
+        let Some(own) = label(view, BRANCH_LABEL).filter(|own| *own != branch) else {
+            continue;
+        };
+        if !base.is_some_and(|base| on_branch.contains(&base)) {
+            continue;
+        }
+        checked = checked.checked_add(1).ok_or("too many stacked tasks")?;
+        if checked > STACKED_CHECKS_MAX {
+            return Err(format!(
+                "more than {STACKED_CHECKS_MAX} tasks are stacked on it"
+            ));
+        }
+        let full = format!("refs/heads/{own}");
+        let text = |error: GitError| error.to_string();
+        // A stacked task whose branch is not here, or cannot be named to git, is not judged.
+        let safe = git::is_safe_ref(own) && git::is_safe_ref(&full);
+        if !safe || !git::branch_exists(dir, own).map_err(text)? {
+            continue;
+        }
+        let own_head = git::commit_of(dir, &full).map_err(text)?;
+        if !git::is_ancestor(dir, head, &own_head).map_err(text)? {
+            behind.push(view.id.0);
+        }
+    }
+    assert!(behind.len() <= checked && behind.len() <= STACKED_CHECKS_MAX);
+    Ok(behind)
 }
 
 fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Result<(), RunError> {
@@ -1009,9 +1087,14 @@ mod tests {
     }
 
     fn record(branch: Option<&str>, head: &str, commits: u64, summary: &str) -> String {
-        let record =
-            json!({"branch": branch, "head": head, "commits": commits, "summary": summary});
-        format!("post_structured 7 rider-result@1 {record}")
+        let record = json!({
+            "branch": branch,
+            "head": head,
+            "commits": commits,
+            "summary": summary,
+            "behind": [],
+        });
+        format!("post_structured 7 rider-result@2 {record}")
     }
 
     fn run(env: &Env, board: &FakeBoard, launch: &Launch) -> Verdict {
