@@ -26,13 +26,6 @@ channel while the rest of the work goes on.
 | `security`  | Mythos 5.2      | Reviews the finished stack                  |
 | `qa`        | Opus 5.5        | Optional: uses another task's work like a person would |
 
-Every implementing task is reviewed by a different model than the one that
-built it. A task is done only when its agent exited cleanly, its worktree is
-clean, and its branch has new commits.
-
-Each task's branch is cut from the task it builds on, so the result can become
-one pull request or a stack.
-
 ## Getting started
 
 Paste this into your coding agent:
