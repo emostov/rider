@@ -1479,7 +1479,13 @@ pub mod testing {
         }
 
         fn set_label(&self, id: TaskId, key: &str, value: &str) -> Result<(), BoardError> {
-            self.record(format!("set_label {} {key}={value}", id.0))
+            self.record(format!("set_label {} {key}={value}", id.0))?;
+            let mut tasks = self.tasks.borrow_mut();
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == id) {
+                task.labels.retain(|(name, _)| name != key);
+                task.labels.push((key.to_string(), value.to_string()));
+            }
+            Ok(())
         }
 
         fn reply(&self, id: TaskId, text: &str) -> Result<(), BoardError> {

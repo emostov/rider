@@ -1324,7 +1324,7 @@ mod tests {
         let verdict = run(&env, &board, &committing_agent(&fixture));
         assert_eq!(verdict, completed("Extracted the store."));
         let head = git(&fixture.repo, &["rev-parse", BRANCH]);
-        let json = json!({"branch": BRANCH, "head": head, "commits": 1,
+        let json = json!({"behind": [], "branch": BRANCH, "head": head, "commits": 1,
             "summary": "Extracted the store."});
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
