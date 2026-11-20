@@ -1072,7 +1072,8 @@ pub fn given_a_client_on_the_daemon_socket(world: &World) -> UnixStream {
 }
 
 /// When the client sends status requests and never reads, until a write waits
-/// `FLOOD_STALL_SECONDS` because the daemon stopped reading; returns the requests sent whole.
+/// `FLOOD_STALL_SECONDS` or is refused because the daemon stopped reading; returns the
+/// requests sent whole.
 pub fn when_the_client_sends_status_requests_without_reading(client: &mut UnixStream) -> u64 {
     let stall = Duration::from_secs(FLOOD_STALL_SECONDS);
     client
@@ -1082,7 +1083,15 @@ pub fn when_the_client_sends_status_requests_without_reading(client: &mut UnixSt
         let request = format!("{{\"v\":1,\"id\":{id},\"cmd\":\"status\"}}\n");
         match client.write_all(request.as_bytes()) {
             Ok(()) => {}
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                ) =>
+            {
                 return id - 1;
             }
             Err(error) => panic!("sending request {id} failed: {error}"),
