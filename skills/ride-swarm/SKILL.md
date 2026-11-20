@@ -38,6 +38,9 @@ answer from memory.
 3. What finished or failed recently. For a finished `review` or `security` task, say
    whether its summary reports anything blocking, and whether a fix task exists for it.
 
+End the answer with the `Your move:` line that `lead.md` defines under "Telling the owner
+where it stands".
+
 Old blocked tasks the user did not mention are theirs to keep or cancel: list them, and ask.
 
 ## Ride a swarm

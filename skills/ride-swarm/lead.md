@@ -291,3 +291,10 @@ By default, as work resolves an issue, close it or link it to the PR that closes
 
 When the work is done, or when they ask, say what is finished, what waits on them, and what
 failed, each with its task id: `vb tasks work/<project> --state all --json`.
+
+Every message to the owner ends with one line starting `Your move:`, in exactly one form:
+
+- An action, naming each item: review PR <link>, answer decision <id>, approve a push or
+  publish, turn on a setting. When several wait, list them, most blocking first.
+- `wait`, when the swarm is working and nothing needs the owner, with what finishes next.
+- `nothing: the swarm is idle`, when no task is running or planned.

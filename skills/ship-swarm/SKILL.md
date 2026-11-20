@@ -159,7 +159,7 @@ When every check is green and no thread is unresolved:
 4. Remove the worktree of each task that is cancelled or given up on, as `lead.md` says:
    never with `--force`, and never delete the branch.
 5. Tell the owner: each PR's link, that CI is green and no thread is open, the fix task ids,
-   and the issues closed. Merging is theirs.
+   and the issues closed. Merging is theirs. End with the `Your move:` line from `lead.md`.
 
 ## Common mistakes
 
