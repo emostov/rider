@@ -1,5 +1,6 @@
 //! The table of agent roles: which harness and model runs each, and how many at once.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// The program that runs an agent.
@@ -10,7 +11,7 @@ pub enum Harness {
 }
 
 /// One role an agent can take on a task.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RoleSpec {
     pub label: &'static str,
     pub harness: Harness,
@@ -30,6 +31,14 @@ pub struct RoleSpec {
     pub pool_slots: u8,
     /// A file name under `prompts/`, or an absolute path to the user's own prompt.
     pub prompt_file: &'static str,
+    pub skills: &'static [&'static str],
+}
+
+/// The roles one repository overrides, each merged over the role of the same label.
+#[derive(Debug)]
+pub struct RepoRoles {
+    pub repo: PathBuf,
+    pub roles: Vec<RoleSpec>,
 }
 
 /// Upper bound on agents running at once, across every role, and its default.
@@ -40,7 +49,7 @@ const _: () = assert!(BUILDERS_DEFAULT > 0 && BUILDERS_DEFAULT <= AGENTS_MAX);
 /// The longest profile name the board accepts.
 pub const PROFILE_LEN_MAX: usize = 32;
 
-pub const ROLES: [RoleSpec; 6] = [
+pub const ROLES: [RoleSpec; 5] = [
     RoleSpec {
         label: "implement",
         harness: Harness::Claude,
@@ -54,6 +63,7 @@ pub const ROLES: [RoleSpec; 6] = [
         slots: AGENTS_MAX,
         pool_slots: 12,
         prompt_file: "implement.md",
+        skills: &[],
     },
     RoleSpec {
         label: "light",
@@ -68,6 +78,7 @@ pub const ROLES: [RoleSpec; 6] = [
         slots: AGENTS_MAX,
         pool_slots: 12,
         prompt_file: "implement.md",
+        skills: &[],
     },
     RoleSpec {
         label: "review",
@@ -82,20 +93,7 @@ pub const ROLES: [RoleSpec; 6] = [
         slots: AGENTS_MAX,
         pool_slots: 8,
         prompt_file: "review.md",
-    },
-    RoleSpec {
-        label: "polish",
-        harness: Harness::Claude,
-        model: "claude-sonnet-5-5",
-        commits_expected: true,
-        needs_of: false,
-        builds: true,
-        title: "Polish",
-        model_name: "Sonnet 5.5",
-        model_slug: "sonnet-5-5",
-        slots: AGENTS_MAX,
-        pool_slots: 4,
-        prompt_file: "polish.md",
+        skills: &[],
     },
     RoleSpec {
         label: "security",
@@ -110,6 +108,7 @@ pub const ROLES: [RoleSpec; 6] = [
         slots: AGENTS_MAX,
         pool_slots: 2,
         prompt_file: "security.md",
+        skills: &[],
     },
     RoleSpec {
         label: "qa",
@@ -124,6 +123,7 @@ pub const ROLES: [RoleSpec; 6] = [
         slots: AGENTS_MAX,
         pool_slots: 2,
         prompt_file: "qa.md",
+        skills: &[],
     },
 ];
 
@@ -137,23 +137,43 @@ const _: () = {
         assert!(ROLES[index].pool_slots > 0);
         assert!(ROLES[index].pool_slots <= ROLES[index].slots);
         assert!(ROLES[index].commits_expected || ROLES[index].needs_of);
+        assert!(ROLES[index].skills.is_empty());
         index += 1;
     }
 };
 
-static TABLE: OnceLock<&'static [RoleSpec]> = OnceLock::new();
+struct Installed {
+    roles: &'static [RoleSpec],
+    repos: &'static [RepoRoles],
+}
 
-/// Makes `table` the role table for the rest of the process; it can be installed only once.
-pub fn install(table: Vec<RoleSpec>) -> Result<&'static [RoleSpec], InstallError> {
+static TABLE: OnceLock<Installed> = OnceLock::new();
+
+/// Makes `table` the role table, and `repos` the repositories' overrides of it, for the rest
+/// of the process; they can be installed only once.
+pub fn install(
+    table: Vec<RoleSpec>,
+    repos: Vec<RepoRoles>,
+) -> Result<&'static [RoleSpec], InstallError> {
     assert!(!table.is_empty());
     assert!(
         table
             .iter()
             .all(|role| role.slots > 0 && role.slots <= AGENTS_MAX)
     );
-    let leaked: &'static [RoleSpec] = Vec::leak(table);
-    TABLE.set(leaked).map_err(|_| InstallError)?;
-    Ok(leaked)
+    assert!(repos.iter().all(|repo| {
+        repo.repo.is_absolute()
+            && repo
+                .roles
+                .iter()
+                .all(|role| table.iter().any(|base| base.label == role.label))
+    }));
+    let roles: &'static [RoleSpec] = Vec::leak(table);
+    let repos: &'static [RepoRoles] = Vec::leak(repos);
+    TABLE
+        .set(Installed { roles, repos })
+        .map_err(|_| InstallError)?;
+    Ok(roles)
 }
 
 /// A role table was already installed in this process.
@@ -162,9 +182,24 @@ pub struct InstallError;
 
 /// The installed role table, or the built-in one when none was installed.
 pub fn table() -> &'static [RoleSpec] {
-    let table = TABLE.get().copied().unwrap_or(&ROLES);
+    let table = TABLE.get().map_or(&ROLES[..], |installed| installed.roles);
     assert!(!table.is_empty());
     table
+}
+
+/// `role` as the repository at `repo` overrides it, or `role` itself when it does not.
+pub fn role_in_repo(role: &'static RoleSpec, repo: &Path) -> &'static RoleSpec {
+    assert!(repo.is_absolute());
+    let repos = TABLE.get().map_or(&[][..], |installed| installed.repos);
+    let canonical = repo.canonicalize().ok();
+    let found = repos
+        .iter()
+        .filter(|entry| entry.repo == repo || canonical.as_deref() == Some(&entry.repo))
+        .flat_map(|entry| entry.roles.iter())
+        .find(|over| over.label == role.label);
+    let found = found.unwrap_or(role);
+    assert_eq!(found.label, role.label);
+    found
 }
 
 /// The role with this label, or `None` when no role has it.
@@ -231,10 +266,7 @@ mod tests {
             "claude-opus-5-5"
         );
         assert!(role_from_label("implement").unwrap().commits_expected);
-        assert_eq!(
-            role_from_label("polish").unwrap().model,
-            "claude-sonnet-5-5"
-        );
+        assert!(role_from_label("polish").is_none());
         assert_eq!(
             role_from_label("security").unwrap().model,
             "claude-mythos-5-2"

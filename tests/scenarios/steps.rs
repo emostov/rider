@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1052,4 +1054,175 @@ pub fn when_the_group_is_killed(pid: u32) {
         .status()
         .expect("run kill");
     assert!(status.success(), "killing group {pid} failed: {status}");
+}
+
+/// Upper bound on the requests a client that never reads sends before the daemon stops
+/// reading them; past every kernel buffer and the daemon's backlog on Linux and macOS.
+const FLOOD_REQUESTS_MAX: u64 = 1 << 16;
+/// How long a write to the daemon may wait before the daemon is taken to have stopped reading.
+const FLOOD_STALL_SECONDS: u64 = 3;
+/// How long a client that lagged waits for the daemon to end its connection.
+const LAGGED_END_SECONDS_MAX: u64 = 30;
+/// Upper bound on the reads taken to reach the end of a connection.
+const LAGGED_READS_MAX: usize = 1 << 20;
+
+/// A raw connection to the running daemon's socket.
+pub fn given_a_client_on_the_daemon_socket(world: &World) -> UnixStream {
+    UnixStream::connect(world.home.join("rider.sock")).expect("connect to the daemon socket")
+}
+
+/// When the client sends status requests and never reads, until a write waits
+/// `FLOOD_STALL_SECONDS` or is refused because the daemon stopped reading; returns the
+/// requests sent whole.
+pub fn when_the_client_sends_status_requests_without_reading(client: &mut UnixStream) -> u64 {
+    let stall = Duration::from_secs(FLOOD_STALL_SECONDS);
+    client
+        .set_write_timeout(Some(stall))
+        .expect("set a write timeout");
+    for id in 1..=FLOOD_REQUESTS_MAX {
+        let request = format!("{{\"v\":1,\"id\":{id},\"cmd\":\"status\"}}\n");
+        match client.write_all(request.as_bytes()) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                ) =>
+            {
+                return id - 1;
+            }
+            Err(error) => panic!("sending request {id} failed: {error}"),
+        }
+    }
+    panic!("the daemon read all {FLOOD_REQUESTS_MAX} requests from a client that never read");
+}
+
+/// Then the client reads until the daemon ends its connection; returns every line, each
+/// parsed as JSON, failing if a line is cut short or the end is not reached in time.
+pub fn then_the_client_reads_to_the_end(mut client: &UnixStream) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(LAGGED_END_SECONDS_MAX);
+    let mut data = Vec::new();
+    let mut buffer = vec![0; 64 * 1024];
+    for _ in 0..LAGGED_READS_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let bytes = data.len();
+        assert!(!left.is_zero(), "no end of stream in time: {bytes} bytes");
+        // macOS refuses the timeout with EINVAL once the daemon has closed its end; a read
+        // then returns at once, so the error is safe to ignore.
+        let _ = client.set_read_timeout(Some(left));
+        match client.read(&mut buffer) {
+            Ok(0) => {
+                let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+                assert!(text.ends_with('\n'), "a line was cut short: {bytes} bytes");
+                return text.lines().map(parse::<Value>).collect();
+            }
+            Ok(read) => data.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(error) => panic!("reading to the end failed after {bytes} bytes: {error}"),
+        }
+    }
+    panic!("no end of stream within {LAGGED_READS_MAX} reads");
+}
+
+/// How long a scenario waits for `rider wait` to end.
+const WAIT_SECONDS_MAX: u64 = 90;
+/// The exit code of a `rider wait` that timed out.
+pub const WAIT_TIMED_OUT: i32 = 3;
+
+/// When the lead starts `rider wait <project> <args>` in the background.
+pub fn when_rider_wait_starts(world: &World, args: &[&str]) -> std::process::Child {
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command
+        .args(["wait", PROJECT])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    command.spawn().expect("start rider wait")
+}
+
+/// Then `rider wait` ends within `WAIT_SECONDS_MAX`; returns its exit code and output.
+pub fn then_rider_wait_ends(child: std::process::Child) -> crate::world::Output {
+    let (sender, ended) = std::sync::mpsc::sync_channel(1);
+    let pid = child.id();
+    thread::spawn(move || drop(sender.send(child.wait_with_output())));
+    let Ok(output) = ended.recv_timeout(Duration::from_secs(WAIT_SECONDS_MAX)) else {
+        kill_group(pid);
+        panic!("rider wait did not end within {WAIT_SECONDS_MAX} seconds");
+    };
+    let output = output.expect("wait for rider wait");
+    crate::world::Output {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Given the lead has waited once, so the next wait starts from now.
+pub fn given_the_lead_has_waited(world: &World) {
+    let output = when_rider_runs(world, &["wait", PROJECT, "--timeout", "0"]);
+    assert_eq!(output.code, Some(WAIT_TIMED_OUT), "{output:?}");
+}
+
+/// When worker `profile` claims `task`.
+pub fn when_a_worker_claims(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "claim", task, "--lease", "1h"], None);
+    assert_eq!(output.code, Some(0), "claim {task}: {output:?}");
+}
+
+/// When worker `profile` completes the `task` it holds.
+pub fn when_the_worker_completes(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "complete", task, "done"], None);
+    assert_eq!(output.code, Some(0), "complete {task}: {output:?}");
+}
+
+/// The `vb tail` processes started by process `parent`.
+pub fn feeds_of(parent: u32) -> Vec<u32> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "pid=,ppid=,command="])
+        .stdin(Stdio::null());
+    let output = crate::world::run_bounded(command, None);
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let rows = output.stdout.lines().filter_map(|line| {
+        let mut words = line.split_whitespace();
+        let pid: u32 = words.next()?.parse().ok()?;
+        let ppid: u32 = words.next()?.parse().ok()?;
+        let tail = words.any(|word| word == "tail");
+        (ppid == parent && tail).then_some(pid)
+    });
+    rows.collect()
+}
+
+/// When `rider wait` has started following the board's feed; returns its `vb tail` pids.
+pub fn when_the_wait_follows_the_feed(wait: u32) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS_MAX);
+    loop {
+        let feeds = feeds_of(wait);
+        if !feeds.is_empty() {
+            return feeds;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rider wait never started vb tail"
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When process `pid` is sent `signal`, such as `-TERM`.
+pub fn when_the_process_is_sent(pid: u32, signal: &str) {
+    let status = std::process::Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {signal} {pid}");
 }

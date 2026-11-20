@@ -39,7 +39,7 @@ fn every_role_has_a_short_prompt_that_names_its_task_and_the_permission_rule() {
 }
 
 #[test]
-fn polish_reads_the_embedded_slop_rules_and_agents_md_wins() {
+fn the_embedded_slop_rules_are_short_and_agents_md_wins() {
     let rules = asset("prompts/slop-rules.md");
     let embedded = PROMPTS.iter().find(|(name, _)| *name == "slop-rules.md");
     assert_eq!(embedded, Some(&("slop-rules.md", rules.as_str())));
@@ -49,8 +49,6 @@ fn polish_reads_the_embedded_slop_rules_and_agents_md_wins() {
         lines < SLOP_RULES_LINES_MAX,
         "slop-rules.md has {lines} lines"
     );
-    let polish = asset("prompts/polish.md");
-    assert!(polish.contains("prompts/slop-rules.md` in full"));
 }
 
 #[test]
