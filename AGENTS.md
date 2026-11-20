@@ -9,7 +9,7 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 - Security first: correctness and code security outrank features. Prefer verification (types, assertions, simulation) over trust.
 - Keep Rider simple and uncustomised: prefer fewer configuration knobs and less orchestration machinery. A feature that only tunes around a current model's weakness is suspect.
 - Goals are measurable: a change to performance or resource use states a target (10x faster, a memory bound) and measures before and after.
-- There is no `docs/` directory. The prose files are AGENTS.md, README.md, RELEASING.md, the shipped skills under `skills/`, and `fixtures/*/OBSERVED.md`, which record what Board and each agent CLI were observed to do, next to the raw output they explain; anyone who upgrades `vb` or an agent CLI re-checks them. How Board and the agent CLIs behave also lives in recorded fixtures, scenarios and types.
+- There is no documentation directory. The prose files are AGENTS.md, README.md, RELEASING.md, the shipped skills under `skills/`, and `fixtures/*/OBSERVED.md`, which record what Board and each agent CLI were observed to do, next to the raw output they explain; anyone who upgrades `vb` or an agent CLI re-checks them. How Board and the agent CLIs behave also lives in recorded fixtures, scenarios and types.
 
 ## TigerStyle
 
