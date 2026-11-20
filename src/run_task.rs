@@ -1244,7 +1244,6 @@ mod tests {
     const ROLE_PROMPT: &str = "You implement one task.\n";
     const TEXT: &str = "Extract token store\nMove the store into its own module.";
 
-
     fn setup(name: &str) -> (Fixture, Env) {
         let fixture = Fixture::new(name);
         let prompts = fixture.root.join("prompts");
@@ -1289,18 +1288,13 @@ mod tests {
         )
     }
 
-
-
     fn calls(board: &FakeBoard) -> Vec<String> {
         board.calls.borrow().clone()
     }
 
-
     fn never(_: &CommandLine, _: &Path, _: &Path) -> Result<Exit, HarnessError> {
         panic!("no agent may be spawned")
     }
-
-
 
     #[test]
     fn a_task_that_is_not_claimed_is_not_run() {
@@ -1433,5 +1427,4 @@ mod tests {
             );
         }
     }
-
 }
