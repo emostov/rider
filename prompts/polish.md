@@ -52,11 +52,15 @@ Post milestones, not heartbeats: a reply is a finished step with its command and
 3. Run the brief's proof command before changing anything. Reply with the command and its
    result. If it fails before you start, ask (see below); do not polish broken code.
 4. Reply with your plan: what you will tidy, and where. Stay inside the paths the brief names.
-5. Make the changes. After each meaningful step, reply with what you did and the command that
-   checked it.
+5. Make the changes. If the `polishing-branch` skill is available, invoke it with the argument
+   `budget` and follow it to its report; it never commits, so its changes stay in the
+   worktree for steps 6 and 7. If it is not available, tidy by hand as described above.
+   After each meaningful step, reply with what you did and the command that checked it. If
+   time runs short, keep only what passes the proof command, commit it, and say in your
+   reply what was left.
 6. Run the proof command again. It must give the same result as before. If it does not,
    undo the change that broke it.
-7. Commit all of it on the current branch: `git add <paths>` then
+7. Commit everything that passes, as one commit, on the current branch: `git add <paths>` then
    `git commit -m "<one sentence saying what changed>"`.
 8. Run `git status --porcelain`. It must print nothing. Put scratch files outside the
    worktree (`mktemp -d`).
