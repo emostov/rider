@@ -32,21 +32,34 @@ The workflow runs on every `v*` tag.
 ## Publishing to crates.io
 
 Only the crates.io publish is manual. CI never publishes. Push the tag, wait for the release
-workflow to pass, then publish from the tagged commit:
+workflow to pass, then publish from the tagged commit. The block checks the tag against origin
+first, and any mismatch stops it before `cargo package`:
 
 ```sh
 (
   set -e
   tag=v0.2.0
-  git switch --detach "refs/tags/$tag"
-  test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$tag^{commit}")"
+  git fetch --no-tags origin "+refs/tags/$tag:refs/rider-verify/$tag"
+  git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+  commit="$(git rev-parse "refs/rider-verify/$tag^{commit}")"
+  test "$commit" = "$(git rev-parse "refs/tags/$tag^{commit}")"
+  git merge-base --is-ancestor "$commit" refs/remotes/origin/main
+  test "$(gh run list --workflow release.yml --branch "$tag" --json conclusion,headSha \
+    --jq "[.[] | select(.conclusion == \"success\" and .headSha == \"$commit\")] | length")" -gt 0
+  git switch --detach "$commit"
   cargo package --locked
   cargo publish --locked
 )
 ```
 
-The subshell stops at the first failing command, so a missing tag never reaches `cargo publish`.
-`cargo publish` repackages and verifies the tarball before it uploads.
+The subshell stops at the first failing command. The fetch writes the origin tag to a private ref,
+so a local tag that differs from origin is never overwritten and fails the comparison. A missing
+tag never reaches `cargo publish`. `cargo publish` repackages and verifies the tarball before it
+uploads.
+
+The workflow checks do not stop someone who can push tags, because GitHub runs the `release.yml`
+from the tagged commit. The protection is a GitHub tag ruleset that limits who can create, update,
+or delete `v*` tags. The repository owner sets it in the repository settings.
 
 If a step fails, fix the cause and rerun the step. Do not move the tag. If the source must
 change, bump to a new version and release again.
