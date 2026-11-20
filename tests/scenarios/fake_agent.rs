@@ -51,6 +51,8 @@ pub enum Behaviour {
     /// Like `RefuseResume`, but once it has reported the refusal it holds like `Hold` before
     /// it exits 1.
     RefuseResumeThenHold,
+    /// Holds like `Hold`, then reports success having committed nothing.
+    HoldThenNothing,
 }
 
 impl Behaviour {
@@ -69,6 +71,7 @@ impl Behaviour {
             Behaviour::DropEarlier => "drop-earlier",
             Behaviour::RebaseOntoMain => "rebase-onto-main",
             Behaviour::RefuseResumeThenHold => "refuse-resume-then-hold",
+            Behaviour::HoldThenNothing => "hold-then-nothing",
         }
     }
 }
@@ -191,6 +194,7 @@ case "$behaviour" in
       exit 1
     fi
     commit || exit 1 ;;
+  hold-then-nothing) hold ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
