@@ -322,7 +322,6 @@ pub fn most_at_once(world: &Path) -> usize {
 }
 
 /// The pids of fake agents that have not recorded their end.
-// It runs inside `Drop`, so it skips what it cannot parse rather than panic.
 pub fn running_pids(world: &Path) -> Vec<u32> {
     let text = fs::read_to_string(world.join(RUNS_FILE)).unwrap_or_default();
     let mut pids: Vec<u32> = Vec::new();
