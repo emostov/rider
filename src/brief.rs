@@ -262,40 +262,21 @@ mod tests {
     use crate::board::TaskState;
     use crate::feed::Cursor;
     use crate::roles::ROLES;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use tempfile::TempDir;
 
-    /// A fresh directory under the system temp dir, removed when dropped.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(git: bool) -> TempDir {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let name = format!("rider-brief-{}-{n}", std::process::id());
-            let path = std::env::temp_dir().join(name);
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            if git {
-                let status = Process::new("git")
-                    .args(["init", "-q"])
-                    .current_dir(&path)
-                    .stdin(Stdio::null())
-                    .status()
-                    .unwrap();
-                assert!(status.success());
-            }
-            TempDir(path)
+    /// A fresh directory under the system temp dir, a git repository when `git` is set.
+    fn scratch(git: bool) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        if git {
+            let status = Process::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .stdin(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
         }
-
-        fn text(&self) -> String {
-            self.0.to_str().unwrap().to_string()
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+        dir
     }
 
     fn view(labels: &[(&str, &str)]) -> TaskView {
@@ -319,16 +300,16 @@ mod tests {
 
     #[test]
     fn accepts_a_valid_implement_brief() {
-        let repo = TempDir::new(true);
+        let repo = scratch(true);
         let brief = parse_brief(&view(&[
             ("role", "implement"),
-            ("repo", &repo.text()),
+            ("repo", repo.path().to_str().unwrap()),
             ("base", "12"),
         ]))
         .unwrap();
         assert_eq!(brief.id, TaskId(7));
         assert_eq!(brief.role.label, "implement");
-        assert_eq!(brief.repo, repo.0);
+        assert_eq!(brief.repo, repo.path());
         assert_eq!(brief.base, Some(TaskId(12)));
         assert_eq!(brief.onto, None);
         assert_eq!(brief.of, None);
@@ -338,10 +319,10 @@ mod tests {
 
     #[test]
     fn accepts_a_review_with_hash_ids_and_from() {
-        let repo = TempDir::new(true);
+        let repo = scratch(true);
         let brief = parse_brief(&view(&[
             ("role", "review"),
-            ("repo", &repo.text()),
+            ("repo", repo.path().to_str().unwrap()),
             ("onto", "#30"),
             ("of", "#812"),
             ("from", "main"),
@@ -403,8 +384,11 @@ mod tests {
 
     #[test]
     fn repo_without_git_is_rejected() {
-        let plain = TempDir::new(false);
-        let error = parse_brief(&view(&[("role", "implement"), ("repo", &plain.text())]));
+        let plain = scratch(false);
+        let error = parse_brief(&view(&[
+            ("role", "implement"),
+            ("repo", plain.path().to_str().unwrap()),
+        ]));
         assert!(matches!(error, Err(BriefError::RepoNotAGitRepo(_))));
         let error = parse_brief(&view(&[("role", "implement"), ("repo", NOWHERE)]));
         assert!(matches!(error, Err(BriefError::RepoNotAGitRepo(_))));
