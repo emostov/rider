@@ -1540,7 +1540,8 @@ mod tests {
             .collect();
         let json = format!(
             "{{\"message\":{{\"id\":\"7\",\"text\":\"t\",\"labels\":{{{}}},\
-             \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}},\"version\":1}}}}",
+             \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}},\
+             \"version\":1}}}}",
             labels.join(",")
         );
         assert!(matches!(
@@ -1799,7 +1800,8 @@ mod tests {
         let json = |id: &str| {
             format!(
                 "{{\"message\":{{\"id\":\"{id}\",\"text\":\"t\",\"labels\":{{}},\
-                 \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}},\"version\":1}}}}"
+                 \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}},\
+                 \"version\":1}}}}"
             )
         };
         assert_eq!(parse_task_view(&json("17")).unwrap().id, TaskId(17));

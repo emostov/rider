@@ -203,6 +203,7 @@ impl FeedReader {
     fn start_with(cli: &VbCli, after: Cursor, seams: Seams) -> Result<FeedReader, FeedError> {
         assert!(!cli.url.is_empty(), "the board URL is never empty");
         assert!(!cli.profile.is_empty(), "the profile is never empty");
+        assert!(!cli.vb.as_os_str().is_empty(), "the vb path is never empty");
         let after = after.0.to_string();
         let args = [
             "tail",
@@ -258,6 +259,11 @@ impl FeedReader {
         if self.ended {
             return Err(FeedError::Ended);
         }
+        assert!(
+            !self.group_gone || self.killed.is_some(),
+            "only a kill empties the group"
+        );
+        assert!(self.killed.is_none() || self.ending_since.is_some());
         for _ in 0..POLLS_MAX {
             // The exit is checked before every read, so a descendant that keeps stdout busy
             // cannot postpone it. A killed child is already reaped and no longer polled.
@@ -310,6 +316,10 @@ impl FeedReader {
     fn kill(&mut self) -> Result<(), FeedError> {
         assert!(self.killed.is_none(), "the group is killed once");
         assert!(!self.ended);
+        assert!(
+            !self.group_gone,
+            "the group is not gone before it is killed"
+        );
         self.killed = Some(Instant::now());
         let killed = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
         self.group_gone = killed.is_ok();
@@ -322,6 +332,7 @@ impl FeedReader {
         if self.killed.is_none() {
             self.kill()?;
         }
+        assert!(self.killed.is_some());
         self.ended = true;
         let status = self.child.try_wait();
         let status = status.map_err(|error| FeedError::Io(error.to_string()))?;
@@ -346,7 +357,9 @@ fn line_event(line: Vec<u8>) -> Result<FeedItem, FeedError> {
     assert!(line.len() <= FEED_LINE_BYTES_MAX);
     let line =
         String::from_utf8(line).map_err(|_| FeedError::Parse("a line that is not UTF-8".into()))?;
-    parse_event(&line).map(FeedItem::Event)
+    let event = parse_event(&line)?;
+    assert!(matches!(&event, FeedEvent::Other { .. }) || line.contains("\"message\""));
+    Ok(FeedItem::Event(event))
 }
 
 /// Sends each line of `stdout` without its newline. An over-long line is reported once and
@@ -435,15 +448,17 @@ pub fn parse_event(line: &str) -> Result<FeedEvent, FeedError> {
         return Err(field_error(cursor, "a task event with no message.task"));
     }
     assert!(known.labels.len() <= LABELS_MAX);
-    assert_eq!(known.cursor, cursor);
+    assert!(known.actor.as_ref().is_none_or(|actor| !actor.is_empty()));
     Ok(FeedEvent::Known(known))
 }
 
 fn field_error(cursor: Cursor, detail: &str) -> FeedError {
+    assert!(!detail.is_empty());
     FeedError::Parse(format!("event {}: {detail}", cursor.0))
 }
 
 fn string_field<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, FeedError> {
+    assert!(!key.is_empty());
     let value = object.get(key).and_then(Value::as_str);
     value.ok_or_else(|| FeedError::Parse(format!("an event with no string {key}")))
 }
@@ -540,6 +555,7 @@ fn parse_actor(event: &Map<String, Value>, cursor: Cursor) -> Result<Option<Stri
     if id.is_empty() {
         return Err(field_error(cursor, "an empty actor.id"));
     }
+    assert!(id.len() <= FEED_LINE_BYTES_MAX);
     Ok(Some(id.to_string()))
 }
 

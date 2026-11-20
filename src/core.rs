@@ -1,6 +1,6 @@
 //! The daemon's decisions for workers: one pure `step` from a state and an event to actions.
 
-use crate::board::{BOARD_CALL_SECONDS_MAX, TaskId, TaskState, TaskView, Timestamp};
+use crate::board::{BOARD_CALL_SECONDS_MAX, LABELS_MAX, TaskId, TaskState, TaskView, Timestamp};
 use crate::feed::{BoardEvent, Cursor, EventKind};
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::settle::Verdict;
@@ -401,10 +401,18 @@ impl State {
     }
 
     pub fn config(&self) -> &Config {
+        assert!(!self.config.roles.is_empty());
+        assert!(self.config.roles.len() <= ROLES_MAX);
         &self.config
     }
     pub fn tasks(&self) -> &[Task] {
         assert!(self.tasks.len() <= self.config.tasks_max);
+        let roles = self.config.roles.len();
+        assert!(
+            self.tasks
+                .iter()
+                .all(|task| task.role.is_none_or(|role| role < roles))
+        );
         &self.tasks
     }
     /// Tasks seen but not tracked because `tasks_max` was reached.
@@ -420,10 +428,19 @@ impl State {
     }
     pub fn runs(&self) -> &[Run] {
         assert!(self.runs.len() <= usize::from(self.config.agents_max));
+        let roles = &self.config.roles;
+        let valid = |run: &Run| run.role < roles.len() && run.slot >= 1;
+        assert!(
+            self.runs
+                .iter()
+                .all(|run| valid(run) && run.slot <= roles[run.role].slots)
+        );
         &self.runs
     }
     pub fn pending_claims(&self) -> &[PendingClaim] {
         assert!(self.pending_claims.len() <= PENDING_CLAIMS_MAX);
+        let given_up = |pending: &PendingClaim| self.run_index(pending.run).is_none();
+        assert!(self.pending_claims.iter().all(given_up));
         &self.pending_claims
     }
     pub fn board(&self) -> BoardHealth {
@@ -431,6 +448,8 @@ impl State {
     }
     pub fn stopping(&self) -> Stopping {
         assert!(self.stopping != Stopping::No || !self.exited);
+        let running = self.runs.iter().any(|run| run.phase == Phase::Running);
+        assert!(self.stopping != Stopping::Now || !running);
         self.stopping
     }
     pub fn now(&self) -> Timestamp {
@@ -438,6 +457,7 @@ impl State {
     }
     pub fn exited(&self) -> bool {
         assert!(!self.exited || self.runs.is_empty());
+        assert!(!self.exited || self.pending_claims.is_empty());
         self.exited
     }
 
@@ -477,6 +497,7 @@ pub fn step(state: &mut State, event: Event) -> Vec<Action> {
 }
 
 fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
+    assert!(!state.exited);
     match event {
         Event::Tick(now) => {
             state.now = now;
@@ -578,6 +599,8 @@ fn signal(state: &mut State, actions: &mut Vec<Action>) {
         stop_now(state, actions);
     }
     assert!(state.stopping != Stopping::No);
+    let running = state.runs.iter().any(|run| run.phase == Phase::Running);
+    assert!(state.stopping != Stopping::Now || !running);
 }
 
 /// The task is not claimed again until it is learned anew or the next tick.
@@ -808,11 +831,13 @@ fn is_closed(state: TaskState) -> bool {
 
 fn label(labels: &[(String, String)], key: &str) -> Option<String> {
     assert!(!key.is_empty());
+    assert!(labels.len() <= LABELS_MAX);
     let found = labels.iter().find(|(name, _)| name == key);
     found.map(|(_, value)| value.clone())
 }
 
 fn role_of(config: &Config, labels: &[(String, String)]) -> Option<usize> {
+    assert!(labels.len() <= LABELS_MAX);
     let role = labels.iter().find(|(name, _)| name == "role")?;
     let index = config.roles.iter().position(|spec| spec.label == role.1);
     assert!(index.is_none_or(|index| index < config.roles.len()));
@@ -820,10 +845,12 @@ fn role_of(config: &Config, labels: &[(String, String)]) -> Option<usize> {
 }
 
 fn mark_down(state: &mut State) {
+    let before = state.board;
     if state.board == BoardHealth::Up {
         state.board = BoardHealth::Down { since: state.now };
     }
     assert!(state.board != BoardHealth::Up);
+    assert!(before == BoardHealth::Up || state.board == before);
 }
 
 fn board_failed(state: &mut State, call: Call) {
@@ -887,6 +914,7 @@ fn set_phase(run: &mut Run, phase: Phase, now: Timestamp) {
 
 fn run_in(state: &State, run: RunId, phase: Phase) -> Option<usize> {
     let index = state.run_index(run)?;
+    assert!(index < usize::from(state.config.agents_max));
     assert_eq!(state.runs[index].id, run);
     (state.runs[index].phase == phase).then_some(index)
 }
