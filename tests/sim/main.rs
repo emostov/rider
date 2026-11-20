@@ -3,6 +3,7 @@
 //!
 //! Replay one seed with `SIM_SEED=<n> cargo test --test sim`.
 
+mod orderings;
 mod world;
 
 use std::collections::BTreeSet;
@@ -14,7 +15,7 @@ const SEEDS: u64 = 64;
 /// Further seeds every run covers once each.
 const MORE_SEEDS: u64 = 2000;
 /// The phases a run can be in, by name; every one sees a restart and a board outage in some
-/// seed.
+/// seed, and a clock jump comes in every phase that holds a claim.
 const PHASES: [&str; 7] = [
     "Claiming",
     "Preparing",
@@ -44,6 +45,7 @@ fn more_seeds_hold_every_invariant() {
     }
     let mut restarted_in = BTreeSet::new();
     let mut down_in = BTreeSet::new();
+    let mut jumped_in = BTreeSet::new();
     let mut given_up = 0_u64;
     let mut spawns_given_up = 0_u64;
     let mut feeds_given_up = 0_u64;
@@ -53,6 +55,7 @@ fn more_seeds_hold_every_invariant() {
         assert!(!world.trace.is_empty());
         restarted_in.extend(world.restarted_in);
         down_in.extend(world.down_in);
+        jumped_in.extend(world.jumped_in);
         given_up += u64::from(world.board_given_up);
         spawns_given_up += u64::from(world.spawn_given_up);
         feeds_given_up += u64::from(world.feed_given_up);
@@ -74,6 +77,14 @@ fn more_seeds_hold_every_invariant() {
     let expected: BTreeSet<String> = PHASES.iter().map(|phase| phase.to_string()).collect();
     assert_eq!(restarted_in, expected, "the phases a restart came in");
     assert_eq!(down_in, expected, "the phases a board outage came in");
+    let leased: BTreeSet<String> = ["Preparing", "Running", "Judging", "Settling"]
+        .iter()
+        .map(|phase| phase.to_string())
+        .collect();
+    assert!(
+        leased.is_subset(&jumped_in),
+        "the clock jumped past every lease only in {jumped_in:?}"
+    );
 }
 
 fn run(seed: u64) -> Vec<String> {

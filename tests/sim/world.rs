@@ -47,6 +47,8 @@ const OWNED_BOARD_EVERY: u64 = 2;
 const BOARD_RESTART_FAILS_EVERY: u32 = 2;
 /// Upper bound, in minutes, on how long a board left dead stays so until the owner starts it.
 const BOARD_DEAD_MINUTES_MAX: u64 = 12;
+/// Upper bound on how far past one lease a clock jump lands.
+const JUMP_PAST_LEASE_MAX: u64 = 30 * MINUTE;
 
 /// The newest version of one task the core was told, by cursor.
 #[derive(Debug)]
@@ -185,6 +187,8 @@ pub struct World {
     pub restarted_in: BTreeSet<String>,
     /// The phases runs were in when a board outage began, by name.
     pub down_in: BTreeSet<String>,
+    /// The phases runs were in when the clock jumped past every lease, by name.
+    pub jumped_in: BTreeSet<String>,
     /// How many times the core was restarted.
     generation: u64,
     /// The replies the core sent `OWNER` during its current request.
@@ -246,6 +250,7 @@ impl World {
             trace: Vec::new(),
             restarted_in: BTreeSet::new(),
             down_in: BTreeSet::new(),
+            jumped_in: BTreeSet::new(),
             generation: 0,
             replies: Vec::new(),
         }
@@ -348,7 +353,8 @@ impl World {
         }
         match choice {
             80..=87 => self.create_task(),
-            88..=89 => self.lose_claim(),
+            88 => self.lose_claim(),
+            89 => return self.jump_clock(),
             90..=91 => self.crash_agent(),
             92 if self.owns_board && self.rng.bool() => self.board_dies(),
             92 => self.board_outage(),
@@ -444,6 +450,21 @@ impl World {
         } else {
             self.rng.u64(SECOND..3 * MINUTE)
         };
+        self.pass(pause)
+    }
+
+    /// The clock jumps past every lease between two ticks, whatever is in flight.
+    fn jump_clock(&mut self) -> Result<(), String> {
+        for run in self.core.runs() {
+            self.jumped_in.insert(phase_name(run.phase));
+        }
+        let pause = self.config.lease_millis + self.rng.u64(SECOND..JUMP_PAST_LEASE_MAX);
+        self.trace.push(format!("clock jumps {pause} ms"));
+        self.pass(pause)
+    }
+
+    /// Time passes: leases lapse, agents due exit, and the core is told the time.
+    fn pass(&mut self, pause: u64) -> Result<(), String> {
         self.now = Timestamp(self.now.0 + pause);
         let now = self.now;
         for index in 0..self.tasks.len() {
@@ -1291,9 +1312,12 @@ impl World {
                     matches!(action, Action::Renew { run: id, .. }
                         | Action::StopAgent { run: id, .. } if *id == run.id)
                 });
-            if run.phase == Phase::Running && run.lease_until <= now && !covered {
+            // Every phase but Claiming and Abandoning holds the claim and may write with it.
+            let holds = !matches!(run.phase, Phase::Claiming | Phase::Abandoning);
+            if holds && run.lease_until <= now && !covered {
                 return Err(format!(
-                    "invariant 3: {run:?} runs on a lapsed lease at {now:?}"
+                    "invariant 3: {run:?} holds a lapsed lease at {now:?}, neither renewed \
+                     nor abandoned"
                 ));
             }
             // A lost agent has ended its phase: the run waits only for the agent's exit.
