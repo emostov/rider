@@ -409,13 +409,22 @@ pub const DAEMON_START_SECONDS_MAX: u64 = 30;
 /// The line the daemon prints once it follows the board.
 pub const DAEMON_STARTED: &str = "rider daemon: following";
 
+/// The test-only setting that shortens the daemon's lease, attempt limit and tick.
+pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
+
 /// Given a running `rider daemon` that follows the board.
 pub fn given_a_running_daemon(world: &mut World) {
+    given_a_running_daemon_with(world, &[]);
+}
+
+/// Given a running `rider daemon` with `env` added to the world's environment.
+pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
     assert!(world.pool.is_none(), "one daemon per world");
     let log = fs::File::create(world.root.join("pool.log")).expect("create the daemon output");
     let err = log.try_clone().expect("share the daemon output");
-    let child = world
-        .command(Path::new(env!("CARGO_BIN_EXE_rider")))
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command.envs(env.iter().copied());
+    let child = command
         .arg("daemon")
         .stdout(log)
         .stderr(err)
@@ -508,4 +517,32 @@ pub fn is_alive(pid: u32) -> bool {
         .status()
         .expect("run kill");
     status.success()
+}
+
+/// A task's claim lease end, as the board shows it; `None` when it is not claimed.
+pub fn task_claim_until(world: &World, id: &str) -> Option<String> {
+    let read = read_task(world, id);
+    let until = read
+        .pointer("/message/task/claim/until")
+        .and_then(Value::as_str);
+    until.map(str::to_string)
+}
+
+/// Waits up to `seconds` for process `pid` to end; returns whether it did.
+pub fn when_the_process_ends_within(pid: u32, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        if !is_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// How many fake agents are running now.
+pub fn agents_running(world: &World) -> usize {
+    fake_agent::running_pids(&world.root).len()
 }

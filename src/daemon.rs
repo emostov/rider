@@ -15,7 +15,10 @@ use signal_hook::iterator::Signals;
 
 use crate::board::{Board, BoardError, TaskId, Timestamp, VbCli, one_line, parse_failure_reason};
 use crate::cli::with_vb_on_path;
-use crate::core::{self, ACTIONS_MAX, Action, Call, Config, Event, RunId, Settlement, State};
+use crate::core::{
+    self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, Call, Config, Event, LEASE_MILLIS, RunId,
+    Settlement, State,
+};
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader};
 use crate::harness::{CommandLine, Exit, HarnessError};
 use crate::roles::{AGENTS_MAX, ROLES};
@@ -41,6 +44,9 @@ pub const SUBTREE: &str = "work/";
 pub const DAEMON_PROFILE: &str = "rider-daemon";
 /// What the daemon prints once it follows the board.
 pub const FOLLOWING: &str = "rider daemon: following";
+/// The test-only setting that shortens limits: `lease=<ms>,attempt=<ms>,tick=<ms>`, any subset.
+pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
+const TEST_SETTINGS_MAX: usize = 3;
 const _: () = assert!(WORKERS_MAX > AGENTS_MAX as usize && TICK_SECONDS > 0);
 const NO_CHANNEL: &str = "channel_not_found";
 const LOCK_FILE: &str = "daemon.lock";
@@ -83,6 +89,8 @@ pub enum DaemonError {
     JobsFull,
     /// Every source of events has gone.
     QueueClosed,
+    /// `TEST_MILLIS_VAR` is malformed.
+    Setting(String),
 }
 
 impl fmt::Display for DaemonError {
@@ -99,6 +107,7 @@ impl fmt::Display for DaemonError {
             DaemonError::Thread(message) => write!(f, "could not start a thread: {message}"),
             DaemonError::JobsFull => write!(f, "more than {JOBS_QUEUED_MAX} actions waited"),
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
+            DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
         }
     }
 }
@@ -109,6 +118,52 @@ fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Daem
         action,
         path,
         message: error.to_string(),
+    }
+}
+
+struct Timing {
+    lease_millis: u64,
+    attempt_millis_max: u64,
+    tick_millis: u64,
+}
+
+impl Timing {
+    fn parse(setting: Option<&str>) -> Result<Timing, DaemonError> {
+        let mut timing = Timing {
+            lease_millis: LEASE_MILLIS,
+            attempt_millis_max: ATTEMPT_MILLIS_MAX,
+            tick_millis: TICK_SECONDS * 1000,
+        };
+        let pairs = setting
+            .unwrap_or_default()
+            .split(',')
+            .filter(|pair| !pair.is_empty());
+        for (index, pair) in pairs.enumerate() {
+            if index >= TEST_SETTINGS_MAX {
+                return Err(DaemonError::Setting(format!(
+                    "more than {TEST_SETTINGS_MAX} settings"
+                )));
+            }
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let (field, floor, ceiling) = match key {
+                "lease" => (&mut timing.lease_millis, 3, LEASE_MILLIS),
+                "attempt" => (&mut timing.attempt_millis_max, 1, ATTEMPT_MILLIS_MAX),
+                "tick" => (&mut timing.tick_millis, 1, TICK_SECONDS * 1000),
+                _ => return Err(DaemonError::Setting(format!("unknown setting {key:?}"))),
+            };
+            *field = value
+                .parse::<u64>()
+                .ok()
+                .filter(|millis| (floor..=ceiling).contains(millis))
+                .ok_or_else(|| {
+                    DaemonError::Setting(format!(
+                        "{key} must be milliseconds from {floor} to {ceiling}, not {value:?}"
+                    ))
+                })?;
+        }
+        assert!(timing.lease_millis >= 3 && timing.lease_millis <= LEASE_MILLIS);
+        assert!(timing.tick_millis > 0 && timing.attempt_millis_max > 0);
+        Ok(timing)
     }
 }
 
@@ -234,6 +289,7 @@ impl RunContext {
 struct Shared {
     paths: Paths,
     events: SyncSender<Input>,
+    lease_millis: u64,
 }
 
 impl Shared {
@@ -258,6 +314,16 @@ impl Shared {
         }
     }
 
+    // The board's lease end, cut to the daemon's own lease from `sent`, so a shortened lease
+    // renews at a third of itself while the board keeps its longer one.
+    fn lease_until(&self, sent: Timestamp, board: Timestamp) -> Timestamp {
+        assert!(self.lease_millis >= 3);
+        let own = Timestamp(sent.0.saturating_add(self.lease_millis));
+        let until = own.min(board);
+        assert!(until <= board);
+        until
+    }
+
     fn pid_file(&self, task: TaskId) -> PathBuf {
         let path = self
             .paths
@@ -272,17 +338,33 @@ impl Shared {
 /// Runs the daemon in the foreground until it is stopped; returns its exit code.
 pub fn run(paths: Paths) -> Result<u8, DaemonError> {
     assert!(paths.home.is_absolute() && paths.vb.is_absolute());
+    let setting = std::env::var(TEST_MILLIS_VAR);
+    let setting = match &setting {
+        Ok(value) => Some(value.as_str()),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(DaemonError::Setting("not UTF-8".to_string()));
+        }
+    };
+    let timing = Timing::parse(setting)?;
     let _lock = take_lock(&paths.home)?;
     let agents = paths.home.join(AGENTS_DIR);
     fs::create_dir_all(&agents).map_err(io_error("create", &agents))?;
     let (events, inputs) = sync_channel::<Input>(EVENT_QUEUE_MAX);
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
-    let shared = Arc::new(Shared { paths, events });
+    let lease_millis = timing.lease_millis;
+    let shared = Arc::new(Shared {
+        paths,
+        events,
+        lease_millis,
+    });
     start_workers(queued, &shared.events)?;
-    start_timer(shared.events.clone())?;
+    start_timer(shared.events.clone(), timing.tick_millis)?;
     start_signals(shared.events.clone())?;
     let mut config = Config::from_roles(&ROLES);
     config.reconcile_millis = RECONCILE_SECONDS * 1000;
+    config.lease_millis = lease_millis;
+    config.attempt_millis_max = timing.attempt_millis_max;
     let mut state = State::new(config, now());
     let code = drive(&mut state, &inputs, &jobs, &shared)?;
     assert!(state.exited());
@@ -446,13 +528,14 @@ fn call_failed(error: &BoardError) -> bool {
 
 fn claim(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     assert!(!profile.is_empty());
+    let sent = now();
     let claimed = shared.board(profile).claim_task(task);
     let event = match claimed {
         Ok(view) => match view.claim {
             Some(claim) if view.id == task => Event::Claimed {
                 run,
                 epoch: view.epoch,
-                until: claim.until,
+                until: shared.lease_until(sent, claim.until),
             },
             _ => Event::ClaimRefused(run),
         },
@@ -584,11 +667,12 @@ fn judge(
 }
 
 fn renew(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
+    let sent = now();
     let event = match shared.board(profile).renew(task) {
         Ok(view) => match view.claim {
             Some(claim) => Event::Renewed {
                 run,
-                until: claim.until,
+                until: shared.lease_until(sent, claim.until),
             },
             None => Event::ClaimLost(run),
         },
@@ -612,6 +696,11 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
         }
         (Settlement::Verdict(_), Some(attempt), Some(judgement)) => {
             settle_attempt(task, &shared.env(profile), &board, attempt, judgement)
+        }
+        // A failure decided without judging, such as the time limit, still counts the attempt.
+        (Settlement::Verdict(verdict @ Verdict::Fail { .. }), Some(attempt), None) => {
+            let judgement = Judgement::uninspected(verdict.clone());
+            settle_attempt(task, &shared.env(profile), &board, attempt, &judgement)
         }
         (Settlement::Verdict(Verdict::Fail { reason }), _, _) => {
             board.fail(task, reason).map_err(RunError::Board)
@@ -725,11 +814,12 @@ fn start_workers(queued: Receiver<Job>, events: &SyncSender<Input>) -> Result<()
     Ok(())
 }
 
-fn start_timer(events: SyncSender<Input>) -> Result<(), DaemonError> {
+fn start_timer(events: SyncSender<Input>, tick_millis: u64) -> Result<(), DaemonError> {
+    assert!(tick_millis > 0);
     let builder = thread::Builder::new().name("timer".into());
     let spawned = builder.spawn(move || {
         for _ in 0..TICKS_MAX {
-            thread::sleep(Duration::from_secs(TICK_SECONDS));
+            thread::sleep(Duration::from_millis(tick_millis));
             if !send(&events, Event::Tick(now())) {
                 return;
             }

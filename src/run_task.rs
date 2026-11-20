@@ -164,6 +164,19 @@ pub struct Judgement {
     work: Option<Work>,
 }
 
+impl Judgement {
+    /// A failure decided without inspecting the attempt's worktree, such as its time limit.
+    pub fn uninspected(verdict: Verdict) -> Judgement {
+        assert!(matches!(verdict, Verdict::Fail { .. }));
+        let judgement = Judgement {
+            verdict,
+            work: None,
+        };
+        assert!(judgement.work.is_none());
+        judgement
+    }
+}
+
 /// Checks a claimed task's brief and readies its worktree, labelling its branch and start.
 pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepared, RunError> {
     assert!(env.home.is_absolute() && env.home.to_str().is_some());

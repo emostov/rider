@@ -11,6 +11,8 @@ mod steps;
 mod world;
 
 use std::fs;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -227,4 +229,113 @@ fn a_second_sigterm_stops_the_agent_and_leaves_its_task_ready_with_attempt_uncha
     assert!(!is_alive(run.pid), "the agent {} still runs", run.pid);
     assert_eq!(task_state(&world, &task), "ready");
     assert_eq!(task_label(&world, &task, "attempt"), None);
+}
+
+#[test]
+fn three_ready_polish_tasks_never_run_more_than_one_polish_agent_at_once() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let tasks: Vec<String> = [
+        "Polish the first work.",
+        "Polish the second work.",
+        "Polish the third work.",
+    ]
+    .iter()
+    .map(|text| {
+        let new = NewTask::new(text)
+            .label("repo", world.repo_label())
+            .label("from", MAIN)
+            .role("polish");
+        let task = when_the_lead_creates(&world, &new);
+        given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+        task
+    })
+    .collect();
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
+    when_the_agent_has_started(&world, &tasks[0]);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(agents_running(&world), 1);
+
+    for task in &tasks {
+        world.release_agent(task);
+    }
+
+    let tasks: Vec<&str> = tasks.iter().map(String::as_str).collect();
+    assert_eq!(when_the_tasks_settle(&world, &tasks), vec!["completed"; 3]);
+    assert_eq!(world.most_agents_at_once(), 1);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn an_agent_running_past_a_third_of_a_shortened_lease_sees_the_claim_renewed() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=3000,tick=200")]);
+    when_the_agent_has_started(&world, &task);
+    let first = task_claim_until(&world, &task).expect("the task is claimed");
+
+    thread::sleep(Duration::from_secs(4));
+
+    let later = task_claim_until(&world, &task).expect("the task is still claimed");
+    assert!(later > first, "until moved from {first} to {later}");
+    world.release_agent(&task);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_shortened_attempt_limit_stops_a_never_exiting_agent_and_fails_its_task() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "attempt=2000,tick=200")]);
+    let run = when_the_agent_has_started(&world, &task);
+
+    let started = Instant::now();
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["failed"]);
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_secs(15), "failed after {waited:?}");
+    assert!(!is_alive(run.pid), "the agent {} still runs", run.pid);
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    assert_eq!(agent_runs_for(&world, &task).len(), 1);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_writes_nothing() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=3000,tick=200")]);
+    let run = when_the_agent_has_started(&world, &task);
+
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+    let (replies, labels) = (task_replies(&world, &task), task_labels(&world, &task));
+
+    assert!(
+        when_the_process_ends_within(run.pid, 3),
+        "the agent {} still runs:\n{}",
+        run.pid,
+        world.pool_log()
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(task_state(&world, &task), "canceled");
+    assert_eq!(task_replies(&world, &task), replies);
+    assert_eq!(task_labels(&world, &task), labels);
+    assert!(worktree_dir(&world, &task).is_dir(), "the worktree is kept");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
