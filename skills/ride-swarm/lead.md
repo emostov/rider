@@ -256,6 +256,17 @@ check `decisions` each turn (step 7). When the owner answers, record it:
 `vb tasks unblock <id>`, `vb tasks claim <id>`, then `vb tasks complete <id> -- "<answer>"`,
 each with `--as lead-fable-5-2`. `decisions` is the record of what was decided.
 
+## Closing resolved issues
+
+By default, as work resolves an issue, close it or link it to the PR that closes it:
+
+- Work you merge into a local base branch: close each GitHub issue it resolves with
+  `gh issue close <n> --comment "<text>"` naming the commit and how it was checked. Close a
+  Linear issue with the Linear MCP tools when they are available.
+- Work that ships as a PR: put one `Closes #<n>` line per resolved GitHub issue in the PR
+  description, so merging closes them. Link a Linear issue through the Linear MCP.
+- An issue only partly resolved stays open, with a comment saying what remains.
+
 ## Telling the owner where it stands
 
 When the work is done, or when they ask, say what is finished, what waits on them, and what

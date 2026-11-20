@@ -45,7 +45,7 @@ Every `gh` command takes `-R <owner>/<name>`, left out below to keep them short.
 3. Fill the repository's template (`.github/pull_request_template.md`, or a file in
    `.github/PULL_REQUEST_TEMPLATE/`) and write it to a file outside the repository. Use the
    `writing-pr-descriptions` skill when it is installed. Name the issue it closes
-   (`Closes #<issue>`) when there is one.
+   (one `Closes #<issue>` line per resolved issue) when there is one.
 4. `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`.
    Report the PR's URL. For a stack, open the lowest branch first, then each next branch
    with `--base` its parent branch, and say in each body which PR it stacks on.
@@ -120,8 +120,11 @@ When every check is green and no thread is unresolved:
 
 1. Find the linked issues: `gh pr view <n> --json closingIssuesReferences`, or the issues
    the owner named.
-2. Once the work ships (the owner has merged it, or told you to close), close each GitHub
-   issue with the PR's link, what shipped in a few lines, and the command that verifies it:
+2. The `Closes #<issue>` lines close GitHub issues when the owner merges. Link a Linear issue
+   through the Linear MCP. An issue only partly resolved stays open, with a comment saying
+   what remains. Once the work ships (the owner has merged it, or told you to close), close
+   any GitHub issue that is still open with the PR's link, what shipped in a few lines, and
+   the command that verifies it:
    `gh issue close <issue> --comment "<text>"`, or with the text from a file:
    `gh issue close <issue> --comment "$(cat <file>)"`. Close a Linear issue with the Linear
    MCP tools when they are available (comment, then set its status to done); otherwise tell
