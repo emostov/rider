@@ -5,26 +5,35 @@ description: Use when the user asks to ship the stack or a branch the swarm buil
 
 # Ship a swarm's branch
 
-Rider stops at reviewed local branches and never pushes. This skill takes one of them to a
-green pull request with no open review threads. **This session stays the lead** of
-`ride-swarm`: you run the `gh` and `git` steps yourself, and every code change is a board
-task done by a worker. `<ride>` is the `ride-swarm` skill's directory; read `<ride>/lead.md`
-for how to create tasks (the plan file, `onto`, `role` set last) and follow it here.
+Rider stops at reviewed local branches and never pushes. A project usually culminates in
+one PR, or a stack of PRs: one PR per branch, each based on its parent branch (the lowest
+on the base branch). This skill takes them to green pull requests with no open review
+threads. **This session stays the lead** of `ride-swarm`. `<ride>` is the `ride-swarm`
+skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file, `onto`,
+`role` set last) and follow it here.
 
 ## Rules
 
 - Act only when the owner asks, and only on the branch or stack they name. The ask does not
   carry over to another branch or PR.
-- Never force-push, never merge (`gh pr merge` included), never push to the base branch.
-- Once the branch has an open PR, fix forward only: new commits on top. Never a restack or
-  a rebase, since pushing it would need a force-push. A stack ships as one PR from its top
-  branch, so every fix goes `onto` the top branch's task, never onto a lower branch.
+- Never merge (`gh pr merge` included) and never push to the base branch.
+- A feature branch the swarm created may be rewritten, also after its PR is open: restacks
+  and rebases are fine. Push a rewrite with `git push --force-with-lease origin <branch>`
+  on that branch only. Never force-push the base branch or a branch the swarm did not
+  create, and never use a bare `--force`.
+- Git work with judgment in it is a board task for a worker: a restack, a rebase with
+  conflicts, splitting or squashing commits, and every code change. Quick steps (pushing a
+  finished branch, `gh pr create`) you run yourself. Rider has no built-in ship command.
+- Never leave a review on a PR: no `gh pr review`, no review comments. Reviewer findings
+  stay on the board. Replying to a human's review thread, and resolving it once its fix is
+  pushed, is fine.
 - Wait in the background, never poll in the foreground: run each watch as a background
   command and take a turn when it returns, so the owner can talk to you meanwhile.
 - Posting on GitHub publishes. Say what you posted, with its link.
 
-In the commands below, `<repo>` is the repository, `<branch>` the top branch (the `branch`
-label of the stack's top task), `<top>` the id of the last task that moved it, `<n>` the PR.
+In the commands below, `<repo>` is the repository, `<branch>` the branch being shipped (its
+task's `branch` label; the lowest first in a stack), `<top>` the id of the last task that
+moved it, `<n>` its PR, `<base>` its parent branch.
 Every `gh` command takes `-R <owner>/<name>`, left out below to keep them short.
 
 ## 1. Open the PR
@@ -32,13 +41,14 @@ Every `gh` command takes `-R <owner>/<name>`, left out below to keep them short.
 1. Check the branch is settled: no unfinished task is `onto` it or reviews it
    (`vb tasks work/<project> --state all`), and its reviews report nothing blocking.
 2. `git -C <repo> push -u origin <branch>`. If the remote branch exists and the push is
-   rejected as non-fast-forward, stop and tell the owner. Never add `--force`.
+   rejected as non-fast-forward, stop and tell the owner: it may not be the swarm's.
 3. Fill the repository's template (`.github/pull_request_template.md`, or a file in
    `.github/PULL_REQUEST_TEMPLATE/`) and write it to a file outside the repository. Use the
    `writing-pr-descriptions` skill when it is installed. Name the issue it closes
    (`Closes #<issue>`) when there is one.
 4. `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`.
-   Report the PR's URL.
+   Report the PR's URL. For a stack, open the lowest branch first, then each next branch
+   with `--base` its parent branch, and say in each body which PR it stacks on.
 
 ## 2. Watch CI
 
@@ -65,15 +75,15 @@ All passed: step 4. Any failed: step 3. The board wait from `lead.md` runs along
 4. A real failure becomes a fix task, created as `lead.md` describes:
    `role=implement` (or `light` when the log says exactly what to change, as a lint does),
    `onto=<top>`, `needs` every unfinished task on that branch, and its own `review`. The
-   brief carries the check's name, the failing log lines, the local command that reproduces
-   the check (from the workflow file under `.github/workflows/`), and: "Fix forward with a
-   new commit on this branch. Do not rebase or amend."
+   brief carries the check's name, the failing log lines, and the local command that
+   reproduces the check (from the workflow file under `.github/workflows/`).
 5. When the fix and its review complete, read the result, then push: `git -C <repo> push
-   origin <branch>` (a fast-forward; never `--force`). `<top>` is now the fix task. Watch
-   again (step 2).
+   origin <branch>`. `<top>` is now the fix task. Watch again (step 2).
 
-If CI fails because the base branch moved (a conflict, or a change on the base breaking
-the branch), do not merge or rebase: tell the owner and ask.
+If CI fails because the base branch moved, or a lower branch in the stack changed, make a
+restack task (`role=light`, or `implement` when conflicts need judgment) as in `lead.md`,
+once per branch from the bottom up. After each completes, push with
+`git -C <repo> push --force-with-lease origin <branch>`, then watch CI again.
 
 ## 4. Review comments
 
@@ -108,13 +118,16 @@ the branch), do not merge or rebase: tell the owner and ask.
 
 When every check is green and no thread is unresolved:
 
-1. Find the linked issue: `gh pr view <n> --json closingIssuesReferences`, or the issue the
-   owner named.
-2. Comment on it: `gh issue comment <issue> --body-file <file>`, with the PR's link, what
-   shipped in a few lines, and the command that verifies it. Do not close the issue:
-   merging the PR does.
-3. Tell the owner: the PR's link, that CI is green and no thread is open, and the fix task
-   ids. Merging is theirs.
+1. Find the linked issues: `gh pr view <n> --json closingIssuesReferences`, or the issues
+   the owner named.
+2. Once the work ships (the owner has merged it, or told you to close), close each GitHub
+   issue with the PR's link, what shipped in a few lines, and the command that verifies it:
+   `gh issue close <issue> --comment "<text>"`, or with the text from a file:
+   `gh issue close <issue> --comment "$(cat <file>)"`. Close a Linear issue with the Linear
+   MCP tools when they are available (comment, then set its status to done); otherwise tell
+   the owner it is open.
+3. Tell the owner: each PR's link, that CI is green and no thread is open, the fix task ids,
+   and the issues closed. Merging is theirs.
 
 ## Common mistakes
 
@@ -122,4 +135,6 @@ When every check is green and no thread is unresolved:
 - Watching CI in the foreground, or looping `gh pr checks` without `--watch`.
 - Rerunning a check a second time, or calling a failure a flake because a rerun is cheaper.
 - Replying "fixed" or resolving a thread before the fix is pushed and CI is green.
-- A restack, rebase, or amend on a branch with an open PR. Those need a force-push.
+- Pushing a rewritten branch with a bare `--force` instead of `--force-with-lease`, or
+  force-pushing a branch the swarm did not create.
+- Leaving a review on a PR. Findings go on the board.
