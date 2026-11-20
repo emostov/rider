@@ -244,3 +244,52 @@ fn a_completed_attempt_takes_the_agents_last_message_or_says_completed() {
         vec![summary(&built), completed.clone(), completed, summary(&qa)]
     );
 }
+
+#[test]
+fn an_agent_that_outlives_a_shortened_attempt_limit_is_failed_for_its_time_limit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "attempt=2000,tick=200")]);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(
+        (states, then_the_daemon_exits(&mut world)),
+        (vec!["failed".to_string()], Some(0))
+    );
+    then_the_task_failed_with(&world, &task, "the attempt reached its time limit");
+}
+
+#[test]
+fn an_onto_task_whose_branch_has_too_many_tasks_to_check_is_blocked_naming_the_onto_label() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    for target in 9001..9034 {
+        let holder = NewTask::new("Hold a branch.")
+            .label("repo", world.repo_label())
+            .label("onto", &target.to_string());
+        when_the_lead_creates(&world, &holder);
+    }
+    let task = NewTask::new("Fix the work.")
+        .label("repo", world.repo_label())
+        .label("onto", "9000")
+        .role("implement");
+    let task = when_the_lead_creates(&world, &task);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = "Finish or cancel unfinished tasks, or remove the `onto` label: 2 of them are \
+                  past rider's bounds, so it cannot check which are unfinished on the branch of \
+                  task #9000.";
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("invalid_brief".to_string(), reason.to_string()))
+    );
+    assert_eq!(agent_runs(&world), vec![]);
+}

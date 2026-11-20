@@ -87,39 +87,3 @@ pub fn judge(o: &Outcome) -> Verdict {
     assert!(o.state_after != TaskState::Blocked || verdict == Verdict::LeaveBlocked);
     verdict
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn done() -> Outcome<'static> {
-        Outcome {
-            exit: Exit::Code(0),
-            state_after: TaskState::Claimed,
-            stream_failed: false,
-            clean: true,
-            branch: Some("rider/7-token-store"),
-            on_branch: true,
-            head_moved: true,
-            keeps_start: true,
-            own_commits: 1,
-            commits_expected: true,
-            last_message: Some("Extracted the token store."),
-        }
-    }
-
-    fn fail(reason: &str) -> Verdict {
-        Verdict::Fail {
-            reason: reason.to_string(),
-        }
-    }
-
-    #[test]
-    fn a_timed_out_attempt_fails() {
-        let outcome = Outcome {
-            exit: Exit::TimedOut,
-            ..done()
-        };
-        assert_eq!(judge(&outcome), fail("timed out after 55 minutes"));
-    }
-}
