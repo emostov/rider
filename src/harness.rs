@@ -5,7 +5,8 @@ use crate::board::one_line;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
@@ -515,9 +516,74 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
     false
 }
 
-// Visits each line of `log` that is JSON; skips other lines and those over `LINE_BYTES_MAX`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Field<T> {
+    Valid(T),
+    Malformed(IgnoredAny),
+}
+
+fn valid<T>(field: Option<Field<T>>) -> Option<T> {
+    match field? {
+        Field::Valid(value) => Some(value),
+        Field::Malformed(_) => None,
+    }
+}
+
+// Agent streams gain fields and event types often: only what Rider reads is named.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeEvent {
+    #[serde(rename = "result")]
+    Result {
+        result: Option<Field<String>>,
+        subtype: Option<Field<String>>,
+        is_error: Option<Field<bool>>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum CodexEvent {
+    #[serde(rename = "item.completed")]
+    ItemCompleted { item: Option<Field<CodexItem>> },
+    #[serde(rename = "turn.failed")]
+    TurnFailed,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct CodexItem {
+    #[serde(rename = "type")]
+    kind: Option<Field<String>>,
+    text: Option<Field<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum TactEvent {
+    #[serde(rename = "assistant.message")]
+    AssistantMessage { payload: Option<Field<TactPayload>> },
+    #[serde(rename = "run.failed")]
+    RunFailed,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct TactPayload {
+    phase: Option<Field<String>>,
+    text: Option<Field<String>>,
+}
+
+// Visits each line of `log` that is an `E`; skips other lines and those over `LINE_BYTES_MAX`.
 // Returns whether the whole log was read.
-fn scan(log: &Path, mut visit: impl FnMut(&Value)) -> bool {
+fn scan<E: DeserializeOwned>(log: &Path, mut visit: impl FnMut(E)) -> bool {
     assert!(!log.as_os_str().is_empty());
     let Ok(file) = File::open(log) else {
         return false;
@@ -540,45 +606,49 @@ fn scan(log: &Path, mut visit: impl FnMut(&Value)) -> bool {
             }
             continue;
         }
-        if let Ok(event) = serde_json::from_slice::<Value>(&line) {
-            visit(&event);
+        if let Ok(event) = serde_json::from_slice::<E>(&line) {
+            visit(event);
         }
     }
     false
 }
 
-fn text_at<'a>(event: &'a Value, pointer: &str) -> Option<&'a str> {
-    assert!(pointer.starts_with('/'));
-    let text = event.pointer(pointer).and_then(Value::as_str);
-    assert!(text.is_none_or(|t| t.len() <= LINE_BYTES_MAX));
-    text
-}
-
-// `Some(text)` when `event` is where `harness` puts its final message, `text` being `None`
-// when that event carries no string; `None` for any other event.
-fn final_text<'a>(harness: &Harness, event: &'a Value) -> Option<Option<&'a str>> {
-    let kind = text_at(event, "/type")?;
-    let found = match harness {
-        Harness::Claude => (kind == "result").then(|| text_at(event, "/result")),
-        Harness::Codex => (kind == "item.completed"
-            && text_at(event, "/item/type") == Some("agent_message"))
-        .then(|| text_at(event, "/item/text")),
-        Harness::Tact => (kind == "assistant.message"
-            && text_at(event, "/payload/phase") == Some("final_answer"))
-        .then(|| text_at(event, "/payload/text")),
-    };
-    assert!(found.flatten().is_none_or(|t| t.len() <= LINE_BYTES_MAX));
-    found
-}
-
 /// The agent's trimmed final message, or `None` when the log is unreadable or has none.
 pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
     let mut last: Option<String> = None;
-    let complete = scan(log, |event| {
-        if let Some(text) = final_text(harness, event) {
-            last = text.map(str::to_string);
-        }
-    });
+    let mut set = |text: Option<String>| {
+        assert!(text.as_ref().is_none_or(|t| t.len() <= LINE_BYTES_MAX));
+        last = text;
+    };
+    let complete = match harness {
+        Harness::Claude => scan(log, |event| {
+            if let ClaudeEvent::Result { result, .. } = event {
+                set(valid(result));
+            }
+        }),
+        Harness::Codex => scan(log, |event| {
+            let CodexEvent::ItemCompleted { item } = event else {
+                return;
+            };
+            let Some(item) = valid(item) else {
+                return;
+            };
+            if valid(item.kind).as_deref() == Some("agent_message") {
+                set(valid(item.text));
+            }
+        }),
+        Harness::Tact => scan(log, |event| {
+            let TactEvent::AssistantMessage { payload } = event else {
+                return;
+            };
+            let Some(payload) = valid(payload) else {
+                return;
+            };
+            if valid(payload.phase).as_deref() == Some("final_answer") {
+                set(valid(payload.text));
+            }
+        }),
+    };
     if !complete {
         return None;
     }
@@ -596,21 +666,24 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut failed = false;
     let mut last_result_failed = false;
     // A log cut short still counts for what it showed.
-    let _ = scan(log, |event| {
-        let kind = text_at(event, "/type");
-        match harness {
-            // tact exits 0 when cancelled; only the stream says so.
-            Harness::Tact => failed |= kind == Some("run.failed"),
-            // `item.type == "error"` inside `item.completed` is a harmless warning.
-            Harness::Codex => failed |= matches!(kind, Some("turn.failed" | "error")),
-            Harness::Claude if kind == Some("result") => {
-                let is_error = event.pointer("/is_error").and_then(Value::as_bool);
-                let subtype = text_at(event, "/subtype");
-                last_result_failed = is_error == Some(true) || subtype != Some("success");
+    let _ = match harness {
+        // tact exits 0 when cancelled; only the stream says so.
+        Harness::Tact => scan(log, |event| failed |= matches!(event, TactEvent::RunFailed)),
+        // `item.type == "error"` inside `item.completed` is a harmless warning.
+        Harness::Codex => scan(log, |event| {
+            failed |= matches!(event, CodexEvent::TurnFailed | CodexEvent::Error);
+        }),
+        Harness::Claude => scan(log, |event| {
+            if let ClaudeEvent::Result {
+                subtype, is_error, ..
+            } = event
+            {
+                let subtype = valid(subtype);
+                last_result_failed =
+                    valid(is_error) == Some(true) || subtype.as_deref() != Some("success");
             }
-            Harness::Claude => {}
-        }
-    });
+        }),
+    };
     assert!(!failed || *harness != Harness::Claude);
     assert!(!last_result_failed || *harness == Harness::Claude);
     failed || last_result_failed
