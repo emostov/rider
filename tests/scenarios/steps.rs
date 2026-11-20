@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1052,6 +1054,81 @@ pub fn when_the_group_is_killed(pid: u32) {
         .status()
         .expect("run kill");
     assert!(status.success(), "killing group {pid} failed: {status}");
+}
+
+/// Upper bound on the requests a client that never reads sends before the daemon stops
+/// reading them; past every kernel buffer and the daemon's backlog on Linux and macOS.
+const FLOOD_REQUESTS_MAX: u64 = 1 << 16;
+/// How long a write to the daemon may wait before the daemon is taken to have stopped reading.
+const FLOOD_STALL_SECONDS: u64 = 3;
+/// How long a client that lagged waits for the daemon to end its connection.
+const LAGGED_END_SECONDS_MAX: u64 = 30;
+/// Upper bound on the reads taken to reach the end of a connection.
+const LAGGED_READS_MAX: usize = 1 << 20;
+
+/// A raw connection to the running daemon's socket.
+pub fn given_a_client_on_the_daemon_socket(world: &World) -> UnixStream {
+    UnixStream::connect(world.home.join("rider.sock")).expect("connect to the daemon socket")
+}
+
+/// When the client sends status requests and never reads, until a write waits
+/// `FLOOD_STALL_SECONDS` or is refused because the daemon stopped reading; returns the
+/// requests sent whole.
+pub fn when_the_client_sends_status_requests_without_reading(client: &mut UnixStream) -> u64 {
+    let stall = Duration::from_secs(FLOOD_STALL_SECONDS);
+    client
+        .set_write_timeout(Some(stall))
+        .expect("set a write timeout");
+    for id in 1..=FLOOD_REQUESTS_MAX {
+        let request = format!("{{\"v\":1,\"id\":{id},\"cmd\":\"status\"}}\n");
+        match client.write_all(request.as_bytes()) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                ) =>
+            {
+                return id - 1;
+            }
+            Err(error) => panic!("sending request {id} failed: {error}"),
+        }
+    }
+    panic!("the daemon read all {FLOOD_REQUESTS_MAX} requests from a client that never read");
+}
+
+/// Then the client reads until the daemon ends its connection; returns every line, each
+/// parsed as JSON, failing if a line is cut short or the end is not reached in time.
+pub fn then_the_client_reads_to_the_end(mut client: &UnixStream) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(LAGGED_END_SECONDS_MAX);
+    let mut data = Vec::new();
+    let mut buffer = vec![0; 64 * 1024];
+    for _ in 0..LAGGED_READS_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let bytes = data.len();
+        assert!(!left.is_zero(), "no end of stream in time: {bytes} bytes");
+        // macOS refuses the timeout with EINVAL once the daemon has closed its end; a read
+        // then returns at once, so the error is safe to ignore.
+        let _ = client.set_read_timeout(Some(left));
+        match client.read(&mut buffer) {
+            Ok(0) => {
+                let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+                assert!(text.ends_with('\n'), "a line was cut short: {bytes} bytes");
+                return text.lines().map(parse::<Value>).collect();
+            }
+            Ok(read) => data.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(error) => panic!("reading to the end failed after {bytes} bytes: {error}"),
+        }
+    }
+    panic!("no end of stream within {LAGGED_READS_MAX} reads");
 }
 
 /// How long a scenario waits for `rider wait` to end.
