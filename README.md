@@ -10,7 +10,7 @@ a model picked for the job.
 
 ## How it works
 
-**The lead** is a Claude Code session on Fable 5.2. It plans the work, answers
+**The lead** is your coding-agent session, guided by the `ride-swarm` skill. It plans the work, answers
 the workers' questions, checks their results, and keeps you updated. It never
 writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
@@ -49,8 +49,9 @@ Then say "ride a swarm to <goal>" in a new session.
 - **Agents run unsandboxed, with permission prompts skipped.** They can read
   and change anything your user can. Only point Rider at repositories you are
   prepared to have changed.
-- **Nothing leaves your machine.** Rider never pushes, opens a pull request, or
-  merges. Work stays on local branches named `rider/<task id>-<slug>`.
+- **The Rider binary never pushes, opens a pull request, or merges.** Work stays on
+  local branches named `rider/<task id>-<slug>`. The `ship-swarm` skill pushes branches
+  and opens pull requests only when you ask it to.
 
 ## Status
 
