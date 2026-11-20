@@ -12,6 +12,8 @@ use world::World;
 
 /// The fixed seeds every run covers, each replayed.
 const SEEDS: u64 = 64;
+/// Seeds that once found a bug, replayed by every run.
+const FOUND_SEEDS: [u64; 1] = [1215];
 /// Further seeds every run covers once each.
 const MORE_SEEDS: u64 = 2000;
 /// The phases a run can be in, by name; every one sees a restart and a board outage in some
@@ -34,7 +36,7 @@ fn seeds() -> Vec<u64> {
             Ok(seed) => vec![seed],
             Err(_) => panic!("SIM_SEED must be a number, got {text:?}"),
         },
-        Err(_) => (0..SEEDS).collect(),
+        Err(_) => (0..SEEDS).chain(FOUND_SEEDS).collect(),
     }
 }
 
