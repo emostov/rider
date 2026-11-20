@@ -480,29 +480,29 @@ fn a_second_sigterm_kills_an_agent_that_ignores_sigterm_within_the_grace_and_rel
 }
 
 #[test]
-fn five_ready_polish_tasks_never_run_more_than_the_four_polish_slots_at_once() {
+fn five_ready_light_tasks_never_run_more_than_the_four_light_slots_at_once() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let tasks: Vec<String> = [
-        "Polish the first work.",
-        "Polish the second work.",
-        "Polish the third work.",
-        "Polish the fourth work.",
-        "Polish the fifth work.",
+        "Tidy the first work.",
+        "Tidy the second work.",
+        "Tidy the third work.",
+        "Tidy the fourth work.",
+        "Tidy the fifth work.",
     ]
     .iter()
     .map(|text| {
         let new = NewTask::new(text)
             .label("repo", world.repo_label())
             .label("from", MAIN)
-            .role("polish");
+            .role("light");
         let task = when_the_lead_creates(&world, &new);
         given_the_agent_will(&world, &task, &[Behaviour::Hold]);
         task
     })
     .collect();
-    given_a_rider_toml(&world, "[roles.polish]\nslots = 4\n");
+    given_a_rider_toml(&world, "[roles.light]\nslots = 4\n");
     given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
     when_the_agent_has_started(&world, &tasks[0]);
     thread::sleep(Duration::from_secs(2));
@@ -689,21 +689,6 @@ fn a_prompt_file_named_directly_under_the_rider_home_is_accepted() {
 }
 
 #[test]
-fn the_tact_harness_is_refused_naming_the_harness() {
-    let Some(world) = given_a_board_and_a_repository() else {
-        return;
-    };
-    given_a_rider_toml(&world, "[roles.light]\nharness = \"tact\"\n");
-
-    let output = when_rider_runs(&world, &["config"]);
-
-    assert_ne!(output.code, Some(0), "{output:?}");
-    assert!(output.stderr.contains("tact"), "{output:?}");
-    assert!(output.stderr.contains("claude"), "{output:?}");
-    assert!(output.stderr.contains("codex"), "{output:?}");
-}
-
-#[test]
 fn a_model_name_with_a_newline_is_refused_naming_the_field() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
@@ -747,6 +732,176 @@ fn a_model_with_a_control_character_is_refused_naming_the_field() {
 
     assert_eq!(output.code, Some(1), "{output:?}");
     assert!(output.stderr.contains("roles.review.model"), "{output:?}");
+}
+
+#[test]
+fn a_repository_table_giving_implement_a_skill_puts_it_in_only_that_repositorys_prompts() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let other = given_another_repository(&world);
+    let toml = format!(
+        "[repo.\"{}\".roles.implement]\nskills = [\"polish-branch\", \"tidy\"]\n",
+        world.repo_label()
+    );
+    given_a_rider_toml(&world, &toml);
+    let skilled = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let plain = an_implement_task(&world, "Add other work.");
+    let plain = plain.label("repo", other.to_str().expect("UTF-8 path"));
+    let plain = when_the_lead_creates(&world, &plain);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&skilled, &plain]);
+
+    assert_eq!(states, vec!["completed".to_string(); 2]);
+    assert_eq!(exit, Some(0));
+    let sent = agent_prompt(&world, &skilled, 0);
+    let step = "Before you complete, run each of these skills in order over the task's whole \
+                PR range, every commit on its branch, and fix what each one reports: \
+                `polish-branch`, then `tidy`.";
+    assert!(sent.trim_end().ends_with(step), "{sent}");
+    let sent = agent_prompt(&world, &plain, 0);
+    assert!(!sent.contains("polish-branch"), "{sent}");
+}
+
+#[test]
+fn an_unknown_key_in_a_repository_role_table_stops_the_daemon_naming_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let toml = format!(
+        "[repo.\"{}\".roles.implement]\nskils = [\"polish-branch\"]\n",
+        world.repo_label()
+    );
+    given_a_rider_toml(&world, &toml);
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("roles.implement.skils"),
+        "{output:?}"
+    );
+    assert!(output.stderr.contains("rider.toml"), "{output:?}");
+}
+
+#[test]
+fn a_role_key_other_than_skills_in_a_repository_table_stops_the_daemon_naming_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let toml = format!(
+        "[repo.\"{}\".roles.review]\nbuilds = true\nskills = [\"tidy\"]\n",
+        world.repo_label()
+    );
+    given_a_rider_toml(&world, &toml);
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("roles.review.builds"), "{output:?}");
+    let only = "only `skills` may be set per repository";
+    assert!(output.stderr.contains(only), "{output:?}");
+    assert!(output.stderr.contains("rider.toml"), "{output:?}");
+}
+
+#[test]
+fn a_skill_on_a_codex_role_reaches_its_workers_prompt() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let toml = format!(
+        "[roles.implement]\nharness = \"codex\"\nmodel = \"gpt-test-implement\"\n\n\
+         [repo.\"{}\".roles.implement]\nskills = [\"polish-branch\"]\n",
+        world.repo_label()
+    );
+    given_a_rider_toml(&world, &toml);
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_runs_for(&world, &task)[0].harness, "codex");
+    let sent = agent_prompt(&world, &task, 0);
+    let step = "Before you complete, run each of these skills in order over the task's whole \
+                PR range, every commit on its branch, and fix what each one reports: \
+                `polish-branch`.";
+    assert!(sent.trim_end().ends_with(step), "{sent}");
+}
+
+#[test]
+fn a_task_labelled_with_the_removed_polish_role_is_left_unclaimed_as_an_unknown_role() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let new = an_implement_task(&world, "Polish the work.").role("polish");
+    let polish = when_the_lead_creates(&world, &new);
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(task_state(&world, &polish), "ready");
+    assert_eq!(task_claim_profile(&world, &polish), None);
+    assert_eq!(agent_runs_for(&world, &polish).len(), 0);
+}
+
+#[test]
+fn rider_config_for_a_repository_prints_its_merged_role_table() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let toml = format!(
+        "[roles.light]\nskills = [\"tidy\"]\n\n[repo.\"{}\".roles.implement]\n\
+         skills = [\"polish-branch\"]\n",
+        world.repo_label()
+    );
+    given_a_rider_toml(&world, &toml);
+
+    let plain = when_rider_runs(&world, &["config"]);
+    let merged = when_rider_runs(&world, &["config", "--repo", world.repo_label()]);
+
+    assert_eq!(plain.code, Some(0), "{plain:?}");
+    assert_eq!(merged.code, Some(0), "{merged:?}");
+    let default = include_str!("rider-config-default.toml");
+    let light = "skills = [\"tidy\"]\n";
+    let plain_expected = replace_role_key(default, "light", "skills = []\n", light);
+    assert_eq!(plain.stdout, plain_expected);
+    let merged_expected = replace_role_key(
+        &plain_expected,
+        "implement",
+        "skills = []\n",
+        "skills = [\"polish-branch\"]\n",
+    );
+    assert_eq!(merged.stdout, merged_expected);
+}
+
+/// `table` with `from` replaced by `to` inside the `[roles.<role>]` section.
+fn replace_role_key(table: &str, role: &str, from: &str, to: &str) -> String {
+    let header = format!("[roles.{role}]\n");
+    let (head, section) = table.split_once(&header).expect("the role's section");
+    assert!(section.contains(from), "{section}");
+    format!("{head}{header}{}", section.replacen(from, to, 1))
+}
+
+/// A second scratch repository, cloned from the world's, with `main` checked out.
+fn given_another_repository(world: &World) -> PathBuf {
+    let other = world.root.join("other-repo");
+    let other_label = other.to_str().expect("UTF-8 path");
+    let clone = world.git(
+        &world.root,
+        &["clone", "-q", world.repo_label(), other_label],
+    );
+    assert_eq!(clone.code, Some(0), "git clone: {clone:?}");
+    for args in [
+        &["config", "user.name", "Scenario Tester"][..],
+        &["config", "user.email", "scenario@example.invalid"],
+        &["config", "commit.gpgsign", "false"],
+    ] {
+        assert_eq!(world.git(&other, args).code, Some(0), "git {args:?}");
+    }
+    other
 }
 
 #[test]

@@ -1220,7 +1220,8 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
         for ListedTask { view, channel } in tasks {
             let has_run = state.runs.iter().any(|run| run.task == view.id);
             let newer = state.tasks.iter().any(|task| task.id == view.id)
-                || (state.closed.iter()).any(|(id, at)| *id == view.id && *at >= view.version);
+                || (state.closed.iter()).any(|(id, at)| *id == view.id && *at >= view.version)
+                || (state.untracked.iter()).any(|(id, at)| *id == view.id && *at > view.version);
             if has_run != with_run || newer {
                 continue;
             }
