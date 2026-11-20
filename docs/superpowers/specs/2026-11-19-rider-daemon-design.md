@@ -1,6 +1,7 @@
 # Rider milestone 1: the daemon
 
-Status: draft for approval, 2026-11-19.
+Status: draft for approval, 2026-11-19. Decided change, 2026-11-20: the lead is an
+open terminal session, not a process the daemon runs; the daemon runs workers only.
 
 "Decided" marks what Zeke chose in conversation. "Call" marks a choice made
 while writing this, open to correction. This document sits under the overall
@@ -10,23 +11,23 @@ one milestone.
 ## Intent
 
 Milestone 0 proved the pieces: a pool that runs role-based agents through the
-board, and a lead that plans. Three things still need a person. Someone starts
-the lead and keeps its session open. Someone watches a terminal to know what is
-running. And a crash, a long sleep, or a stuck `vb` call costs up to an hour or
-hangs a slot for good.
+board, and a lead that plans. Two things still need a person. Someone watches a
+terminal to know what is running. And a crash, a long sleep, or a stuck `vb`
+call costs up to an hour or hangs a slot for good.
 
-Milestone 1 is one long-running process, `rider daemon`, that removes all
-three. It runs workers, runs the lead one turn at a time, answers a CLI over a
-socket, and rebuilds itself from the board and git after a crash.
+Milestone 1 is one long-running process, `rider daemon`, that removes both. It
+runs workers, answers a CLI over a socket, and rebuilds itself from the board
+and git after a crash. The lead is not part of it: the lead is a terminal
+session running the ride-swarm skill (`skills/ride-swarm/`), which waits on the
+board with `vb wait`. (Decided)
 
 ## Goals
 
 1. `rider up` starts the swarm and `rider down` stops it. (Decided)
 2. A ready task with a `role` is claimed within seconds while a slot of its
    role is free, by following the board's event feed, not by polling.
-3. The lead runs under the daemon, woken with one message when something needs
-   judgment, one turn at a time. (Decided)
-4. `rider status`, `agents`, `logs`, `kill` and `chat` work from any terminal.
+3. The daemon runs workers only and never starts a lead. (Decided)
+4. `rider status`, `agents`, `logs` and `kill` work from any terminal.
 5. After a crash, the daemon rebuilds from the board and git and resumes or
    re-claims what it held. A restart is not a failed attempt.
 6. The core is one pure function, `step(state, event) -> actions`, with every
@@ -51,7 +52,7 @@ socket, and rebuilds itself from the board and git after a crash.
 - State that exists only in the daemon. Everything it keeps on disk is a cache:
   deleting it loses convenience, never work.
 - A second way to run the tests. Scenarios use the harness from issue #14.
-- Two leads, or two daemons, writing to one board.
+- Two daemons writing to one board.
 
 ## Approaches
 
@@ -95,27 +96,22 @@ another port), since `docs/board-observed.md` did not cover it:
 
 Step 1 records these in `docs/board-observed.md` with fixtures.
 
-**2. Running the lead. Decided: one `claude -p --resume <session>` per
-wake-up.** A turn is a process: it has a start, an end, and a time limit, and
-it survives a daemon restart as nothing but a saved session id. Considered: one
-long-lived lead process (its state lives in a process that can hang, and "one
-turn" has to be inferred), and a fresh session per wake-up (it forgets what
-Zeke agreed in conversation).
+**2. Running the lead. Decided: a terminal session, not the daemon.** The lead
+is an open terminal session running the ride-swarm skill, waiting on the board
+with `vb wait`. Considered: one `claude -p --resume <session>` per turn
+(the daemon would own a session id, a message queue, and failure handling for
+judgment it must never make), and one long-lived lead process under the daemon
+(its state lives in a process that can hang).
 
-**3. `rider chat` during a turn. Decided: queue it.** The message goes first
-in the next turn. Considered: interrupting the turn (wastes partial turns), and
-answering in parallel (two leads on one session).
-
-**4. Running the daemon. Decided: `rider up` starts it in the background;
+**3. Running the daemon. Decided: `rider up` starts it in the background;
 `rider daemon` is the foreground form.** Considered: foreground only (dies
 with the terminal), and launchd (macOS-only, untestable by scenarios, starts
 unattended agents at login).
 
-**5. Build order. Decided: workers first, the lead last.** See "Build
-order". Considered: the lead first (two processes share the board for a
-while), and the whole core before any I/O (nothing usable until late).
+**4. Build order. Decided: workers first.** See "Build order". Considered: the
+whole core before any I/O (nothing usable until late).
 
-**6. Milestone 0 issues. Decided:** see "Issues absorbed".
+**5. Milestone 0 issues. Decided:** see "Issues absorbed".
 
 ## Shape
 
@@ -123,7 +119,7 @@ while), and the whole core before any I/O (nothing usable until late).
  feed reader ----\                         /--> board calls (vb, time-limited)
  timer ----------+--> bounded  --> core --+--> git and worktree work
  socket clients --+    queue      step()   +--> agent processes
- action results --/                         \--> lead turns, socket replies
+ action results --/                         \--> socket replies
 ```
 
 - **One core thread** owns the state and calls `step`. It never blocks on I/O.
@@ -148,7 +144,6 @@ while), and the whole core before any I/O (nothing usable until late).
 |---|---|---|
 | `tasks` | every open task the daemon has seen: id, channel, state, role, labels it uses, needs | `TASKS_MAX` |
 | `runs` | one per task the daemon is working: phase, profile, epoch, lease end, attempt start time | `AGENTS_MAX` |
-| `leads` | one per project with a lead session: phase, pending wake-ups, failures in a row | `PROJECTS_MAX` |
 | `clients` | open socket connections and what each subscribes to | `CLIENTS_MAX` |
 | `board` | `Up`, or `Down` since a time | one value |
 | `stopping` | `No`, `Drain`, or `Now` | one value |
@@ -163,10 +158,6 @@ Claiming -> Preparing -> Running -> Judging -> Settling -> (removed)
                +--> Settling (blocked: invalid_brief, attempts_exhausted, ...)
 any phase --> Abandoning -> (removed)   the claim was lost: stop, write nothing
 ```
-
-A lead's phase: `Idle`, `Turn` (a process is running), `Backoff` (a turn
-failed; retry after a pause), `Halted` (too many failures; `rider chat` or a
-restart clears it).
 
 ### Events
 
@@ -184,7 +175,6 @@ restart clears it).
 | `Settled(task)` / `SettleFailed(task, tries)` | settle writes done / board error |
 | `StackChecked(task, moved)` | which child branches no longer contain the parent's head |
 | `BoardFailed` / `BoardAnswered` | a board call timed out or could not connect / one succeeded |
-| `LeadExited(project, outcome, session)` | lead turn ended |
 | `Client(id, request)` / `ClientGone(id)` | socket |
 | `Signal(term)` | SIGTERM or SIGINT: same as `down` |
 
@@ -193,8 +183,7 @@ restart clears it).
 `Claim(task, profile)`, `Prepare(task)`, `Spawn(task, profile)`,
 `Renew(task)`, `StopAgent(task)`, `Judge(task)`, `Settle(task, verdict)`,
 `Release(task)`, `CheckStack(task)`, `ListTasks`, `RestartFeed(cursor)`,
-`RestartBoard`, `RunLead(project, session, message)`, `StopLead(project)`,
-`Notify(text)`, `Reply(client, message)`, `SaveCursor(cursor)`, `Exit(code)`.
+`RestartBoard`, `Notify(text)`, `Reply(client, message)`, `SaveCursor(cursor)`, `Exit(code)`.
 
 ### Rules the core follows
 
@@ -219,11 +208,11 @@ restart clears it).
   the run is abandoned and the lease lapses.
 - **`rider kill <task>`** stops the agent and fails the task with "killed by
   the owner". It counts as an attempt.
-- **Draining** (`down`): claim nothing new; when no run and no lead turn is
-  left, exit. **Now** (`down --now`): stop every agent and the lead, release
+- **Draining** (`down`): claim nothing new; when no run is
+  left, exit. **Now** (`down --now`): stop every agent, release
   each claim so the task is ready again, exit. Released attempts do not count.
 - **Board down.** Any board call that times out or cannot connect sets `Down`.
-  While down: no claims, no settles, no lead turns; agents keep running; the
+  While down: no claims, no settles; agents keep running; the
   daemon restarts the board if it started it, and probes on each tick.
 - **Feed lost.** Restart the feed from the saved cursor, then take a snapshot,
   so nothing is missed whichever of them is behind.
@@ -247,8 +236,7 @@ any other `onto` task must keep it. (Call: the `restack` label.)
 
 When an `onto` task completes and its branch head changed, `CheckStack` finds
 every task whose `base` names a task on that branch and whose own branch does
-not contain the new head. The result record says so, and the lead gets a
-`stack moved` wake-up.
+not contain the new head. The result record says so.
 
 ## Bounds
 
@@ -263,8 +251,6 @@ Every one is a named constant. Values are Calls; the first five exist today. The
 | `ATTEMPT_SECONDS_MAX` | 55 min (`limits.attempt_minutes`, 1 to 55; default 55) | the agent is stopped; the task fails |
 | `ATTEMPTS_DEFAULT` | 3 (`limits.attempts`, 1 to `ATTEMPTS_MAX` = 9) | blocked as `attempts_exhausted` |
 | `TASKS_MAX` | 256 | further tasks are not tracked or claimed; `rider status` says how many; they are picked up as others finish |
-| `PROJECTS_MAX` | 8 | `rider chat` for a ninth project is refused |
-| `WAKEUPS_MAX` | 64 per lead | the oldest wake-up for the same task is dropped; if none, the oldest of any; the next message says "some events were dropped: re-read the channel" |
 | `EVENT_QUEUE_MAX` | 1024 | sources block until the core catches up; the feed is not lost because `vb tail` is read only as fast as it is queued |
 | `CLIENTS_MAX` | 8 | a new connection is answered `busy` and closed |
 | `REQUEST_BYTES_MAX` | 64 KiB | the request is refused and the connection closed |
@@ -274,9 +260,6 @@ Every one is a named constant. Values are Calls; the first five exist today. The
 | `FEED_LINE_BYTES_MAX` | 1 MiB | the event is skipped and a snapshot taken |
 | `FEED_RESTARTS_MAX` | 10 in a row | the board is treated as down |
 | `BOARD_RESTARTS_MAX` | 5 in a row | spawning stays paused; `rider status` says the board is down |
-| `LEAD_TURN_SECONDS_MAX` | 15 min | the turn is stopped and counts as failed |
-| `LEAD_FAILURES_MAX` | 3 in a row | the lead is `Halted`; its wake-ups are kept |
-| `LEAD_BACKOFF_SECONDS` | 60 | fixed pause before a retry |
 | `DRAIN_SECONDS_MAX` | `ATTEMPT_SECONDS_MAX` + 5 min | `down` becomes `down --now` |
 | `TICK_SECONDS` | 5 | not a limit; the timer's period |
 | `RECONCILE_SECONDS` | 60 | not a limit; how often a snapshot is taken |
@@ -291,83 +274,31 @@ Every one is a named constant. Values are Calls; the first five exist today. The
 5. `Spawn` is only ever emitted after `Claimed` and `Prepared` for that run.
 6. Every `Settle` follows exactly one `Judged`; no task is settled twice in
    one epoch.
-7. At most one `RunLead` is outstanding per project.
-8. No collection exceeds its bound.
-9. While the board is `Down` or `stopping` is not `No`, no `Claim` is emitted.
-10. Every emitted action is answered by exactly one result event (checked by
+7. No collection exceeds its bound.
+8. While the board is `Down` or `stopping` is not `No`, no `Claim` is emitted.
+9. Every emitted action is answered by exactly one result event (checked by
     the simulator's fakes), and a run never stays in one phase past that
     phase's time limit.
-11. Liveness, checked at the end of a run once faults stop: every claimable
-    task is claimed or waiting only on a full slot, and every queued wake-up
-    has been delivered or its lead is `Halted`.
-12. Replaying the same seed gives the same sequence of actions.
+10. Liveness, checked at the end of a run once faults stop: every claimable
+    task is claimed or waiting only on a full slot.
+11. Replaying the same seed gives the same sequence of actions.
 
 ## The lead
 
-- **Where it lives.** The lead's instructions are embedded in the binary and
-  written to `<home>/lead/` at start, as the worker prompts are. Each project
-  has `<home>/leads/<project>.json` holding its session id. (Call)
-- **How a project gets a lead.** The first `rider chat <project> "<goal>"`
-  starts a session with no `--resume` and saves the id from the stream's first
-  event. A project with tasks but no session gets no wake-ups, so a lead run by
-  hand still works. (Call: one session per project.)
-- **A turn** is `claude -p --resume <id>` with the lead's model, stream JSON
-  output, permission prompts skipped, the message on standard input, and the
-  output written to `<home>/logs/lead/<project>/<n>.jsonl`. Exit 0 with a
-  successful result ends the turn. Anything else puts the wake-ups back and
-  counts a failure.
-- **The lead no longer waits.** Its instructions lose the `vb wait` step and
-  end each turn after creating the next tasks.
-- **Decisions** stay in the one `decisions` channel. The lead adds the label
-  `project=<name>` to each, so the daemon knows whose it is. A decision
-  without the label still raises the notification but wakes no lead, which is
-  how a lead run by hand works today. (Call)
-- **What does not wake the lead.** An event whose actor is that project's lead
-  profile raises no wake-up, so a lead's own writes never start its next turn.
-  Tasks in `decisions` raise only `answered`, and do not count as open work
-  for `idle`. `idle` is raised once, when the count of open tasks in
-  `work/<project>` reaches zero.
+The lead is an open terminal session running the ride-swarm skill
+(`skills/ride-swarm/`). It waits on the board with `vb wait` and plans, answers
+and checks from there. The daemon never starts, resumes, or wakes a lead, and
+keeps no state about one. Rider reads the same board the lead writes to, so a
+lead run by hand and a daemon work together without a link between them.
 
-### Wake-up kinds
-
-| Kind | Raised when |
-|---|---|
-| `chat` | `rider chat` sent text |
-| `completed` | a task in the project completed |
-| `failed` | a task failed |
-| `blocked` | a task was blocked, any kind but `awaiting_approval` |
-| `answered` | the owner, as a person, replied in the thread of a `decisions` task labelled with the project |
-| `stack moved` | `CheckStack` found children behind |
-| `idle` | the project has no task that is waiting, ready, claimed or blocked |
-| `restarted` | the daemon started and this project has open tasks |
-
-Wake-ups for one project are delivered together. Two of the same kind for the
-same task collapse into one. `chat` always goes first.
-
-### Message shape
-
-Pointers, not content: the lead reads the board for the rest. (Call)
-
-```
-Wake-up for project rider. Board events 171 to 184.
-From Zeke: <chat text>
-completed: 147, 152
-failed: 149 (no committed work)
-blocked: 150 needs_input, 155 invalid_brief
-answered: decisions 160
-stack moved: 147 moved under 151, 153
-idle: nothing is open in work/rider
-restarted: the daemon restarted; re-read work/rider before acting
-dropped: some events were dropped; re-read work/rider
-```
-
-Only the lines that apply are present. The first line is always present.
+A `rider wait` command, wrapping `vb wait` for the lead, is a possible later
+enhancement (GitHub issue #133). It is not in this milestone.
 
 ### Notification
 
 When a task in `decisions` is blocked as `awaiting_approval`, the daemon
 raises one desktop notification with the task id and its first line. A failure
-to notify is logged and ignored.
+to notify is logged and ignored. (GitHub issue #45, outside milestone 1.)
 
 ## The socket and CLI
 
@@ -387,15 +318,14 @@ time per connection. Unknown fields and an unknown `v` are refused.
 |---|---|---|
 | `rider up` | none | starts `rider daemon` detached, waits for the socket, prints the status line |
 | `rider down [--now]` | `down` | stream of one line per agent as it ends, then `end` |
-| `rider status` | `status` | board state, running count and limit, each lead's phase, open decisions, tasks by project as in the overall design |
+| `rider status` | `status` | board state, running count and limit, open decisions, tasks by project as in the overall design |
 | `rider agents` | `agents` | each run: task, role, profile, phase, age, time of last output |
 | `rider logs <task> [-f]` | `logs` | the newest attempt's log; with `-f`, a stream. Works without the daemon by reading the file |
-| `rider kill <task>` / `rider kill lead <project>` | `kill` | the agent is stopped and the task failed / the turn is stopped |
-| `rider chat <project> ["text"]` | `chat` | stream: `queued` if a turn is running, then that turn's text, then the reply's text, then `end`. Without text, reads lines from the terminal, one turn each. Ctrl-C detaches and leaves the lead running |
+| `rider kill <task>` | `kill` | the agent is stopped and the task failed |
 | `rider daemon` | none | the daemon in the foreground; this is what scenarios run |
 
-Error codes: `busy`, `bad_request`, `unknown_task`, `unknown_project`,
-`not_running`, `too_many_projects`, `stopping`, `lagged`.
+Error codes: `busy`, `bad_request`, `unknown_task`,
+`not_running`, `stopping`, `lagged`.
 
 `rider limits` and `rider open` from the overall design wait for the config
 file and are not in this milestone. (Call)
@@ -406,16 +336,15 @@ file and are not in this milestone. (Call)
 |---|---|---|
 | `daemon.lock` | pid and start time; taken at start, also by `rider pool` | a second daemon could start |
 | `rider.sock` | the control socket | recreated at start |
-| `daemon.log` | timestamped lines: every claim, spawn, settle, wake-up | history only |
+| `daemon.log` | timestamped lines: every claim, spawn, settle | history only |
 | `cursor` | last feed cursor handled | the feed starts at the head; the snapshot covers the gap |
 | `agents.json` | process group and start time of each running agent | leftover agents are not stopped at restart; their claims lapse |
-| `leads/<project>.json` | lead session id | the next chat starts a new session, which re-reads the board |
 | `worktrees/<repo>/<id>/` plus a `.rider-board` file beside the git link | the board's identity, taken from where its data lives and when it was created | the worktree is treated as foreign and not reused (absorbs #23) |
 
 ## Restart recovery, step by step
 
 1. Take `daemon.lock`. If a live process holds it, say who and exit.
-2. Stop leftover agents and lead turns named in `agents.json`, but only where
+2. Stop leftover agents named in `agents.json`, but only where
    the process group still exists and its start time matches. (Call: agents do
    not outlive the daemon; they are stopped, then re-run in the same worktree.)
 3. Make sure the board answers; start it if not.
@@ -429,10 +358,7 @@ file and are not in this milestone. (Call)
      lease lapses and is claimed in the ordinary way.
 6. Start the feed from the saved cursor, or from the snapshot's cursor when
    there is none.
-7. For each project with a session and open tasks, queue a `restarted`
-   wake-up. Wake-ups queued before the crash are not recovered; `restarted`
-   tells the lead to re-read.
-8. Open the socket. Begin claiming.
+7. Open the socket. Begin claiming.
 
 Worktrees whose task is no longer open are left alone. Removing them stays
 with the completion path and its safety checks.
@@ -518,36 +444,11 @@ with "the pool" read as "the daemon"; the ones below are new.
     board reuses its task id, then the task is blocked as `rider_error`
     naming the worktree, and the worktree is untouched.
 
-**The lead** (a fake `claude` plays the lead: it records the message it was
-given and runs scripted `vb` commands)
+**Notification**
 
-25. *First chat.* When `rider chat demo "<goal>"` runs on a project with no
-    session, then the lead is started without `--resume`, its reply is
-    printed, and a session id is saved.
-26. *Woken on completion.* Given a project with a session, when a task
-    completes, then the lead is resumed with that session and a message
-    containing `completed: <id>`.
-27. *Woken on failure and on block.* Likewise for `failed:` and `blocked:`.
-28. *One turn at a time.* Given a lead turn that takes 5 seconds, when three
-    tasks complete during it, then exactly one more turn runs, and its message
-    lists all three.
-29. *Chat queues.* Given a running turn, when `rider chat demo "x"` runs, then
-    it prints `queued`, the running turn's text, then the reply to "x"; and
-    the turn that carried "x" lists it first.
-30. *Answered decision.* Given a blocked task in `decisions` labelled
-    `project=demo`, when the owner replies in its thread, then the lead is woken with `answered:`.
-31. *Idle.* When the last open task in `work/demo` completes, the message
-    contains `idle:`.
-32. *Failing lead.* Given a lead that exits non-zero three times, then
-    `rider status` shows it halted, no further turns run, and the next
-    `rider chat` starts one that carries the kept wake-ups.
-33. *Restarted.* Given a project with a session and an open task, when the
-    daemon restarts, then the lead's next message contains `restarted:`.
-34. *No session, no wake-up.* Given tasks in a project that has no lead
-    session, when one completes, then no lead process is started.
-35. *The lead does not wake itself.* Given a lead whose turn cancels a task and
-    completes a decision, then no further turn runs until something else
-    happens.
+25. *Decision blocked.* Given a task in `decisions` that is blocked as
+    `awaiting_approval`, then one desktop notification is raised naming the task
+    id and its first line, and a failing notifier does not stop the daemon.
 
 ### Covered only by the simulator, and why
 
@@ -557,11 +458,11 @@ given and runs scripted `vb` commands)
   exits; `down --now` during `Settling`; a kill during `Claiming`; a feed loss
   between `task.ready` and the claim. A scenario cannot place two real
   processes' events in a chosen order.
-- **Bounds that need volume**: `TASKS_MAX`, `WAKEUPS_MAX`, `EVENT_QUEUE_MAX`
-  and `CLIENTS_MAX` at their limits, and the drop rule for wake-ups.
+- **Bounds that need volume**: `TASKS_MAX`, `EVENT_QUEUE_MAX` and
+  `CLIENTS_MAX` at their limits.
 - **Long fault sequences**: repeated board outages, restarts in every phase,
   and failures of every action in turn, across thousands of seeded runs.
-- **Invariants over time**: 3, 4, 10 and 11 above are statements about every
+- **Invariants over time**: 3, 4, 9 and 10 above are statements about every
   step, not about one outcome.
 
 The simulator drives `step` through its events only, with a fake board, git,
@@ -580,7 +481,7 @@ as recovery does.
 | `run_task.rs` | split along its existing seams into the `Prepare`, `Spawn`, `Judge` and `Settle` actions; the settle order changes |
 | `pool.rs`, and `pool` and `run-task` in `cli.rs` | deleted in the last step; until then `rider pool` stays as the fallback and takes the daemon's lock |
 | `rider serve` | kept; `rider up` uses the same code to start the board |
-| `lead/CLAUDE.md` | the `vb wait` step goes; label rules move from "yours to keep" to "Rider checks"; the `project` label on decisions; `restack=1` |
+| lead's `CLAUDE.md` | the lead's instructions live in `skills/ride-swarm/lead.md` and keep the `vb wait` step; label rules move from "yours to keep" to "Rider checks"; `restack=1` |
 
 ## Issues absorbed (Decided)
 
@@ -610,8 +511,7 @@ Each step is one to three issues, and each leaves something usable.
    board down, board restart, the board identity on worktrees. Scenarios 7 to
    9, 22 to 24.
 5. **Label rules and stack-moved detection.** Scenarios 11 to 15.
-6. **The lead.** Wake-ups, turns, `rider chat`, the notification, and the
-   change to `lead/CLAUDE.md`. Scenarios 25 to 35.
+6. **The notification.** Scenario 25.
 7. **Close out.** Widen the simulator's faults, delete `rider pool`, update
    the README.
 
@@ -632,7 +532,6 @@ Each step is one to three issues, and each leaves something usable.
   `serde` derive for the socket and board shapes and a seeded random number
   crate for the simulator are the expected ones. (Call)
 - The exact fields of `status` and `agents` data, and their terminal layout.
-- How the lead's stream is turned into chat text.
 - How the notification is raised, with text never passed as a bare argument.
 - How scenarios shorten the lease and time limits (a test-only setting read
   from the environment is expected).

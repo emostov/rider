@@ -439,8 +439,9 @@ behaviour change adds or changes a scenario first. Tracked as issue #14 and
 built through Rider.
 
 **1. The daemon.** One milestone, designed in `2026-11-19-rider-daemon-design.md`: workers
-under the daemon, the control socket and CLI, restart recovery, the lead under
-the daemon with `rider chat`, and the simulator. It replaces what this document
+under the daemon, the control socket and CLI, restart recovery, the desktop
+notification, and the simulator. The lead is a terminal session, not run by the
+daemon. It replaces what this document
 first split into milestones 1 to 3.
 
 ## v2: working remotely (Decided as the next version, not designed)
