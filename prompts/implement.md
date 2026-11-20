@@ -55,8 +55,12 @@ Post milestones, not heartbeats: a reply is a finished step with its command and
 4. After each meaningful step, reply with what you did, the command you ran, and its result.
 5. Run the brief's proof command. Fix the work until it passes. Then run each scenario the
    task added or changed one at a time (`cargo test --test scenarios <name>`) and
-   `cargo test --test sim`, and fix what fails; the full scenario suite stays in CI. Then
-   polish your own diff against AGENTS.md: there are no separate polish tasks.
+   `cargo test --test sim`, and fix what fails; the full scenario suite stays in CI.
+   Then polish your own diff (there are no separate polish tasks), without changing behaviour:
+   run `cargo fmt` and `cargo clippy --all-targets -- -D warnings` and fix what they report;
+   check every changed line against each `AGENTS.md` rule (bounds, assertions, error enums,
+   comments, function length) and against `${RIDER_HOME:-$HOME/.rider}/prompts/slop-rules.md`;
+   remove dead code, clones and one-use helpers your diff added. Then rerun the proof.
 6. Commit all of it on the current branch: `git add <paths>` then
    `git commit -m "<one sentence saying what changed>"`. Make as many commits as make sense.
 7. Run `git status --porcelain`. It must print nothing. Put scratch files outside the
