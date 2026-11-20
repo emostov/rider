@@ -54,6 +54,18 @@ pub enum Behaviour {
     /// Like `RefuseResume`, but once it has reported the refusal it holds like `Hold` before
     /// it exits 1.
     RefuseResumeThenHold,
+    /// Kills itself with SIGKILL.
+    ExitOnSignal,
+    /// Commits like `Commit`, then reports a failed result and exits 0.
+    CommitReportingFailure,
+    /// Commits like `Commit` and exits 0 without reporting anything.
+    CommitSilently,
+    /// Commits like `Commit`, then reports a result of only whitespace.
+    CommitReportingBlank,
+    /// Checks out a new branch `elsewhere-<task>`, then commits like `Commit`.
+    LeaveBranch,
+    /// Blocks its own task like `Block`, then exits `FAIL_EXIT_CODE`.
+    BlockThenExitNonZero,
 }
 
 impl Behaviour {
@@ -73,6 +85,12 @@ impl Behaviour {
             Behaviour::DropEarlier => "drop-earlier",
             Behaviour::RebaseOntoMain => "rebase-onto-main",
             Behaviour::RefuseResumeThenHold => "refuse-resume-then-hold",
+            Behaviour::ExitOnSignal => "exit-on-signal",
+            Behaviour::CommitReportingFailure => "commit-reporting-failure",
+            Behaviour::CommitSilently => "commit-silently",
+            Behaviour::CommitReportingBlank => "commit-reporting-blank",
+            Behaviour::LeaveBranch => "leave-branch",
+            Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
         }
     }
 }
@@ -203,6 +221,17 @@ case "$behaviour" in
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
     hold
     commit || exit 1 ;;
+  exit-on-signal) kill -KILL $$ ;;
+  commit-reporting-failure)
+    commit || exit 1
+    echo '{{"type":"result","subtype":"error_during_execution","is_error":true}}'
+    exit 0 ;;
+  commit-silently) commit || exit 1; exit 0 ;;
+  commit-reporting-blank) commit || exit 1; summary="  " ;;
+  leave-branch) git checkout -q -b "elsewhere-$task" && commit || exit 1 ;;
+  block-then-exit-non-zero)
+    vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1
+    exit {fail} ;;
   *) echo "unknown behaviour $behaviour" >&2; exit 97 ;;
 esac
 report
