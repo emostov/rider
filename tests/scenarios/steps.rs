@@ -499,6 +499,8 @@ pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
 pub const BOARD_STARTED: &str = "started the board, pid";
 /// The daemon log's line naming a board process a killed daemon started, kept as its own.
 pub const BOARD_KEPT: &str = "kept the board started before, pid";
+/// The daemon log's line for the first stop signal.
+pub const DAEMON_DRAINING: &str = "a stop signal: draining";
 /// How long a held `vb` call waits for its release, in tenths of a second.
 const HELD_TENTHS_MAX: u32 = 1200;
 
@@ -543,6 +545,25 @@ pub fn when_the_daemon_is_sent_sigterm(world: &World) {
         .status()
         .expect("run kill");
     assert!(status.success());
+}
+
+/// When the daemon, once its log shows it is draining, is sent a second SIGTERM; two sent
+/// back to back can reach it as one.
+pub fn when_the_daemon_is_sent_a_second_sigterm(world: &World) {
+    let log = world.home.join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains(DAEMON_DRAINING)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never drained:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+    when_the_daemon_is_sent_sigterm(world);
 }
 
 /// Then the daemon exits within `DAEMON_STOP_SECONDS_MAX`; returns its exit code.

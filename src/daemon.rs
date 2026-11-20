@@ -57,6 +57,8 @@ pub const SUBTREE: &str = "work/";
 pub const DAEMON_PROFILE: &str = "rider-daemon";
 /// What the daemon prints once it follows the board.
 pub const FOLLOWING: &str = "rider daemon: following";
+const DRAIN_LINE: &str = "a stop signal: draining, claiming nothing new";
+const STOP_NOW_LINE: &str = "a second stop signal: stopping now";
 /// The test-only setting that shortens limits: `lease=<ms>,attempt=<ms>,tick=<ms>,grace=<ms>`,
 /// any subset.
 pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
@@ -806,7 +808,17 @@ fn drive(
         }
         let event = absorb(input, &mut contexts, &shared.log);
         let ticked = matches!(event, Event::Tick(_));
+        let signalled = matches!(event, Event::Signal);
         pending = step(state, event);
+        if signalled {
+            let stopping = state.stopping();
+            assert!(stopping != Stopping::No);
+            shared.log.write(if stopping == Stopping::Now {
+                STOP_NOW_LINE
+            } else {
+                DRAIN_LINE
+            });
+        }
         if ticked && state.cursor() != saved {
             saved = state.cursor();
             save_cursor(shared, saved);
