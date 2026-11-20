@@ -336,7 +336,7 @@ fn a_second_sigterm_stops_the_agent_and_leaves_its_task_ready_with_attempt_uncha
     let run = when_the_agent_has_started(&world, &task);
 
     when_the_daemon_is_sent_sigterm(&world);
-    when_the_daemon_is_sent_sigterm(&world);
+    when_the_daemon_is_sent_a_second_sigterm(&world);
 
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert!(!is_alive(run.pid), "the agent {} still runs", run.pid);
@@ -355,7 +355,7 @@ fn a_second_sigterm_kills_an_agent_that_ignores_sigterm_within_the_grace_and_rel
     let run = when_the_agent_has_started(&world, &task);
 
     when_the_daemon_is_sent_sigterm(&world);
-    when_the_daemon_is_sent_sigterm(&world);
+    when_the_daemon_is_sent_a_second_sigterm(&world);
 
     assert!(
         when_the_process_ends_within(run.pid, 5),
@@ -741,7 +741,7 @@ fn a_second_sigterm_while_the_fenced_fail_is_in_flight_finishes_the_failure() {
     }
 
     when_the_daemon_is_sent_sigterm(&world);
-    when_the_daemon_is_sent_sigterm(&world);
+    when_the_daemon_is_sent_a_second_sigterm(&world);
 
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert_eq!(task_state(&world, &task), "failed");
@@ -766,9 +766,10 @@ fn a_task_onto_one_that_is_still_settling_waits_for_its_worktree_and_completes()
     given_the_agent_will(&world, &built, &[Behaviour::Commit]);
     given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
     // The result record is posted after the fenced complete and before the worktree is
-    // released, so the fix is ready while the branch is still checked out.
+    // released, so the fix is ready while the branch is still checked out. Only the result
+    // post is held: the daemon posts the board's identity before it follows.
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "post", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_task_is(&world, &fix, "ready");
