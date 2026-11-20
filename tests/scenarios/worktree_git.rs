@@ -660,3 +660,341 @@ fn a_review_checkout_with_a_commit_only_an_old_head_reflog_id_reaches_is_kept() 
     assert_eq!(state, "completed");
     then_the_detached_worktree_is_kept_because(&world, &qa, "commits only its HEAD reflog reaches");
 }
+
+fn when_the_checkout_changes_after_completion(
+    world: &mut World,
+    task: &str,
+    change: impl Fn(&World, &Path),
+) {
+    let marker = world.root.join("result-posted");
+    let release = world.root.join("release-result");
+    given_vb_waits_for(world, "rider-result@2", &marker, &release);
+    given_a_running_daemon(world);
+    when_the_file_exists(world, &marker);
+    assert_eq!(task_state(world, task), "completed");
+    change(world, &worktree_dir(world, task));
+    fs::write(&release, "").expect("release the result post");
+    when_the_daemon_stops(world);
+}
+
+fn then_a_reply_holds(world: &World, task: &str, text: &str) {
+    let replies: Vec<String> = task_replies(world, task)
+        .iter()
+        .map(|reply| reply.to_string())
+        .collect();
+    assert!(
+        replies.iter().any(|reply| reply.contains(text)),
+        "no reply holds {text:?}: {replies:?}"
+    );
+}
+
+#[test]
+fn a_file_left_in_a_completed_tasks_worktree_before_its_removal_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    when_the_checkout_changes_after_completion(&mut world, &task, |_, dir| {
+        fs::write(dir.join("precious.txt"), "keep me\n").expect("write precious.txt");
+    });
+
+    let kept = fs::read_to_string(worktree_dir(&world, &task).join("precious.txt"));
+    assert_eq!(kept.ok(), Some("keep me\n".to_string()));
+    then_a_reply_holds(&world, &task, "Kept the worktree at");
+}
+
+#[test]
+fn a_completed_tasks_worktree_switched_to_another_branch_before_its_removal_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    when_the_checkout_changes_after_completion(&mut world, &task, |world, dir| {
+        git_in(world, dir, &["switch", "-q", "-c", "other"]);
+    });
+
+    assert!(worktree_dir(&world, &task).is_dir(), "the worktree is kept");
+    then_a_reply_holds(&world, &task, "It was kept because not on its branch.");
+}
+
+#[test]
+fn a_completed_reviews_checkout_moved_before_its_removal_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = a_completed_task(&mut world);
+    when_the_daemon_stops(&mut world);
+    let qa = when_the_lead_creates(&world, &a_qa_task(&world, &built, "Run the work."));
+    given_the_agent_will(&world, &qa, &[Behaviour::CommitNothing]);
+
+    when_the_checkout_changes_after_completion(&mut world, &qa, |world, dir| {
+        git_in(world, dir, &["checkout", "-q", "--detach", MAIN]);
+    });
+
+    then_the_detached_worktree_is_kept_because(&world, &qa, "moved from its start");
+}
+
+#[test]
+fn a_completed_tasks_worktree_with_a_rebase_stopped_before_its_removal_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    when_the_checkout_changes_after_completion(&mut world, &task, |world, dir| {
+        let stopped = world.git(dir, &["rebase", "-q", "--exec", "false", "HEAD~1"]);
+        assert_ne!(stopped.code, Some(0), "the rebase stops: {stopped:?}");
+    });
+
+    then_the_detached_worktree_is_kept_because(&world, &task, "an operation is in progress");
+}
+
+#[test]
+fn a_finished_worktree_with_a_cherry_pick_stopped_after_its_first_commit_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    world.git_ok(&["checkout", "-q", "-b", "picks"]);
+    fs::write(world.repo.join("work.txt"), "theirs\n").expect("write work.txt");
+    world.git_ok(&["add", "--", "work.txt"]);
+    git_in(&world, &world.repo, &["commit", "-q", "-m", "First pick."]);
+    let first = world.git_ok(&["rev-parse", "HEAD"]);
+    let empty = ["commit", "-q", "--allow-empty", "-m", "Second pick."];
+    git_in(&world, &world.repo, &empty);
+    let second = world.git_ok(&["rev-parse", "HEAD"]);
+    world.git_ok(&["checkout", "-q", MAIN]);
+
+    let task = when_a_held_agent_finishes_after(&mut world, |world, dir| {
+        fs::write(dir.join("work.txt"), "ours\n").expect("write work.txt");
+        git_in(world, dir, &["add", "--", "work.txt"]);
+        git_in(world, dir, &["commit", "-q", "-m", "Our work."]);
+        let picked = world.git(dir, &["cherry-pick", &first, &second]);
+        assert_ne!(picked.code, Some(0), "the cherry-pick stops: {picked:?}");
+        fs::write(dir.join("work.txt"), "resolved\n").expect("resolve work.txt");
+        git_in(world, dir, &["commit", "-q", "-a", "--no-edit"]);
+    });
+
+    then_the_worktree_is_kept_because(&world, &task, "an operation is in progress");
+}
+
+#[test]
+fn a_hook_printing_past_git_output_bound_blocks_the_task_and_its_process_group_is_killed() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let hooks = world.root.join("hooks");
+    fs::create_dir_all(&hooks).expect("create the hooks directory");
+    let pid_file = world.root.join("sleeper.pid");
+    let hook = format!(
+        "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nhead -c 4194305 /dev/zero\nexec sleep 60\n",
+        pid_file.display()
+    );
+    crate::world::write_executable(&hooks.join("post-checkout"), &hook);
+    let hooks_path = hooks.to_str().expect("UTF-8 path");
+    world.git_ok(&["config", "core.hooksPath", hooks_path]);
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["blocked"]);
+    when_the_daemon_stops(&mut world);
+
+    let block = task_block(&world, &task).expect("the task has a block");
+    assert_eq!(block.0, "rider_error");
+    assert!(
+        block.1.contains("printed more than 4194304 bytes"),
+        "{block:?}"
+    );
+    let pid = fs::read_to_string(&pid_file).expect("the hook wrote its sleeper's pid");
+    let pid: u32 = pid.trim().parse().expect("a pid");
+    assert!(
+        when_the_process_ends_within(pid, 10),
+        "the hook's background sleep {pid} outlived the git call"
+    );
+}
+
+#[test]
+fn a_task_from_a_branch_other_than_main_is_cut_from_that_branch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    world.git_ok(&["checkout", "-q", "-b", "feature"]);
+    git_in(
+        &world,
+        &world.repo,
+        &["commit", "-q", "--allow-empty", "-m", "Feature."],
+    );
+    let feature = world.git_ok(&["rev-parse", "HEAD"]);
+    world.git_ok(&["checkout", "-q", MAIN]);
+    let mut new = an_implement_task(&world, "Add the work.");
+    new.labels.retain(|(key, _)| key != "from");
+    let task = when_the_lead_creates(&world, &new.label("from", "feature"));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let branch = then_the_branch_has_the_agents_commit(&world, &task, 0);
+    assert_eq!(
+        world.git_ok(&["rev-parse", &format!("{branch}~1")]),
+        feature
+    );
+}
+
+#[test]
+fn a_commit_another_local_branch_also_holds_is_not_the_agents_own() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let new = an_implement_task(&world, "Add the work.");
+
+    let (task, state) = when_a_task_settles_after_a_hold(&mut world, &new, |world, dir| {
+        git_in(
+            world,
+            dir,
+            &["commit", "-q", "--allow-empty", "-m", "Borrowed."],
+        );
+        git_in(world, dir, &["branch", "sibling"]);
+    });
+
+    then_the_task_failed_because(
+        &world,
+        &task,
+        &state,
+        "the branch has no commits of its own",
+    );
+}
+
+#[test]
+fn a_retry_reuses_the_dirty_worktree_of_the_failed_attempt_untouched() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    let new = an_implement_task(&world, "Add the work.");
+
+    let task = when_a_failed_task_is_reopened_after(&mut world, &new, |_, dir| {
+        fs::write(dir.join("README.md"), "precious modification\n").expect("modify README.md");
+        fs::write(dir.join("precious.txt"), "precious untracked\n").expect("write precious.txt");
+    });
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+    when_the_daemon_stops(&mut world);
+    let runs = agent_runs_for(&world, &task);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].dir, worktree_dir(&world, &task));
+    let dir = worktree_dir(&world, &task);
+    let readme = fs::read_to_string(dir.join("README.md")).ok();
+    assert_eq!(readme, Some("precious modification\n".to_string()));
+    let untracked = fs::read_to_string(dir.join("precious.txt")).ok();
+    assert_eq!(untracked, Some("precious untracked\n".to_string()));
+}
+
+#[test]
+fn a_new_task_whose_branch_exists_without_a_worktree_continues_that_branch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let mut new = an_implement_task(&world, "Add the work.");
+    new.role = None;
+    let task = when_the_lead_creates(&world, &new);
+    let branch = format!("rider/{task}-add-the-work");
+    world.git_ok(&["checkout", "-q", "-b", &branch]);
+    git_in(
+        &world,
+        &world.repo,
+        &["commit", "-q", "--allow-empty", "-m", "Existing work."],
+    );
+    let existing = world.git_ok(&["rev-parse", "HEAD"]);
+    world.git_ok(&["checkout", "-q", MAIN]);
+    given_a_running_daemon(&mut world);
+
+    world.vb_lead(&["label", &task, "role=implement"], None);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+    when_the_daemon_stops(&mut world);
+    assert_eq!(
+        then_the_branch_has_the_agents_commit(&world, &task, 0),
+        branch
+    );
+    assert_eq!(
+        world.git_ok(&["rev-parse", &format!("{branch}~1")]),
+        existing
+    );
+}
+
+const INHERITED: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+#[test]
+fn a_daemon_started_with_every_git_repository_variable_starts_agents_with_none_of_them() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let foreign = world.root.join("foreign");
+    let paths: Vec<String> = INHERITED
+        .iter()
+        .map(|name| foreign.join(name).to_str().expect("UTF-8 path").to_string())
+        .collect();
+    let env: Vec<(&str, &str)> = INHERITED
+        .iter()
+        .zip(&paths)
+        .map(|(name, path)| (*name, path.as_str()))
+        .collect();
+    given_a_running_daemon_with(&mut world, &env);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+    when_the_daemon_stops(&mut world);
+
+    then_the_branch_has_the_agents_commit(&world, &task, 0);
+    let seen = fake_agent::git_env(&world.root, &task, 0);
+    let leaked: Vec<&String> = seen
+        .iter()
+        .filter(|name| INHERITED.contains(&name.as_str()))
+        .collect();
+    assert_eq!(leaked, Vec::<&String>::new(), "the agent saw {seen:?}");
+    assert!(
+        !foreign.exists(),
+        "nothing was written to {}",
+        foreign.display()
+    );
+}
+
+#[test]
+fn a_start_label_naming_no_commit_is_ignored() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let new = an_implement_task(&world, "Add the work.").label("start", &"0".repeat(40));
+    let task = when_the_lead_creates(&world, &new);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    then_the_branch_has_the_agents_commit(&world, &task, 0);
+}
+
+#[test]
+fn a_task_whose_heading_is_all_punctuation_gets_the_fallback_branch_name() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "!!! !!!"));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert_eq!(
+        then_the_branch_has_the_agents_commit(&world, &task, 0),
+        format!("rider/{task}-task")
+    );
+}
