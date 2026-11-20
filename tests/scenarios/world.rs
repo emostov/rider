@@ -215,7 +215,7 @@ impl World {
                 "--no-inspect",
                 "--dir",
             ])
-            .arg(self.root.join("board"))
+            .arg(self.home.join("board"))
             .stdout(log)
             .stderr(err)
             .process_group(0)
@@ -230,6 +230,14 @@ impl World {
             thread::sleep(Duration::from_millis(POLL_MILLIS));
         }
         panic!("the board did not answer within {BOARD_START_SECONDS_MAX} seconds");
+    }
+
+    /// Stops the board, deletes its data, and starts a fresh board on the same port.
+    pub fn wipe_board(&mut self) {
+        let mut board = self.board.take().expect("the board was started");
+        assert!(reap(&mut board), "the board outlived its kill");
+        fs::remove_dir_all(self.home.join("board")).expect("delete the board's data");
+        self.start_board();
     }
 
     /// Runs `vb <args> --url <world> --as <profile>`, with `input` on standard input.

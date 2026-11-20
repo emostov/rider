@@ -2,8 +2,10 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use crate::board::{Board, BoardError, LABELS_MAX, TaskId, TaskView};
 use crate::brief::Brief;
@@ -21,6 +23,12 @@ const WORKTREES_DIR: &str = "worktrees";
 const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
 pub const BRANCH_LABEL: &str = "branch";
+// In the worktree's own git directory, beside its `gitdir` link: never a checked-out file, and
+// removed with the worktree.
+const BOARD_RECORD: &str = ".rider-board";
+const BOARD_RECORD_BYTES_MAX: u64 = 4096;
+// Where `vb serve --dir <home>/board` keeps the board's data.
+const BOARD_DATA: &str = "board/local.db";
 // What git keeps in a worktree's git directory while an operation is unfinished.
 const IN_PROGRESS: [&str; 8] = [
     "rebase-merge",
@@ -64,6 +72,16 @@ pub enum WorktreeError {
         dir: PathBuf,
         reason: &'static str,
     },
+    /// The checkout was made for another board, or its record of the board is missing.
+    ForeignBoard {
+        dir: PathBuf,
+        record: Record,
+    },
+    /// The board's identity or the worktree's record of it could not be read or written.
+    BoardRecord {
+        path: PathBuf,
+        why: String,
+    },
     /// The checkout is not on the task's branch, or not detached when it should be; `None`
     /// stands for a detached HEAD.
     NotOnBranch {
@@ -71,6 +89,45 @@ pub enum WorktreeError {
         on: Option<String>,
         expected: Option<String>,
     },
+}
+
+/// What a reused worktree's record of its board was found to be, when it is not this board's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Record {
+    Missing,
+    Different,
+}
+
+/// Which board a worktree is made for: where its data lives and when that data was created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardIdentity(String);
+
+impl BoardIdentity {
+    /// The board whose data is under `home`, or the board at `url` when its data is elsewhere.
+    pub fn read(home: &Path, url: &str) -> Result<BoardIdentity, WorktreeError> {
+        assert!(home.is_absolute(), "rider's home is an absolute path");
+        assert!(!url.is_empty());
+        let data = home.join(BOARD_DATA);
+        let failed = |why: String| WorktreeError::BoardRecord {
+            path: data.clone(),
+            why,
+        };
+        let created = match fs::metadata(&data) {
+            Ok(metadata) => metadata
+                .created()
+                .map_err(|error| failed(error.to_string()))?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(BoardIdentity(format!("url {url}\n")));
+            }
+            Err(error) => return Err(failed(error.to_string())),
+        };
+        let since = created.duration_since(UNIX_EPOCH);
+        let since = since.map_err(|_| failed("created before 1970".to_string()))?;
+        let (seconds, nanos) = (since.as_secs(), since.subsec_nanos());
+        let identity = format!("data {}\ncreated {seconds}.{nanos:09}\n", data.display());
+        assert!(identity.starts_with("data /"));
+        Ok(BoardIdentity(identity))
+    }
 }
 
 impl fmt::Display for WorktreeError {
@@ -109,6 +166,16 @@ impl fmt::Display for WorktreeError {
             }
             WorktreeError::NotReleasable { dir, reason } => {
                 write!(f, "{} cannot be removed safely: {reason}", dir.display())
+            }
+            WorktreeError::ForeignBoard { dir, record } => {
+                let found = match record {
+                    Record::Missing => "it has no .rider-board record",
+                    Record::Different => "its .rider-board record names another board",
+                };
+                write!(f, "{} was not made for this board: {found}", dir.display())
+            }
+            WorktreeError::BoardRecord { path, why } => {
+                write!(f, "the board record {} failed: {why}", path.display())
             }
             WorktreeError::NotOnBranch { dir, on, expected } => {
                 let head = |branch: &Option<String>| match branch {
@@ -340,10 +407,50 @@ fn is_checkout_of(dir: &Path, repo: &Path) -> Result<bool, WorktreeError> {
     Ok(same)
 }
 
-fn reuse(brief: &Brief, board: &dyn Board, dir: PathBuf) -> Result<Checkout, WorktreeError> {
+fn record_path(dir: &Path) -> Result<PathBuf, WorktreeError> {
+    let path = git::git_dir(dir)?.join(BOARD_RECORD);
+    assert!(path.is_absolute() && path.ends_with(BOARD_RECORD));
+    Ok(path)
+}
+
+fn recorded_board(dir: &Path) -> Result<Option<String>, WorktreeError> {
+    let path = record_path(dir)?;
+    let failed = |error: std::io::Error| WorktreeError::BoardRecord {
+        path: path.clone(),
+        why: error.to_string(),
+    };
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failed(error)),
+    };
+    let mut bytes = Vec::new();
+    let read = file
+        .take(BOARD_RECORD_BYTES_MAX + 1)
+        .read_to_end(&mut bytes);
+    read.map_err(failed)?;
+    assert!(u64::try_from(bytes.len()).is_ok_and(|n| n <= BOARD_RECORD_BYTES_MAX + 1));
+    // A record too long or not UTF-8 is not this board's, whose record is short text.
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn reuse(
+    brief: &Brief,
+    board: &dyn Board,
+    dir: PathBuf,
+    identity: &BoardIdentity,
+) -> Result<Checkout, WorktreeError> {
     assert!(dir.is_absolute());
     if !is_checkout_of(&dir, &brief.repo)? {
         return Err(WorktreeError::NotACheckout(dir));
+    }
+    let record = match recorded_board(&dir)? {
+        None => Some(Record::Missing),
+        Some(found) if found != identity.0 => Some(Record::Different),
+        Some(_) => None,
+    };
+    if let Some(record) = record {
+        return Err(WorktreeError::ForeignBoard { dir, record });
     }
     let expected = match brief.role.commits_expected {
         true => Some(expected_branch(brief, board)?),
@@ -384,16 +491,27 @@ pub fn dir_for(brief: &Brief, home: &Path) -> PathBuf {
     home.join(WORKTREES_DIR).join(project).join(id)
 }
 
-/// The task's checkout under `home`, reused exactly as found or else added as the brief says.
-pub fn prepare(brief: &Brief, board: &dyn Board, home: &Path) -> Result<Checkout, WorktreeError> {
+/// The task's checkout under `home`, reused exactly as found when it was made for the board
+/// `identity` names, or else added as the brief says and marked as made for that board.
+pub fn prepare(
+    brief: &Brief,
+    board: &dyn Board,
+    home: &Path,
+    identity: &BoardIdentity,
+) -> Result<Checkout, WorktreeError> {
     let dir = dir_for(brief, home);
     assert!(dir.starts_with(home) && dir != home);
     // Anything at the path counts, even a dangling symlink: it is never replaced.
     if fs::symlink_metadata(&dir).is_ok() {
-        return reuse(brief, board, dir);
+        return reuse(brief, board, dir, identity);
     }
     let plan = plan(brief, board)?;
     let branch = add(&brief.repo, &dir, plan)?;
+    let path = record_path(&dir)?;
+    fs::write(&path, &identity.0).map_err(|error| WorktreeError::BoardRecord {
+        path,
+        why: error.to_string(),
+    })?;
     let start_head = git::head(&dir)?;
     assert!(brief.role.commits_expected == branch.is_some());
     Ok(Checkout {
@@ -457,6 +575,11 @@ mod tests {
     use std::fs;
 
     const BASE_BRANCH: &str = "rider/3-token-store";
+
+    fn prepare(brief: &Brief, board: &dyn Board, home: &Path) -> Result<Checkout, WorktreeError> {
+        let identity = BoardIdentity("url http://board.invalid\n".to_string());
+        super::prepare(brief, board, home, &identity)
+    }
 
     fn task(id: u64, branch: Option<&str>) -> TaskView {
         let labels = branch.map(|b| ("branch".to_string(), b.to_string()));

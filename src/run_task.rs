@@ -18,7 +18,7 @@ use crate::harness::{
 };
 use crate::roles::{Harness, RoleSpec};
 use crate::settle::{Outcome, Verdict, judge};
-use crate::worktree::{self, BRANCH_LABEL, Checkout, WorktreeError};
+use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
@@ -434,7 +434,9 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = worktree::prepare(&brief, board, &env.home);
+    let identity = BoardIdentity::read(&env.home, &env.board_url);
+    let identity = identity.map_err(|error| worktree_block(&error))?;
+    let checkout = worktree::prepare(&brief, board, &env.home, &identity);
     let checkout = checkout.map_err(|error| worktree_block(&error))?;
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
@@ -662,7 +664,14 @@ fn worktree_block(error: &WorktreeError) -> Block {
              this task."
             ),
         ),
+        WorktreeError::ForeignBoard { .. } => Block::new(
+            "rider_error",
+            format!(
+                "Rider will not reuse the worktree: {error}. Move it aside or remove it, then unblock this task."
+            ),
+        ),
         WorktreeError::NotACheckout(_)
+        | WorktreeError::BoardRecord { .. }
         | WorktreeError::NotOnBranch { .. }
         | WorktreeError::NotReleasable { .. }
         | WorktreeError::Git(_)

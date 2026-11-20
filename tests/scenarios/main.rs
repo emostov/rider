@@ -1161,3 +1161,50 @@ fn a_panicking_world_kills_its_wrapped_vb_and_spares_a_process_that_names_its_pa
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn a_task_reusing_the_id_of_a_task_on_a_wiped_board_is_blocked_and_its_worktree_untouched() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let old = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &old, &[Behaviour::Block, Behaviour::Commit]);
+    let (states, _) = when_the_pool_runs_until_settled(&mut world, &[&old]);
+    assert_eq!(states, vec!["blocked"]);
+    let dir = worktree_dir(&world, &old);
+    let before = worktree_state(&world, &dir);
+    when_the_board_is_wiped(&mut world);
+
+    let new = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&new]);
+
+    assert_eq!(new, old, "the fresh board reuses the id");
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let text = task_text(&world, &new);
+    assert!(text.contains("rider_error"), "{text}");
+    assert!(text.contains(dir.to_str().expect("UTF-8 path")), "{text}");
+    assert_eq!(agent_runs_for(&world, &new).len(), 1);
+    assert_eq!(worktree_state(&world, &dir), before);
+}
+
+#[test]
+fn the_daemon_blocks_a_task_whose_worktree_has_no_board_record_and_leaves_it_untouched() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let dir = given_a_leftover_worktree(&world, &task, &format!("rider/{task}-add-the-work"));
+    fs::write(dir.join("left.txt"), "left behind\n").expect("write a leftover file");
+    let before = worktree_state(&world, &dir);
+
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["blocked"]);
+    let text = task_text(&world, &task);
+    assert!(text.contains("rider_error"), "{text}");
+    assert!(text.contains(dir.to_str().expect("UTF-8 path")), "{text}");
+    assert_eq!(agent_runs_for(&world, &task), vec![]);
+    assert_eq!(worktree_state(&world, &dir), before);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}

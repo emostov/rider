@@ -78,11 +78,7 @@ impl NewTask {
 pub fn given_a_board_and_a_repository() -> Option<World> {
     let mut world = World::new()?;
     world.start_board();
-    for (name, file) in SCHEMAS {
-        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
-        let file = file.to_str().expect("UTF-8 path");
-        world.vb_lead(&["schemas", "create", name, "--file", file], None);
-    }
+    register_schemas(&world);
     fs::create_dir_all(&world.repo).expect("create the repository");
     let repo = world.repo.clone();
     for args in [
@@ -98,6 +94,41 @@ pub fn given_a_board_and_a_repository() -> Option<World> {
     world.git_ok(&["commit", "-q", "-m", "Start the scratch repository"]);
     assert_eq!(world.git_ok(&["branch", "--show-current"]), MAIN);
     Some(world)
+}
+
+fn register_schemas(world: &World) {
+    for (name, file) in SCHEMAS {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let file = file.to_str().expect("UTF-8 path");
+        world.vb_lead(&["schemas", "create", name, "--file", file], None);
+    }
+}
+
+/// When the board's data is deleted and a fresh board, with the schemas, takes its place.
+pub fn when_the_board_is_wiped(world: &mut World) {
+    world.wipe_board();
+    register_schemas(world);
+}
+
+/// Given a worktree on a new `branch` at `id`'s worktree directory that rider did not make.
+pub fn given_a_leftover_worktree(world: &World, id: &str, branch: &str) -> PathBuf {
+    let dir = worktree_dir(world, id);
+    let dir_text = dir.to_str().expect("UTF-8 path");
+    world.git_ok(&["worktree", "add", "-q", "-b", branch, dir_text, MAIN]);
+    dir
+}
+
+/// The worktree's HEAD and its `git status --porcelain`, to show it was left untouched.
+pub fn worktree_state(world: &World, dir: &Path) -> (String, String) {
+    let head = world.git(dir, &["rev-parse", "HEAD"]);
+    let status = world.git(dir, &["status", "--porcelain"]);
+    assert_eq!((head.code, status.code), (Some(0), Some(0)));
+    (head.stdout, status.stdout)
+}
+
+/// The task's whole `vb read <id> --json` output, where its block reason is.
+pub fn task_text(world: &World, id: &str) -> String {
+    world.vb_lead(&["read", id, "--json"], None)
 }
 
 /// An implement task in the world's repository, cut from `main`.
