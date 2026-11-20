@@ -1,5 +1,6 @@
 //! The prompt, lead, and schema files rider ships carry what the agents and the board rely on.
 
+use rider::cli::PROMPTS;
 use rider::roles::ROLES;
 use serde_json::Value;
 use std::fs;
@@ -7,6 +8,8 @@ use std::path::Path;
 
 /// Each prompt file is read in full by an agent working unattended, so it stays short.
 const PROMPT_LINES_MAX: usize = 100;
+/// The slop rules are read in full on every polish, so they stay short too.
+const SLOP_RULES_LINES_MAX: usize = 100;
 
 fn asset(path: &str) -> String {
     let full = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
@@ -33,6 +36,19 @@ fn every_role_has_a_short_prompt_that_names_its_task_and_the_permission_rule() {
         let lines = prompt.lines().count();
         assert!(lines < PROMPT_LINES_MAX, "{path} has {lines} lines");
     }
+}
+
+#[test]
+fn the_embedded_slop_rules_are_short_and_agents_md_wins() {
+    let rules = asset("prompts/slop-rules.md");
+    let embedded = PROMPTS.iter().find(|(name, _)| *name == "slop-rules.md");
+    assert_eq!(embedded, Some(&("slop-rules.md", rules.as_str())));
+    assert!(rules.contains("`AGENTS.md` wins"));
+    let lines = rules.lines().count();
+    assert!(
+        lines < SLOP_RULES_LINES_MAX,
+        "slop-rules.md has {lines} lines"
+    );
 }
 
 #[test]
