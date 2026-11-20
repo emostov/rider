@@ -3,31 +3,23 @@
 use rider::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, run};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+use tempfile::{Builder, TempDir};
 
 /// A fresh directory under the system temp dir, removed when dropped.
 struct Scratch {
+    _dir: TempDir,
     root: PathBuf,
 }
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let unique = format!("rider-harness-{name}-{}-{n}", std::process::id());
-        let root = std::env::temp_dir().join(unique);
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        Scratch {
-            root: root.canonicalize().unwrap(),
-        }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        let dir = Builder::new()
+            .prefix(&format!("rider-harness-{name}-"))
+            .tempdir()
+            .unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        Scratch { _dir: dir, root }
     }
 }
 
