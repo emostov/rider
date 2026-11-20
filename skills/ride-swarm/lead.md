@@ -287,7 +287,8 @@ By default, as work resolves an issue, close it or link it to the PR that closes
 - Work that ships as a PR: put one `Closes #<n>` line per resolved GitHub issue in the PR
   description, so merging closes them. Link a Linear issue through the Linear MCP.
 - An issue only partly resolved stays open, with a comment saying what remains.
-- File a GitHub issue (`gh issue create`) only for work you decide not to do in this run, close it when the work lands, and never mirror board findings into issues.
+- Keep deferred work on the board: one thread in `work/<project>` collects it, one reply per item. File GitHub
+  issues (`gh issue create`) only when the run ends, one per item still open; never mirror board findings into issues.
 
 ## Telling the owner where it stands
 
