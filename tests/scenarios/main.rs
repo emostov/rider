@@ -204,6 +204,117 @@ fn a_qa_agent_that_commits_fails_and_leaves_the_tested_branch_alone() {
 }
 
 #[test]
+fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_alone() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    let branch = then_the_branch_has_the_agents_commit(&world, &built, 0);
+    let head = branch_head(&world, &branch);
+    assert_eq!(fake_agent::head(&world.root, &review, 0), (head, None));
+    let runs = agent_runs_for(&world, &review);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].dir, worktree_dir(&world, &review));
+    assert_eq!(task_label(&world, &review, "branch"), None);
+    assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
+    then_the_worktree_is_removed(&world, &review);
+    then_only_the_repository_is_a_worktree(&world);
+}
+
+#[test]
+fn a_task_with_no_repo_label_is_blocked_as_an_invalid_brief_and_no_agent_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = NewTask::new("Add the work.")
+        .label("from", MAIN)
+        .role("implement");
+    let task = when_the_lead_creates(&world, &task);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = "Set the `repo` label to the absolute path of the repository.";
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("invalid_brief".to_string(), reason.to_string()))
+    );
+    assert_eq!(agent_runs(&world), vec![]);
+    assert_eq!(branches(&world), vec![MAIN.to_string()]);
+}
+
+#[test]
+fn an_agent_that_commits_nothing_fails_and_once_reopened_completes_on_the_same_branch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(
+        &world,
+        &task,
+        &[Behaviour::CommitNothing, Behaviour::Commit],
+    );
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+    let text = task_text(&world, &task);
+    let reason = "no committed work: the branch has no commits of its own";
+    assert!(text.contains(reason), "{text}");
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let first = task_label(&world, &task, "branch").expect("the failed task's branch");
+
+    world.vb_lead(&["tasks", "reopen", &task], None);
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(
+        (states, then_the_daemon_exits(&mut world)),
+        (vec!["completed".to_string()], Some(0))
+    );
+    assert_eq!(
+        then_the_branch_has_the_agents_commit(&world, &task, 1),
+        first
+    );
+    assert_eq!(branches(&world), vec![MAIN.to_string(), first]);
+    let runs = agent_runs_for(&world, &task);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].dir, runs[1].dir);
+    then_the_worktree_is_removed(&world, &task);
+    then_only_the_repository_is_a_worktree(&world);
+}
+
+#[test]
+fn an_agent_that_leaves_uncommitted_changes_fails_and_its_worktree_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
+    let text = task_text(&world, &task);
+    let reason = "no committed work: the worktree has uncommitted changes";
+    assert!(text.contains(reason), "{text}");
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let left = worktree_dir(&world, &task).join(format!("uncommitted-{task}.txt"));
+    let left = fs::read_to_string(&left).expect("the uncommitted file is kept");
+    assert_eq!(left, "left behind\n");
+}
+
+#[test]
 fn the_daemon_claims_a_new_task_with_a_role_within_five_seconds() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
