@@ -130,3 +130,17 @@ Recorded on a scratch board, `vb serve --dir <temp> --port 4177 --no-open --no-i
 - `vb tasks release 2 --as opus-1 --json`: exit 0, `{task, outcome: "released"}`, state `ready`, `claim` null, epoch unchanged (`release.json`).
 - `vb tasks complete 2 --as opus-1 --json -- done` after the release: exit 1, stdout empty, stderr `reason: "claim_not_held"` (`claim-not-held.stderr.txt`). `vb tasks renew` of a task the profile does not hold gives the same reason.
 - Claimed again, then `vb tasks cancel 2 --json -- scratch` as the owner, then the same complete: exit 1, stderr `reason: "claim_lost"`, with `data.error.code` `claim_lost` and status 409 (`claim-lost.stderr.txt`). A renewal of the canceled task afterwards gave `claim_not_held`.
+
+## The event feed: `vb tail --json`
+
+Recorded on a scratch board, `vb serve --dir <temp> --port 4178 --no-open --no-inspect`, never the board on 4100. Channel `work/scratch`, a two-task plan (`a`, id 2; `b`, id 4, needing `a`), worked as the owner and as `--as w-1`. A `vb tail --after 0 --json` with no channel ran throughout.
+
+- One JSON object per line, for the whole board: `{cursor, type, createdAt, payload, message, actor}`. `cursor` is a decimal string, and replies, tasks and events share one counter. `message` is the full message after the event, with `channel`, `labels` and, on a task, `task.state`.
+- Fixtures, one raw line each: `tail-task-created.json` (3), `tail-labels-changed.json` (6, `vb label`), `tail-task-claimed.json` (8), `tail-task-released.json` (9), `tail-task-expired.json` (11, a claim with `--lease 30s` left to run out), `tail-task-blocked.json` (13), `tail-message-posted-reply.json` (14, a reply by the owner in the blocked thread), `tail-task-unblocked.json` (15), `tail-task-failed.json` (17), `tail-task-reopened.json` (18), `tail-task-completed.json` (20), `tail-task-ready.json` (21), `tail-task-canceled.json` (22).
+- `--lease` takes 30s to 1h; `--lease 2s` exits 2, `invalid_arguments`.
+- A plan task appears first as `message.posted` (cursor 2) whose `message` has no `task`, then as `task.created` (3) with `board.task` set.
+- A reply's `message` is the reply: `re` holds the root's id, its own `labels` (here `{}`) and no `task`, so the event does not carry the root's state.
+- On every task event `payload.id` equals `message.id`. `task.claimed` has `payload.until`; `task.blocked` has `payload.kind` and `reason`; `task.failed` and `task.canceled` have `reason`; `task.completed` has `result`.
+- `actor` is `{id, kind, handle, ...}`: `kind` `person` with id `local:user:<login>` for the owner, `agent` with id `local:user:<login>+<profile>` for a profile. `task.expired` and `task.ready` have no `actor` key at all: the board did them.
+- `task.ready` (21) is printed when a task's needs are met (task 4, after 2 completed). It is not one of the types the feed names, so it passes as "other".
+- `vb tail` stayed running, printing nothing, while its board was stopped. When the board was started again on the same directory and port, both running tails printed `reason: "login_required"` ("invalid token: signature verification failed", status 401) on stderr and exited; the exit code was not recorded. A new `vb tail --after 22 --json` then printed the next event (23, a reply) and kept following.
