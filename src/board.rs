@@ -1489,6 +1489,8 @@ mod tests {
     use std::fs;
     use std::io::{Error, ErrorKind};
 
+    use crate::test_support::write_executable;
+
     #[test]
     fn kill_group_returns_the_error_when_neither_signal_lands() {
         let mut child = Process::new("sleep")
@@ -1927,12 +1929,10 @@ mod tests {
 
     /// A stand-in vb in a fresh directory, running `body`.
     fn stand_in(name: &str, body: &str) -> (VbCli, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("rider-board-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let vb = dir.join("vb");
-        fs::write(&vb, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&vb, &format!("#!/bin/sh\n{body}"));
         let board = VbCli {
             vb,
             url: "http://127.0.0.1:1".into(),
@@ -2090,47 +2090,49 @@ printf '],"cursor":"%s"}}\n' $cursor
         );
     }
 
+    /// Upper bound on the runs of one timeout test whose `sh` is too slow to write its pid.
+    const TIMEOUT_RUNS_MAX: usize = 5;
+
     /// Runs `read_task` against a stand-in vb made of `body`, which writes the pid to kill to
     /// `$0.pid`, and checks the call times out at the limit and that pid is gone afterwards.
     fn times_out_and_kills(name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("rider-board-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let vb = dir.join("vb");
-        fs::write(&vb, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
-        let board = VbCli {
-            vb: vb.clone(),
-            url: "http://127.0.0.1:1".into(),
-            profile: "tester".into(),
-        };
-        let started = Instant::now();
-        let result = board.read_task(TaskId(7));
-        let took = started.elapsed();
-        assert!(
-            matches!(
-                result,
-                Err(BoardError::TimedOut {
-                    call: "read",
-                    seconds: CALL_SECONDS
-                })
-            ),
-            "{result:?}"
-        );
         let limit = Duration::from_secs(u64::from(CALL_SECONDS));
-        assert!(
-            took >= limit && took < limit + Duration::from_secs(1),
-            "{took:?}"
-        );
-        let pid = fs::read_to_string(dir.join("vb.pid")).unwrap();
-        let pid = Pid::from_raw(pid.trim().parse().unwrap()).unwrap();
-        // A killed descendant stays a zombie until its new parent reaps it.
-        let gone = (0..100).any(|_| {
-            thread::sleep(Duration::from_millis(20));
-            rustix::process::test_kill_process(pid) == Err(Errno::SRCH)
-        });
-        assert!(gone, "{} is still running", pid.as_raw_pid());
-        fs::remove_dir_all(&dir).unwrap();
+        for run in 0..TIMEOUT_RUNS_MAX {
+            let (board, dir) = stand_in(&format!("{name}-{run}"), body);
+            let started = Instant::now();
+            let result = board.read_task(TaskId(7));
+            let took = started.elapsed();
+            assert!(
+                matches!(
+                    result,
+                    Err(BoardError::TimedOut {
+                        call: "read",
+                        seconds: CALL_SECONDS
+                    })
+                ),
+                "{result:?}"
+            );
+            assert!(
+                took >= limit && took < limit + Duration::from_secs(1),
+                "{took:?}"
+            );
+            // On a loaded machine `sh` may be killed before it writes the pid; that run proves
+            // nothing, and everything it started went with its group.
+            let Ok(pid) = fs::read_to_string(dir.join("vb.pid")) else {
+                fs::remove_dir_all(&dir).unwrap();
+                continue;
+            };
+            let pid = Pid::from_raw(pid.trim().parse().unwrap()).unwrap();
+            // A killed descendant stays a zombie until its new parent reaps it.
+            let gone = (0..100).any(|_| {
+                thread::sleep(Duration::from_millis(20));
+                rustix::process::test_kill_process(pid) == Err(Errno::SRCH)
+            });
+            assert!(gone, "{} is still running", pid.as_raw_pid());
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        panic!("{name}: no run of {TIMEOUT_RUNS_MAX} wrote its pid before the limit");
     }
 
     #[test]
