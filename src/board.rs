@@ -970,14 +970,26 @@ fn wait_until(
 }
 
 /// Sends SIGKILL to the process group `child` leads, then kills and reaps `child`. A group that
-/// is already gone is not an error.
+/// is already gone is not an error. A child that could not be killed is never waited on.
 pub(crate) fn kill_group(child: &mut Child) -> Result<(), BoardError> {
+    kill_group_with(
+        child,
+        |group| kill_process_group(group, Signal::KILL),
+        |child| child.kill(),
+    )
+}
+
+fn kill_group_with(
+    child: &mut Child,
+    signal_group: impl FnOnce(Pid) -> Result<(), Errno>,
+    kill_child: impl FnOnce(&mut Child) -> std::io::Result<()>,
+) -> Result<(), BoardError> {
     let group = Pid::from_child(child);
     assert!(
         group.as_raw_pid() > 1,
         "never signal the caller's own group"
     );
-    let signalled = match kill_process_group(group, Signal::KILL) {
+    let signalled = match signal_group(group) {
         Ok(()) => Ok(()),
         Err(Errno::SRCH) => Ok(()),
         Err(error) => Err(BoardError::Kill(format!(
@@ -985,10 +997,20 @@ pub(crate) fn kill_group(child: &mut Child) -> Result<(), BoardError> {
             group.as_raw_pid()
         ))),
     };
-    // `vb` itself may already be reaped, so neither result says anything more.
-    let _ = child.kill();
-    let _ = child.wait();
-    signalled
+    match kill_child(child) {
+        Ok(()) => {
+            let _ = child.wait();
+            signalled
+        }
+        Err(error) => match child.try_wait() {
+            // `vb` already exited, so there is nothing left to kill.
+            Ok(Some(_)) => signalled,
+            Ok(None) | Err(_) => signalled.and(Err(BoardError::Kill(format!(
+                "child {}: {error}",
+                group.as_raw_pid()
+            )))),
+        },
+    }
 }
 
 /// Feeds `input` to `child` and reads both of its streams, each on its own thread so no full
@@ -1361,6 +1383,27 @@ pub mod testing {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn kill_group_returns_the_error_when_neither_signal_lands() {
+        let mut child = Process::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let result = kill_group_with(
+            &mut child,
+            |_| Err(Errno::PERM),
+            |_| Err(Error::new(ErrorKind::PermissionDenied, "denied")),
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let expected = format!("group {}: {}", child.id(), Errno::PERM);
+        assert!(matches!(result, Err(BoardError::Kill(ref m)) if *m == expected));
+        kill_group(&mut child).unwrap();
+    }
 
     #[test]
     fn parses_a_recorded_task() {
