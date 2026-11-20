@@ -30,12 +30,10 @@ pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
 /// Every role's prompt file and the files they read, once each, built into the binary.
-pub const PROMPTS: [(&str, &str); 6] = [
+pub const PROMPTS: [(&str, &str); 4] = [
     ("implement.md", include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
-    ("polish.md", include_str!("../prompts/polish.md")),
     ("security.md", include_str!("../prompts/security.md")),
-    ("slop-rules.md", include_str!("../prompts/slop-rules.md")),
     ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
@@ -89,7 +87,11 @@ pub enum Command {
         id: TaskId,
     },
     /// Print the effective rider.toml: the built-in roles and limits with the file's over them.
-    Config,
+    Config {
+        /// Print the role table as this repository's tasks see it.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+    },
     /// List orphaned vb processes whose board no longer answers.
     ///
     /// Only those on the given boards if any; --yes stops them.
@@ -346,7 +348,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Agents => agents(config),
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
-        Command::Config => print_config(config),
+        Command::Config { repo } => print_config(config, repo.as_deref()),
         Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
     }
 }
@@ -391,16 +393,23 @@ fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliErro
 fn settings(config: &Config) -> Result<(&'static [RoleSpec], Limits), CliError> {
     let settings = config::load(&config.home).map_err(CliError::ConfigFile)?;
     let limits = settings.limits;
-    let table = roles::install(settings.roles).map_err(|_| CliError::TableInstalled)?;
+    let repos = settings.repos.into_iter().map(|repo| repo.roles).collect();
+    let table = roles::install(settings.roles, repos).map_err(|_| CliError::TableInstalled)?;
     assert!(!table.is_empty() && limits.agents > 0);
     Ok((table, limits))
 }
 
-fn print_config(config: &Config) -> Result<u8, CliError> {
+fn print_config(config: &Config, repo: Option<&Path>) -> Result<u8, CliError> {
     let settings = config::load(&config.home).map_err(CliError::ConfigFile)?;
-    assert!(settings.toml.ends_with('\n'));
+    let canonical = repo.map(|repo| repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()));
+    let toml = settings
+        .repos
+        .iter()
+        .find(|entry| canonical.as_ref() == Some(&entry.roles.repo))
+        .map_or(&settings.toml, |entry| &entry.toml);
+    assert!(toml.ends_with('\n') && toml.starts_with("[limits]"));
     let mut out = io::stdout().lock();
-    out.write_all(settings.toml.as_bytes())
+    out.write_all(toml.as_bytes())
         .map_err(|error| CliError::Io {
             action: "write",
             path: PathBuf::from("standard output"),
@@ -916,7 +925,7 @@ mod tests {
     fn every_role_has_an_embedded_prompt() {
         for (index, (name, _)) in PROMPTS.iter().enumerate() {
             assert!(
-                *name == "slop-rules.md" || ROLES.iter().any(|role| role.prompt_file == *name),
+                ROLES.iter().any(|role| role.prompt_file == *name),
                 "{name} is unused"
             );
             assert!(!PROMPTS[..index].iter().any(|(earlier, _)| earlier == name));

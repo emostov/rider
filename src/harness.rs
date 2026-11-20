@@ -803,6 +803,7 @@ mod tests {
         slots: 1,
         pool_slots: 1,
         prompt_file: "none.md",
+        skills: &[],
     };
 
     const PROMPT: &str = "Do the task.";

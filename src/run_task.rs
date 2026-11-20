@@ -11,14 +11,14 @@ use serde::Serialize;
 use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
-use crate::brief::{Brief, echo, label, parse_brief};
+use crate::brief::{Brief, BriefError, echo, label, parse_brief};
 use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
     SESSION_BYTES_MAX, SessionId, command_for,
 };
-use crate::roles::{Harness, RoleSpec};
+use crate::roles::{Harness, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, Checkout, WorktreeError};
 
@@ -375,7 +375,11 @@ pub fn launch_agent(cmd: &CommandLine, dir: &Path, log: &Path) -> Result<Exit, H
 fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
     assert!(attempts > 0 && attempts <= ATTEMPTS_MAX);
     let invalid = |reason: String| Block::new("invalid_brief", reason);
-    let brief = parse_brief(view).map_err(|error| invalid(error.to_string()))?;
+    let mut brief = parse_brief(view).map_err(|error| invalid(error.to_string()))?;
+    brief.role = role_in_repo(brief.role, &brief.repo);
+    if brief.role.needs_of && brief.of.is_none() {
+        return Err(invalid(BriefError::ReviewWithoutOf.to_string()));
+    }
     let failed = match label(view, ATTEMPT_LABEL) {
         None => 0,
         Some(value) => parse_attempts(value).ok_or_else(|| {
@@ -603,6 +607,19 @@ fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> 
     if retry {
         prompt.push_str("\n\n");
         prompt.push_str(RETRY_NOTE);
+    }
+    if !brief.role.skills.is_empty() {
+        let names: Vec<String> = brief
+            .role
+            .skills
+            .iter()
+            .map(|skill| format!("`{skill}`"))
+            .collect();
+        prompt.push_str(&format!(
+            "\n\nBefore you complete, run each of these skills in order over the task's whole \
+             PR range, every commit on its branch, and fix what each one reports: {}.",
+            names.join(", then ")
+        ));
     }
     assert!(prompt.starts_with(role_prompt));
     assert!(prompt.contains(brief.text.as_str()));
@@ -1372,7 +1389,6 @@ mod tests {
     #[test]
     fn an_onto_task_runs_after_its_target_completed_with_ignored_build_output() {
         let (fixture, env) = setup("run-onto-after");
-        fs::write(env.prompts.join("polish.md"), "You polish one task.\n").unwrap();
         let board = FakeBoard::new(vec![task(&fixture, &[])]);
         let build = |_: &CommandLine, dir: &Path, log: &Path| {
             fixture.commit(dir, ".gitignore", "target/\n");
@@ -1384,15 +1400,15 @@ mod tests {
         assert_eq!(run(&env, &board, &build), completed("Extracted the store."));
         let repo = fixture.repo.to_str().unwrap();
         let target = view(7, &[("branch", BRANCH)], TaskState::Completed);
-        let labels = [("role", "polish"), ("repo", repo), ("onto", "#7")];
+        let labels = [("role", "light"), ("repo", repo), ("onto", "#7")];
         *board.tasks.borrow_mut() = vec![target, view(8, &labels, TaskState::Claimed)];
-        let polish = |_: &CommandLine, dir: &Path, log: &Path| {
+        let tidy = |_: &CommandLine, dir: &Path, log: &Path| {
             assert_eq!(git(dir, &["symbolic-ref", "--short", "HEAD"]), BRANCH);
-            fixture.commit(dir, "polish.txt", "polished");
+            fixture.commit(dir, "tidy.txt", "tidied");
             write_log(log, &format!("{DONE_STREAM}\n"));
             Ok(Exit::Code(0))
         };
-        let ran = run_task(TaskId(8), &env, &board, None, &polish).unwrap();
+        let ran = run_task(TaskId(8), &env, &board, None, &tidy).unwrap();
         assert_eq!(ran, Ran::Settled(completed("Extracted the store.")));
     }
 
