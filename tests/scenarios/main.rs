@@ -8,6 +8,7 @@
 mod fake_agent;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
+mod run_task;
 mod world;
 
 use std::fs;
