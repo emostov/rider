@@ -1,6 +1,6 @@
 ---
 name: ship-swarm
-description: Use when the user asks to ship the stack or a branch the swarm built, open a PR for it, get CI green, babysit CI, or address review comments on a PR, in a session that leads a Rider swarm.
+description: Use when the user asks to ship the stack or a branch the swarm built, send it for their review in a packet, open a PR for it, get CI green, babysit CI, address review comments, or change how those loops run, in a session that leads a Rider swarm.
 ---
 
 # Ship a swarm's branch
@@ -31,12 +31,37 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
 - Wait in the background as `lead.md` step 9 says, never in the foreground: run each watch
   as a background command and take a turn when it returns.
 - Posting on GitHub publishes. Say what you posted, with its link.
+- The owner's loop settings (`settings.md`) choose how each loop runs. They never relax a
+  rule above.
 
 In the commands below, `<repo>` is the repository, `<branch>` the branch being shipped (its
 task's `branch` label; the lowest first in a stack), `<top>` the id of the last task that
 moved it, `<n>` its PR, `<base>` its parent branch.
 `gh pr`, `gh run` and `gh issue` commands take `-R <owner>/<name>`, left out below to keep
 them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>` and `<name>`.
+
+## 0. Settings and the owner's review
+
+1. Read the owner's settings as `settings.md` says. When the file does not exist, ask the
+   owner the questions there and write it before going on.
+2. With `packet.enabled = false`, go to step 1.
+3. When the branch is settled (step 1.1), push it as a packet with the packet tool, covering
+   the branch's diff from `<base>` (for `reviews`: the `writing-review-packets` skill, then
+   `reviews push --range <base>..<branch> --packet <file>`). Give the owner the link.
+4. Wait in the background with a bounded poll: every `packet.poll_seconds` read the packet's
+   threads (and its section decisions when `packet.approval = "decisions"`), and stop on any
+   change or after `packet.cap_minutes`. At the cap, tell the owner the packet is still
+   waiting, and start the poll again only when they ask.
+5. On a change:
+   - **An actionable comment**: with `comments.actionable = "task"`, a fix task as in
+     step 3.4, its brief quoting the comment, the file and line, and the packet link. With
+     `"ask"`, ask the owner first. When the fix completes, push a new patchset to the same
+     packet (for `reviews`: `reviews push --update <slug> ...`), and with
+     `comments.reply = "after_fix"` reply in the thread naming the commit.
+   - **A question or a disagreement**: as in step 4.2.
+   - **Approval**: every section approved (`"decisions"`), or the owner says the packet is
+     approved (`"owner_says"`). Go to step 1, and link the packet in the PR body.
+6. Start the poll again after each change until the packet is approved.
 
 ## 1. Open the PR
 
@@ -48,9 +73,11 @@ them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>`
    `.github/PULL_REQUEST_TEMPLATE/`) and write it to a file outside the repository. Use the
    `writing-pr-descriptions` skill when it is installed. Name the issue it closes
    (one `Closes #<issue>` line per resolved issue) when there is one.
-4. `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`.
-   Report the PR's URL. For a stack, open the lowest branch first, then each next branch
-   with `--base` its parent branch, and say in each body which PR it stacks on.
+4. `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`, with
+   `--draft` when `pr.draft` is true and one `--reviewer <login>` for each of
+   `pr.reviewers`. Report the PR's URL. For a stack, open the lowest branch first, then
+   each next branch with `--base` its parent branch, and say in each body which PR it
+   stacks on.
 
 The lead may open a PR as a draft (`gh pr create --draft`) before the work is finished,
 so CI runs while reviews, polish and the security review go on. Push each later fix on the
@@ -59,8 +86,9 @@ CI is green.
 
 ## 2. Watch CI
 
-Choose `<cap>`, the most minutes to wait for CI (the longest the workflows normally run,
-doubled). Run as one background command (the rule in `lead.md` step 9) a bounded poll: every 30 seconds read
+`<cap>` is `ci.cap_minutes`, or when that is 0, the most minutes to wait for CI (the longest
+the workflows normally run, doubled). Run as one background command (the rule in `lead.md`
+step 9) a bounded poll: every `ci.poll_seconds` seconds read
 `gh pr checks <n> --json name,bucket,link`, and stop when a check has bucket `fail`, or when
 there are checks and none is `pending`, or when `<cap>` minutes have passed. No checks yet
 (right after a push) counts as still waiting. The cap is tested on every pass, so a check
@@ -86,8 +114,8 @@ All green: step 4. The board wait from `lead.md` runs alongside it.
 3. Decide:
    - **Flake**: the failure is not in the code: a runner lost, a network or registry
      timeout, a cache download, or a known-intermittent test the diff does not touch. It
-     gets **one** rerun: `gh run rerun <run> --failed`, then watch again (step 2). The same
-     check failing again is real.
+     gets `ci.flake_reruns` reruns (one by default): `gh run rerun <run> --failed`, then
+     watch again (step 2). The same check failing after the last rerun is real.
    - **Real**: anything the branch's code causes or could cause: a compile error, a lint, a
      failing assertion, a formatting check.
 4. A real failure becomes a fix task, created as `lead.md` describes:
@@ -122,8 +150,9 @@ once per branch from the bottom up. After each completes, push with
    ```
 
 2. For each thread, decide:
-   - **Actionable** (a bug, a missing test, a requested change you agree with): a fix task
-     as in step 3.4, its brief quoting the comment, the file and line, and the PR. Fix
+   - **Actionable** (a bug, a missing test, a requested change you agree with): with
+     `threads.actionable = "ask"`, ask the owner first. Otherwise a fix task as in
+     step 3.4, its brief quoting the comment, the file and line, and the PR. Fix
      tasks for several threads on one branch run one after another: each `needs` the one
      before, since they share the branch.
    - **A question** the code already answers: reply with the answer, no task, and resolve
@@ -131,7 +160,8 @@ once per branch from the bottom up. After each completes, push with
      decide.
    - **A disagreement or a change of scope**: ask the owner. Do not reply on their behalf.
 3. Push each fix as in step 3.5 and watch CI. Only after the fix is pushed **and** CI is
-   green, reply in the thread naming the commit, then resolve it:
+   green, reply in the thread naming the commit, then resolve it. With
+   `threads.reply = "ask"`, show the owner the reply first:
 
    ```sh
    gh api repos/<owner>/<name>/pulls/<n>/comments/<first comment databaseId>/replies \
@@ -156,7 +186,8 @@ When every check is green and no thread is unresolved:
    `gh issue close <issue> --comment "$(cat <file>)"`. Close a Linear issue with the Linear
    MCP tools when they are available (comment, then set its status to done); otherwise tell
    the owner it is open.
-3. Mark each draft PR ready: `gh pr ready <n>`.
+3. Mark each draft PR ready: `gh pr ready <n>`. With `pr.ready = "ask"`, ask the owner
+   first.
 4. Remove the worktree of each task that is cancelled or given up on, as `lead.md` says:
    never with `--force`, and never delete the branch.
 5. Tell the owner: each PR's link, that CI is green and no thread is open, the fix task ids,
@@ -166,7 +197,10 @@ When every check is green and no thread is unresolved:
 
 - Fixing a failure or a comment yourself as the lead. Make it a task.
 - Watching CI in the foreground, or looping `gh pr checks` without `--watch`.
-- Rerunning a check a second time, or calling a failure a flake because a rerun is cheaper.
+- Rerunning a check more than `ci.flake_reruns` times, or calling a failure a flake because
+  a rerun is cheaper.
+- Asking the settings questions again when the file exists, or treating a setting as
+  permission to break a rule.
 - Replying "fixed" or resolving a thread before the fix is pushed and CI is green.
 - Pushing a rewritten branch with a bare `--force` instead of `--force-with-lease`, or
   force-pushing a branch the swarm did not create.
