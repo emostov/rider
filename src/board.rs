@@ -104,6 +104,8 @@ pub struct TaskView {
     pub epoch: u64,
     /// Present exactly when the task is claimed.
     pub claim: Option<Claim>,
+    /// The cursor of the newest event that changed the task's message.
+    pub version: Cursor,
 }
 
 /// One page of a listing and the cursor the board printed with it.
@@ -729,6 +731,8 @@ fn parse_message(message: &Map<String, Value>) -> Result<TaskView, BoardError> {
     let epoch = task.get("epoch").and_then(Value::as_u64);
     let epoch = epoch.ok_or_else(|| BoardError::Parse("no whole task.epoch".into()))?;
     let claim = parse_task_claim(task)?;
+    let version = message.get("version").and_then(Value::as_u64);
+    let version = Cursor(version.ok_or_else(|| BoardError::Parse("no whole version".into()))?);
     if claim.is_some() != (state == TaskState::Claimed) {
         return Err(BoardError::Parse(format!(
             "a {state:?} task {} a claim",
@@ -743,6 +747,7 @@ fn parse_message(message: &Map<String, Value>) -> Result<TaskView, BoardError> {
         needs: parse_needs(task)?,
         epoch,
         claim,
+        version,
     };
     assert!(view.text.len() < OUTPUT_BYTES_MAX);
     assert_eq!(view.claim.is_some(), view.state == TaskState::Claimed);
@@ -1535,7 +1540,7 @@ mod tests {
             .collect();
         let json = format!(
             "{{\"message\":{{\"id\":\"7\",\"text\":\"t\",\"labels\":{{{}}},\
-             \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}}}}}}",
+             \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}},\"version\":1}}}}",
             labels.join(",")
         );
         assert!(matches!(
@@ -1794,7 +1799,7 @@ mod tests {
         let json = |id: &str| {
             format!(
                 "{{\"message\":{{\"id\":\"{id}\",\"text\":\"t\",\"labels\":{{}},\
-                 \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}}}}}}"
+                 \"task\":{{\"state\":\"ready\",\"epoch\":0,\"needs\":[],\"claim\":null}},\"version\":1}}}}"
             )
         };
         assert_eq!(parse_task_view(&json("17")).unwrap().id, TaskId(17));
@@ -1826,6 +1831,14 @@ mod tests {
             needs: Vec::new(),
             epoch: 1,
             claim: None,
+            version: Cursor(0),
+        }
+    }
+
+    fn versioned(view: TaskView, version: u64) -> TaskView {
+        TaskView {
+            version: Cursor(version),
+            ..view
         }
     }
 
@@ -1842,7 +1855,7 @@ mod tests {
         let claim = include_str!("../fixtures/board/claim-by-id.json");
         let labels = [("board.task", "claimed"), ("role", "implement")];
         let expected = held(
-            recorded(2, "task a", &labels, TaskState::Claimed),
+            versioned(recorded(2, "task a", &labels, TaskState::Claimed), 7),
             1_795_136_047_105,
         );
         assert_eq!(parse_lease(claim).unwrap(), expected);
@@ -1856,11 +1869,14 @@ mod tests {
     fn parses_a_recorded_renewal() {
         let renew = include_str!("../fixtures/board/renew.json");
         let expected = held(
-            recorded(
-                12,
-                "task c",
-                &[("board.task", "claimed")],
-                TaskState::Claimed,
+            versioned(
+                recorded(
+                    12,
+                    "task c",
+                    &[("board.task", "claimed")],
+                    TaskState::Claimed,
+                ),
+                15,
             ),
             1_795_136_077_438,
         );
@@ -1884,7 +1900,8 @@ mod tests {
         let object = parse_object(release).unwrap();
         let task = object.get("task").and_then(Value::as_object).unwrap();
         let view = parse_message(task).unwrap();
-        assert_eq!(view, recorded(2, "task a", &labels, TaskState::Ready));
+        let expected = versioned(recorded(2, "task a", &labels, TaskState::Ready), 9);
+        assert_eq!(view, expected);
     }
 
     #[test]
@@ -1892,11 +1909,11 @@ mod tests {
         let list = include_str!("../fixtures/board/tasks-open.json");
         let claimed = [("board.task", "claimed"), ("role", "implement")];
         let a = held(
-            recorded(2, "task a", &claimed, TaskState::Claimed),
+            versioned(recorded(2, "task a", &claimed, TaskState::Claimed), 8),
             1_795_133_349_261,
         );
         let waiting = [("board.task", "waiting"), ("role", "implement")];
-        let mut b = recorded(4, "task b", &waiting, TaskState::Waiting);
+        let mut b = versioned(recorded(4, "task b", &waiting, TaskState::Waiting), 5);
         b.needs = vec![TaskId(2)];
         b.epoch = 0;
         let page = TaskPage {
@@ -1928,7 +1945,7 @@ mod tests {
     fn listing_of(name: &str, count: usize) -> (VbCli, PathBuf) {
         let task = concat!(
             r#"{"message":{"id":"%d","text":"t","labels":{},"#,
-            r#""task":{"state":"ready","epoch":0,"needs":[],"claim":null}}}"#
+            r#""task":{"state":"ready","epoch":0,"needs":[],"claim":null},"version":%d}}"#
         );
         let read = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1942,7 +1959,7 @@ last=$((after + {TASKS_PAGE_MAX}))
 [ $last -gt {count} ] && last={count}
 printf '{{"tasks":['
 id=$((after + 1)); sep=
-while [ $id -le $last ]; do printf "$sep"; printf '{task}' $id; sep=,; id=$((id + 1)); done
+while [ $id -le $last ]; do printf "$sep"; printf '{task}' $id $id; sep=,; id=$((id + 1)); done
 cursor=9999
 [ $((last - after)) -eq {TASKS_PAGE_MAX} ] && cursor=$last
 printf '],"cursor":"%s"}}\n' $cursor

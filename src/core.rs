@@ -139,7 +139,7 @@ pub struct Task {
     /// Index into the config's roles; `None` when the task has no known role.
     pub role: Option<usize>,
     pub branch: Option<String>,
-    /// The cursor of the newest event or snapshot this was learned from.
+    /// The task's board version: the cursor of the newest event this was learned from.
     pub seen: Cursor,
     /// A claim of the task was refused since it was last learned or the last tick.
     pub claim_refused: bool,
@@ -253,9 +253,11 @@ pub enum Event {
     Feed(BoardEvent),
     FeedLost,
     FeedResumed(Cursor),
+    /// A listing: its tasks, the cursor read before its first page, and how many it left out.
     Snapshot {
         tasks: Vec<TaskView>,
         cursor: Cursor,
+        left_out: usize,
     },
     Claimed {
         run: RunId,
@@ -347,6 +349,8 @@ pub struct State {
     untracked: Vec<(TaskId, Cursor)>,
     /// The newest cursor at which an untracked task went uncounted.
     untracked_overflow: Option<Cursor>,
+    /// When the last listing left tasks out: a lower bound on the untracked tasks.
+    left_out: Option<usize>,
     /// Tasks the feed closed, with the closing event's cursor, until a snapshot covers it.
     closed: Vec<(TaskId, Cursor)>,
     /// The newest closing cursor that did not fit in `closed`.
@@ -375,6 +379,7 @@ impl State {
             tasks: Vec::new(),
             untracked: Vec::new(),
             untracked_overflow: None,
+            left_out: None,
             closed: Vec::new(),
             closed_unrecorded: Cursor(0),
             runs: Vec::new(),
@@ -408,10 +413,9 @@ impl State {
         assert!(count <= UNTRACKED_MAX);
         let tracked = |id: TaskId| self.tasks.iter().any(|task| task.id == id);
         assert!(self.untracked.iter().all(|(id, _)| !tracked(*id)));
-        if self.untracked_overflow.is_some() {
-            Untracked::AtLeast(count)
-        } else {
-            Untracked::Exactly(count)
+        match (self.untracked_overflow, self.left_out) {
+            (None, None) => Untracked::Exactly(count),
+            (_, floor) => Untracked::AtLeast(count.max(floor.unwrap_or(0))),
         }
     }
     pub fn runs(&self) -> &[Run] {
@@ -489,11 +493,15 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             state.feed_delivered = false;
             state.cursor = state.cursor.max(cursor);
         }
-        Event::Snapshot { tasks, cursor } => {
+        Event::Snapshot {
+            tasks,
+            cursor,
+            left_out,
+        } => {
             state.listing = false;
             state.board = BoardHealth::Up;
             state.cursor = state.cursor.max(cursor);
-            reconcile(state, &tasks, cursor);
+            reconcile(state, &tasks, cursor, left_out);
         }
         Event::BoardFailed(call) => board_failed(state, call),
         Event::Signal => signal(state, actions),
@@ -603,9 +611,16 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
     // A label event's labels are the whole task's only when the event is on the task itself.
     let labels_are_task = feed.kind != EventKind::MessagePosted;
     let index = state.tasks.iter().position(|task| task.id == feed.task);
+    // A listing can show a task at a version the feed has not reached yet.
+    let closed_at = state.closed.iter().find(|(id, _)| *id == feed.task);
+    let version = index.map(|index| state.tasks[index].seen);
+    if version.or(closed_at.map(|(_, at)| *at)) >= Some(feed.cursor) {
+        return;
+    }
     if is_closed(task_state) {
-        if let Some(index) = index {
-            state.tasks.remove(index);
+        match index {
+            Some(index) => _ = state.tasks.remove(index),
+            None => untracked_left(state),
         }
         state.untracked.retain(|(id, _)| *id != feed.task);
         note_closed(state, feed.task, feed.cursor);
@@ -630,6 +645,7 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         None if state.tasks.len() < state.config.tasks_max => {
             state.untracked.retain(|(id, _)| *id != feed.task);
             state.tasks.push(task);
+            untracked_left(state);
         }
         None => note_untracked(state, feed.task, feed.cursor),
     }
@@ -643,6 +659,16 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
     );
     reserve_branches(state);
     assert!(state.untracked.len() <= UNTRACKED_MAX);
+}
+
+/// A task the last listing may have left out became tracked or closed, so the bound drops.
+fn untracked_left(state: &mut State) {
+    let before = state.left_out;
+    if let Some(floor) = state.left_out.as_mut() {
+        *floor = floor.saturating_sub(1);
+    }
+    assert_eq!(before.is_some(), state.left_out.is_some());
+    assert!(state.left_out <= before);
 }
 
 /// A run whose branch was unknown reserves it once its task's branch is learned and free.
@@ -704,8 +730,8 @@ fn note_closed(state: &mut State, task: TaskId, at: Cursor) {
     assert!(state.closed.len() <= CLOSED_MAX);
 }
 
-/// Replaces what the core knows with a snapshot, except what the feed told it since.
-fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor) {
+/// Replaces what the core knows with a snapshot, except what is newer by the task's version.
+fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor, left_out: usize) {
     if cursor < state.closed_unrecorded {
         return;
     }
@@ -714,18 +740,36 @@ fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor) {
     if state.untracked_overflow.is_some_and(|at| at <= cursor) {
         state.untracked_overflow = None;
     }
-    state.tasks.retain(|task| task.seen > cursor);
+    let listed = |id: TaskId| views.iter().find(|view| view.id == id);
+    // A task the listing omits is gone unless the feed told of it after the listing began.
+    state.tasks.retain(|task| match listed(task.id) {
+        Some(view) => view.version <= task.seen,
+        None => task.seen > cursor,
+    });
+    // A tracked task the listing omits may be one of those it left out.
+    let kept = (state.tasks.iter())
+        .filter(|task| listed(task.id).is_none())
+        .count();
+    let mut listed_untracked: usize = 0;
     // Tasks with a run go first, so a run's task stays known whatever the overflow.
     for with_run in [true, false] {
         for view in views {
             let has_run = state.runs.iter().any(|run| run.task == view.id);
             let newer = state.tasks.iter().any(|task| task.id == view.id)
-                || state.closed.iter().any(|(id, _)| *id == view.id);
-            if is_closed(view.state) || has_run != with_run || newer {
+                || (state.closed.iter()).any(|(id, at)| *id == view.id && *at >= view.version);
+            if has_run != with_run || newer {
+                continue;
+            }
+            if is_closed(view.state) {
+                (state.untracked).retain(|(id, at)| *id != view.id || *at > view.version);
+                if view.version > cursor {
+                    note_closed(state, view.id, view.version);
+                }
                 continue;
             }
             if state.tasks.len() == state.config.tasks_max {
-                note_untracked(state, view.id, cursor);
+                note_untracked(state, view.id, view.version);
+                listed_untracked = listed_untracked.saturating_add(1);
                 continue;
             }
             state.untracked.retain(|(id, _)| *id != view.id);
@@ -734,14 +778,23 @@ fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor) {
                 state: view.state,
                 role: role_of(&state.config, &view.labels),
                 branch: label(&view.labels, "branch"),
-                seen: cursor,
+                seen: view.version,
                 claim_refused: false,
             });
         }
     }
+    // The tasks left out are none of those listed, so both counts add to a lower bound.
+    let left_out_untracked = left_out.saturating_sub(kept);
+    state.left_out = (left_out > 0).then(|| listed_untracked.saturating_add(left_out_untracked));
     reserve_branches(state);
     assert!(state.tasks.len() <= state.config.tasks_max);
-    assert!(state.tasks.iter().all(|task| task.seen <= state.cursor));
+    let version = |id: TaskId| listed(id).map(|view| view.version);
+    assert!(
+        state
+            .tasks
+            .iter()
+            .all(|task| version(task.id) <= Some(task.seen))
+    );
     let untracked = |id: TaskId| state.untracked.iter().any(|(other, _)| *other == id);
     assert!(state.tasks.iter().all(|task| !untracked(task.id)));
 }

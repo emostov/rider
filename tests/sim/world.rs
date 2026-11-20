@@ -28,6 +28,11 @@ const SMALL_TASKS_EVERY: u64 = 4;
 const SMALL_TASKS_MAX: usize = 6;
 /// How far before the requested cursor a restarted feed may start replaying.
 const REPLAY_BACK_MAX: u64 = 8;
+/// The open tasks one listing returns; the rest it only counts, as the board's does past
+/// `TASKS_MAX`.
+const LISTING_TASKS_MAX: usize = 24;
+/// How many events may happen between a listing reading its cursor and reading its pages.
+const LISTING_LAG_MAX: u64 = 4;
 /// One flapping fault in this many is a burst of feeds that exit at once.
 const FLAP_EVERY: u32 = 4;
 
@@ -46,6 +51,8 @@ struct FakeTask {
     epoch: u64,
     holder: Option<RunId>,
     lease_until: Timestamp,
+    /// The cursor of the newest event published about the task.
+    version: u64,
 }
 
 struct Agent {
@@ -108,6 +115,12 @@ pub struct World {
     settled_epochs: HashSet<(u64, u64)>,
     /// The newest version of each task the delivered feed events and snapshots told the core.
     told: HashMap<u64, Told>,
+    /// Open tasks the last delivered listing left out and the core has not been told of since.
+    left_out: HashSet<u64>,
+    /// The newest cursor a delivered listing read: every event up to it is reflected.
+    listed_through: u64,
+    /// What each listing not yet delivered left out, by the id of its action.
+    listings: HashMap<u64, Vec<u64>>,
     /// Tasks whose claim was refused, with no newer news of them nor a tick since.
     refused: HashSet<u64>,
     /// Runs whose agent has been spawned.
@@ -149,6 +162,9 @@ impl World {
             settled_epochs: HashSet::new(),
             told: HashMap::new(),
             refused: HashSet::new(),
+            left_out: HashSet::new(),
+            listings: HashMap::new(),
+            listed_through: 0,
             spawned: HashSet::new(),
             stopped_now: false,
             signals: 0,
@@ -211,6 +227,9 @@ impl World {
             let index = ready[self.rng.usize(0..ready.len())];
             let (event, id, _) = self.results.swap_remove(index);
             self.answer(id, &event)?;
+            if let Some(left_out) = self.listings.remove(&id) {
+                self.left_out = left_out.into_iter().collect();
+            }
             let Event::FeedResumed(cursor) = event else {
                 return self.deliver(event);
             };
@@ -297,6 +316,7 @@ impl World {
             epoch: 0,
             holder: None,
             lease_until: self.now,
+            version: 0,
         });
         self.publish(self.tasks.len() - 1, EventKind::TaskCreated);
     }
@@ -388,6 +408,7 @@ impl World {
 
     fn publish(&mut self, index: usize, kind: EventKind) {
         self.cursor += 1;
+        self.tasks[index].version = self.cursor;
         let task = &self.tasks[index];
         let event = BoardEvent {
             cursor: Cursor(self.cursor),
@@ -495,7 +516,7 @@ impl World {
         match event {
             Event::Tick(_) => self.refused.clear(),
             Event::Feed(feed) => {
-                if let Some(state) = feed.state {
+                if let Some(state) = feed.state.filter(|_| feed.cursor.0 > self.listed_through) {
                     let newer = (self.told.get(&feed.task.0))
                         .is_none_or(|told| told.cursor < feed.cursor.0);
                     if newer {
@@ -503,12 +524,23 @@ impl World {
                     }
                 }
             }
-            Event::Snapshot { tasks, cursor } => {
+            Event::Snapshot { tasks, cursor, .. } => {
+                self.listed_through = self.listed_through.max(cursor.0);
+                // A listing shows every open task it does not leave out, as of its cursor.
+                let listed = |id: &u64| tasks.iter().any(|view| view.id.0 == *id);
+                let left_out = &self.left_out;
+                for (id, told) in self.told.iter_mut() {
+                    if !listed(id) && !left_out.contains(id) && told.cursor <= cursor.0 {
+                        told.cursor = cursor.0;
+                        told.state = TaskState::Completed;
+                    }
+                }
                 for view in tasks {
+                    let version = view.version.0;
                     let newer =
-                        (self.told.get(&view.id.0)).is_none_or(|told| told.cursor <= cursor.0);
+                        (self.told.get(&view.id.0)).is_none_or(|told| told.cursor <= version);
                     if newer {
-                        self.tell(view.id, cursor.0, view.state, &view.labels);
+                        self.tell(view.id, version, view.state, &view.labels);
                     }
                 }
             }
@@ -518,6 +550,7 @@ impl World {
 
     fn tell(&mut self, task: TaskId, cursor: u64, state: TaskState, labels: &[(String, String)]) {
         self.refused.remove(&task.0);
+        self.left_out.remove(&task.0);
         let labels = labels.to_vec();
         self.told.insert(
             task.0,
@@ -753,9 +786,14 @@ impl World {
             self.reply(id, Event::BoardFailed(Call::ListTasks));
             return;
         }
-        let tasks = self
-            .tasks
-            .iter()
+        let open: Vec<&FakeTask> = (self.tasks.iter())
+            .filter(|fake| !is_closed(fake.state))
+            .collect();
+        let (listed, rest) = open.split_at(open.len().min(LISTING_TASKS_MAX));
+        let left_out = rest.len();
+        self.listings
+            .insert(id, rest.iter().map(|fake| fake.id.0).collect());
+        let tasks = (listed.iter())
             .map(|fake| TaskView {
                 id: fake.id,
                 text: String::new(),
@@ -764,10 +802,20 @@ impl World {
                 needs: Vec::new(),
                 epoch: fake.epoch,
                 claim: None,
+                version: Cursor(fake.version),
             })
             .collect();
-        let cursor = Cursor(self.cursor);
-        self.reply(id, Event::Snapshot { tasks, cursor });
+        // The cursor is read before the pages, so events may land between the two.
+        let lag = self.rng.u64(0..=LISTING_LAG_MAX);
+        let cursor = Cursor(self.cursor.saturating_sub(lag));
+        self.reply(
+            id,
+            Event::Snapshot {
+                tasks,
+                cursor,
+                left_out,
+            },
+        );
     }
 
     fn check(&mut self, actions: &[Action]) -> Result<(), String> {
@@ -815,9 +863,12 @@ impl World {
         self.check_tasks_newest()?;
         let tracked = self.core.tasks().len();
         let untracked = self.core.untracked();
+        let told_open = |id: &u64| self.told.get(id).is_some_and(|told| !is_closed(told.state));
+        let unseen = self.left_out.iter().filter(|id| !told_open(id)).count();
         let open = (self.told.values())
             .filter(|told| !is_closed(told.state))
-            .count();
+            .count()
+            + unseen;
         let counted = match untracked {
             Untracked::Exactly(count) => tracked + count == open,
             Untracked::AtLeast(count) => tracked + count <= open,

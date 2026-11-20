@@ -444,6 +444,7 @@ mod tests {
     use super::*;
     use crate::board::testing::FakeBoard;
     use crate::board::{TaskState, TaskView};
+    use crate::feed::Cursor;
     use crate::git::testing::{Fixture, git, git_succeeds};
     use crate::roles::role_from_label;
     use std::fs;
@@ -460,6 +461,7 @@ mod tests {
             needs: Vec::new(),
             epoch: 1,
             claim: None,
+            version: Cursor(0),
         }
     }
 

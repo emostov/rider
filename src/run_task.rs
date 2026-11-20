@@ -603,6 +603,7 @@ mod tests {
     use super::*;
     use crate::board::TaskView;
     use crate::board::testing::FakeBoard;
+    use crate::feed::Cursor;
     use crate::git::testing::{Fixture, git};
     use serde_json::json;
     use std::cell::RefCell;
@@ -644,6 +645,7 @@ mod tests {
             needs: Vec::new(),
             epoch: 1,
             claim: None,
+            version: Cursor(0),
         }
     }
 
