@@ -1,4 +1,4 @@
-//! Black-box scenarios: the real `rider pool` against a real board, a scratch repository, and
+//! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
 #[expect(
@@ -34,7 +34,7 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add one work file."));
     given_the_agent_will(&world, &task, &[Behaviour::Commit]);
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&task]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
 
     assert_eq!(states, vec!["completed".to_string()]);
     assert_eq!(exit, Some(0));
@@ -68,7 +68,7 @@ fn a_fix_that_moves_a_branch_names_the_stacked_task_left_behind_in_its_result_re
         &a_fix(&world, "Fix the base work.", &base, &stacked, false),
     );
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&base, &stacked, &fix]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&base, &stacked, &fix]);
 
     assert_eq!(states, vec!["completed", "completed", "completed"]);
     assert_eq!(exit, Some(0));
@@ -108,7 +108,7 @@ fn a_second_fix_onto_an_earlier_fix_names_the_task_stacked_on_the_first_one() {
         first.as_str(),
         second.as_str(),
     ];
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &tasks);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &tasks);
 
     assert_eq!(states, vec!["completed"; 4]);
     assert_eq!(exit, Some(0));
@@ -138,7 +138,7 @@ fn a_stacked_task_is_cut_from_its_base_tasks_branch() {
         .role("implement");
     let stacked = when_the_lead_creates(&world, &stacked);
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&base, &stacked]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&base, &stacked]);
 
     assert_eq!(
         states,
@@ -167,7 +167,7 @@ fn a_qa_task_tests_a_completed_task_in_claude_and_completes_without_commits() {
     let qa = when_the_lead_creates(&world, &a_qa_task(&world, &built, "Run the new work."));
     given_the_agent_will(&world, &qa, &[Behaviour::CommitNothing]);
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &qa]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &qa]);
 
     assert_eq!(
         states,
@@ -194,7 +194,7 @@ fn a_qa_agent_that_commits_fails_and_leaves_the_tested_branch_alone() {
     let qa = when_the_lead_creates(&world, &a_qa_task(&world, &built, "Run the new work."));
     given_the_agent_will(&world, &qa, &[Behaviour::Commit]);
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &qa]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &qa]);
 
     assert_eq!(states, vec!["completed".to_string(), "failed".to_string()]);
     assert_eq!(exit, Some(0));
@@ -242,29 +242,26 @@ fn the_daemon_claims_a_ready_task_within_five_seconds_of_its_role_being_set() {
 }
 
 #[test]
-fn a_second_daemon_or_pool_on_the_same_home_exits_naming_the_holder() {
+fn a_second_daemon_on_the_same_home_exits_naming_the_holder() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     given_a_running_daemon(&mut world);
     let holder = world
-        .pool
+        .daemon
         .as_ref()
         .expect("the daemon")
         .child
         .id()
         .to_string();
 
-    let daemon = when_rider_runs(&world, &["daemon"]);
-    let pool = when_rider_runs(&world, &["pool", PROJECT]);
+    let second = when_rider_runs(&world, &["daemon"]);
 
-    for second in [daemon, pool] {
-        assert_eq!(second.code, Some(1), "{second:?}");
-        assert!(
-            second.stderr.contains(&format!("pid {holder}")),
-            "{second:?}"
-        );
-    }
+    assert_eq!(second.code, Some(1), "{second:?}");
+    assert!(
+        second.stderr.contains(&format!("pid {holder}")),
+        "{second:?}"
+    );
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
@@ -343,7 +340,7 @@ fn a_second_sigterm_kills_an_agent_that_ignores_sigterm_within_the_grace_and_rel
         when_the_process_ends_within(run.pid, 5),
         "the agent {} still runs:\n{}",
         run.pid,
-        world.pool_log()
+        world.daemon_log()
     );
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert_eq!(task_state(&world, &task), "ready");
@@ -426,38 +423,6 @@ fn one_builder_at_once_runs_implement_tasks_one_by_one_while_a_review_runs_besid
     assert_eq!(world.most_agents_at_once(), 2);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
-}
-
-#[test]
-fn a_pool_stopped_after_a_failed_release_of_a_task_whose_role_changed_retries_it_first() {
-    let Some(mut world) = given_a_board_and_a_repository() else {
-        return;
-    };
-    given_a_rider_toml(&world, "[roles.light]\nslots = 1\n");
-    let task = an_implement_task(&world, "Add the work.").role("light");
-    let task = when_the_lead_creates(&world, &task);
-    let releases = world.root.join("releases.log");
-    given_the_role_changes_after_the_claim_and_one_release_fails(
-        &world,
-        &task,
-        "light",
-        "implement",
-        &releases,
-    );
-    when_the_pool_starts(&mut world);
-    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
-    while !releases.exists() {
-        assert!(Instant::now() < deadline, "{}", world.pool_log());
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let exit = when_the_pool_is_stopped(&mut world);
-
-    assert_eq!(exit, Some(0), "{}", world.pool_log());
-    assert_eq!(task_state(&world, &task), "ready", "{}", world.pool_log());
-    let tries = fs::read_to_string(&releases).expect("read the release log");
-    assert_eq!(tries, "release\nrelease\n");
-    assert_eq!(agent_runs_for(&world, &task), vec![]);
 }
 
 #[test]
@@ -723,7 +688,7 @@ fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_wr
         when_the_process_ends_within(run.pid, 3),
         "the agent {} still runs:\n{}",
         run.pid,
-        world.pool_log()
+        world.daemon_log()
     );
     thread::sleep(Duration::from_secs(2));
     assert_eq!(task_state(&world, &task), "canceled");
@@ -749,7 +714,7 @@ fn a_second_sigterm_while_the_fenced_fail_is_in_flight_finishes_the_failure() {
         assert!(
             Instant::now() < deadline,
             "no fail began:\n{}",
-            world.pool_log()
+            world.daemon_log()
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -838,7 +803,7 @@ fn a_vb_that_hangs_on_claim_marks_the_board_down_after_the_call_limit_and_holds_
     assert!(
         down,
         "rider status never said the board was down:\n{}",
-        world.pool_log()
+        world.daemon_log()
     );
     assert!(marker.exists(), "no claim began");
     assert_eq!(agents_running(&world), 0);
@@ -936,7 +901,7 @@ fn a_fix_task_with_resume_continues_the_claude_session_of_its_onto_task() {
     let fresh = when_the_lead_creates(&world, &fresh);
 
     let tasks = [built.as_str(), resumed.as_str(), fresh.as_str()];
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &tasks);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &tasks);
 
     assert_eq!(states, vec!["completed".to_string(); 3]);
     assert_eq!(exit, Some(0));
@@ -976,7 +941,7 @@ fn a_resumed_fix_forks_the_session_so_its_onto_tasks_session_stays_its_own() {
         chained.as_str(),
         again.as_str(),
     ];
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &tasks);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &tasks);
 
     assert_eq!(states, vec!["completed".to_string(); 4]);
     assert_eq!(exit, Some(0));
@@ -1008,7 +973,7 @@ fn a_resumed_session_claude_refuses_falls_back_to_a_fresh_start_in_the_same_atte
     );
     given_the_agent_will(&world, &fix, &[Behaviour::RefuseResume]);
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &fix]);
 
     assert_eq!(states, vec!["completed".to_string(); 2]);
     assert_eq!(exit, Some(0));
@@ -1039,7 +1004,7 @@ fn a_resumed_session_claude_refuses_falls_back_to_a_fresh_start_in_the_same_atte
 }
 
 #[test]
-fn a_pool_gives_a_refused_resumes_fresh_start_only_what_remains_of_the_attempt_limit() {
+fn the_daemon_gives_a_refused_resumes_fresh_start_only_what_remains_of_the_attempt_limit() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -1053,14 +1018,15 @@ fn a_pool_gives_a_refused_resumes_fresh_start_only_what_remains_of_the_attempt_l
     );
     given_the_agent_will(&world, &fix, &[Behaviour::RefuseResumeSlowly]);
 
-    when_the_pool_starts(&mut world);
+    given_a_running_daemon(&mut world);
     let built_states = when_the_tasks_settle(&world, &[&built]);
     let fix_states =
         when_the_tasks_settle_within(&world, &[&fix], attempt_minutes * 60 + SETTLE_SECONDS_MAX);
-    let exit = when_the_pool_is_stopped(&mut world);
+    when_the_daemon_is_sent_sigterm(&world);
+    let exit = then_the_daemon_exits(&mut world);
 
-    assert_eq!(built_states, vec!["completed"], "{}", world.pool_log());
-    assert_eq!(fix_states, vec!["failed"], "{}", world.pool_log());
+    assert_eq!(built_states, vec!["completed"], "{}", world.daemon_log());
+    assert_eq!(fix_states, vec!["failed"], "{}", world.daemon_log());
     assert_eq!(exit, Some(0));
     assert_eq!(agent_runs_for(&world, &fix).len(), 2);
     assert_eq!(task_label(&world, &fix, "attempt").as_deref(), Some("1"));
@@ -1107,7 +1073,7 @@ fn a_session_recorded_for_another_repository_is_not_resumed() {
         return;
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    when_the_pool_starts(&mut world);
+    given_a_running_daemon(&mut world);
     assert_eq!(
         when_the_tasks_settle(&world, &[&built]),
         vec!["completed".to_string()]
@@ -1119,7 +1085,8 @@ fn a_session_recorded_for_another_repository_is_not_resumed() {
     let fix = when_the_lead_creates(&world, &fix);
 
     let states = when_the_tasks_settle(&world, &[&fix]);
-    let exit = when_the_pool_is_stopped(&mut world);
+    when_the_daemon_is_sent_sigterm(&world);
+    let exit = then_the_daemon_exits(&mut world);
 
     assert_eq!(states, vec!["completed".to_string()]);
     assert_eq!(exit, Some(0));
@@ -1146,7 +1113,7 @@ fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
         &a_fix(&world, "Fix the work.", &built, &built, true),
     );
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &fix]);
 
     assert_eq!(states, vec!["completed".to_string(); 2]);
     assert_eq!(exit, Some(0));
@@ -1762,11 +1729,11 @@ fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_work
         when_the_process_ends_within(leftover.pid, 10),
         "the leftover agent {} still runs:\n{}",
         leftover.pid,
-        world.pool_log()
+        world.daemon_log()
     );
     assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
     let runs = agent_runs_for(&world, &task);
-    assert_eq!(runs.len(), 2, "{}", world.pool_log());
+    assert_eq!(runs.len(), 2, "{}", world.daemon_log());
     assert_eq!(runs[1].dir, runs[0].dir);
     assert!(agent_prompt(&world, &task, 2).contains("This is a retry"));
     assert_eq!(task_epoch(&world, &task), epoch);
@@ -1800,7 +1767,7 @@ fn a_daemon_that_crashes_past_its_shortened_lease_claims_the_task_afresh_and_com
         when_the_process_ends_within(leftover.pid, 10),
         "the leftover agent {} still runs:\n{}",
         leftover.pid,
-        world.pool_log()
+        world.daemon_log()
     );
     assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
     assert_eq!(agent_runs_for(&world, &task).len(), 2);
@@ -1831,7 +1798,7 @@ fn when_the_daemon_log_shows(world: &World, text: &str) {
         assert!(
             Instant::now() < deadline,
             "the daemon log never showed {text}:\n{}",
-            world.pool_log()
+            world.daemon_log()
         );
         thread::sleep(Duration::from_millis(LOG_POLL_MILLIS));
     }
@@ -1845,7 +1812,7 @@ fn when_the_task_is(world: &World, task: &str, state: &str) {
             Instant::now() < deadline,
             "#{task} was {}, never {state}:\n{}",
             task_state(world, task),
-            world.pool_log()
+            world.daemon_log()
         );
         thread::sleep(Duration::from_millis(LEASE_POLL_MILLIS));
     }

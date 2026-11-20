@@ -90,7 +90,7 @@ worker take it again.
 Never write `branch`, `attempt`, or `start` yourself, except `attempt=0` to retry an
 exhausted task.
 
-`role` makes a task claimable: the pool claims only tasks with `role=<role>`. So `role` is
+`role` makes a task claimable: the daemon claims only tasks with `role=<role>`. So `role` is
 always the last label a task gets (see "Creating a plan").
 
 Rider checks these before starting a worker, and blocks the task as `invalid_brief` when one
@@ -160,7 +160,7 @@ These rules are yours to keep. Rider does not check them:
 
 The rule: **a task becomes claimable only when it has `role`, and `role` is always set
 last.** Never create a task with `role` and add `base`, `onto`, `of`, or `from` afterwards:
-the pool may claim it in between and run it on the wrong branch.
+the daemon may claim it in between and run it on the wrong branch.
 
 1. Write the plan to a file outside this directory (`mktemp`): a JSON array of
    `{"key", "text", "labels", "needs"}`. A need is `{"key": "<key in this plan>"}` or the

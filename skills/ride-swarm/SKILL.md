@@ -65,8 +65,6 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    `rider-finding@1` from `rider-finding.json`).
 4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
    run `rider up`, which starts it in the background, and check `rider status` again.
-   (`rider pool <project>` in a terminal the user keeps open is the fallback until it is
-   removed.)
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
    `lead-fable-5-2`. Answer the user before anything else.
 

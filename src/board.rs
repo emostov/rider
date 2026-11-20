@@ -480,8 +480,7 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
     (words, text)
 }
 
-/// The argument list for `command`: its words as the commands in docs/board-observed.md were
-/// run, then the global `--json --url <url> --as <profile>`, then `--` and any free text, so
+/// The argument list for `command`: its words, then the global `--json --url <url> --as <profile>`, then `--` and any free text, so
 /// text that starts with `-` is never read as an option.
 fn command_args(command: &Command, url: &str, profile: &str) -> Vec<String> {
     assert!(!url.is_empty(), "the board URL is never empty");
