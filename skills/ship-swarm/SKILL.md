@@ -50,6 +50,11 @@ Every `gh` command takes `-R <owner>/<name>`, left out below to keep them short.
    Report the PR's URL. For a stack, open the lowest branch first, then each next branch
    with `--base` its parent branch, and say in each body which PR it stacks on.
 
+The lead may open a PR as a draft (`gh pr create --draft`) before the work is finished,
+so CI runs while reviews, polish and the security review go on. Push each later fix on the
+branch to it. Mark it ready with `gh pr ready <n>` only when the stack's tasks are done and
+CI is green.
+
 ## 2. Watch CI
 
 Run as a background command: `gh pr checks <n> --watch --interval 30`. It exits 0 when
@@ -129,7 +134,10 @@ When every check is green and no thread is unresolved:
    `gh issue close <issue> --comment "$(cat <file>)"`. Close a Linear issue with the Linear
    MCP tools when they are available (comment, then set its status to done); otherwise tell
    the owner it is open.
-3. Tell the owner: each PR's link, that CI is green and no thread is open, the fix task ids,
+3. Mark each draft PR ready: `gh pr ready <n>`.
+4. Remove the worktree of each task that is cancelled or given up on, as `lead.md` says:
+   never with `--force`, and never delete the branch.
+5. Tell the owner: each PR's link, that CI is green and no thread is open, the fix task ids,
    and the issues closed. Merging is theirs.
 
 ## Common mistakes

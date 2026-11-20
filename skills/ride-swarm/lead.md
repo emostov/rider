@@ -230,6 +230,15 @@ Then `vb label <review-fix> of=<fix> --as lead-fable-5-2`, then
 `vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
 "<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.
 
+Worktrees are large, mostly the Rust `target/` directory, so remove one once nothing will
+use it again. Rider removes a task's worktree when the task completes, and keeps it when
+the task fails or blocks so a retry can reuse it. When you cancel a task, or give up on a
+failed or blocked one, remove its worktree: `git -C <repo> worktree remove
+~/.rider/worktrees/<repository directory name>/<task id>`. It refuses when there are
+modified or untracked files: then tell the owner rather than forcing. Never `--force`,
+never delete the branch. A completed task whose thread says "Kept the worktree" is the
+same case once its changes are understood. `rider clean` (issue #60) will replace this rule.
+
 A branch moves after children were cut from it only when an `onto` task completes on it.
 Then restack each child branch, bottom up, one task at a time: `role=light` (or
 `implement`), `onto=<the child's task>`, needing the task that moved its parent. Its brief
