@@ -62,8 +62,11 @@ Text that begins with `-` is read by `vb` as an option. So:
 5. Attack each point in the brief. Read the code, run the tests, and write failing cases
    outside the worktree. A finding needs evidence: a command, an input, or a line of code
    that shows it. Do not report style preferences.
-6. Post each finding as its own structured reply. `severity` is `blocking` when the change is
-   unsafe or wrong for what depends on it now, otherwise `non-blocking`. `file` is relative to
+6. Post each finding as its own structured reply. `severity` is `blocking` only when the
+   failure is reachable in normal operation, leaks processes, files or claims, or is a security
+   hole; a leak or a security hole is always `blocking`. Any other failure that needs a rare
+   combination of events (a failed signal plus id reuse, more than the core's task bound) is
+   `non-blocking`. `file` is relative to
    the repository root. `line` is a number, or `null` for the whole file.
 
    ```sh
