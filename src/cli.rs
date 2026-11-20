@@ -547,6 +547,7 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
 
 /// How long `rider up` waits for the daemon's socket to answer.
 const UP_SECONDS_MAX: u64 = 30;
+/// How often `rider up` asks the socket again.
 const UP_POLL_MILLIS: u64 = 100;
 /// Upper bound on the lines one `rider down` prints.
 const DOWN_LINES_MAX: usize = 4096;

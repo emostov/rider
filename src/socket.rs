@@ -25,6 +25,7 @@ use crate::core::{
 pub const SOCKET_FILE: &str = "rider.sock";
 /// The directory under the Rider home the socket is bound in before it is moved into place.
 const BIND_DIR: &str = ".bind";
+/// The socket's file name inside `BIND_DIR`.
 const BIND_FILE: &str = "s";
 /// The protocol version a request names in `v`.
 pub const VERSION: u64 = 1;
@@ -38,14 +39,19 @@ pub const REPLY_BYTES_MAX: usize = 4 * 1024 * 1024;
 const LOG_FILES_MAX: usize = 64;
 /// How long closing waits for queued lines to reach their clients.
 const CLOSE_MILLIS_MAX: u64 = 2000;
+/// How often closing checks whether the queued lines have gone.
 const CLOSE_POLL_MILLIS: u64 = 20;
+/// Upper bound on the connections the acceptor takes in one run.
 const ACCEPTS_MAX: u64 = u64::MAX;
+/// Upper bound on the requests read from one connection.
 const REQUESTS_MAX: u64 = u64::MAX;
+/// Upper bound on the lines one client's writer sends.
 const STREAM_LINES_MAX: u64 = u64::MAX;
 /// Upper bound on one log line streamed to a client; a longer one is split.
 const LOG_LINE_BYTES_MAX: usize = REPLY_BYTES_MAX / 8;
 /// The most bytes JSON writes for one log byte: a control byte becomes `\u00XX`.
 const JSON_BYTES_PER_BYTE_MAX: usize = 6;
+/// The most bytes the JSON around one streamed log line takes.
 const STREAM_FRAME_BYTES_MAX: usize = 64;
 const _: () = assert!(
     LOG_LINE_BYTES_MAX * JSON_BYTES_PER_BYTE_MAX + STREAM_FRAME_BYTES_MAX <= REPLY_BYTES_MAX
@@ -54,6 +60,7 @@ const _: () = assert!(
 const LOG_READ_BYTES_MAX: u64 = 4 * 1024 * 1024;
 /// How often a followed log is read again.
 const LOG_POLL_MILLIS: u64 = 100;
+/// Upper bound on the times a followed log is read again.
 const LOG_POLLS_MAX: u64 = u64::MAX;
 /// Upper bound on writer threads kept for joining at close; finished ones are dropped first.
 const WRITERS_MAX: usize = 4 * CLIENTS_MAX;
