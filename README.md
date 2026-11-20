@@ -40,7 +40,7 @@ Clone this repository, open your agent in it, and paste:
 Set up Rider from this checkout by following docs/manual.md: check the
 prerequisites, install the Board CLI and its skill, run `cargo install --path .`,
 start the board with `rider serve` in the background, and register the two
-schemas in schemas/. Then tell me the commands to start the worker pool and the
+schemas in skills/ride-swarm/schemas/. Then tell me the commands to start the worker pool and the
 lead in my own terminals. Do not start any agents yourself.
 ```
 
@@ -73,6 +73,17 @@ security review of the stack. I have agreed the goal and the channel
 ```
 
 Watch the swarm in the board's inspector at <http://127.0.0.1:4100>.
+
+## Using the skills
+
+Install the `ride-swarm` skill, then talk to Claude Code:
+
+```bash
+npx skills add emostov/rider --skill ride-swarm -g
+```
+
+Say "ride a swarm to ..." to start work and "check my swarm" for status. The
+`ship-swarm` skill, in `skills/`, carries a finished stack through pull requests.
 
 ## Safety
 

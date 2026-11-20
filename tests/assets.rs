@@ -50,11 +50,11 @@ fn no_prompt_tells_a_worker_to_settle_its_own_task() {
 fn schemas_are_json_schemas_with_their_required_fields() {
     let cases = [
         (
-            "schemas/rider-result.json",
+            "skills/ride-swarm/schemas/rider-result.json",
             vec!["branch", "head", "commits", "summary"],
         ),
         (
-            "schemas/rider-finding.json",
+            "skills/ride-swarm/schemas/rider-finding.json",
             vec!["severity", "file", "line", "claim", "reproduce"],
         ),
     ];
@@ -71,7 +71,7 @@ fn schemas_are_json_schemas_with_their_required_fields() {
 
 #[test]
 fn the_finding_schema_names_both_severities() {
-    let schema = json_asset("schemas/rider-finding.json");
+    let schema = json_asset("skills/ride-swarm/schemas/rider-finding.json");
     assert_eq!(
         schema["properties"]["severity"]["enum"],
         serde_json::json!(["blocking", "non-blocking"])
@@ -80,7 +80,7 @@ fn the_finding_schema_names_both_severities() {
 
 #[test]
 fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
-    let lead = asset("lead/CLAUDE.md");
+    let lead = asset("skills/ride-swarm/lead.md");
     let words = [
         "`role`",
         "`repo`",
@@ -102,13 +102,13 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
         "vb tasks unblock",
     ];
     for word in words {
-        assert!(lead.contains(word), "lead/CLAUDE.md lacks {word}");
+        assert!(lead.contains(word), "lead.md lacks {word}");
     }
     for role in ROLES.iter() {
         let label = format!("`{}`", role.label);
         let profile = format!("`{}-<n>-{}`", role.label, role.model_slug);
         for word in [label, profile, role.model_name.to_string()] {
-            assert!(lead.contains(&word), "lead/CLAUDE.md lacks {word}");
+            assert!(lead.contains(&word), "lead.md lacks {word}");
         }
     }
 }
@@ -121,7 +121,7 @@ fn lead_settings_pick_the_lead_model() {
 
 #[test]
 fn lead_instructions_make_role_the_last_label() {
-    let lead = asset("lead/CLAUDE.md");
+    let lead = asset("skills/ride-swarm/lead.md");
     let rules = [
         "a task becomes claimable only when it has `role`, and `role` is always set",
         "| `start` | Rider |",
@@ -129,7 +129,7 @@ fn lead_instructions_make_role_the_last_label() {
         "Use a new key for each new plan",
     ];
     for rule in rules {
-        assert!(lead.contains(rule), "lead/CLAUDE.md lacks {rule:?}");
+        assert!(lead.contains(rule), "lead.md lacks {rule:?}");
     }
 }
 
@@ -159,10 +159,8 @@ fn only_a_task_with_onto_may_rebase() {
 
 #[test]
 fn each_turn_finishes_tasks_left_without_a_role() {
-    let lead = asset("lead/CLAUDE.md");
-    let turn = &lead[lead
-        .find("## Each turn")
-        .expect("lead/CLAUDE.md has a turn order")..];
+    let lead = asset("skills/ride-swarm/lead.md");
+    let turn = &lead[lead.find("## Each turn").expect("lead.md has a turn order")..];
     let filter = "select(.message.labels.role == null)";
     assert!(turn.contains("2. Finish tasks left without `role`"));
     assert!(
@@ -174,23 +172,18 @@ fn each_turn_finishes_tasks_left_without_a_role() {
 
 #[test]
 fn lead_retries_a_failed_light_task_as_implement_by_relabelling_first() {
-    let lead = asset("lead/CLAUDE.md");
+    let lead = asset("skills/ride-swarm/lead.md");
     for word in [
         "`light`",
         "`light-<n>-sonnet-5-5`",
         "Light <n> (Sonnet 5.5)",
     ] {
-        assert!(lead.contains(word), "lead/CLAUDE.md lacks {word}");
+        assert!(lead.contains(word), "lead.md lacks {word}");
     }
     let relabel = lead
         .find("`vb label <id> role=implement --as lead-fable-5-2`, then `vb tasks reopen <id>")
-        .expect("lead/CLAUDE.md relabels a light task before reopening it");
-    assert!(
-        relabel
-            > lead
-                .find("## Roles")
-                .expect("lead/CLAUDE.md has a role table")
-    );
+        .expect("lead.md relabels a light task before reopening it");
+    assert!(relabel > lead.find("## Roles").expect("lead.md has a role table"));
 }
 
 #[test]

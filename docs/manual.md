@@ -15,8 +15,8 @@ This is milestone 0. What works:
 - `rider pool <project>` runs worker slots on the channel `work/<project>`. Each slot claims a
   ready task by its `role` label, makes a worktree and a branch, runs one agent, and then
   completes, fails, or blocks the task. At most 4 agents run at once.
-- The lead's instructions (`lead/CLAUDE.md`), the worker prompts (`prompts/`), and the result
-  and finding schemas (`schemas/`).
+- The `ride-swarm` skill (`skills/ride-swarm/`), which holds the lead's instructions
+  (`lead.md`) and the result and finding schemas; and the worker prompts (`prompts/`).
 
 What does not exist yet: the daemon, `rider up`, `rider chat`, `rider status`, `rider agents`,
 `rider logs`, and `rider kill`. The lead is a Claude Code session that you start yourself.
@@ -69,8 +69,8 @@ checkout in another terminal:
 
 ```sh
 export BOARD_URL=http://127.0.0.1:4100/api/board PATH="$HOME/.rider/node/node_modules/.bin:$PATH"
-vb schemas create rider-result@1 --file schemas/rider-result.json
-vb schemas create rider-finding@1 --file schemas/rider-finding.json
+vb schemas create rider-result@1 --file skills/ride-swarm/schemas/rider-result.json
+vb schemas create rider-finding@1 --file skills/ride-swarm/schemas/rider-finding.json
 ```
 
 The `vb` commands under "Watching" need the same two `export` settings.
@@ -88,7 +88,7 @@ cd lead && claude
 ```
 
 The lead runs on Fable 5.2 (set in `lead/.claude/settings.json`) and follows
-`lead/CLAUDE.md`. Tell it the project, the repository, the base branch, and the goal, and say
+`skills/ride-swarm/lead.md`. Tell it the project, the repository, the base branch, and the goal, and say
 what it may decide alone. For example:
 
 > You are the lead for project `demo`. The repository is `/abs/path/to/repo`, base branch
@@ -134,7 +134,7 @@ once, in `src/roles.rs`.
 The lead sets `from` to the base branch you agreed on every task that has neither `base` nor
 `onto`. A task without any of the three is cut from `origin/HEAD`, and is blocked as
 `invalid_brief` in a repository that has none. The full rules, including what Rider checks
-before it starts a worker, are in `lead/CLAUDE.md`.
+before it starts a worker, are in `skills/ride-swarm/lead.md`.
 
 ## Watching
 
