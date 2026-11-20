@@ -14,6 +14,7 @@ prompt = "implement"
 commits = true
 needs_of = false
 builds = true
+skills = []
 
 [roles.light]
 harness = "claude"
@@ -25,6 +26,7 @@ prompt = "implement"
 commits = true
 needs_of = false
 builds = true
+skills = []
 
 [roles.review]
 harness = "codex"
@@ -36,17 +38,7 @@ prompt = "review"
 commits = false
 needs_of = true
 builds = false
-
-[roles.polish]
-harness = "claude"
-model = "claude-sonnet-5-5"
-title = "Polish"
-model_name = "Sonnet 5.5"
-model_slug = "sonnet-5-5"
-prompt = "polish"
-commits = true
-needs_of = false
-builds = true
+skills = []
 
 [roles.security]
 harness = "claude"
@@ -58,6 +50,7 @@ prompt = "security"
 commits = false
 needs_of = true
 builds = false
+skills = []
 
 [roles.qa]
 harness = "claude"
@@ -69,3 +62,4 @@ prompt = "qa"
 commits = false
 needs_of = true
 builds = true
+skills = []

@@ -664,7 +664,7 @@ mod tests {
         let fixture = Fixture::new("wt-onto");
         let base_head = fixture.branch_ahead(BASE_BRANCH);
         let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
-        let mut brief = brief(&fixture, "polish", "Polish the store");
+        let mut brief = brief(&fixture, "light", "Polish the store");
         brief.onto = Some(TaskId(3));
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
         assert_eq!(checkout.dir, expected_dir(&fixture));
@@ -864,7 +864,7 @@ mod tests {
             stacked.base = Some(TaskId(n));
             let result = prepare(&stacked, &board, &fixture.home);
             assert!(matches!(result, Err(WorktreeError::BaseHasNoBranch(TaskId(id))) if id == n));
-            let mut onto = brief(&fixture, "polish", "Onto");
+            let mut onto = brief(&fixture, "light", "Onto");
             onto.onto = Some(TaskId(n));
             let result = prepare(&onto, &board, &fixture.home);
             assert!(matches!(result, Err(WorktreeError::OntoHasNoBranch(TaskId(id))) if id == n));
@@ -931,7 +931,7 @@ mod tests {
             task(4, Some("HEAD")),
         ]);
         for n in [3, 4] {
-            let mut onto = brief(&fixture, "polish", "Onto");
+            let mut onto = brief(&fixture, "light", "Onto");
             onto.onto = Some(TaskId(n));
             let result = prepare(&onto, &board, &fixture.home);
             assert!(matches!(result, Err(WorktreeError::OntoHasNoBranch(TaskId(id))) if id == n));
@@ -1048,7 +1048,7 @@ mod tests {
         );
         let base = base.unwrap();
         let committed = fixture.commit(&base.dir, "store.txt", "store");
-        let mut polish = brief(&fixture, "polish", "Polish");
+        let mut polish = brief(&fixture, "light", "Polish");
         polish.onto = Some(TaskId(3));
         let result = prepare(&polish, &board, &fixture.home);
         assert!(matches!(
@@ -1070,7 +1070,7 @@ mod tests {
     fn onto_branch_checked_out_in_the_main_checkout_is_busy() {
         let fixture = Fixture::new("wt-busy-main");
         let board = FakeBoard::new(vec![task(7, None), task(3, Some("main"))]);
-        let mut polish = brief(&fixture, "polish", "Polish");
+        let mut polish = brief(&fixture, "light", "Polish");
         polish.onto = Some(TaskId(3));
         let result = prepare(&polish, &board, &fixture.home);
         assert!(matches!(
@@ -1116,7 +1116,7 @@ mod tests {
             result,
             Err(WorktreeError::BaseHasNoBranch(TaskId(3)))
         ));
-        let mut onto = brief(&fixture, "polish", "Onto");
+        let mut onto = brief(&fixture, "light", "Onto");
         onto.onto = Some(TaskId(3));
         let result = prepare(&onto, &board, &fixture.home);
         assert!(matches!(

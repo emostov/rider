@@ -14,6 +14,7 @@ const RUNS_FILE: &str = "agent-runs.log";
 const BEHAVIOURS_DIR: &str = "agent-behaviours";
 const RELEASES_DIR: &str = "agent-releases";
 const ARGS_DIR: &str = "agent-args";
+const HEADS_DIR: &str = "agent-heads";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
@@ -27,6 +28,8 @@ pub enum Behaviour {
     Commit,
     /// Reports success having committed nothing.
     CommitNothing,
+    /// Records its worktree's `HEAD` commit and branch, then acts like `CommitNothing`.
+    RecordHead,
     /// Writes `uncommitted-<task>.txt` without committing it and reports success.
     LeaveUncommitted,
     /// Blocks its own task as `needs_input` with `vb`, then reports success.
@@ -75,6 +78,7 @@ impl Behaviour {
         match self {
             Behaviour::Commit => "commit",
             Behaviour::CommitNothing => "commit-nothing",
+            Behaviour::RecordHead => "record-head",
             Behaviour::LeaveUncommitted => "leave-uncommitted",
             Behaviour::Block => "block",
             Behaviour::ExitNonZero => "exit-non-zero",
@@ -196,6 +200,9 @@ commit() {{
 case "$behaviour" in
   commit) commit || exit 1 ;;
   commit-nothing) ;;
+  record-head)
+    head="$world/{HEADS_DIR}/$task-$attempt"
+    git rev-parse HEAD > "$head" && (git symbolic-ref -q HEAD || true) >> "$head" || exit 1 ;;
   drop-earlier) git reset -q --hard HEAD~1 && commit || exit 1 ;;
   rebase-onto-main) git rebase -q main && commit || exit 1 ;;
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
@@ -239,7 +246,7 @@ pub fn install(world: &Path, agents: &Path) {
     for name in ["claude", "codex"] {
         write_executable(&agents.join(name), &text);
     }
-    for dir in [BEHAVIOURS_DIR, RELEASES_DIR, ARGS_DIR] {
+    for dir in [BEHAVIOURS_DIR, RELEASES_DIR, ARGS_DIR, HEADS_DIR] {
         fs::create_dir_all(world.join(dir)).expect("create an agent directory");
     }
     assert!(agents.join("claude").is_file() && agents.join("codex").is_file());
@@ -258,6 +265,22 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+/// The commit and the branch ref, `None` when detached, that attempt `attempt` of `task`
+/// found its worktree's `HEAD` at.
+pub fn head(world: &Path, task: &str, attempt: u32) -> (String, Option<String>) {
+    let path = world.join(HEADS_DIR).join(format!("{task}-{attempt}"));
+    let text = fs::read_to_string(&path).expect("read an agent's recorded HEAD");
+    let mut lines = text.lines().map(str::to_string);
+    let commit = lines.next().expect("the recorded HEAD names a commit");
+    let branch = lines.next();
+    assert_eq!(
+        lines.next(),
+        None,
+        "the recorded HEAD is at most two lines: {text:?}"
+    );
+    (commit, branch)
 }
 
 /// Lets a holding agent of `task` go on.
@@ -329,7 +352,6 @@ pub fn most_at_once(world: &Path) -> usize {
 }
 
 /// The pids of fake agents that have not recorded their end.
-// It runs inside `Drop`, so it skips what it cannot parse rather than panic.
 pub fn running_pids(world: &Path) -> Vec<u32> {
     let text = fs::read_to_string(world.join(RUNS_FILE)).unwrap_or_default();
     let mut pids: Vec<u32> = Vec::new();

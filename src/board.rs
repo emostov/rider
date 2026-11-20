@@ -71,6 +71,10 @@ pub const NEEDS_MAX: usize = 64;
 pub const TASKS_PAGE_MAX: usize = 200;
 /// Upper bound on the pages one listing reads; a subtree with more is an error.
 pub const LISTING_PAGES_MAX: usize = 16;
+/// Upper bound on the replies one thread read takes.
+pub const REPLIES_MAX: usize = 10_000;
+/// The schema a reviewer posts each finding under.
+const FINDING_SCHEMA: &str = "rider-finding";
 /// The reasons a fenced write gives when its claim is over or was never held.
 const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
 /// The reasons `vb` gives when it could not reach the board at all.
@@ -279,6 +283,8 @@ pub trait Board {
         key: &str,
         values: &[&str],
     ) -> Result<Listing, BoardError>;
+    /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
+    fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -657,6 +663,24 @@ struct WireRead {
     message: WireMessage,
 }
 
+/// The replies of `vb read <id> --json`, each with its structured blocks.
+#[derive(Deserialize)]
+struct WireReplies {
+    replies: Vec<WireReply>,
+}
+
+#[derive(Deserialize)]
+struct WireReply {
+    blocks: Vec<WireBlock>,
+}
+
+/// A structured block: `{schema, version, data}`.
+#[derive(Deserialize)]
+struct WireBlock {
+    schema: String,
+    data: serde_json::Value,
+}
+
 /// A successful `vb tasks claim --json`: `{task, claim}`, the task null when none was ready.
 #[derive(Deserialize)]
 struct WireClaimed {
@@ -893,6 +917,29 @@ pub fn parse_task_view(json: &str) -> Result<TaskView, BoardError> {
     let view = view_from_wire(read.message)?;
     assert!(view.labels.len() <= LABELS_MAX);
     Ok(view)
+}
+
+/// How many `rider-finding` blocks in the replies of `vb read <id> --json` are `blocking`.
+pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
+    let thread: WireReplies = parse(json)?;
+    if thread.replies.len() > REPLIES_MAX {
+        return Err(BoardError::Parse(format!(
+            "a thread of {} replies, over {REPLIES_MAX}",
+            thread.replies.len()
+        )));
+    }
+    let blocks = thread.replies.iter().flat_map(|reply| &reply.blocks);
+    let findings = blocks.filter(|block| block.schema == FINDING_SCHEMA);
+    let mut blocking: usize = 0;
+    for finding in findings {
+        match finding.data["severity"].as_str() {
+            Some("blocking") => blocking += 1,
+            Some("non-blocking") => {}
+            _ => return Err(BoardError::Parse("a finding without its severity".into())),
+        }
+    }
+    assert!(blocking <= OUTPUT_BYTES_MAX);
+    Ok(blocking)
 }
 
 /// The claimed task from the output of a successful `vb tasks claim --json`.
@@ -1462,6 +1509,18 @@ impl Board for VbCli {
         let label = format!("{key}={}", values.join("|"));
         self.list(channel, "all", Some(&label))
     }
+
+    fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
+        let json = self.read(&Command::Read { id })?;
+        let view = parse_task_view(&json)?;
+        if view.id != id {
+            return Err(BoardError::Parse(format!(
+                "asked for {id:?}, read {:?}",
+                view.id
+            )));
+        }
+        parse_blocking_findings(&json)
+    }
 }
 
 impl VbCli {
@@ -1699,6 +1758,10 @@ pub mod testing {
                 cursor: Cursor(0),
                 left_out: 0,
             })
+        }
+
+        fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
+            self.read_task(id).map(|_| 0)
         }
     }
 }

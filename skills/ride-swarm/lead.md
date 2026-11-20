@@ -55,7 +55,6 @@ when you ask: the answer applies to every repository there.
 | `implement` | Opus 5.5 | `implement-<n>-opus-5-5` | Implement <n> (Opus 5.5) | yes |
 | `light` | Sonnet 5.5 | `light-<n>-sonnet-5-5` | Light <n> (Sonnet 5.5) | yes |
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
-| `polish` | Sonnet 5.5 | `polish-<n>-sonnet-5-5` | Polish <n> (Sonnet 5.5) | yes |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
 | `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
@@ -76,7 +75,7 @@ worker take it again.
 
 | Label | Set by | Value |
 |---|---|---|
-| `role` | you, required | `implement`, `light`, `review`, `polish`, `security`, or `qa` |
+| `role` | you, required | `implement`, `light`, `review`, `security`, or `qa` |
 | `repo` | you, required | absolute path of the target git repository |
 | `base` | you | id of the task whose branch this one is cut from |
 | `from` | you, required when `base` and `onto` are absent | the agreed base branch to cut from |
@@ -134,28 +133,31 @@ These rules are yours to keep. Rider does not check them:
   effective value. Size tasks well inside that.
 - Sizing: changes that each take under about ten minutes and touch the same files go in one
   task, not several.
-- Review policy: each pull request gets one holistic `review` of its whole diff. Each
-  `implement` task (design judgment) gets its own `review` task with `of` set to it, and three
-  or four specific things to attack. A `light` task, a fix task for a finding, and a mechanical
-  change get no review task of their own: the PR's holistic review covers them, and you read
-  the diff. Say what to attack. A task's review finds its range from the reviewed task's `start` label;
-  a holistic review's brief names the PR's range itself, `git diff <base branch>...HEAD`, so
-  earlier fixes on the branch are included.
+- Proof: a brief's proof names targeted tests (`cargo test --test scenarios <name>`,
+  `cargo test --test sim`), not the full suite; CI runs the full suite.
+- Review policy: one review per PR. A PR of one task gets only its holistic `review` of the
+  whole diff (`git diff <base branch>...HEAD`, so earlier fixes are included). Only a PR of
+  several `implement` tasks (design judgment) gives each its own `review` task with `of` set
+  to it and three or four specific things to attack; its holistic review then reads the diff
+  only. A `light` task, a fix task for a finding, and a mechanical change get no review task of
+  their own: you read the diff. Say what to attack. A task's review finds its range from the
+  reviewed task's `start` label.
 - Blocking means a failure reachable in normal operation, a leak of processes, files or claims,
   or a security hole. A finding that needs a rare combination is non-blocking.
 - At most two review rounds per piece of work. After the second review, either accept the piece
   and record the remaining findings in the project's deferred-work thread, or change the approach.
   Never start a third fix-and-review round on the same piece unchanged.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the
-  reviewed task>`, `resume=1` when the reviewed task is `implement` or `light`, needing every
+  reviewed task>`, always `resume=1` when the reviewed task is `implement` or `light`, needing every
   unfinished task on that branch, and no review of its own.
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.
-- `polish` is one task per branch, after that branch's blocking findings are fixed:
-  `onto=<the branch's task>`. Polish a stack from the bottom up.
-- `security` is one task per stack, after polish, and for any task you judge sensitive:
-  `of=<the top task>`, and `needs` every polish task in the stack, so it never runs while
-  polish still moves a branch. Name the range in the brief, such as `main..HEAD`.
+- There are no polish tasks: the implementer polishes its own diff against AGENTS.md.
+- `security` is one task per stack, and for any task you judge sensitive: `of=<the top
+  task>`, `needs` every unfinished task on the stack. Name the range in the brief, such as
+  `main..HEAD`.
+- Merge each PR to main as soon as it is green and reviewed, and cut the next work from main.
+  Never stack more than two PRs.
 - `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI. It
   runs after the task's review: `of=<the task under test>`, and `needs` that task and its
   review. Its brief names the flows to exercise and the unhappy paths that matter. It builds
@@ -241,12 +243,15 @@ task of its own.
 9. Wait for the board in the background, never in the foreground. Run this as one background
    command (in Claude Code, the Bash tool with `run_in_background`, which notifies the session
    when the command exits):
-   `for i in 1 2 3 4 5 6; do o=$(vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json 2>&1); echo "$o" | jq -e '.reason == "timeout"' >/dev/null 2>&1 || break; done; echo "$o"`
-   The loop repeats the 9-minute wait only when the output's own top-level `reason` is
-   `"timeout"` (nothing happened; an event's `reason` is nested, so it never matches), at most 6
-   times (54 minutes), so a quiet board does not end it early and an error never spins. Any event, even a reply of yours in a finished task's thread,
-   ends it. While it runs, answer the owner. When it ends, read its output and take the next turn; if it ended on
-   an error, report it to the owner. Never run the wait in the foreground and never sleep-poll.
+   `rider wait <project> --as lead-fable-5-2`
+   It blocks until something needs you and prints one line for each thing that happened since
+   the last wait: `completed`, `failed` or `blocked` with the task's id and first line (a
+   completed review also names its blocking-finding count), `answered` for a decision, and
+   `idle` when no task in `work/<project>` is open. Your own events never end it, and it keeps
+   its own cursor, so no event is named twice. After 54 minutes with nothing to report it
+   prints nothing and exits 3: start it again. While it runs, answer the owner. When it ends,
+   read its output and take the next turn; if it ended on an error, report it to the owner.
+   Never run the wait in the foreground and never sleep-poll.
 
 ## What Rider leaves on the board
 
@@ -317,8 +322,8 @@ By default, as work resolves an issue, close it or link it to the PR that closes
 
 ## Telling the owner where it stands
 
-When the work is done, or when they ask, say what is finished, what waits on them, and what
-failed, each with its task id: `vb tasks work/<project> --state all --json`.
+Report only decisions, PRs and failures, not each settled task. When the work is done, or when
+they ask, say what is finished, what waits on them, and what failed, each with its task id: `vb tasks work/<project> --state all --json`.
 
 Every message to the owner ends with one line starting `Your move:`, in exactly one form:
 
