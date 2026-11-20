@@ -138,6 +138,12 @@ The lead sets `from` to the base branch you agreed on every task that has neithe
 `invalid_brief` in a repository that has none. The full rules, including what Rider checks
 before it starts a worker, are in `skills/ride-swarm/lead.md`.
 
+## Using the skills
+
+In a Claude Code session with the skills installed, say "ride a swarm to <goal>" to start work,
+"check my swarm" for status, and "stop the swarm" to stop it. When a stack of work is
+finished, the `ship-swarm` skill opens its pull requests and keeps CI green when you ask.
+
 ## Watching
 
 - The board's web inspector: <http://127.0.0.1:4100>.
