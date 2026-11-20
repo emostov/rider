@@ -95,8 +95,14 @@ pub fn find_tools() -> Option<(PathBuf, PathBuf)> {
             } else {
                 "node"
             };
-            // `eprintln!` is captured by the test runner; a skip must be seen.
             let line = format!("skipping scenario: {missing} not found; {INSTALL_HINT}\n");
+            // CI sets this so a missing tool fails the run instead of passing as a skip.
+            assert!(
+                std::env::var_os("RIDER_SCENARIOS_REQUIRED").is_none_or(|value| value != "1"),
+                "{}",
+                line.trim_end()
+            );
+            // `eprintln!` is captured by the test runner; a skip must be seen.
             let _ = stderr().write_all(line.as_bytes());
             None
         }
