@@ -271,7 +271,7 @@ fn a_second_sigterm_kills_an_agent_that_ignores_sigterm_within_the_grace_and_rel
 }
 
 #[test]
-fn three_ready_polish_tasks_never_run_more_than_one_polish_agent_at_once() {
+fn five_ready_polish_tasks_never_run_more_than_the_four_polish_slots_at_once() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -279,6 +279,8 @@ fn three_ready_polish_tasks_never_run_more_than_one_polish_agent_at_once() {
         "Polish the first work.",
         "Polish the second work.",
         "Polish the third work.",
+        "Polish the fourth work.",
+        "Polish the fifth work.",
     ]
     .iter()
     .map(|text| {
@@ -294,15 +296,15 @@ fn three_ready_polish_tasks_never_run_more_than_one_polish_agent_at_once() {
     given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
     when_the_agent_has_started(&world, &tasks[0]);
     thread::sleep(Duration::from_secs(2));
-    assert_eq!(agents_running(&world), 1);
+    assert_eq!(agents_running(&world), 4);
 
     for task in &tasks {
         world.release_agent(task);
     }
 
     let tasks: Vec<&str> = tasks.iter().map(String::as_str).collect();
-    assert_eq!(when_the_tasks_settle(&world, &tasks), vec!["completed"; 3]);
-    assert_eq!(world.most_agents_at_once(), 1);
+    assert_eq!(when_the_tasks_settle(&world, &tasks), vec!["completed"; 5]);
+    assert_eq!(world.most_agents_at_once(), 4);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
