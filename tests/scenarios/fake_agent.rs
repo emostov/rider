@@ -75,6 +75,11 @@ pub enum Behaviour {
     /// Prints one line of `LONG_LINE_BYTES` bytes without a newline, then exits
     /// `FAIL_EXIT_CODE`.
     LongLine,
+    /// Prints a line of `LONG_LINE_BYTES` bytes, a line holding the byte 0xff, and `end`,
+    /// then exits `FAIL_EXIT_CODE`.
+    BadBytes,
+    /// Prints 40 lines of 250 four-byte characters each, then exits `FAIL_EXIT_CODE`.
+    WideLines,
 }
 
 impl Behaviour {
@@ -103,6 +108,8 @@ impl Behaviour {
             Behaviour::FastForwardSibling => "fast-forward-sibling",
             Behaviour::ManyLines => "many-lines",
             Behaviour::LongLine => "long-line",
+            Behaviour::BadBytes => "bad-bytes",
+            Behaviour::WideLines => "wide-lines",
         }
     }
 }
@@ -230,6 +237,11 @@ case "$behaviour" in
   fast-forward-sibling) git merge -q --ff-only sibling || exit 1 ;;
   many-lines) i=1; while [ $i -le 50 ]; do echo "line $i"; i=$((i + 1)); done; exit {fail} ;;
   long-line) head -c {long} /dev/zero | tr '\0' z; exit {fail} ;;
+  bad-bytes)
+    head -c {long} /dev/zero | tr '\0' y; printf '\nbad \377 byte\nend\n'; exit {fail} ;;
+  wide-lines)
+    l=$(i=0; while [ $i -lt 250 ]; do printf '\360\237\230\200'; i=$((i + 1)); done)
+    i=0; while [ $i -lt 40 ]; do printf '%s\n' "$l"; i=$((i + 1)); done; exit {fail} ;;
   refuse-resume|refuse-resume-slowly|refuse-resume-then-hold)
     [ "$behaviour" = refuse-resume-slowly ] && sleep {slow}
     if [ -n "$resumed" ]; then

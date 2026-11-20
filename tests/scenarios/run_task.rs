@@ -2,6 +2,7 @@ use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::{MAIN, World};
 use serde_json::{Value, json};
+use std::os::unix::fs::PermissionsExt;
 
 fn then_it_is_blocked_before_any_agent_runs(world: &mut World, task: &str) -> (String, String) {
     let (states, exit) = when_the_daemon_runs_until_settled(world, &[task]);
@@ -497,4 +498,260 @@ fn an_agent_cli_missing_from_path_fails_its_attempt_replying_with_the_error() {
     let text = task_text(&world, &task);
     assert!(text.contains("agent exited 127"), "{text}");
     assert!(text.contains("claude: not found"), "{text}");
+}
+
+#[test]
+fn a_role_prompt_file_removed_while_the_daemon_runs_blocks_its_task_as_a_rider_error() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompt = world.root.join("docs-prompt.md");
+    std::fs::write(&prompt, "You write the documentation for one task.\n").expect("a prompt");
+    let toml = format!(
+        r#"[roles.docs]
+harness = "claude"
+model = "claude-docs-model"
+title = "Docs"
+model_name = "Docs Model"
+model_slug = "docs-model"
+prompt = "{}"
+commits = true
+"#,
+        prompt.display()
+    );
+    given_a_rider_toml(&world, &toml);
+    given_a_running_daemon(&mut world);
+    std::fs::remove_file(&prompt).expect("remove the prompt");
+    let mut task = an_implement_task(&world, "Document the work.");
+    task.role = Some("docs".to_string());
+    let task = when_the_lead_creates(&world, &task);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(
+        (states, then_the_daemon_exits(&mut world)),
+        (vec!["blocked".to_string()], Some(0))
+    );
+    assert_eq!(agent_runs(&world), vec![]);
+    assert!(!worktree_dir(&world, &task).exists());
+    let reason = format!(
+        "Rider cannot read its prompt file {}: No such file or directory (os error 2).",
+        prompt.display()
+    );
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("rider_error".to_string(), reason))
+    );
+}
+
+#[test]
+fn an_attempt_whose_log_cannot_be_created_fails_naming_the_error() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let dir = world.home.join("logs").join(&task);
+    std::fs::create_dir_all(&dir).expect("the task's log directory");
+    let read_only = std::fs::Permissions::from_mode(0o555);
+    std::fs::set_permissions(&dir, read_only).expect("make the log directory read-only");
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
+    assert_eq!(agent_runs(&world), vec![]);
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let text = task_text(&world, &task);
+    let reason = format!("the agent's log failed: {}", dir.join("1.jsonl").display());
+    assert!(text.contains(&reason), "{text}");
+}
+
+#[test]
+fn a_task_whose_board_read_fails_is_blocked_naming_the_error_and_no_agent_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let read = format!(r#""read {task} --json --url "*" --as implement"*"#);
+    given_vb_fails_every(&world, &[&read]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    assert_eq!(agent_runs(&world), vec![]);
+    assert!(!worktree_dir(&world, &task).exists());
+    assert_eq!(task_label(&world, &task, "branch"), None);
+    let reason = "Rider could not prepare the attempt: vb exited with code 1: injected read \
+                  failure.";
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("rider_error".to_string(), reason.to_string()))
+    );
+}
+
+#[test]
+fn an_attempt_run_past_its_log_bound_reuses_its_last_log() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let dir = world.home.join("logs").join(&task);
+    std::fs::create_dir_all(&dir).expect("the task's log directory");
+    let mut names = vec!["1.jsonl".to_string()];
+    names.extend((2..=16).map(|run| format!("1-{run}.jsonl")));
+    for name in &names {
+        std::fs::write(dir.join(name), "an earlier run\n").expect("an earlier log");
+    }
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    names.push("session".to_string());
+    names.sort();
+    assert_eq!(task_logs(&world, &task), names);
+    let last = std::fs::read_to_string(dir.join("1-16.jsonl")).expect("the last log");
+    assert!(last.contains(&fake_agent::summary(&task, 0)), "{last}");
+    let first = std::fs::read_to_string(dir.join("1-15.jsonl")).expect("an earlier log");
+    assert_eq!(first, "an earlier run\n");
+}
+
+#[test]
+fn a_failed_attempt_replies_marking_the_bytes_of_its_log_that_are_not_utf8() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let tail = when_it_fails_its_log_reply(&mut world, Behaviour::BadBytes);
+    assert_eq!(tail, "bad \u{fffd} byte\nend");
+}
+
+#[test]
+fn a_failed_attempt_replies_with_the_whole_lines_of_its_logs_last_16_kib() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let tail = when_it_fails_its_log_reply(&mut world, Behaviour::WideLines);
+    let line = "\u{1f600}".repeat(250);
+    assert_eq!(tail, vec![line.as_str(); 16].join("\n"));
+}
+
+fn then_a_task_of_a_task_without_a_branch_is_blocked(key: &str, role: &str, reason: &str) {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let other = when_the_lead_creates(&world, &NewTask::new("Done by hand."));
+    given_the_lead_completes(&world, &other);
+    let task = NewTask::new("Work on it.")
+        .label("repo", world.repo_label())
+        .label(key, &other)
+        .needs(&other)
+        .role(role);
+    let task = when_the_lead_creates(&world, &task);
+
+    let block = then_it_is_blocked_before_any_agent_runs(&mut world, &task);
+
+    let reason = reason.replace("{other}", &other);
+    assert_eq!(block, ("invalid_brief".to_string(), reason));
+}
+
+#[test]
+fn a_task_onto_a_task_without_a_branch_is_blocked_as_an_invalid_brief() {
+    then_a_task_of_a_task_without_a_branch_is_blocked(
+        "onto",
+        "implement",
+        "Set the `branch` label on task #{other} to its branch, or remove the `onto` label \
+         from this task.",
+    );
+}
+
+#[test]
+fn a_review_of_a_task_without_a_branch_is_blocked_as_an_invalid_brief() {
+    then_a_task_of_a_task_without_a_branch_is_blocked(
+        "of",
+        "review",
+        "Set the `branch` label on task #{other} to the branch to check, or change the `of` \
+         label to a task that has one.",
+    );
+}
+
+#[test]
+fn a_task_whose_worktree_path_holds_a_plain_directory_is_blocked_as_a_rider_error() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let dir = worktree_dir(&world, &task);
+    std::fs::create_dir_all(&dir).expect("a plain directory");
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    assert_eq!(agent_runs(&world), vec![]);
+    let reason = format!(
+        "Rider cannot prepare the worktree: {} exists but is not a checkout of the repository.",
+        dir.display()
+    );
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("rider_error".to_string(), reason))
+    );
+}
+
+fn given_a_checkout_elsewhere_of(world: &World, branch: &str) {
+    let dir = world.root.join("elsewhere");
+    let dir = dir.to_str().expect("a UTF-8 path");
+    let added = world.git(&world.repo, &["worktree", "add", "-q", dir, branch]);
+    assert_eq!(added.code, Some(0), "{added:?}");
+}
+
+#[test]
+fn a_task_onto_a_branch_checked_out_elsewhere_is_blocked_as_branch_busy() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&built]);
+    assert_eq!(states, vec!["completed"]);
+    let branch = task_label(&world, &built, "branch").expect("the built task's branch");
+    given_a_checkout_elsewhere_of(&world, &branch);
+    let fix = NewTask::new("Fix the work.")
+        .label("repo", world.repo_label())
+        .label("onto", &built)
+        .needs(&built)
+        .role("implement");
+    let fix = when_the_lead_creates(&world, &fix);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&fix]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    assert_eq!(agent_runs_for(&world, &fix), vec![]);
+    let reason = format!(
+        "Wait until the branch of task #{built} is not checked out in another worktree, then \
+         unblock this task."
+    );
+    assert_eq!(
+        task_block(&world, &fix),
+        Some(("branch_busy".to_string(), reason))
+    );
+}
+
+#[test]
+fn a_task_whose_branch_is_checked_out_elsewhere_is_blocked_as_branch_busy() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    world.git_ok(&["branch", "rider/busy"]);
+    given_a_checkout_elsewhere_of(&world, "rider/busy");
+    let task = an_implement_task(&world, "Add the work.").label("branch", "rider/busy");
+    let task = when_the_lead_creates(&world, &task);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    assert_eq!(agent_runs(&world), vec![]);
+    let reason = "Wait until branch rider/busy is not checked out in another worktree, then \
+                  unblock this task.";
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("branch_busy".to_string(), reason.to_string()))
+    );
 }
