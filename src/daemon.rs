@@ -391,6 +391,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     start_signals(shared.events.clone())?;
     let mut config = Config::from_roles(roles);
     config.agents_max = limits.agents;
+    config.builders_max = limits.builders_at_once;
     config.reconcile_millis = RECONCILE_SECONDS * 1000;
     config.lease_millis = lease_millis;
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);

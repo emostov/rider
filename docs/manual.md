@@ -125,16 +125,25 @@ file they use the built-in roles and limits. `rider config` prints the effective
 configuration, built-in plus file, in the file's own form, so you can start a file from it.
 
 A role in the file overrides a built-in role field by field, or adds a new role (at most 16
-roles in all). A new role sets every field but `needs_of` and `slots`. `prompt` is a built-in
+roles in all). A new role sets every field but `needs_of`, `builds` and `slots`. `prompt` is a built-in
 prompt name (`implement`, `review`, `polish`, `security`, `qa`) or a path to your own prompt
 file, relative to `$RIDER_HOME` or absolute. `needs_of` makes a task of the role name the task
 it checks in an `of` label; it defaults to `true` for a role that does not commit and must be
 `true` for one. `slots` caps how many agents of the role run at once; unset, only
 `limits.agents` does in `rider daemon`, and `rider pool` keeps its built-in slot counts.
 
+`builds` marks a role whose agents compile and run tests: `true` for `implement`, `light`,
+`polish` and `qa`, `false` for `review` and `security`, and `true` for a new role unless it
+says otherwise. `limits.builders_at_once` caps how many agents of building roles run at once,
+on top of `limits.agents` and each role's `slots`, in both `rider daemon` and `rider pool`. A
+ready task of a building role waits while that cap is full, just as it waits for a free slot.
+With the example below, at most 4 agents build at once while up to 8 run in all, so reviews
+keep running while builds wait.
+
 ```toml
 [limits]
 agents = 8           # agents at once, 1 to 32 (default 32)
+builders_at_once = 4 # agents of building roles at once, 1 to 32 (default 4)
 attempt_minutes = 30 # one attempt's time limit, 1 to 55 (default 55)
 attempts = 2         # failed attempts before a task is blocked, 1 to 9 (default 3)
 
@@ -143,6 +152,9 @@ model = "gpt-6.1-sol-mini"
 
 [roles.polish]
 slots = 1
+
+[roles.security]
+builds = true        # this role's agents build and test too
 
 [roles.docs]
 harness = "claude"   # claude or codex

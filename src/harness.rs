@@ -711,6 +711,7 @@ mod tests {
         model: "sol",
         commits_expected: false,
         needs_of: true,
+        builds: false,
         title: "Tact-test",
         model_name: "Sol",
         model_slug: "sol",

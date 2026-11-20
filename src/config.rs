@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
-use crate::roles::{AGENTS_MAX, Harness, PROFILE_LEN_MAX, ROLES, RoleSpec};
+use crate::roles::{AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RoleSpec};
 use crate::run_task::{ATTEMPTS_DEFAULT, ATTEMPTS_MAX};
 
 /// The file's name under the Rider home.
@@ -31,6 +31,8 @@ const _: () = assert!(AGENTS_MAX < 100);
 pub struct Limits {
     /// Agents running at once, across every role.
     pub agents: u8,
+    /// Agents of building roles running at once.
+    pub builders_at_once: u8,
     pub attempt_millis: u64,
     /// Failed attempts after which a task is blocked instead of run again.
     pub attempts: u8,
@@ -107,6 +109,8 @@ struct LimitsShape {
     #[serde(skip_serializing_if = "Option::is_none")]
     agents: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    builders_at_once: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     attempt_minutes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempts: Option<u8>,
@@ -141,6 +145,8 @@ struct RoleShape {
     #[serde(skip_serializing_if = "Option::is_none")]
     needs_of: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    builds: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     slots: Option<u8>,
 }
 
@@ -162,6 +168,7 @@ impl RoleShape {
             prompt: prompt.map(str::to_string),
             commits: Some(spec.commits_expected),
             needs_of: Some(spec.needs_of),
+            builds: Some(spec.builds),
             slots: None,
         }
     }
@@ -176,6 +183,7 @@ impl RoleShape {
             prompt,
             commits,
             needs_of,
+            builds,
             slots,
         } = over;
         self.harness = harness.or(self.harness);
@@ -186,6 +194,7 @@ impl RoleShape {
         self.prompt = prompt.or(self.prompt.take());
         self.commits = commits.or(self.commits);
         self.needs_of = needs_of.or(self.needs_of);
+        self.builds = builds.or(self.builds);
         self.slots = slots.or(self.slots);
     }
 }
@@ -276,6 +285,12 @@ fn limits(path: &Path, shape: &LimitsShape) -> Result<Limits, ConfigFileError> {
         let problem = format!("must be from 1 to {AGENTS_MAX}, not {agents}");
         return Err(field_error(path, "limits.agents".to_string(), problem));
     }
+    let builders_at_once = shape.builders_at_once.unwrap_or(BUILDERS_DEFAULT);
+    if !(1..=AGENTS_MAX).contains(&builders_at_once) {
+        let problem = format!("must be from 1 to {AGENTS_MAX}, not {builders_at_once}");
+        let field = "limits.builders_at_once".to_string();
+        return Err(field_error(path, field, problem));
+    }
     let minutes = shape.attempt_minutes.unwrap_or(ATTEMPT_MINUTES_MAX);
     if !(1..=ATTEMPT_MINUTES_MAX).contains(&minutes) {
         let problem = format!("must be from 1 to {ATTEMPT_MINUTES_MAX}, not {minutes}");
@@ -292,10 +307,12 @@ fn limits(path: &Path, shape: &LimitsShape) -> Result<Limits, ConfigFileError> {
     }
     let limits = Limits {
         agents,
+        builders_at_once,
         attempt_millis: minutes * 60_000,
         attempts,
     };
     assert!(limits.attempt_millis > 0 && limits.attempt_millis <= ATTEMPT_MILLIS_MAX);
+    assert!(limits.builders_at_once > 0 && limits.builders_at_once <= AGENTS_MAX);
     Ok(limits)
 }
 
@@ -366,6 +383,7 @@ fn role_spec(
         model: String::leak(model),
         commits_expected: commits,
         needs_of,
+        builds: role.builds.unwrap_or(true),
         title: String::leak(title),
         model_name: String::leak(model_name),
         model_slug: String::leak(model_slug),
@@ -425,6 +443,7 @@ fn render(
 ) -> Result<String, ConfigFileError> {
     let shape = LimitsShape {
         agents: Some(limits.agents),
+        builders_at_once: Some(limits.builders_at_once),
         attempt_minutes: Some(limits.attempt_millis / 60_000),
         attempts: Some(limits.attempts),
     };

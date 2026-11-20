@@ -19,6 +19,8 @@ pub struct RoleSpec {
     pub commits_expected: bool,
     /// A task of this role must name, in its `of` label, the task whose work it checks.
     pub needs_of: bool,
+    /// An agent of this role builds and tests, so it counts against the builders limit.
+    pub builds: bool,
     /// The role's name for people, such as "Implement" or "QA".
     pub title: &'static str,
     /// The model's name for people, such as "Opus 5.5".
@@ -34,6 +36,9 @@ pub struct RoleSpec {
 
 /// Upper bound on agents running at once, across every role, and its default.
 pub const AGENTS_MAX: u8 = 32;
+/// Agents of building roles running at once, unless the configuration sets it.
+pub const BUILDERS_DEFAULT: u8 = 4;
+const _: () = assert!(BUILDERS_DEFAULT > 0 && BUILDERS_DEFAULT <= AGENTS_MAX);
 /// The longest profile name the board accepts.
 pub const PROFILE_LEN_MAX: usize = 32;
 
@@ -44,6 +49,7 @@ pub const ROLES: [RoleSpec; 6] = [
         model: "claude-opus-5-5",
         commits_expected: true,
         needs_of: false,
+        builds: true,
         title: "Implement",
         model_name: "Opus 5.5",
         model_slug: "opus-5-5",
@@ -57,6 +63,7 @@ pub const ROLES: [RoleSpec; 6] = [
         model: "claude-sonnet-5-5",
         commits_expected: true,
         needs_of: false,
+        builds: true,
         title: "Light",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
@@ -70,6 +77,7 @@ pub const ROLES: [RoleSpec; 6] = [
         model: "gpt-6.1-sol",
         commits_expected: false,
         needs_of: true,
+        builds: false,
         title: "Review",
         model_name: "Sol 6.1",
         model_slug: "sol-6-1",
@@ -83,6 +91,7 @@ pub const ROLES: [RoleSpec; 6] = [
         model: "claude-sonnet-5-5",
         commits_expected: true,
         needs_of: false,
+        builds: true,
         title: "Polish",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
@@ -96,6 +105,7 @@ pub const ROLES: [RoleSpec; 6] = [
         model: "claude-mythos-5-2",
         commits_expected: false,
         needs_of: true,
+        builds: false,
         title: "Security",
         model_name: "Mythos 5.2",
         model_slug: "mythos-5-2",
@@ -109,6 +119,7 @@ pub const ROLES: [RoleSpec; 6] = [
         model: "claude-opus-5-5",
         commits_expected: false,
         needs_of: true,
+        builds: true,
         title: "QA",
         model_name: "Opus 5.5",
         model_slug: "opus-5-5",

@@ -64,50 +64,63 @@ pub fn slots(table: &'static [RoleSpec]) -> Vec<Slot> {
     all
 }
 
-/// A counting gate that lets at most its limit of holders through at once.
+/// A counting gate that lets at most its limit of holders through at once, and at most its
+/// builders limit of holders that build.
 pub struct Gate {
     limit: u8,
-    running: Mutex<u8>,
+    builders_limit: u8,
+    running: Mutex<Running>,
     freed: Condvar,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Running {
+    all: u8,
+    builders: u8,
 }
 
 /// A place in the gate, given back when dropped, a panic's unwinding included.
 pub struct GatePass<'a> {
     gate: &'a Gate,
+    builds: bool,
 }
 
 impl Gate {
-    /// A gate that lets at most `limit` holders through at once.
-    pub fn new(limit: u8) -> Gate {
+    /// A gate that lets at most `limit` holders, of which at most `builders_limit` build,
+    /// through at once.
+    pub fn new(limit: u8, builders_limit: u8) -> Gate {
         assert!(limit > 0 && limit <= AGENTS_MAX);
+        assert!(builders_limit > 0 && builders_limit <= AGENTS_MAX);
         Gate {
             limit,
-            running: Mutex::new(0),
+            builders_limit,
+            running: Mutex::new(Running::default()),
             freed: Condvar::new(),
         }
     }
 
-    /// Waits for a free place and takes it, or returns `None` once `stop` is set or the wait
-    /// passes `GATE_WAITS_MAX` waits.
-    pub fn enter_unless(&self, stop: &AtomicBool) -> Option<GatePass<'_>> {
-        // The count is changed only by `enter_unless` and `drop`, which cannot panic while
-        // holding the lock except on a broken invariant, so a poisoned lock still holds a true
-        // count.
+    /// Waits for a free place, and a free builder place when `builds`, and takes it; or returns
+    /// `None` once `stop` is set or the wait passes `GATE_WAITS_MAX` waits.
+    pub fn enter_unless(&self, stop: &AtomicBool, builds: bool) -> Option<GatePass<'_>> {
+        // The counts are changed only by `enter_unless` and `drop`, which cannot panic while
+        // holding the lock except on a broken invariant, so a poisoned lock still holds true
+        // counts.
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..GATE_WAITS_MAX {
             if stop.load(Ordering::SeqCst) {
                 return None;
             }
-            if *running < self.limit {
-                *running += 1;
-                assert!(*running <= self.limit);
-                return Some(GatePass { gate: self });
+            if running.all < self.limit && (!builds || running.builders < self.builders_limit) {
+                running.all += 1;
+                running.builders += u8::from(builds);
+                assert!(running.all <= self.limit && running.builders <= self.builders_limit);
+                return Some(GatePass { gate: self, builds });
             }
             let wait = Duration::from_millis(GATE_WAIT_MILLIS);
             let waited = self.freed.wait_timeout(running, wait);
             running = waited.unwrap_or_else(PoisonError::into_inner).0;
         }
-        assert!(*running <= self.limit);
+        assert!(running.all <= self.limit);
         None
     }
 }
@@ -119,10 +132,13 @@ impl Drop for GatePass<'_> {
             .running
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        assert!(*running > 0 && *running <= self.gate.limit);
-        *running -= 1;
+        assert!(running.all > 0 && running.all <= self.gate.limit);
+        assert!(!self.builds || running.builders > 0);
+        running.all -= 1;
+        running.builders -= u8::from(self.builds);
         drop(running);
-        self.gate.freed.notify_one();
+        // A waiter that builds and one that does not may both wait; wake every one to recheck.
+        self.gate.freed.notify_all();
     }
 }
 
@@ -203,7 +219,7 @@ pub fn slot_loop(
     for _ in 0..SLOT_ROUNDS_MAX {
         // The place is taken before the claim, so a claimed task starts at once and its lease
         // cannot run out while it waits for a place.
-        let Some(pass) = gate.enter_unless(stop) else {
+        let Some(pass) = gate.enter_unless(stop, slot.role.builds) else {
             if stop.load(Ordering::SeqCst) {
                 return SlotEnd::Stopped;
             }
@@ -418,7 +434,7 @@ mod tests {
     fn never_more_than_four_tasks_run_at_once() {
         const TASKS: u64 = 12;
         let board = QueueBoard::new((1..=TASKS).map(Step::Task).collect());
-        let gate = Gate::new(AGENTS_MAX);
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
         let stop = AtomicBool::new(false);
         let running = &board.running;
         let running_max = AtomicUsize::new(0);
@@ -503,7 +519,7 @@ mod tests {
             &review,
             "work/demo",
             &board,
-            &Gate::new(AGENTS_MAX),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -532,7 +548,7 @@ mod tests {
             say: &quiet,
             now: &epoch,
         };
-        let gate = Gate::new(AGENTS_MAX);
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
         for slot in slots(&ROLES) {
             let board = FakeBoard::new(Vec::new());
             board.claims.borrow_mut().push_back(TaskId(1));
@@ -568,7 +584,7 @@ mod tests {
             &implement,
             "work/demo",
             &board,
-            &Gate::new(AGENTS_MAX),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -615,7 +631,7 @@ mod tests {
             &polish,
             "work/demo",
             &board,
-            &Gate::new(AGENTS_MAX),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -656,7 +672,7 @@ mod tests {
             &security,
             "work/demo",
             &board,
-            &Gate::new(AGENTS_MAX),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -704,7 +720,7 @@ mod tests {
             &review,
             "work/demo",
             &board,
-            &Gate::new(AGENTS_MAX),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -752,7 +768,7 @@ mod tests {
             &implement,
             "work/demo",
             &board,
-            &Gate::new(AGENTS_MAX),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -765,31 +781,73 @@ mod tests {
 
     #[test]
     fn the_gate_admits_at_most_its_capacity_and_frees_a_place_on_panic() {
-        let gate = Gate::new(AGENTS_MAX);
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
         let panicked = thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _pass = gate.enter_unless(&AtomicBool::new(false));
+                    let _pass = gate.enter_unless(&AtomicBool::new(false), true);
                     panic!("an agent run panicked");
                 })
                 .join()
         });
         assert!(panicked.is_err());
-        assert_eq!(*gate.running.lock().unwrap(), 0);
+        assert_eq!(*gate.running.lock().unwrap(), Running::default());
         let go = AtomicBool::new(false);
-        let passes: Vec<Option<GatePass>> =
-            (0..AGENTS_MAX).map(|_| gate.enter_unless(&go)).collect();
+        let passes: Vec<Option<GatePass>> = (0..AGENTS_MAX)
+            .map(|_| gate.enter_unless(&go, false))
+            .collect();
         assert!(passes.iter().all(Option::is_some));
-        assert_eq!(*gate.running.lock().unwrap(), AGENTS_MAX);
+        let full = Running {
+            all: AGENTS_MAX,
+            builders: 0,
+        };
+        assert_eq!(*gate.running.lock().unwrap(), full);
         drop(passes);
-        assert_eq!(*gate.running.lock().unwrap(), 0);
+        assert_eq!(*gate.running.lock().unwrap(), Running::default());
+    }
+
+    #[test]
+    fn a_full_builders_limit_holds_back_builders_but_not_others() {
+        let gate = Gate::new(4, 2);
+        let go = AtomicBool::new(false);
+        let builders: Vec<Option<GatePass>> =
+            (0..2).map(|_| gate.enter_unless(&go, true)).collect();
+        assert!(builders.iter().all(Option::is_some));
+        let stop = AtomicBool::new(false);
+        let third = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(100));
+                stop.store(true, Ordering::SeqCst);
+            });
+            gate.enter_unless(&stop, true).is_some()
+        });
+        assert!(!third, "a third builder entered a gate that allows two");
+        let other = gate.enter_unless(&go, false);
+        assert!(other.is_some());
+        assert_eq!(
+            *gate.running.lock().unwrap(),
+            Running {
+                all: 3,
+                builders: 2
+            }
+        );
+        drop(builders);
+        let builder = gate.enter_unless(&go, true);
+        assert!(builder.is_some());
+        assert_eq!(
+            *gate.running.lock().unwrap(),
+            Running {
+                all: 2,
+                builders: 1
+            }
+        );
     }
 
     #[test]
     fn a_role_with_ready_work_gets_a_place_from_idle_slots() {
         let mut board = QueueBoard::new(vec![Step::Task(1)]);
         board.role = Some("review");
-        let gate = Gate::new(4);
+        let gate = Gate::new(4, 4);
         let stop = AtomicBool::new(false);
         let ran = AtomicBool::new(false);
         let run = |id: TaskId| -> Result<Verdict, RunError> {
@@ -857,7 +915,7 @@ mod tests {
             &polish,
             "work/demo",
             &board,
-            &Gate::new(AGENTS_MAX),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -872,16 +930,18 @@ mod tests {
 
     #[test]
     fn a_stopped_gate_gives_no_place() {
-        let gate = Gate::new(AGENTS_MAX);
-        assert!(gate.enter_unless(&AtomicBool::new(true)).is_none());
-        assert_eq!(*gate.running.lock().unwrap(), 0);
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
+        assert!(gate.enter_unless(&AtomicBool::new(true), false).is_none());
+        assert_eq!(*gate.running.lock().unwrap(), Running::default());
     }
 
     #[test]
     fn a_slot_waiting_for_a_place_returns_soon_after_stop() {
-        let gate = Gate::new(AGENTS_MAX);
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
         let go = AtomicBool::new(false);
-        let full: Vec<Option<GatePass>> = (0..AGENTS_MAX).map(|_| gate.enter_unless(&go)).collect();
+        let full: Vec<Option<GatePass>> = (0..AGENTS_MAX)
+            .map(|_| gate.enter_unless(&go, false))
+            .collect();
         assert!(full.iter().all(Option::is_some));
         let stop = AtomicBool::new(false);
         let started = Instant::now();

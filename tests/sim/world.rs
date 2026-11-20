@@ -26,6 +26,8 @@ const BRANCHES: [&str; 3] = ["stack-a", "stack-b", "stack-c"];
 const SMALL_TASKS_EVERY: u64 = 4;
 /// The task bound those seeds run under.
 const SMALL_TASKS_MAX: usize = 6;
+/// Seeds that track every task cycle the builders limit through 1 to this, so it often binds.
+const BUILDERS_CYCLE: u64 = 3;
 /// How far before the requested cursor a restarted feed may start replaying.
 const REPLAY_BACK_MAX: u64 = 8;
 /// The open tasks one listing returns; the rest it only counts, as the board's does past
@@ -139,6 +141,8 @@ impl World {
         let mut config = Config::from_roles(&ROLES);
         if seed % SMALL_TASKS_EVERY == SMALL_TASKS_EVERY - 1 {
             config.tasks_max = SMALL_TASKS_MAX;
+        } else {
+            config.builders_max = u8::try_from(seed % BUILDERS_CYCLE + 1).expect("a small limit");
         }
         let now = Timestamp(1_800_000_000_000);
         World {
@@ -832,6 +836,15 @@ impl World {
             if count > usize::from(spec.slots) {
                 return Err(format!("invariant 1: {count} runs of role {}", spec.label));
             }
+        }
+        let builders = (runs.iter())
+            .filter(|run| self.config.roles[run.role].builds)
+            .count();
+        if builders > usize::from(self.config.builders_max) {
+            let max = self.config.builders_max;
+            return Err(format!(
+                "invariant 1: {builders} runs of building roles, over {max}"
+            ));
         }
         for (index, run) in runs.iter().enumerate() {
             for other in &runs[index + 1..] {

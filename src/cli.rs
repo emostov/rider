@@ -451,7 +451,7 @@ fn pool(project: &Project, config: &Config) -> Result<u8, CliError> {
         all.len(),
         limits.agents
     ));
-    let gate = Gate::new(limits.agents);
+    let gate = Gate::new(limits.agents, limits.builders_at_once);
     let ends: Vec<bool> = thread::scope(|scope| {
         let handles: Vec<_> = all
             .iter()

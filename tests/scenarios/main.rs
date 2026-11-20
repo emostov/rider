@@ -311,6 +311,44 @@ fn five_ready_polish_tasks_never_run_more_than_the_four_polish_slots_at_once() {
 }
 
 #[test]
+fn one_builder_at_once_runs_implement_tasks_one_by_one_while_a_review_runs_beside_them() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nbuilders_at_once = 1\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let first = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
+    let second = when_the_lead_creates(&world, &an_implement_task(&world, "Add other work."));
+    let review = NewTask::new("Review the new work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &first, &[Behaviour::Hold]);
+    given_the_agent_will(&world, &second, &[Behaviour::Hold]);
+    given_the_agent_will(&world, &review, &[Behaviour::Hold]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
+
+    when_the_agent_has_started(&world, &first);
+    when_the_agent_has_started(&world, &review);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(agents_running(&world), 2);
+    assert_eq!(agent_runs_for(&world, &second).len(), 0);
+    world.release_agent(&first);
+    when_the_agent_has_started(&world, &second);
+    assert_eq!(agents_running(&world), 2);
+    world.release_agent(&second);
+    world.release_agent(&review);
+
+    let states = when_the_tasks_settle(&world, &[&built, &first, &second]);
+    assert_eq!(states, vec!["completed"; 3]);
+    assert_eq!(world.most_agents_at_once(), 2);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
 fn a_rider_toml_giving_review_another_model_starts_the_review_agent_with_it() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;

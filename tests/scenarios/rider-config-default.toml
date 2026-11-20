@@ -1,5 +1,6 @@
 [limits]
 agents = 32
+builders_at_once = 4
 attempt_minutes = 55
 attempts = 3
 
@@ -12,6 +13,7 @@ model_slug = "opus-5-5"
 prompt = "implement"
 commits = true
 needs_of = false
+builds = true
 
 [roles.light]
 harness = "claude"
@@ -22,6 +24,7 @@ model_slug = "sonnet-5-5"
 prompt = "implement"
 commits = true
 needs_of = false
+builds = true
 
 [roles.review]
 harness = "codex"
@@ -32,6 +35,7 @@ model_slug = "sol-6-1"
 prompt = "review"
 commits = false
 needs_of = true
+builds = false
 
 [roles.polish]
 harness = "claude"
@@ -42,6 +46,7 @@ model_slug = "sonnet-5-5"
 prompt = "polish"
 commits = true
 needs_of = false
+builds = true
 
 [roles.security]
 harness = "claude"
@@ -52,6 +57,7 @@ model_slug = "mythos-5-2"
 prompt = "security"
 commits = false
 needs_of = true
+builds = false
 
 [roles.qa]
 harness = "claude"
@@ -62,3 +68,4 @@ model_slug = "opus-5-5"
 prompt = "qa"
 commits = false
 needs_of = true
+builds = true
