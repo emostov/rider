@@ -2,7 +2,8 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use crate::board::{Board, BoardError, LABELS_MAX, TaskId, TaskView};
@@ -21,6 +22,10 @@ const WORKTREES_DIR: &str = "worktrees";
 const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
 pub const BRANCH_LABEL: &str = "branch";
+// In the worktree's own git directory, beside its `gitdir` link: never a checked-out file, and
+// removed with the worktree.
+const BOARD_RECORD: &str = ".rider-board";
+const BOARD_RECORD_BYTES_MAX: u64 = 4096;
 // What git keeps in a worktree's git directory while an operation is unfinished.
 const IN_PROGRESS: [&str; 8] = [
     "rebase-merge",
@@ -64,6 +69,16 @@ pub enum WorktreeError {
         dir: PathBuf,
         reason: &'static str,
     },
+    /// The checkout was made for another board, or its record of the board is missing.
+    ForeignBoard {
+        dir: PathBuf,
+        record: Record,
+    },
+    /// The worktree's record of its board could not be read or written.
+    BoardRecord {
+        path: PathBuf,
+        why: String,
+    },
     /// The checkout is not on the task's branch, or not detached when it should be; `None`
     /// stands for a detached HEAD.
     NotOnBranch {
@@ -71,6 +86,27 @@ pub enum WorktreeError {
         on: Option<String>,
         expected: Option<String>,
     },
+}
+
+/// What a reused worktree's record of its board was found to be, when it is not this board's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Record {
+    Missing,
+    Different,
+}
+
+/// Which board a worktree is made for: the identity the board keeps in its own data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardIdentity(String);
+
+impl BoardIdentity {
+    /// The identity a board reported, as its worktrees record it.
+    pub fn new(marker: &str) -> BoardIdentity {
+        assert!(!marker.is_empty() && !marker.contains('\n'));
+        let identity = BoardIdentity(format!("board {marker}\n"));
+        assert!(u64::try_from(identity.0.len()).is_ok_and(|n| n <= BOARD_RECORD_BYTES_MAX));
+        identity
+    }
 }
 
 impl fmt::Display for WorktreeError {
@@ -109,6 +145,16 @@ impl fmt::Display for WorktreeError {
             }
             WorktreeError::NotReleasable { dir, reason } => {
                 write!(f, "{} cannot be removed safely: {reason}", dir.display())
+            }
+            WorktreeError::ForeignBoard { dir, record } => {
+                let found = match record {
+                    Record::Missing => "it has no .rider-board record",
+                    Record::Different => "its .rider-board record names another board",
+                };
+                write!(f, "{} was not made for this board: {found}", dir.display())
+            }
+            WorktreeError::BoardRecord { path, why } => {
+                write!(f, "the board record {} failed: {why}", path.display())
             }
             WorktreeError::NotOnBranch { dir, on, expected } => {
                 let head = |branch: &Option<String>| match branch {
@@ -340,10 +386,50 @@ fn is_checkout_of(dir: &Path, repo: &Path) -> Result<bool, WorktreeError> {
     Ok(same)
 }
 
-fn reuse(brief: &Brief, board: &dyn Board, dir: PathBuf) -> Result<Checkout, WorktreeError> {
+fn record_path(dir: &Path) -> Result<PathBuf, WorktreeError> {
+    let path = git::git_dir(dir)?.join(BOARD_RECORD);
+    assert!(path.is_absolute() && path.ends_with(BOARD_RECORD));
+    Ok(path)
+}
+
+fn recorded_board(dir: &Path) -> Result<Option<String>, WorktreeError> {
+    let path = record_path(dir)?;
+    let failed = |error: std::io::Error| WorktreeError::BoardRecord {
+        path: path.clone(),
+        why: error.to_string(),
+    };
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failed(error)),
+    };
+    let mut bytes = Vec::new();
+    let read = file
+        .take(BOARD_RECORD_BYTES_MAX + 1)
+        .read_to_end(&mut bytes);
+    read.map_err(failed)?;
+    assert!(u64::try_from(bytes.len()).is_ok_and(|n| n <= BOARD_RECORD_BYTES_MAX + 1));
+    // A record too long or not UTF-8 is not this board's, whose record is short text.
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn reuse(
+    brief: &Brief,
+    board: &dyn Board,
+    dir: PathBuf,
+    identity: &BoardIdentity,
+) -> Result<Checkout, WorktreeError> {
     assert!(dir.is_absolute());
     if !is_checkout_of(&dir, &brief.repo)? {
         return Err(WorktreeError::NotACheckout(dir));
+    }
+    let record = match recorded_board(&dir)? {
+        None => Some(Record::Missing),
+        Some(found) if found != identity.0 => Some(Record::Different),
+        Some(_) => None,
+    };
+    if let Some(record) = record {
+        return Err(WorktreeError::ForeignBoard { dir, record });
     }
     let expected = match brief.role.commits_expected {
         true => Some(expected_branch(brief, board)?),
@@ -384,16 +470,27 @@ pub fn dir_for(brief: &Brief, home: &Path) -> PathBuf {
     home.join(WORKTREES_DIR).join(project).join(id)
 }
 
-/// The task's checkout under `home`, reused exactly as found or else added as the brief says.
-pub fn prepare(brief: &Brief, board: &dyn Board, home: &Path) -> Result<Checkout, WorktreeError> {
+/// The task's checkout under `home`, reused exactly as found when it was made for the board
+/// `identity` names, or else added as the brief says and marked as made for that board.
+pub fn prepare(
+    brief: &Brief,
+    board: &dyn Board,
+    home: &Path,
+    identity: &BoardIdentity,
+) -> Result<Checkout, WorktreeError> {
     let dir = dir_for(brief, home);
     assert!(dir.starts_with(home) && dir != home);
     // Anything at the path counts, even a dangling symlink: it is never replaced.
     if fs::symlink_metadata(&dir).is_ok() {
-        return reuse(brief, board, dir);
+        return reuse(brief, board, dir, identity);
     }
     let plan = plan(brief, board)?;
     let branch = add(&brief.repo, &dir, plan)?;
+    let path = record_path(&dir)?;
+    fs::write(&path, &identity.0).map_err(|error| WorktreeError::BoardRecord {
+        path,
+        why: error.to_string(),
+    })?;
     let start_head = git::head(&dir)?;
     assert!(brief.role.commits_expected == branch.is_some());
     Ok(Checkout {
@@ -458,6 +555,11 @@ mod tests {
 
     const BASE_BRANCH: &str = "rider/3-token-store";
 
+    fn prepare(brief: &Brief, board: &dyn Board, home: &Path) -> Result<Checkout, WorktreeError> {
+        let identity = BoardIdentity::new("rider board test");
+        super::prepare(brief, board, home, &identity)
+    }
+
     fn task(id: u64, branch: Option<&str>) -> TaskView {
         let labels = branch.map(|b| ("branch".to_string(), b.to_string()));
         TaskView {
@@ -482,6 +584,7 @@ mod tests {
             of: None,
             from: Some("main".to_string()),
             resume: false,
+            restack: false,
             text: text.to_string(),
         }
     }
@@ -561,7 +664,7 @@ mod tests {
         let fixture = Fixture::new("wt-onto");
         let base_head = fixture.branch_ahead(BASE_BRANCH);
         let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
-        let mut brief = brief(&fixture, "polish", "Polish the store");
+        let mut brief = brief(&fixture, "light", "Polish the store");
         brief.onto = Some(TaskId(3));
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
         assert_eq!(checkout.dir, expected_dir(&fixture));
@@ -761,7 +864,7 @@ mod tests {
             stacked.base = Some(TaskId(n));
             let result = prepare(&stacked, &board, &fixture.home);
             assert!(matches!(result, Err(WorktreeError::BaseHasNoBranch(TaskId(id))) if id == n));
-            let mut onto = brief(&fixture, "polish", "Onto");
+            let mut onto = brief(&fixture, "light", "Onto");
             onto.onto = Some(TaskId(n));
             let result = prepare(&onto, &board, &fixture.home);
             assert!(matches!(result, Err(WorktreeError::OntoHasNoBranch(TaskId(id))) if id == n));
@@ -828,7 +931,7 @@ mod tests {
             task(4, Some("HEAD")),
         ]);
         for n in [3, 4] {
-            let mut onto = brief(&fixture, "polish", "Onto");
+            let mut onto = brief(&fixture, "light", "Onto");
             onto.onto = Some(TaskId(n));
             let result = prepare(&onto, &board, &fixture.home);
             assert!(matches!(result, Err(WorktreeError::OntoHasNoBranch(TaskId(id))) if id == n));
@@ -945,7 +1048,7 @@ mod tests {
         );
         let base = base.unwrap();
         let committed = fixture.commit(&base.dir, "store.txt", "store");
-        let mut polish = brief(&fixture, "polish", "Polish");
+        let mut polish = brief(&fixture, "light", "Polish");
         polish.onto = Some(TaskId(3));
         let result = prepare(&polish, &board, &fixture.home);
         assert!(matches!(
@@ -967,7 +1070,7 @@ mod tests {
     fn onto_branch_checked_out_in_the_main_checkout_is_busy() {
         let fixture = Fixture::new("wt-busy-main");
         let board = FakeBoard::new(vec![task(7, None), task(3, Some("main"))]);
-        let mut polish = brief(&fixture, "polish", "Polish");
+        let mut polish = brief(&fixture, "light", "Polish");
         polish.onto = Some(TaskId(3));
         let result = prepare(&polish, &board, &fixture.home);
         assert!(matches!(
@@ -1013,7 +1116,7 @@ mod tests {
             result,
             Err(WorktreeError::BaseHasNoBranch(TaskId(3)))
         ));
-        let mut onto = brief(&fixture, "polish", "Onto");
+        let mut onto = brief(&fixture, "light", "Onto");
         onto.onto = Some(TaskId(3));
         let result = prepare(&onto, &board, &fixture.home);
         assert!(matches!(

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{ChildStdin, Command as Process, ExitStatus, Stdio};
@@ -12,7 +13,7 @@ use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process_group};
 use serde::Deserialize;
-use serde::de::{DeserializeOwned, Deserializer};
+use serde::de::{DeserializeOwned, Deserializer, IgnoredAny};
 
 use crate::core::TASKS_MAX;
 use crate::feed::Cursor;
@@ -76,12 +77,26 @@ pub const NEEDS_MAX: usize = 64;
 pub const TASKS_PAGE_MAX: usize = 200;
 /// Upper bound on the pages one listing reads; a subtree with more is an error.
 pub const LISTING_PAGES_MAX: usize = 16;
+/// Upper bound on the replies one thread read takes.
+pub const REPLIES_MAX: usize = 10_000;
+/// The schema a reviewer posts each finding under.
+const FINDING_SCHEMA: &str = "rider-finding";
 /// The reasons a fenced write gives when its claim is over or was never held.
 const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
 /// The reasons `vb` gives when it could not reach the board at all.
 const UNREACHABLE_REASONS: [&str; 1] = ["network_error"];
 /// The length of a time as the board prints it: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 const TIMESTAMP_LEN: usize = 24;
+/// The channel that holds the board's identity markers, in the board's own data.
+pub const IDENTITY_CHANNEL: &str = "rider/identity";
+/// What an identity marker's text starts with; random hex follows.
+const MARKER_PREFIX: &str = "rider board ";
+/// The random bytes in one identity marker.
+const MARKER_BYTES: usize = 16;
+/// Upper bound on the threads read from the identity channel; more is an error.
+const IDENTITY_THREADS_MAX: usize = 50;
+/// The failure reason of a read of a channel that does not exist yet.
+const CHANNEL_NOT_FOUND: &str = "channel_not_found";
 
 /// A moment the board printed, in milliseconds since the Unix epoch, UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -263,6 +278,9 @@ pub trait Board {
     fn release(&self, id: TaskId) -> Result<(), BoardError>;
     /// The open tasks in `subtree`, a channel prefix ending in `/`, and every channel below it.
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError>;
+    /// The board's identity: the oldest marker in its own data, posted first when it has none,
+    /// so replacing or wiping the board's data changes it.
+    fn identity(&self) -> Result<String, BoardError>;
     /// The tasks in any state in `channel`, or below it when it ends in `/`, whose label `key`
     /// has one of `values`, none empty or holding `|`.
     fn list_labelled(
@@ -271,6 +289,8 @@ pub trait Board {
         key: &str,
         values: &[&str],
     ) -> Result<Listing, BoardError>;
+    /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
+    fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -302,6 +322,13 @@ enum Command<'a> {
     },
     Cursor {
         subtree: &'a str,
+    },
+    Channel {
+        channel: &'a str,
+    },
+    PostRoot {
+        channel: &'a str,
+        text: &'a str,
     },
     List {
         subtree: &'a str,
@@ -433,6 +460,11 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
         }
         Command::Release { id } => (to_strings(&["tasks", "release", &id.0.to_string()]), None),
         Command::Cursor { subtree } => (to_strings(&["read", subtree, "--limit", "1"]), None),
+        Command::Channel { channel } => {
+            let limit = IDENTITY_THREADS_MAX.to_string();
+            (to_strings(&["read", channel, "--limit", &limit]), None)
+        }
+        Command::PostRoot { channel, text } => (to_strings(&["post", channel]), Some(text.into())),
         Command::List {
             subtree,
             state,
@@ -520,6 +552,8 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
         Command::Renew { .. } => ("tasks renew", 0),
         Command::Release { .. } => ("tasks release", 0),
         Command::Cursor { .. } => ("read", 0),
+        Command::Channel { .. } => ("read", 0),
+        Command::PostRoot { .. } => ("post", 0),
         Command::List { .. } => ("tasks", 0),
         Command::Label { .. } => ("label", 0),
         Command::Reply { .. } => ("reply", 0),
@@ -545,6 +579,8 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
         | Command::ClaimId { .. }
         | Command::Renew { .. }
         | Command::Cursor { .. }
+        | Command::Channel { .. }
+        | Command::PostRoot { .. }
         | Command::List { .. } => None,
         Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
@@ -633,6 +669,24 @@ struct WireRead {
     message: WireMessage,
 }
 
+/// The replies of `vb read <id> --json`, each with its structured blocks.
+#[derive(Deserialize)]
+struct WireReplies {
+    replies: Vec<WireReply>,
+}
+
+#[derive(Deserialize)]
+struct WireReply {
+    blocks: Vec<WireBlock>,
+}
+
+/// A structured block: `{schema, version, data}`.
+#[derive(Deserialize)]
+struct WireBlock {
+    schema: String,
+    data: serde_json::Value,
+}
+
 /// A successful `vb tasks claim --json`: `{task, claim}`, the task null when none was ready.
 #[derive(Deserialize)]
 struct WireClaimed {
@@ -704,6 +758,68 @@ struct WireWrite {
     outcome: String,
     task: Option<WireTaskRef>,
     message: Option<WireMessageRef>,
+}
+
+/// A root's `message` in a channel read: only its ID and text are used.
+#[derive(Deserialize)]
+struct WireRoot {
+    id: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct WireThread {
+    message: WireRoot,
+}
+
+/// `vb read <channel> --json`: `{threads: [{message, ...}], cursor, older}`, `older` null on
+/// the last page.
+#[derive(Deserialize)]
+struct WireThreads {
+    threads: Vec<WireThread>,
+    #[serde(deserialize_with = "nullable")]
+    older: Option<IgnoredAny>,
+}
+
+/// The text of the oldest identity marker in a read of the identity channel, if any. Roots
+/// that are not markers are ignored; a channel with more than one page is an error.
+pub fn parse_oldest_marker(json: &str) -> Result<Option<String>, BoardError> {
+    let read: WireThreads = parse(json)?;
+    if read.older.is_some() || read.threads.len() > IDENTITY_THREADS_MAX {
+        return Err(BoardError::Parse(format!(
+            "more than {IDENTITY_THREADS_MAX} threads in {IDENTITY_CHANNEL}"
+        )));
+    }
+    let mut oldest: Option<(TaskId, String)> = None;
+    for thread in read.threads {
+        let WireRoot { id, text } = thread.message;
+        let id = parse_id_text(&id)?;
+        if is_marker(&text) && oldest.as_ref().is_none_or(|(first, _)| id.0 < first.0) {
+            oldest = Some((id, text));
+        }
+    }
+    assert!(oldest.as_ref().is_none_or(|(_, text)| is_marker(text)));
+    Ok(oldest.map(|(_, text)| text))
+}
+
+fn is_marker(text: &str) -> bool {
+    let hex = text.strip_prefix(MARKER_PREFIX).unwrap_or_default();
+    let digits = MARKER_BYTES * 2;
+    hex.len() == digits
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A new identity marker: the prefix, then random bytes in hex.
+fn new_marker() -> Result<String, BoardError> {
+    let mut bytes = [0u8; MARKER_BYTES];
+    let read = File::open("/dev/urandom").and_then(|mut random| random.read_exact(&mut bytes));
+    read.map_err(|error| BoardError::Io(format!("reading /dev/urandom: {error}")))?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let marker = format!("{MARKER_PREFIX}{hex}");
+    assert!(is_marker(&marker));
+    Ok(marker)
 }
 
 /// An ID as the board prints it: canonical decimal, no sign and no leading zeros.
@@ -807,6 +923,29 @@ pub fn parse_task_view(json: &str) -> Result<TaskView, BoardError> {
     let view = view_from_wire(read.message)?;
     assert!(view.labels.len() <= LABELS_MAX);
     Ok(view)
+}
+
+/// How many `rider-finding` blocks in the replies of `vb read <id> --json` are `blocking`.
+pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
+    let thread: WireReplies = parse(json)?;
+    if thread.replies.len() > REPLIES_MAX {
+        return Err(BoardError::Parse(format!(
+            "a thread of {} replies, over {REPLIES_MAX}",
+            thread.replies.len()
+        )));
+    }
+    let blocks = thread.replies.iter().flat_map(|reply| &reply.blocks);
+    let findings = blocks.filter(|block| block.schema == FINDING_SCHEMA);
+    let mut blocking: usize = 0;
+    for finding in findings {
+        match finding.data["severity"].as_str() {
+            Some("blocking") => blocking += 1,
+            Some("non-blocking") => {}
+            _ => return Err(BoardError::Parse("a finding without its severity".into())),
+        }
+    }
+    assert!(blocking <= OUTPUT_BYTES_MAX);
+    Ok(blocking)
 }
 
 /// The claimed task from the output of a successful `vb tasks claim --json`.
@@ -1188,6 +1327,25 @@ impl VbCli {
         write_outcome(command, &output)
     }
 
+    /// The oldest identity marker on the board; none when the identity channel does not exist.
+    fn oldest_marker(&self) -> Result<Option<String>, BoardError> {
+        let channel = IDENTITY_CHANNEL;
+        let output = self.run(&Command::Channel { channel })?;
+        if output.code == Some(0) {
+            return parse_oldest_marker(&output.stdout);
+        }
+        let reason = output
+            .code
+            .and_then(|_| parse_failure_reason(&output.stderr));
+        if reason.as_deref() == Some(CHANNEL_NOT_FOUND) {
+            return Ok(None);
+        }
+        Err(BoardError::Exit {
+            code: output.code,
+            stderr: output.stderr,
+        })
+    }
+
     /// The stdout of a read that exited 0.
     fn read(&self, command: &Command) -> Result<String, BoardError> {
         assert!(
@@ -1204,6 +1362,37 @@ impl VbCli {
 }
 
 impl Board for VbCli {
+    fn identity(&self) -> Result<String, BoardError> {
+        assert!(!self.url.is_empty() && !self.profile.is_empty());
+        if let Some(marker) = self.oldest_marker()? {
+            return Ok(marker);
+        }
+        let marker = new_marker()?;
+        let channel = IDENTITY_CHANNEL;
+        let output = self.run(&Command::PostRoot {
+            channel,
+            text: &marker,
+        })?;
+        if output.code != Some(0) {
+            return Err(BoardError::Exit {
+                code: output.code,
+                stderr: output.stderr,
+            });
+        }
+        let write: WireWrite = parse(&output.stdout)?;
+        if write.outcome != "posted" {
+            return Err(BoardError::Parse(format!(
+                "posting a marker: {}",
+                write.outcome
+            )));
+        }
+        // Another rider may have posted its marker first: the oldest is the board's.
+        let oldest = self.oldest_marker()?;
+        let oldest = oldest.ok_or_else(|| BoardError::Parse("the posted marker is gone".into()))?;
+        assert!(is_marker(&oldest));
+        Ok(oldest)
+    }
+
     fn read_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
         assert!(!self.url.is_empty() && !self.profile.is_empty());
         let view = parse_task_view(&self.read(&Command::Read { id })?)?;
@@ -1325,6 +1514,18 @@ impl Board for VbCli {
         );
         let label = format!("{key}={}", values.join("|"));
         self.list(channel, "all", Some(&label))
+    }
+
+    fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
+        let json = self.read(&Command::Read { id })?;
+        let view = parse_task_view(&json)?;
+        if view.id != id {
+            return Err(BoardError::Parse(format!(
+                "asked for {id:?}, read {:?}",
+                view.id
+            )));
+        }
+        parse_blocking_findings(&json)
     }
 }
 
@@ -1523,6 +1724,11 @@ pub mod testing {
             self.record(format!("release {}", id.0))
         }
 
+        fn identity(&self) -> Result<String, BoardError> {
+            self.scripted("identity")?;
+            Ok("rider board 00000000000000000000000000000000".to_string())
+        }
+
         fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
             self.record(format!("list_open {subtree}"))?;
             let closed = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
@@ -1558,6 +1764,10 @@ pub mod testing {
                 cursor: Cursor(0),
                 left_out: 0,
             })
+        }
+
+        fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
+            self.read_task(id).map(|_| 0)
         }
     }
 }

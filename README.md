@@ -19,11 +19,15 @@ writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
 **The swarm** is the `rider up` daemon. It runs agents in roles you configure in
-`~/.rider/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
+`<rider home>/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
 at once. `rider config` prints the settings in effect: the built-in roles and limits with the
-file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI) or
-`tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
-for the roles that use it.
+file's over them. Rider spawns agents through `claude` (Claude Code) or `codex` (Codex CLI),
+chosen per role with `harness` in `rider.toml`; each must be installed and signed in
+for the roles that use it. A role may list `skills = ["<name>", ...]`; its
+worker runs each one, in order, over the task's whole PR range and fixes what it reports
+before completing. A `[repo."<absolute path>".roles.<role>]` table sets only that role's
+`skills`, for that repository's tasks only, and `rider config --repo <path>` prints the table
+they see.
 
 ## Getting started
 
@@ -37,15 +41,15 @@ Install Rider: clone https://github.com/emostov/rider if you don't have it yet, 
 
 Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
-review threads) and saves the answers in `~/.rider/ship.toml`.
+review threads) and saves the answers in `<rider home>/ship.toml`.
 
 ## Quickstart
 
-Rider needs Rust, Node 22, and `claude`, `codex` or `tact` on `PATH`, signed in for the roles
+Rider needs Rust, Node 22, and `claude` or `codex` on `PATH`, signed in for the roles
 that use them. Install the Board CLI where Rider looks for it:
 
 ```sh
-npm install --prefix ~/.rider/node @vercel/board
+npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board
 ```
 
 1. Start the daemon. It starts the local board if none is running, then claims ready tasks on
@@ -86,7 +90,7 @@ are prepared to have changed. Rider never pushes or merges; work stays on local 
 
 ## Where things live
 
-Everything is under `~/.rider`, or `$RIDER_HOME` when it is set.
+Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
 
 | Path | What |
 |---|---|
@@ -113,6 +117,17 @@ Everything is under `~/.rider`, or `$RIDER_HOME` when it is set.
   limit and names the whole log; `rider logs <id>` prints it.
 - **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
   `vb label`, then `vb tasks unblock <id>`.
+- **A task is blocked as `rider_error`: "Rider will not reuse the worktree ... was not made
+  for this board".** Worktrees are named by task id, so after the board's data is replaced a
+  new task can reuse the id of an old task whose worktree is still there. Each worktree Rider
+  makes records which board it is for in a `.rider-board` file in the worktree's git
+  directory. The board's identity is the oldest post in the board's own `rider/identity`
+  channel, a random id Rider posts there when the channel is empty, so wiping, replacing, or
+  switching the board gives it a new one. The daemon reads it once when it starts: restart it
+  after replacing the board, and do not post in or delete `rider/identity`. A worktree with no
+  record, or with another board's, is left as it is. Keep what you need from the directory
+  the reason names, remove it with `git worktree remove <dir>` from the repository, then
+  `vb tasks unblock <id>`.
 - **Many `node ... vb` processes are left running.** `rider reap` lists Board CLI processes
   whose board no longer answers; `rider reap --yes` stops them.
 
@@ -121,7 +136,7 @@ Everything is under `~/.rider`, or `$RIDER_HOME` when it is set.
 Bump `version` in `Cargo.toml`, refresh `Cargo.lock` with
 `cargo update -p swarm-rider --offline`, and merge it to `main` once CI passes. Then tag the
 merge commit `v<version>` and push the tag; the release workflow checks the tag against the
-manifest, runs CI again, and creates the GitHub release. Publishing to crates.io is manual.
+manifest, runs CI again, and creates the GitHub release. Publishing to crates.io is manual. See [RELEASING.md](RELEASING.md).
 
 ## Status
 

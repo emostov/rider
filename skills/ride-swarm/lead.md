@@ -20,7 +20,7 @@ asks for it in this conversation.
 
 ## The board
 
-- The Board CLI is `vb`. If it is not on `PATH`, use `~/.rider/node/node_modules/.bin/vb`.
+- The Board CLI is `vb`. If it is not on `PATH`, use `<rider home>/node/node_modules/.bin/vb`.
   `BOARD_URL` is `http://127.0.0.1:4100/api/board`.
 - Write as yourself: pass `--as lead-fable-5-2` on every `vb` command that writes or waits.
 - `work/<project>` holds a project's tasks. `decisions` holds questions for the owner.
@@ -82,6 +82,7 @@ worker take it again.
 | `onto` | you | id of a task whose existing branch this task works on directly |
 | `of` | you, required for `review`, `security`, and `qa` | id of the task under review |
 | `resume` | you | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
+| `restack` | you | `1` on a restack task: it may rebase its `onto` branch and leave the branch's starting commit behind |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |
@@ -95,23 +96,28 @@ always the last label a task gets (see "Creating a plan").
 Rider checks these before starting a worker, and blocks the task as `invalid_brief` when one
 fails: `role` is present and known; `repo` is absolute and a git repository; `base`, `onto`,
 and `of` are task ids; `base` and `onto` are not both set; `review`, `security`, and `qa`
-have `of`; `from` is a valid branch name; the task named by `base`, `onto`, or `of` has a
-`branch` label that names a local branch. Only a task's own `branch` label that names a branch other
-than the one its worktree is on blocks as `rider_error`. A branch checked out in another
-task's worktree blocks as `branch_busy`.
+have `of`; `from` is a valid branch name; `resume` and `restack` are `1` when set, and
+`restack` comes with `onto`; the task named by `base`, `onto`, or `of` has a `branch` label
+that names a local branch. It also checks the order of work:
+
+- `base` must be one of the task's `needs`, so the task never starts before its base has
+  finished.
+- An `onto` task must `need` every unfinished task on that branch, unless that task waits
+  for it, so two workers never change one branch.
+- A `review`, `security`, or `qa` task must `need` its `of` task, so it never reviews
+  unfinished work.
+
+Only a task's own `branch` label that names a branch other than the one its worktree is on
+blocks as `rider_error`. A branch checked out in another task's worktree blocks as
+`branch_busy`. An `onto` task whose branch no longer contains its starting commit fails,
+unless it has `restack=1`.
 
 These rules are yours to keep. Rider does not check them:
 
-- `base` must also be one of the task's `needs`. Otherwise the task can start before its
-  base has finished, and is cut from a half-done branch or blocked for a missing `branch`.
-  Without `base`, the branch is cut from `from`. Set `from=<the agreed base branch>` on
+- Without `base`, the branch is cut from `from`. Set `from=<the agreed base branch>` on
   every task that has neither `base` nor `onto`, in the plan file. A task without any of
   the three is cut from `origin/HEAD`, and is blocked as `invalid_brief` in a repository
   that has none.
-- An `onto` task must `need` every unfinished task on that branch. Otherwise two workers
-  change one branch, and one is blocked or builds on the other's half-done work.
-- A `review`, `security`, or `qa` task must `need` its `of` task. Otherwise it reviews unfinished
-  work, or is blocked for a missing `branch`.
 - Stacks are linear: a task sees only its base's ancestry, and Rider never merges. If a task
   needs code from two sibling branches, sequence them into one stack.
 
@@ -237,12 +243,15 @@ task of its own.
 9. Wait for the board in the background, never in the foreground. Run this as one background
    command (in Claude Code, the Bash tool with `run_in_background`, which notifies the session
    when the command exits):
-   `for i in 1 2 3 4 5 6; do o=$(vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json 2>&1); echo "$o" | jq -e '.reason == "timeout"' >/dev/null 2>&1 || break; done; echo "$o"`
-   The loop repeats the 9-minute wait only when the output's own top-level `reason` is
-   `"timeout"` (nothing happened; an event's `reason` is nested, so it never matches), at most 6
-   times (54 minutes), so a quiet board does not end it early and an error never spins. Any event, even a reply of yours in a finished task's thread,
-   ends it. While it runs, answer the owner. When it ends, read its output and take the next turn; if it ended on
-   an error, report it to the owner. Never run the wait in the foreground and never sleep-poll.
+   `rider wait <project> --as lead-fable-5-2`
+   It blocks until something needs you and prints one line for each thing that happened since
+   the last wait: `completed`, `failed` or `blocked` with the task's id and first line (a
+   completed review also names its blocking-finding count), `answered` for a decision, and
+   `idle` when no task in `work/<project>` is open. Your own events never end it, and it keeps
+   its own cursor, so no event is named twice. After 54 minutes with nothing to report it
+   prints nothing and exits 3: start it again. While it runs, answer the owner. When it ends,
+   read its output and take the next turn; if it ended on an error, report it to the owner.
+   Never run the wait in the foreground and never sleep-poll.
 
 ## What Rider leaves on the board
 
@@ -264,16 +273,17 @@ Worktrees are large, mostly the Rust `target/` directory, so remove one once not
 use it again. Rider removes a task's worktree when the task completes, and keeps it when
 the task fails or blocks so a retry can reuse it. When you cancel a task, or give up on a
 failed or blocked one, remove its worktree: `git -C <repo> worktree remove
-~/.rider/worktrees/<repository directory name>/<task id>`. It refuses when there are
+<rider home>/worktrees/<repository directory name>/<task id>`. It refuses when there are
 modified or untracked files: then tell the owner rather than forcing. Never `--force`,
 never delete the branch. A completed task whose thread says "Kept the worktree" is the
 same case once its changes are understood. `rider clean` (issue #60) will replace this rule.
 
 A branch moves after children were cut from it only when an `onto` task completes on it.
 The `behind` field of that task's `rider-result@2` record names the children whose branches
-lack its new head. Then restack each child branch, bottom up, one task at a time: `role=light` (or
-`implement`), `onto=<the child's task>`, needing the task that moved its parent. Its brief
-names the commit to rebase onto (the parent's new head, from the `rider-result@2` record of
+lack its new head. Then restack each child branch, bottom up, one task at a time:
+`role=light` (or `implement`), `onto=<the child's task>`, `restack=1`, needing the task that
+moved its parent. Its brief names the commit to rebase onto (the parent's new head, from the
+`rider-result@2` record of
 the task that moved it) and the proof command. That head does not exist until the restack
 below completes, so create each restack only after the one below it has completed, never as
 one batch.

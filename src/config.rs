@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{PROMPTS, PROMPTS_DIR};
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
-use crate::roles::{AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RoleSpec};
+use crate::roles::{
+    AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RepoRoles, RoleSpec,
+};
 use crate::run_task::{ATTEMPTS_DEFAULT, ATTEMPTS_MAX};
 
 /// The file's name under the Rider home.
@@ -26,6 +28,11 @@ const MODEL_NAME_LEN_MAX: usize = 32;
 const MODEL_LEN_MAX: usize = 128;
 const SLOT_DIGITS_MAX: usize = 2;
 const POOL_SLOTS_NEW_ROLE: u8 = 2;
+/// Upper bound on the repositories the file overrides roles for.
+pub const REPOS_MAX: usize = 64;
+/// Upper bound on the skills one role runs.
+pub const SKILLS_MAX: usize = 8;
+const SKILL_LEN_MAX: usize = 64;
 const MISSING: &str = "is missing for a role that is not built in";
 const _: () = assert!(AGENTS_MAX < 100);
 
@@ -45,7 +52,15 @@ pub struct Limits {
 #[derive(Debug)]
 pub struct Settings {
     pub roles: Vec<RoleSpec>,
+    pub repos: Vec<RepoSettings>,
     pub limits: Limits,
+    pub toml: String,
+}
+
+/// One repository's overridden roles, and the TOML of the whole table as it sees it.
+#[derive(Debug)]
+pub struct RepoSettings {
+    pub roles: RepoRoles,
     pub toml: String,
 }
 
@@ -104,6 +119,15 @@ struct FileShape {
     limits: LimitsShape,
     #[serde(default)]
     roles: BTreeMap<String, RoleShape>,
+    #[serde(default)]
+    repo: BTreeMap<String, RepoShape>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoShape {
+    #[serde(default)]
+    roles: BTreeMap<String, BTreeMap<String, toml::Value>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -124,7 +148,6 @@ struct LimitsShape {
 enum HarnessName {
     Claude,
     Codex,
-    Tact,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -150,6 +173,8 @@ struct RoleShape {
     builds: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     slots: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skills: Option<Vec<String>>,
 }
 
 impl RoleShape {
@@ -157,7 +182,6 @@ impl RoleShape {
         let harness = match spec.harness {
             Harness::Claude => HarnessName::Claude,
             Harness::Codex => HarnessName::Codex,
-            Harness::Tact => HarnessName::Tact,
         };
         let prompt = spec.prompt_file.strip_suffix(PROMPT_SUFFIX);
         assert!(prompt.is_some(), "built-in prompts are .md files");
@@ -172,6 +196,7 @@ impl RoleShape {
             needs_of: Some(spec.needs_of),
             builds: Some(spec.builds),
             slots: None,
+            skills: Some(spec.skills.iter().map(|skill| skill.to_string()).collect()),
         }
     }
 
@@ -187,6 +212,7 @@ impl RoleShape {
             needs_of,
             builds,
             slots,
+            skills,
         } = over;
         self.harness = harness.or(self.harness);
         self.model = model.or(self.model.take());
@@ -198,6 +224,7 @@ impl RoleShape {
         self.needs_of = needs_of.or(self.needs_of);
         self.builds = builds.or(self.builds);
         self.slots = slots.or(self.slots);
+        self.skills = skills.or(self.skills.take());
     }
 }
 
@@ -233,9 +260,10 @@ pub fn load(home: &Path) -> Result<Settings, ConfigFileError> {
     let limits = limits(&path, &shape.limits)?;
     let specs = roles
         .iter()
-        .map(|(label, role)| role_spec(&path, home, label, role, limits.agents))
+        .map(|(label, role)| role_spec(&path, home, "", label, role, limits.agents))
         .collect::<Result<Vec<RoleSpec>, ConfigFileError>>()?;
     let toml = render(&path, &limits, &roles)?;
+    let repos = repo_settings(&path, home, &limits, &roles, shape.repo)?;
     assert!(!specs.is_empty() && specs.len() <= ROLES_MAX);
     assert!(
         specs
@@ -244,9 +272,68 @@ pub fn load(home: &Path) -> Result<Settings, ConfigFileError> {
     );
     Ok(Settings {
         roles: specs,
+        repos,
         limits,
         toml,
     })
+}
+
+fn repo_settings(
+    path: &Path,
+    home: &Path,
+    limits: &Limits,
+    roles: &[(String, RoleShape)],
+    repos: BTreeMap<String, RepoShape>,
+) -> Result<Vec<RepoSettings>, ConfigFileError> {
+    if repos.len() > REPOS_MAX {
+        let problem = format!("names more than the {REPOS_MAX} repositories allowed");
+        return Err(field_error(path, "repo".to_string(), problem));
+    }
+    let mut out: Vec<RepoSettings> = Vec::with_capacity(repos.len());
+    for (key, repo) in repos {
+        let prefix = format!("repo.{key:?}.");
+        let written = PathBuf::from(&key);
+        if !written.is_absolute() {
+            let problem = "must be an absolute path".to_string();
+            return Err(field_error(path, format!("repo.{key:?}"), problem));
+        }
+        let canonical = written.canonicalize().unwrap_or(written);
+        if out.iter().any(|seen| seen.roles.repo == canonical) {
+            let problem = "names a repository another key already names".to_string();
+            return Err(field_error(path, format!("repo.{key:?}"), problem));
+        }
+        let mut merged = roles.to_vec();
+        let mut specs = Vec::with_capacity(repo.roles.len());
+        for (label, mut keys) in repo.roles {
+            let field = format!("{prefix}roles.{label}");
+            let Some((_, role)) = merged.iter_mut().find(|(known, _)| *known == label) else {
+                return Err(field_error(path, field, "is not a role".to_string()));
+            };
+            let skills = keys.remove("skills");
+            if let Some(key) = keys.into_keys().next() {
+                let problem =
+                    format!("cannot be set in [{field}]: only `skills` may be set per repository");
+                return Err(field_error(path, format!("{field}.{key}"), problem));
+            }
+            let Some(skills) = skills else {
+                continue;
+            };
+            let skills = skills.try_into::<Vec<String>>().map_err(|_| {
+                let problem = "must be a list of skill names".to_string();
+                field_error(path, format!("{field}.skills"), problem)
+            })?;
+            role.skills = Some(skills);
+            specs.push(role_spec(path, home, &prefix, &label, role, limits.agents)?);
+        }
+        let toml = render(path, limits, &merged)?;
+        let roles = RepoRoles {
+            repo: canonical,
+            roles: specs,
+        };
+        out.push(RepoSettings { roles, toml });
+    }
+    assert!(out.len() <= REPOS_MAX);
+    Ok(out)
 }
 
 fn read(path: &Path) -> Result<Option<String>, ConfigFileError> {
@@ -333,21 +420,26 @@ fn text_fits(text: &str, len_max: usize) -> bool {
 fn role_spec(
     path: &Path,
     home: &Path,
+    prefix: &str,
     label: &str,
     role: &RoleShape,
     agents: u8,
 ) -> Result<RoleSpec, ConfigFileError> {
-    let error =
-        |name: &str, problem: String| field_error(path, format!("roles.{label}.{name}"), problem);
+    let error = |name: &str, problem: String| {
+        field_error(path, format!("{prefix}roles.{label}.{name}"), problem)
+    };
     let missing = |name: &str| error(name, MISSING.to_string());
     if !is_name(label) {
         let problem = "must be lowercase letters, digits and '-', starting with a letter";
-        return Err(field_error(path, format!("roles.{label}"), problem.into()));
+        return Err(field_error(
+            path,
+            format!("{prefix}roles.{label}"),
+            problem.into(),
+        ));
     }
     let harness = match role.harness.ok_or_else(|| missing("harness"))? {
         HarnessName::Claude => Harness::Claude,
         HarnessName::Codex => Harness::Codex,
-        HarnessName::Tact => Harness::Tact,
     };
     let model = role.model.clone().ok_or_else(|| missing("model"))?;
     let spaced = model.contains(char::is_whitespace);
@@ -384,6 +476,8 @@ fn role_spec(
     }
     let (slots, pool_slots) =
         slot_counts(label, role.slots, agents).map_err(|problem| error("slots", problem))?;
+    let skills = role.skills.as_deref().unwrap_or_default();
+    let skills = skills_for(skills).map_err(|problem| error("skills", problem))?;
     // Validated once here; the table lives for the rest of the process.
     Ok(RoleSpec {
         label: String::leak(label.to_string()),
@@ -398,7 +492,31 @@ fn role_spec(
         slots,
         pool_slots,
         prompt_file: String::leak(prompt_file),
+        skills,
     })
+}
+
+fn skills_for(skills: &[String]) -> Result<&'static [&'static str], String> {
+    if skills.len() > SKILLS_MAX {
+        return Err(format!("lists more than the {SKILLS_MAX} skills allowed"));
+    }
+    let mut out: Vec<&'static str> = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let named = skill.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && skill.len() <= SKILL_LEN_MAX
+            && skill
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b));
+        if !named {
+            return Err(format!(
+                "{skill:?} is not a skill name: letters, digits, '-', '_' and ':', starting \
+                 with a letter or digit, at most {SKILL_LEN_MAX} bytes"
+            ));
+        }
+        out.push(String::leak(skill.clone()));
+    }
+    assert!(out.len() == skills.len() && out.len() <= SKILLS_MAX);
+    Ok(Vec::leak(out))
 }
 
 fn slot_counts(label: &str, set: Option<u8>, agents: u8) -> Result<(u8, u8), String> {

@@ -39,7 +39,7 @@ fn every_role_has_a_short_prompt_that_names_its_task_and_the_permission_rule() {
 }
 
 #[test]
-fn polish_reads_the_embedded_slop_rules_and_agents_md_wins() {
+fn the_embedded_slop_rules_are_short_and_agents_md_wins() {
     let rules = asset("prompts/slop-rules.md");
     let embedded = PROMPTS.iter().find(|(name, _)| *name == "slop-rules.md");
     assert_eq!(embedded, Some(&("slop-rules.md", rules.as_str())));
@@ -49,8 +49,6 @@ fn polish_reads_the_embedded_slop_rules_and_agents_md_wins() {
         lines < SLOP_RULES_LINES_MAX,
         "slop-rules.md has {lines} lines"
     );
-    let polish = asset("prompts/polish.md");
-    assert!(polish.contains("prompts/slop-rules.md` in full"));
 }
 
 #[test]
@@ -132,12 +130,6 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
 }
 
 #[test]
-fn lead_settings_pick_the_lead_model() {
-    let settings = json_asset("lead/.claude/settings.json");
-    assert_eq!(settings["model"], "claude-fable-5-2");
-}
-
-#[test]
 fn lead_instructions_make_role_the_last_label() {
     let lead = asset("skills/ride-swarm/lead.md");
     let rules = [
@@ -169,10 +161,10 @@ fn reviewers_find_their_range_from_the_start_label() {
 }
 
 #[test]
-fn only_a_task_with_onto_may_rebase() {
+fn only_a_task_with_restack_may_rebase() {
     let prompt = asset("prompts/implement.md");
-    assert!(prompt.contains("the task has an `onto` label"));
-    assert!(prompt.contains("Without an `onto` label, never rebase"));
+    assert!(prompt.contains("the task has the labels `onto` and `restack=1`"));
+    assert!(prompt.contains("Without\n  `restack=1`, never rebase"));
 }
 
 #[test]

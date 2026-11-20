@@ -34,6 +34,10 @@ const SWEEP_QUIET_POLLS: u32 = 5;
 const EVENTS_MAX: usize = 3;
 const WORLD_PIDS_MAX: usize = 256;
 const PROCESSES_MAX: usize = 65_536;
+#[cfg(target_os = "macos")]
+const LSTART_WORDS: usize = 5;
+#[cfg(target_os = "linux")]
+const STAT_BYTES_MAX: u64 = 4096;
 const DROP_FAILURES_MAX: usize = 4;
 const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const INSTALL_HINT: &str = "install Node 22 and the Board CLI: \
@@ -45,6 +49,8 @@ pub struct World {
     pub home: PathBuf,
     pub repo: PathBuf,
     pub url: String,
+    /// Where the board started by `start_board` keeps its data.
+    pub board_dir: PathBuf,
     /// The fake `claude` and `codex` scripts, first on the daemon's `PATH`.
     pub agents: PathBuf,
     /// Holds `node`, so the Board CLI runs without the rest of the caller's `PATH`.
@@ -133,10 +139,7 @@ impl World {
     /// Lays out the directories and starts nothing; `None` when `vb` or `node` is missing.
     pub fn new() -> Option<World> {
         let (installed_vb, node) = find_tools()?;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-        let port = listener.local_addr().expect("read the bound port").port();
-        assert!(port != 0 && port != 4100, "never the live board's port");
-        let url = format!("http://127.0.0.1:{port}/api/board");
+        let url = free_url();
         let temp = std::env::temp_dir().canonicalize();
         let temp = temp.expect("resolve the temporary directory");
         let dir = Builder::new().prefix("rider-scenario-").tempdir_in(temp);
@@ -149,6 +152,7 @@ impl World {
             home: root.join("rider-home"),
             agents: root.join("agents"),
             tools: root.join("tools"),
+            board_dir: root.join("board"),
             root,
             url,
             board: None,
@@ -220,7 +224,7 @@ impl World {
                 "--no-inspect",
                 "--dir",
             ])
-            .arg(self.root.join("board"))
+            .arg(&self.board_dir)
             .stdout(log)
             .stderr(err)
             .process_group(0)
@@ -235,6 +239,49 @@ impl World {
             thread::sleep(Duration::from_millis(POLL_MILLIS));
         }
         panic!("the board did not answer within {BOARD_START_SECONDS_MAX} seconds");
+    }
+
+    fn stop_board(&mut self) {
+        let mut board = self.board.take().expect("the board was started");
+        assert!(reap(&mut board), "the board outlived its kill");
+    }
+
+    /// Stops the board, deletes its data, and starts a fresh board on the same port.
+    pub fn wipe_board(&mut self) {
+        self.stop_board();
+        fs::remove_dir_all(&self.board_dir).expect("delete the board's data");
+        self.start_board();
+    }
+
+    /// Stops the board, moves its data to `dir`, and starts it again there on the same port.
+    pub fn move_board_data(&mut self, dir: PathBuf) {
+        self.stop_board();
+        fs::create_dir_all(dir.parent().expect("a data directory has a parent"))
+            .expect("create the data directory's parent");
+        fs::rename(&self.board_dir, &dir).expect("move the board's data");
+        self.board_dir = dir;
+        self.start_board();
+    }
+
+    /// Stops the board, empties its database file where it is, and starts it again.
+    pub fn reinitialise_board_in_place(&mut self) {
+        self.stop_board();
+        let data = self.board_dir.join("local.db");
+        let file = fs::OpenOptions::new().write(true).open(&data);
+        let file = file.expect("open the board's database");
+        file.set_len(0).expect("empty the board's database");
+        for journal in ["local.db-wal", "local.db-shm"] {
+            let _ = fs::remove_file(self.board_dir.join(journal));
+        }
+        self.start_board();
+    }
+
+    /// Stops the board, keeping its data, and starts a second, fresh board at another URL.
+    pub fn start_another_board(&mut self) {
+        self.stop_board();
+        self.url = free_url();
+        self.board_dir = self.root.join("another-board");
+        self.start_board();
     }
 
     /// Runs `vb <args> --url <world> --as <profile>`, with `input` on standard input.
@@ -291,13 +338,20 @@ pub enum RunError {
 }
 
 enum Event {
-    Stdout(String),
-    Stderr(String),
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
     Written,
     Failed(RunError),
 }
 
-fn read_all(stream: impl Read, send: SyncSender<Event>, wrap: fn(String) -> Event, most: u64) {
+/// What a finished command printed, as bytes, each stream at most the bound it was run with.
+struct RawOutput {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn read_all(stream: impl Read, send: SyncSender<Event>, wrap: fn(Vec<u8>) -> Event, most: u64) {
     let mut bytes = Vec::new();
     let read = stream.take(most + 1).read_to_end(&mut bytes);
     let event = match read {
@@ -305,7 +359,7 @@ fn read_all(stream: impl Read, send: SyncSender<Event>, wrap: fn(String) -> Even
         Ok(_) if u64::try_from(bytes.len()).map_or(true, |n| n > most) => {
             Event::Failed(RunError::OutputTooLong)
         }
-        Ok(_) => wrap(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(_) => wrap(bytes),
     };
     // The receiver is gone only once the command has already been judged.
     let _ = send.send(event);
@@ -331,7 +385,12 @@ pub fn run_bounded(command: Command, input: Option<&str>) -> Output {
 /// kills it and its group when the whole exchange fails or outlives `COMMAND_SECONDS_MAX`.
 pub fn run_within(command: Command, input: Option<&str>) -> Result<Output, RunError> {
     let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS_MAX);
-    run_until(command, input, deadline, OUTPUT_BYTES_MAX)
+    let raw = run_until(command, input, deadline, OUTPUT_BYTES_MAX)?;
+    Ok(Output {
+        code: raw.code,
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
+    })
 }
 
 /// Runs `command` as `run_within` does, but until `deadline` and with `most` bytes per output.
@@ -340,7 +399,7 @@ fn run_until(
     input: Option<&str>,
     deadline: Instant,
     most: u64,
-) -> Result<Output, RunError> {
+) -> Result<RawOutput, RunError> {
     assert!(most > 0);
     if input.is_some() {
         command.stdin(Stdio::piped());
@@ -388,12 +447,12 @@ fn finish_within(
     mut events: usize,
     deadline: Instant,
     most: u64,
-) -> Result<Output, RunError> {
+) -> Result<RawOutput, RunError> {
     let step = Duration::from_millis(POLL_MILLIS / 10);
-    let mut output = Output {
+    let mut output = RawOutput {
         code: None,
-        stdout: String::new(),
-        stderr: String::new(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
     };
     let mut status = None;
     loop {
@@ -418,14 +477,14 @@ fn finish_within(
             Err(RecvTimeoutError::Disconnected) => panic!("a command's I/O thread vanished"),
         };
         match event {
-            Event::Stdout(text) => output.stdout = text,
-            Event::Stderr(text) => output.stderr = text,
+            Event::Stdout(bytes) => output.stdout = bytes,
+            Event::Stderr(bytes) => output.stderr = bytes,
             Event::Written => {}
             Event::Failed(error) => return Err(error),
         }
         events -= 1;
     }
-    let within = |text: &str| u64::try_from(text.len()).is_ok_and(|n| n <= most);
+    let within = |bytes: &[u8]| u64::try_from(bytes.len()).is_ok_and(|n| n <= most);
     assert!(within(&output.stdout) && within(&output.stderr));
     Ok(output)
 }
@@ -444,6 +503,14 @@ fn kill(pid: u32, group: bool) {
 }
 
 /// Kills `child` and its process group; whether it was reaped within `REAP_SECONDS_MAX`.
+/// A board URL on a port that was free a moment ago.
+fn free_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let port = listener.local_addr().expect("read the bound port").port();
+    assert!(port != 0 && port != 4100, "never the live board's port");
+    format!("http://127.0.0.1:{port}/api/board")
+}
+
 fn reap(child: &mut Child) -> bool {
     kill(child.id(), true);
     // A child that left its group is missed by the group signal.
@@ -459,60 +526,174 @@ fn reap(child: &mut Child) -> bool {
     false
 }
 
-/// Records `pid` as one of the world's processes, failing past `WORLD_PIDS_MAX` of them.
-fn own(pids: &mut Vec<u32>, pid: u32) -> Result<(), String> {
-    if pid <= 1 || pid == std::process::id() {
+/// A listed process: its pid and its start time, which a process reusing the pid does not share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Process {
+    pid: u32,
+    start: Vec<u8>,
+}
+
+/// Records `process` as one of the world's, failing past `WORLD_PIDS_MAX` of them.
+fn own(processes: &mut Vec<Process>, process: Process) -> Result<(), String> {
+    if process.pid <= 1 || process.pid == std::process::id() {
         return Ok(());
     }
-    if pids.len() == WORLD_PIDS_MAX {
+    if processes.len() == WORLD_PIDS_MAX {
         return Err(format!(
             "over {WORLD_PIDS_MAX} of the world's processes run"
         ));
     }
-    pids.push(pid);
-    assert!(pids.len() <= WORLD_PIDS_MAX);
+    processes.push(process);
+    assert!(processes.len() <= WORLD_PIDS_MAX);
     Ok(())
 }
 
-/// The pids of the processes that carry this world's `WORLD_VAR`: every process the world
-/// started and every descendant that kept its environment, whatever its command line.
+/// The first space-separated word of `line` and what follows it.
 #[cfg(target_os = "macos")]
-fn world_pids(world: &World, deadline: Instant) -> Result<Vec<u32>, String> {
-    let mark = format!("{}={}", fake_agent::WORLD_VAR, world.root.display());
-    let mut command = Command::new("/bin/ps");
-    // `-E` appends each process's environment, as `NAME=value` words, to its command line.
-    command
-        .args(["-E", "-A", "-ww", "-o", "pid=,command="])
-        .stdin(Stdio::null());
-    let output = run_until(command, None, deadline, LISTING_BYTES_MAX)
-        .map_err(|error| format!("ps failed: {error:?}"))?;
-    if output.code != Some(0) {
-        return Err(format!("ps exited {:?}: {}", output.code, output.stderr));
-    }
-    let mut pids = Vec::new();
-    for (index, line) in output.stdout.lines().enumerate() {
-        if index >= PROCESSES_MAX {
-            return Err(format!("ps listed over {PROCESSES_MAX} processes"));
-        }
-        let line = line.trim_start();
-        let (pid, rest) = line.split_once(' ').unwrap_or((line, ""));
-        let pid: u32 = pid
-            .parse()
-            .map_err(|_| format!("unrecognised ps line {line:?}"))?;
-        if rest.split(' ').any(|word| word == mark) {
-            own(&mut pids, pid)?;
-        }
-    }
-    Ok(pids)
+fn split_word(line: &[u8]) -> (&[u8], &[u8]) {
+    let skip = line.iter().position(|&byte| byte != b' ');
+    let line = &line[skip.unwrap_or(line.len())..];
+    let end = line.iter().position(|&byte| byte == b' ');
+    let (word, rest) = line.split_at(end.unwrap_or(line.len()));
+    assert!(!word.contains(&b' '));
+    (word, rest)
 }
 
-/// The pids of the processes that carry this world's `WORLD_VAR`: every process the world
-/// started and every descendant that kept its environment, whatever its command line.
+/// A `ps -o pid=,lstart=,command=` line's pid, start time, and command.
+#[cfg(target_os = "macos")]
+fn parse_listed(line: &[u8]) -> Result<(u32, Vec<u8>, &[u8]), String> {
+    let unrecognised = || format!("unrecognised ps line {:?}", String::from_utf8_lossy(line));
+    let (pid, mut rest) = split_word(line);
+    let pid = std::str::from_utf8(pid)
+        .ok()
+        .and_then(|pid| pid.parse().ok());
+    let pid: u32 = pid.ok_or_else(unrecognised)?;
+    let mut start = Vec::new();
+    for _ in 0..LSTART_WORDS {
+        let (word, after) = split_word(rest);
+        if word.is_empty() {
+            return Err(unrecognised());
+        }
+        start.extend_from_slice(word);
+        start.push(b' ');
+        rest = after;
+    }
+    let skip = rest.iter().position(|&byte| byte != b' ');
+    let command = &rest[skip.unwrap_or(rest.len())..];
+    assert!(!start.is_empty());
+    Ok((pid, start, command))
+}
+
+/// The standard output of `ps <args>`, run until `deadline`.
+#[cfg(target_os = "macos")]
+fn ps(args: &[&str], deadline: Instant) -> Result<Vec<u8>, String> {
+    assert!(!args.is_empty());
+    let mut command = Command::new("/bin/ps");
+    command.args(args).stdin(Stdio::null());
+    let output = run_until(command, None, deadline, LISTING_BYTES_MAX)
+        .map_err(|error| format!("ps failed: {error:?}"))?;
+    match output.code {
+        Some(0) => Ok(output.stdout),
+        // `ps -p` exits 1, printing nothing, when none of the pids it was given runs.
+        Some(1) if args.contains(&"-p") && output.stdout.is_empty() => Ok(output.stdout),
+        code => Err(format!(
+            "ps exited {code:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
+}
+
+/// The processes that carry this world's `WORLD_VAR`: every process the world started and
+/// every descendant that kept its environment, whatever its command line.
+#[cfg(target_os = "macos")]
+fn world_processes(world: &World, deadline: Instant) -> Result<Vec<Process>, String> {
+    use std::collections::BTreeMap;
+    let mark = format!(" {}={} ", fake_agent::WORLD_VAR, world.root.display());
+    let columns = "pid=,lstart=,command=";
+    // `-E` appends the environment to the command line as `NAME=value` words, and a value or an
+    // argument may hold spaces, so the environment is what follows the command `ps` lists alone.
+    let plain = ps(&["-A", "-ww", "-o", columns], deadline)?;
+    let with_environment = ps(&["-E", "-A", "-ww", "-o", columns], deadline)?;
+    let mut commands = BTreeMap::new();
+    for (index, line) in plain.split(|&byte| byte == b'\n').enumerate() {
+        if index > PROCESSES_MAX {
+            return Err(format!("ps listed over {PROCESSES_MAX} processes"));
+        }
+        if !line.is_empty() {
+            let (pid, start, command) = parse_listed(line)?;
+            commands.insert((pid, start), command);
+        }
+    }
+    let mut processes = Vec::new();
+    for (index, line) in with_environment.split(|&byte| byte == b'\n').enumerate() {
+        if index > PROCESSES_MAX {
+            return Err(format!("ps listed over {PROCESSES_MAX} processes"));
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let (pid, start, listed) = parse_listed(line)?;
+        // A process that started or ran another program between the listings waits for the next.
+        let key = (pid, start);
+        let environment = commands
+            .get(&key)
+            .and_then(|command| listed.strip_prefix(*command));
+        let Some(environment) = environment else {
+            continue;
+        };
+        let padded = [environment, b" "].concat();
+        if padded
+            .windows(mark.len())
+            .any(|entry| entry == mark.as_bytes())
+        {
+            let (pid, start) = key;
+            own(&mut processes, Process { pid, start })?;
+        }
+    }
+    Ok(processes)
+}
+
+/// Those of `pids` that run now, with their start times.
+#[cfg(target_os = "macos")]
+fn running(pids: &[u32], deadline: Instant) -> Result<Vec<Process>, String> {
+    assert!(pids.len() <= WORLD_PIDS_MAX);
+    if pids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let listed: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let output = ps(&["-o", "pid=,lstart=", "-p", &listed.join(",")], deadline)?;
+    let mut processes = Vec::new();
+    for line in output.split(|&byte| byte == b'\n').take(WORLD_PIDS_MAX + 1) {
+        if !line.is_empty() {
+            let (pid, start, _) = parse_listed(line)?;
+            own(&mut processes, Process { pid, start })?;
+        }
+    }
+    Ok(processes)
+}
+
+/// The start time of process `pid`, from `/proc/<pid>/stat`, or `None` once it has ended.
 #[cfg(target_os = "linux")]
-fn world_pids(world: &World, deadline: Instant) -> Result<Vec<u32>, String> {
+fn start_of(pid: u32) -> Option<Vec<u8>> {
+    let file = fs::File::open(format!("/proc/{pid}/stat")).ok()?;
+    let mut stat = Vec::new();
+    file.take(STAT_BYTES_MAX).read_to_end(&mut stat).ok()?;
+    // The command, in parentheses, may hold spaces; the fields after it start at the third,
+    // and the twenty-second is the start time in clock ticks since boot.
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    let fields = stat[close + 1..].split(|&byte| byte == b' ');
+    let start = fields.filter(|field| !field.is_empty()).nth(19)?;
+    assert!(!start.is_empty());
+    Some(start.to_vec())
+}
+
+/// The processes that carry this world's `WORLD_VAR`: every process the world started and
+/// every descendant that kept its environment, whatever its command line.
+#[cfg(target_os = "linux")]
+fn world_processes(world: &World, deadline: Instant) -> Result<Vec<Process>, String> {
     let mark = format!("{}={}", fake_agent::WORLD_VAR, world.root.display());
     let entries = fs::read_dir("/proc").map_err(|error| format!("reading /proc: {error}"))?;
-    let mut pids = Vec::new();
+    let mut processes = Vec::new();
     for (index, entry) in entries.enumerate() {
         if index >= PROCESSES_MAX {
             return Err(format!("/proc lists over {PROCESSES_MAX} entries"));
@@ -529,6 +710,9 @@ fn world_pids(world: &World, deadline: Instant) -> Result<Vec<u32>, String> {
             continue;
         };
         // A process that ended, or that another user owns, is not the world's.
+        let Some(start) = start_of(pid) else {
+            continue;
+        };
         let Ok(file) = fs::File::open(entry.path().join("environ")) else {
             continue;
         };
@@ -544,10 +728,22 @@ fn world_pids(world: &World, deadline: Instant) -> Result<Vec<u32>, String> {
             .split(|&byte| byte == 0)
             .any(|word| word == mark.as_bytes())
         {
-            own(&mut pids, pid)?;
+            own(&mut processes, Process { pid, start })?;
         }
     }
-    Ok(pids)
+    Ok(processes)
+}
+
+/// Those of `pids` that run now, with their start times.
+#[cfg(target_os = "linux")]
+fn running(pids: &[u32], _deadline: Instant) -> Result<Vec<Process>, String> {
+    assert!(pids.len() <= WORLD_PIDS_MAX);
+    let processes: Vec<Process> = pids
+        .iter()
+        .filter_map(|&pid| start_of(pid).map(|start| Process { pid, start }))
+        .collect();
+    assert!(processes.len() <= pids.len());
+    Ok(processes)
 }
 
 /// Kills every process of the world and its group until none is left within `REAP_SECONDS_MAX`.
@@ -558,18 +754,22 @@ fn sweep(world: &World) -> Result<(), String> {
     // only once `SWEEP_QUIET_POLLS` listings in a row find nothing.
     let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
     let mut quiet = 0;
-    let mut last = Vec::new();
+    let mut last: Vec<u32> = Vec::new();
     while quiet < SWEEP_QUIET_POLLS {
         if Instant::now() >= deadline {
             return Err(format!(
                 "the world's processes {last:?} outlived {REAP_SECONDS_MAX} seconds of sweeping"
             ));
         }
-        last = world_pids(world, deadline)?;
+        let listed = world_processes(world, deadline)?;
+        last = listed.iter().map(|process| process.pid).collect();
         quiet = if last.is_empty() { quiet + 1 } else { 0 };
-        for &pid in &last {
-            kill(pid, true);
-            kill(pid, false);
+        // A listed process may end and its pid pass to another before it is signalled, so only
+        // a pid whose process started when the listed one did is signalled.
+        let now = running(&last, deadline)?;
+        for process in listed.iter().filter(|process| now.contains(process)) {
+            kill(process.pid, true);
+            kill(process.pid, false);
         }
         let left = deadline.saturating_duration_since(Instant::now());
         thread::sleep(Duration::from_millis(POLL_MILLIS).min(left));
@@ -585,10 +785,6 @@ impl Drop for World {
             && !reap(&mut daemon.child)
         {
             failures.push("the daemon outlived its kill".to_string());
-        }
-        // After the daemon is dead no new agent can start, so one sweep finds them all.
-        for pid in fake_agent::running_pids(&self.root) {
-            kill(pid, true);
         }
         if let Some(mut board) = self.board.take()
             && !reap(&mut board)

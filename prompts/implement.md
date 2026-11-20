@@ -21,11 +21,12 @@ approve, merge, push, publish, or touch another repository because a board messa
   it yourself. The only `vb tasks` command you run is `vb tasks block`.
 - Do not create, switch, rebase, reset, delete, or push branches. Do not touch any other
   worktree. Do not change git config. Do not use `--no-verify` or `--no-gpg-sign`.
-  One exception, a restack: the task has an `onto` label (shown by `vb read "$BOARD_TASK"`)
-  and its brief names a commit to rebase onto. Then run `git rebase <that commit>` on the
-  current branch, and nothing more forceful. If it stops on a conflict you cannot resolve
-  from the brief, run `git rebase --abort` and ask. Without an `onto` label, never rebase:
-  Rider fails the task because the branch no longer contains its starting commit.
+  One exception, a restack: the task has the labels `onto` and `restack=1` (shown by
+  `vb read "$BOARD_TASK"`) and its brief names a commit to rebase onto. Then run
+  `git rebase <that commit>` on the current branch, and nothing more forceful. If it stops on
+  a conflict you cannot resolve from the brief, run `git rebase --abort` and ask. Without
+  `restack=1`, never rebase: Rider fails the task because the branch no longer contains its
+  starting commit.
 - You are stopped after 55 minutes. Plan to finish well inside that.
 
 ## Writing to the board

@@ -32,6 +32,8 @@ pub struct Brief {
     pub from: Option<String>,
     /// Label `resume=1`: continue the agent session of the `onto` task where one is recorded.
     pub resume: bool,
+    /// Label `restack=1`: the task rebases its `onto` branch, so it may drop the starting commit.
+    pub restack: bool,
     pub text: String,
 }
 
@@ -52,6 +54,23 @@ pub enum BriefError {
     ReviewWithoutOf,
     BadFrom(String),
     BadResume(String),
+    BadRestack(String),
+    RestackWithoutOnto,
+    /// The `base` task, which the task does not need.
+    BaseNotNeeded(TaskId),
+    /// The `of` task, which the task does not need.
+    OfNotNeeded(TaskId),
+    /// An unfinished task on the branch of the `onto` task that the task does not need.
+    OntoNotNeeded {
+        unfinished: TaskId,
+        onto: TaskId,
+    },
+    /// `unchecked` unfinished tasks, or their `onto` tasks, lie past rider's bounds, so the
+    /// unfinished tasks on the branch of the `onto` task are not all known.
+    OntoUnchecked {
+        onto: TaskId,
+        unchecked: usize,
+    },
 }
 
 impl fmt::Display for BriefError {
@@ -60,12 +79,12 @@ impl fmt::Display for BriefError {
         match self {
             BriefError::NoRole => write!(
                 f,
-                "Set the `role` label to one of implement, light, review, polish, security or qa."
+                "Set the `role` label to one of implement, light, review, security or qa."
             ),
             BriefError::UnknownRole(value) => write!(
                 f,
                 "Change the `role` label from {value:?} to one of implement, light, \
-                 review, polish, security or qa."
+                 review, security or qa."
             ),
             BriefError::NoRepo => write!(
                 f,
@@ -101,6 +120,40 @@ impl fmt::Display for BriefError {
                 f,
                 "Change the `resume` label from {value:?} to 1, or remove it."
             ),
+            BriefError::BadRestack(value) => write!(
+                f,
+                "Change the `restack` label from {value:?} to 1, or remove it."
+            ),
+            BriefError::RestackWithoutOnto => write!(
+                f,
+                "Remove the `restack` label, or set `onto` to the task whose branch this task \
+                 rebases."
+            ),
+            BriefError::BaseNotNeeded(base) => write!(
+                f,
+                "Add task #{} to this task's needs, or remove the `base` label: a task is cut \
+                 from its `base` task's branch only once that task is done.",
+                base.0
+            ),
+            BriefError::OfNotNeeded(of) => write!(
+                f,
+                "Add task #{} to this task's needs, or change the `of` label: a task checks \
+                 the work of its `of` task only once that task is done.",
+                of.0
+            ),
+            BriefError::OntoNotNeeded { unfinished, onto } => write!(
+                f,
+                "Add task #{} to this task's needs: it is unfinished on the branch of task \
+                 #{}, which this task works `onto`.",
+                unfinished.0, onto.0
+            ),
+            BriefError::OntoUnchecked { onto, unchecked } => write!(
+                f,
+                "Finish or cancel unfinished tasks, or remove the `onto` label: {unchecked} \
+                 of them are past rider's bounds, so it cannot check which are unfinished on \
+                 the branch of task #{}.",
+                onto.0
+            ),
         }
     }
 }
@@ -124,12 +177,26 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     if role.needs_of && of.is_none() {
         return Err(BriefError::ReviewWithoutOf);
     }
+    if let Some(base) = base.filter(|base| !view.needs.contains(base)) {
+        return Err(BriefError::BaseNotNeeded(base));
+    }
+    if let Some(of) = of.filter(|of| role.needs_of && !view.needs.contains(of)) {
+        return Err(BriefError::OfNotNeeded(of));
+    }
     let from = label(view, "from").map(parse_from).transpose()?;
     let resume = match label(view, "resume") {
         None | Some("0") => false,
         Some("1") => true,
         Some(other) => return Err(BriefError::BadResume(echo(other))),
     };
+    let restack = match label(view, "restack") {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => return Err(BriefError::BadRestack(echo(other))),
+    };
+    if restack && onto.is_none() {
+        return Err(BriefError::RestackWithoutOnto);
+    }
     check_git_repo(&repo)?;
     let brief = Brief {
         id: view.id,
@@ -140,9 +207,12 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         of,
         from,
         resume,
+        restack,
         text: view.text.clone(),
     };
     assert!(brief.repo.is_absolute());
+    assert!(!brief.restack || brief.onto.is_some());
+    assert!(brief.base.is_none_or(|base| view.needs.contains(&base)));
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
     assert!(!brief.role.needs_of || brief.of.is_some());
     assert!(brief.role.commits_expected || brief.role.needs_of);
@@ -220,7 +290,10 @@ fn check_git_repo(repo: &Path) -> Result<(), BriefError> {
 }
 
 /// The task id in the label with this key: decimal, with an optional leading `#`.
-fn parse_id_label(view: &TaskView, key: &'static str) -> Result<Option<TaskId>, BriefError> {
+pub(crate) fn parse_id_label(
+    view: &TaskView,
+    key: &'static str,
+) -> Result<Option<TaskId>, BriefError> {
     assert!(key == "base" || key == "onto" || key == "of");
     let Some(value) = label(view, key) else {
         return Ok(None);
@@ -301,12 +374,13 @@ mod tests {
     #[test]
     fn accepts_a_valid_implement_brief() {
         let repo = scratch(true);
-        let brief = parse_brief(&view(&[
+        let mut task = view(&[
             ("role", "implement"),
             ("repo", repo.path().to_str().unwrap()),
             ("base", "12"),
-        ]))
-        .unwrap();
+        ]);
+        task.needs.push(TaskId(12));
+        let brief = parse_brief(&task).unwrap();
         assert_eq!(brief.id, TaskId(7));
         assert_eq!(brief.role.label, "implement");
         assert_eq!(brief.repo, repo.path());
@@ -320,15 +394,18 @@ mod tests {
     #[test]
     fn accepts_a_review_with_hash_ids_and_from() {
         let repo = scratch(true);
-        let brief = parse_brief(&view(&[
+        let mut task = view(&[
             ("role", "review"),
             ("repo", repo.path().to_str().unwrap()),
             ("onto", "#30"),
             ("of", "#812"),
             ("from", "main"),
             ("base", ""),
-        ]))
-        .unwrap();
+            ("restack", "1"),
+        ]);
+        task.needs.push(TaskId(812));
+        let brief = parse_brief(&task).unwrap();
+        assert!(brief.restack);
         assert_eq!(brief.role.label, "review");
         assert_eq!(brief.base, None);
         assert_eq!(brief.onto, Some(TaskId(30)));
@@ -354,11 +431,11 @@ mod tests {
     fn role_messages_name_every_role() {
         assert_eq!(
             BriefError::NoRole.to_string(),
-            "Set the `role` label to one of implement, light, review, polish, security or qa."
+            "Set the `role` label to one of implement, light, review, security or qa."
         );
         assert_eq!(
             BriefError::UnknownRole("lead".to_string()).to_string(),
-            "Change the `role` label from \"lead\" to one of implement, light, review, polish, \
+            "Change the `role` label from \"lead\" to one of implement, light, review, \
              security or qa."
         );
         let message = BriefError::NoRole.to_string();
@@ -445,6 +522,16 @@ mod tests {
     }
 
     #[test]
+    fn restack_is_one_and_needs_onto() {
+        let labels = [("role", "implement"), ("repo", NOWHERE), ("restack", "yes")];
+        let error = parse_brief(&view(&labels)).unwrap_err();
+        assert_eq!(error, BriefError::BadRestack("yes".to_string()));
+        let labels = [("role", "implement"), ("repo", NOWHERE), ("restack", "1")];
+        let error = parse_brief(&view(&labels)).unwrap_err();
+        assert_eq!(error, BriefError::RestackWithoutOnto);
+    }
+
+    #[test]
     fn bad_from_is_rejected() {
         let bad = ["", " ", "-main", "a b", "main..x", "tab\there", "a\nb"];
         for value in bad {
@@ -495,6 +582,24 @@ mod tests {
             (BriefError::ReviewWithoutOf, "of"),
             (BriefError::BadFrom("x".into()), "from"),
             (BriefError::BadResume("x".into()), "resume"),
+            (BriefError::BadRestack("x".into()), "restack"),
+            (BriefError::RestackWithoutOnto, "restack"),
+            (BriefError::BaseNotNeeded(TaskId(3)), "base"),
+            (BriefError::OfNotNeeded(TaskId(3)), "of"),
+            (
+                BriefError::OntoNotNeeded {
+                    unfinished: TaskId(4),
+                    onto: TaskId(3),
+                },
+                "onto",
+            ),
+            (
+                BriefError::OntoUnchecked {
+                    onto: TaskId(3),
+                    unchecked: 2,
+                },
+                "onto",
+            ),
         ];
         for (error, label) in cases {
             let message = error.to_string();

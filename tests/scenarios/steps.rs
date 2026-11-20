@@ -83,11 +83,7 @@ pub fn given_a_board_and_a_repository() -> Option<World> {
 
 /// Given the board answers: Rider's schemas on it, and a scratch repository with one commit.
 pub fn given_the_schemas_and_a_repository(world: &World) {
-    for (name, file) in SCHEMAS {
-        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
-        let file = file.to_str().expect("UTF-8 path");
-        world.vb_lead(&["schemas", "create", name, "--file", file], None);
-    }
+    register_schemas(world);
     fs::create_dir_all(&world.repo).expect("create the repository");
     let repo = world.repo.clone();
     for args in [
@@ -102,6 +98,68 @@ pub fn given_the_schemas_and_a_repository(world: &World) {
     world.git_ok(&["add", "README.md"]);
     world.git_ok(&["commit", "-q", "-m", "Start the scratch repository"]);
     assert_eq!(world.git_ok(&["branch", "--show-current"]), MAIN);
+}
+
+fn register_schemas(world: &World) {
+    for (name, file) in SCHEMAS {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let file = file.to_str().expect("UTF-8 path");
+        world.vb_lead(&["schemas", "create", name, "--file", file], None);
+    }
+}
+
+/// When the board's data is deleted and a fresh board, with the schemas, takes its place.
+pub fn when_the_board_is_wiped(world: &mut World) {
+    world.wipe_board();
+    register_schemas(world);
+}
+
+/// When the board's database is emptied where it lies, and the board, with the schemas, starts
+/// again on it.
+pub fn when_the_board_is_reinitialised_in_place(world: &mut World) {
+    world.reinitialise_board_in_place();
+    register_schemas(world);
+}
+
+/// When the board stops, keeping its data, and rider is pointed at a second, fresh board, with
+/// the schemas, at another URL.
+pub fn when_rider_moves_to_another_board(world: &mut World) {
+    world.start_another_board();
+    register_schemas(world);
+}
+
+/// Given the board keeps its data in rider's home, where `vb serve --dir ~/.rider/board` puts it.
+pub fn given_the_board_keeps_its_data_in_rider_home(world: &mut World) {
+    let dir = world.home.join("board");
+    world.move_board_data(dir);
+}
+
+/// Given a database in rider's home's board directory that no running board uses.
+pub fn given_a_stray_board_database_in_rider_home(world: &World) {
+    let dir = world.home.join("board");
+    fs::create_dir_all(&dir).expect("create the stray board directory");
+    fs::write(dir.join("local.db"), "not this board's data\n").expect("write a stray database");
+}
+
+/// Given a worktree on a new `branch` at `id`'s worktree directory that rider did not make.
+pub fn given_a_leftover_worktree(world: &World, id: &str, branch: &str) -> PathBuf {
+    let dir = worktree_dir(world, id);
+    let dir_text = dir.to_str().expect("UTF-8 path");
+    world.git_ok(&["worktree", "add", "-q", "-b", branch, dir_text, MAIN]);
+    dir
+}
+
+/// The worktree's HEAD and its `git status --porcelain`, to show it was left untouched.
+pub fn worktree_state(world: &World, dir: &Path) -> (String, String) {
+    let head = world.git(dir, &["rev-parse", "HEAD"]);
+    let status = world.git(dir, &["status", "--porcelain"]);
+    assert_eq!((head.code, status.code), (Some(0), Some(0)));
+    (head.stdout, status.stdout)
+}
+
+/// The task's whole `vb read <id> --json` output, where its block reason is.
+pub fn task_text(world: &World, id: &str) -> String {
+    world.vb_lead(&["read", id, "--json"], None)
 }
 
 /// An implement task in the world's repository, cut from `main`.
@@ -221,6 +279,13 @@ struct TaskFields {
     state: String,
     epoch: u64,
     claim: Option<Claim>,
+    blocked: Option<Blocked>,
+}
+
+#[derive(Deserialize)]
+struct Blocked {
+    kind: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -258,6 +323,12 @@ fn parse<T: DeserializeOwned>(json: &str) -> T {
 /// A task's `vb read <id> --json`.
 pub fn read_task(world: &World, id: &str) -> TaskRead {
     parse(&world.vb_lead(&["read", id, "--json"], None))
+}
+
+/// A blocked task's block kind and reason, or `None` when it is not blocked.
+pub fn task_block(world: &World, id: &str) -> Option<(String, String)> {
+    let blocked = read_task(world, id).message.task.blocked;
+    blocked.map(|blocked| (blocked.kind, blocked.reason))
 }
 
 /// A task's state: `ready`, `claimed`, `completed`, `failed`, `blocked`, or `canceled`.
@@ -428,6 +499,8 @@ pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
 pub const BOARD_STARTED: &str = "started the board, pid";
 /// The daemon log's line naming a board process a killed daemon started, kept as its own.
 pub const BOARD_KEPT: &str = "kept the board started before, pid";
+/// The daemon log's line for the first stop signal.
+pub const DAEMON_DRAINING: &str = "a stop signal: draining";
 /// How long a held `vb` call waits for its release, in tenths of a second.
 const HELD_TENTHS_MAX: u32 = 1200;
 
@@ -472,6 +545,25 @@ pub fn when_the_daemon_is_sent_sigterm(world: &World) {
         .status()
         .expect("run kill");
     assert!(status.success());
+}
+
+/// When the daemon, once its log shows it is draining, is sent a second SIGTERM; two sent
+/// back to back can reach it as one.
+pub fn when_the_daemon_is_sent_a_second_sigterm(world: &World) {
+    let log = world.home.join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains(DAEMON_DRAINING)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never drained:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+    when_the_daemon_is_sent_sigterm(world);
 }
 
 /// Then the daemon exits within `DAEMON_STOP_SECONDS_MAX`; returns its exit code.
@@ -691,6 +783,20 @@ exec '{}' "$@"
 "#,
         marker.display(),
         release.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb` call that names the board's identity channel fails, and no other.
+pub fn given_vb_fails_the_identity_read(world: &World) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" rider/identity "*) echo 'identity unavailable' >&2; exit 1;; esac
+exec '{}' "$@"
+"#,
         real.display()
     );
     crate::world::write_executable(&world.vb, &script);
@@ -946,4 +1052,100 @@ pub fn when_the_group_is_killed(pid: u32) {
         .status()
         .expect("run kill");
     assert!(status.success(), "killing group {pid} failed: {status}");
+}
+
+/// How long a scenario waits for `rider wait` to end.
+const WAIT_SECONDS_MAX: u64 = 90;
+/// The exit code of a `rider wait` that timed out.
+pub const WAIT_TIMED_OUT: i32 = 3;
+
+/// When the lead starts `rider wait <project> <args>` in the background.
+pub fn when_rider_wait_starts(world: &World, args: &[&str]) -> std::process::Child {
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command
+        .args(["wait", PROJECT])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    command.spawn().expect("start rider wait")
+}
+
+/// Then `rider wait` ends within `WAIT_SECONDS_MAX`; returns its exit code and output.
+pub fn then_rider_wait_ends(child: std::process::Child) -> crate::world::Output {
+    let (sender, ended) = std::sync::mpsc::sync_channel(1);
+    let pid = child.id();
+    thread::spawn(move || drop(sender.send(child.wait_with_output())));
+    let Ok(output) = ended.recv_timeout(Duration::from_secs(WAIT_SECONDS_MAX)) else {
+        kill_group(pid);
+        panic!("rider wait did not end within {WAIT_SECONDS_MAX} seconds");
+    };
+    let output = output.expect("wait for rider wait");
+    crate::world::Output {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Given the lead has waited once, so the next wait starts from now.
+pub fn given_the_lead_has_waited(world: &World) {
+    let output = when_rider_runs(world, &["wait", PROJECT, "--timeout", "0"]);
+    assert_eq!(output.code, Some(WAIT_TIMED_OUT), "{output:?}");
+}
+
+/// When worker `profile` claims `task`.
+pub fn when_a_worker_claims(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "claim", task, "--lease", "1h"], None);
+    assert_eq!(output.code, Some(0), "claim {task}: {output:?}");
+}
+
+/// When worker `profile` completes the `task` it holds.
+pub fn when_the_worker_completes(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "complete", task, "done"], None);
+    assert_eq!(output.code, Some(0), "complete {task}: {output:?}");
+}
+
+/// The `vb tail` processes started by process `parent`.
+pub fn feeds_of(parent: u32) -> Vec<u32> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "pid=,ppid=,command="])
+        .stdin(Stdio::null());
+    let output = crate::world::run_bounded(command, None);
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let rows = output.stdout.lines().filter_map(|line| {
+        let mut words = line.split_whitespace();
+        let pid: u32 = words.next()?.parse().ok()?;
+        let ppid: u32 = words.next()?.parse().ok()?;
+        let tail = words.any(|word| word == "tail");
+        (ppid == parent && tail).then_some(pid)
+    });
+    rows.collect()
+}
+
+/// When `rider wait` has started following the board's feed; returns its `vb tail` pids.
+pub fn when_the_wait_follows_the_feed(wait: u32) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS_MAX);
+    loop {
+        let feeds = feeds_of(wait);
+        if !feeds.is_empty() {
+            return feeds;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rider wait never started vb tail"
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When process `pid` is sent `signal`, such as `-TERM`.
+pub fn when_the_process_is_sent(pid: u32, signal: &str) {
+    let status = std::process::Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {signal} {pid}");
 }
