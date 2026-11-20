@@ -128,6 +128,7 @@ once, in `src/roles.rs`.
 | `from` | lead, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | lead | id of a task whose existing branch this task works on directly |
 | `of` | lead, required for `review`, `security`, and `qa` | id of the task under review |
+| `resume` | lead | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |

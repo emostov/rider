@@ -30,6 +30,8 @@ pub struct Brief {
     pub of: Option<TaskId>,
     /// Label `from`: the branch to cut from when `base` is absent.
     pub from: Option<String>,
+    /// Label `resume=1`: continue the agent session of the `onto` task where one is recorded.
+    pub resume: bool,
     pub text: String,
 }
 
@@ -49,6 +51,7 @@ pub enum BriefError {
     },
     ReviewWithoutOf,
     BadFrom(String),
+    BadResume(String),
 }
 
 impl fmt::Display for BriefError {
@@ -94,6 +97,10 @@ impl fmt::Display for BriefError {
                 "Change the `from` label from {value:?} to a branch name without \
                  spaces or `..` that does not start with `-`."
             ),
+            BriefError::BadResume(value) => write!(
+                f,
+                "Change the `resume` label from {value:?} to 1, or remove it."
+            ),
         }
     }
 }
@@ -118,6 +125,11 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         return Err(BriefError::ReviewWithoutOf);
     }
     let from = label(view, "from").map(parse_from).transpose()?;
+    let resume = match label(view, "resume") {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => return Err(BriefError::BadResume(echo(other))),
+    };
     check_git_repo(&repo)?;
     let brief = Brief {
         id: view.id,
@@ -127,6 +139,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         onto,
         of,
         from,
+        resume,
         text: view.text.clone(),
     };
     assert!(brief.repo.is_absolute());
@@ -496,6 +509,7 @@ mod tests {
             ),
             (BriefError::ReviewWithoutOf, "of"),
             (BriefError::BadFrom("x".into()), "from"),
+            (BriefError::BadResume("x".into()), "resume"),
         ];
         for (error, label) in cases {
             let message = error.to_string();
