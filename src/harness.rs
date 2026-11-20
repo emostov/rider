@@ -681,14 +681,20 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
 pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut failed = false;
     let mut last_result_failed = false;
+    let mut last_turn_failed = false;
     // A log cut short still counts for what it showed.
     let _ = scan(log, |event| {
         let kind = text_at(event, "/type");
         match harness {
             // tact exits 0 when cancelled; only the stream says so.
             Harness::Tact => failed |= kind == Some("run.failed"),
-            // `item.type == "error"` inside `item.completed` is a harmless warning.
-            Harness::Codex => failed |= matches!(kind, Some("turn.failed" | "error")),
+            // `item.type == "error"` inside `item.completed` is a harmless warning, and a
+            // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
+            Harness::Codex => match kind {
+                Some("turn.failed" | "error") => last_turn_failed = true,
+                Some("turn.completed") => last_turn_failed = false,
+                _ => {}
+            },
             Harness::Claude if kind == Some("result") => {
                 let is_error = event.pointer("/is_error").and_then(Value::as_bool);
                 let subtype = text_at(event, "/subtype");
@@ -699,7 +705,8 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     });
     assert!(!failed || *harness != Harness::Claude);
     assert!(!last_result_failed || *harness == Harness::Claude);
-    failed || last_result_failed
+    assert!(!last_turn_failed || *harness == Harness::Codex);
+    failed || last_result_failed || last_turn_failed
 }
 
 #[cfg(test)]
@@ -967,5 +974,26 @@ mod tests {
         assert!(reports_failure("codex-failed", Harness::Codex, codex));
         let codex = r#"{"type":"error","message":"x"}"#;
         assert!(reports_failure("codex-error", Harness::Codex, codex));
+    }
+
+    #[test]
+    fn a_codex_turn_is_judged_by_how_it_ended() {
+        let path = Path::new("fixtures/harness/codex-reconnect.jsonl");
+        assert!(!stream_reports_failure(&Harness::Codex, path));
+        let recorded = fs::read_to_string(path).unwrap();
+        let cut: Vec<&str> = recorded
+            .lines()
+            .filter(|l| !l.contains("turn.completed"))
+            .collect();
+        assert_eq!(cut.len() + 1, recorded.lines().count());
+        assert_eq!(
+            cut.iter().filter(|l| l.contains("Reconnecting...")).count(),
+            4
+        );
+        assert!(reports_failure(
+            "codex-unfinished",
+            Harness::Codex,
+            &cut.join("\n")
+        ));
     }
 }

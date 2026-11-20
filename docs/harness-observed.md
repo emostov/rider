@@ -43,6 +43,13 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
 - The stream begins with two `item.completed` events of `item.type == "error"` (a deprecation warning from this machine's config). These are not failures. A parser must not treat `item.type == "error"` as a run failure.
 - Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`.
 - Fixture: `fixtures/harness/codex.jsonl` (4 KB).
+- During a provider outage Codex prints top-level events such as
+  `{"type":"error","message":"Reconnecting... 2/5 (unexpected status 503 Service Unavailable ...)"}`
+  mid-turn, numbered up to `5/5`, and carries on. A turn that recovers still ends with
+  `turn.completed`, so a run is judged by its last turn event: `turn.completed` succeeds;
+  `turn.failed`, or a top-level `error` after which no `turn.completed` comes (Codex gave up), fails.
+  Fixture: `fixtures/harness/codex-reconnect.jsonl`, cut from a real review run, with the provider
+  URL and `cf-ray` id redacted.
 
 ## tact
 
