@@ -35,56 +35,14 @@ one pull request or a stack.
 
 ## Getting started
 
-Clone this repository, open your agent in it, and paste:
+Paste this into your coding agent:
 
 ```
-Set up Rider from this checkout by following docs/manual.md: check the
-prerequisites, install the Board CLI and its skill, run `cargo install --path .`,
-start the board with `rider serve` in the background, and register the two
-schemas in skills/ride-swarm/schemas/. Then tell me the commands to start the worker pool and the
-lead in my own terminals. Do not start any agents yourself.
+Install Rider: run `cargo install swarm-rider`, which installs the `rider` binary.
+Then run `npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
 ```
 
-To install by hand instead, you need Rust, Node 22, `jq`, and the `claude` and
-`codex` CLIs, each signed in:
-
-```bash
-npm install --prefix ~/.rider/node @vercel/board
-npx skills add vercel/board --skill board -g
-cargo install --path .
-```
-
-Then register the schemas (see the [manual](./docs/manual.md)) and start three
-terminals:
-
-```bash
-rider serve              # the board
-rider pool demo          # the swarm, for project "demo"
-cd lead && claude        # the lead
-```
-
-Tell the lead what you want:
-
-```
-You are the lead for project `demo`. The repository is /abs/path/to/repo, base
-branch `main`. Goal: <what you want built, and how you will know it is done>.
-Plan it with a review of each implementing task, a polish pass, and one
-security review of the stack. I have agreed the goal and the channel
-`work/demo`; decide everything else yourself. Workers are already running.
-```
-
-Watch the swarm in the board's inspector at <http://127.0.0.1:4100>.
-
-## Using the skills
-
-Install the `ride-swarm` skill, then talk to Claude Code:
-
-```bash
-npx skills add emostov/rider --skill ride-swarm -g
-```
-
-Say "ride a swarm to ..." to start work and "check my swarm" for status. The
-`ship-swarm` skill, in `skills/`, carries a finished stack through pull requests.
+Then say "ride a swarm to <goal>" in a new session.
 
 ## Safety
 
@@ -96,9 +54,8 @@ Say "ride a swarm to ..." to start work and "check my swarm" for status. The
 
 ## Status
 
-Rider is early. Next up is a daemon: `rider up` to start everything,
-`rider chat` to talk to the lead, `rider status` to see the swarm, and recovery
-after a crash.
+Rider is early. It runs a swarm from the board and the skills; a daemon (`rider up`,
+`rider chat`, `rider status`) is next.
 
 ## Docs
 
