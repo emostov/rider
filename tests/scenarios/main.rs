@@ -1161,3 +1161,140 @@ fn a_panicking_world_kills_its_wrapped_vb_and_spares_a_process_that_names_its_pa
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn rider_up_starts_the_daemon_in_the_background_and_rider_down_stops_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let up = when_rider_runs(&world, &["up"]);
+    assert_eq!(up.code, Some(0), "{up:?}");
+    assert!(up.stdout.contains("board up"), "{up:?}");
+    let pid = daemon_pid(&world);
+    assert!(is_alive(pid), "the daemon {pid} is not running");
+    let status = when_rider_runs(&world, &["status"]);
+    assert_eq!(status.code, Some(0), "{status:?}");
+    assert!(status.stdout.contains("board up"), "{status:?}");
+
+    let down = when_rider_runs(&world, &["down"]);
+
+    assert_eq!(down.code, Some(0), "{down:?}");
+    assert!(
+        when_the_process_ends_within(pid, 30),
+        "the daemon {pid} still runs"
+    );
+    let after = when_rider_runs(&world, &["status"]);
+    assert_eq!(after.code, Some(1), "{after:?}");
+    assert!(after.stderr.contains("not running"), "{after:?}");
+}
+
+#[test]
+fn rider_down_drains_the_running_agent_claims_nothing_new_and_the_daemon_exits() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let running = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &running, &[Behaviour::Hold]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &running);
+
+    let down = thread::scope(|scope| {
+        let down = scope.spawn(|| when_rider_runs(&world, &["down"]));
+        thread::sleep(Duration::from_secs(1));
+        let later = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
+        assert_eq!(
+            when_the_task_leaves_ready_within(&world, &later, 3),
+            "ready"
+        );
+        world.release_agent(&running);
+        let output = down.join().expect("rider down ran");
+        assert_eq!(task_state(&world, &later), "ready");
+        assert!(agent_runs_for(&world, &later).is_empty());
+        output
+    });
+
+    assert_eq!(down.code, Some(0), "{down:?}");
+    assert!(down.stdout.contains(&format!("#{running}")), "{down:?}");
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(task_state(&world, &running), "completed");
+}
+
+#[test]
+fn rider_down_now_stops_the_agent_and_leaves_its_task_ready_with_attempt_unchanged() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_a_running_daemon(&mut world);
+    let run = when_the_agent_has_started(&world, &task);
+
+    let down = when_rider_runs(&world, &["down", "--now"]);
+
+    assert_eq!(down.code, Some(0), "{down:?}");
+    assert!(down.stdout.contains(&format!("#{task}")), "{down:?}");
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(!is_alive(run.pid), "the agent {} still runs", run.pid);
+    assert_eq!(task_state(&world, &task), "ready");
+    assert_eq!(task_label(&world, &task, "attempt"), None);
+}
+
+#[test]
+fn rider_status_shows_a_running_and_a_waiting_task_and_rider_agents_the_running_one() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nbuilders_at_once = 1\n");
+    let running = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let waiting = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
+    given_the_agent_will(&world, &running, &[Behaviour::Hold]);
+    given_the_agent_will(&world, &waiting, &[Behaviour::Hold]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &running);
+
+    let status = when_rider_runs(&world, &["status"]);
+    let agents = when_rider_runs(&world, &["agents"]);
+
+    assert_eq!(status.code, Some(0), "{status:?}");
+    assert!(status.stdout.contains("1 of 32 running"), "{status:?}");
+    let line = |id: &str| {
+        let found = status
+            .stdout
+            .lines()
+            .find(|line| line.contains(&format!("#{id} ")));
+        found.unwrap_or_else(|| panic!("no line for #{id}:\n{}", status.stdout))
+    };
+    let running_line = line(&running);
+    assert!(running_line.contains("claimed"), "{running_line}");
+    assert!(running_line.contains("implement-1-opus"), "{running_line}");
+    let waiting_line = line(&waiting);
+    assert!(waiting_line.contains("ready"), "{waiting_line}");
+    assert!(waiting_line.contains("implement"), "{waiting_line}");
+    assert_eq!(agents.code, Some(0), "{agents:?}");
+    let rows: Vec<&str> = agents
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with('#'))
+        .collect();
+    assert_eq!(rows.len(), 1, "{agents:?}");
+    assert!(
+        rows[0].starts_with(&format!("#{running} implement implement-1-")),
+        "{agents:?}"
+    );
+    assert!(rows[0].contains("running"), "{agents:?}");
+    world.release_agent(&running);
+    world.release_agent(&waiting);
+    when_the_daemon_is_sent_sigterm(&world);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+fn daemon_pid(world: &World) -> u32 {
+    let text = fs::read_to_string(world.home.join("daemon.lock")).expect("read daemon.lock");
+    let pid = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|pid| pid.parse().ok());
+    pid.unwrap_or_else(|| panic!("no pid in daemon.lock: {text:?}"))
+}

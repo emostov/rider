@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use rider::board::{TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
-    ACTIONS_MAX, Action, BoardHealth, Call, Config, Event, FEED_RESTARTS_MAX,
-    FEED_UPTIME_MILLIS_MIN, Phase, RunId, Settlement, State, StopReason, Stopping, Untracked, step,
+    ACTIONS_MAX, Action, BoardHealth, Call, ClientId, Config, Event, FEED_RESTARTS_MAX,
+    FEED_UPTIME_MILLIS_MIN, Phase, Request, RunId, Settlement, State, StopReason, Stopping,
+    Untracked, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -193,7 +194,27 @@ impl World {
             }
             if self.signals < 2 && self.rng.u32(0..40) == 0 {
                 self.signals += 1;
-                self.deliver(Event::Signal)?;
+                // A stop comes as a signal or as `down` on the socket, the second stopping now.
+                let event = match self.rng.bool() {
+                    true => Event::Signal,
+                    false => Event::Client {
+                        client: ClientId(1),
+                        request: Request::Down {
+                            now: self.signals == 2,
+                        },
+                    },
+                };
+                self.deliver(event)?;
+                continue;
+            }
+            if self.rng.u32(0..20) == 0 {
+                let request = match self.rng.bool() {
+                    true => Request::Status,
+                    false => Request::Agents,
+                };
+                let client = ClientId(2);
+                self.deliver(Event::Client { client, request })?;
+                self.deliver(Event::ClientGone(client))?;
                 continue;
             }
             self.turn(false)
@@ -666,6 +687,7 @@ impl World {
                 let id = self.expect(None, "feed");
                 self.reply(id, Event::FeedResumed(cursor));
             }
+            Action::Reply { .. } => {}
             Action::Exit(_) => self.exited = true,
         }
         Ok(())

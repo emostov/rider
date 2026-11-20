@@ -9,8 +9,12 @@ use crate::settle::Verdict;
 pub const TASKS_MAX: usize = 256;
 /// Upper bound on the roles in the table the core is given.
 pub const ROLES_MAX: usize = 16;
-/// Upper bound on the actions one step emits: a few per run, plus a few of its own.
-pub const ACTIONS_MAX: usize = 6 * AGENTS_MAX as usize + 8;
+/// Upper bound on the socket clients connected at once.
+pub const CLIENTS_MAX: usize = 8;
+/// Upper bound on the actions one step emits: a few per run, a line per ended run for each
+/// client waiting on `down`, plus a few of its own.
+pub const ACTIONS_MAX: usize =
+    6 * AGENTS_MAX as usize + CLIENTS_MAX * (AGENTS_MAX as usize + 1) + CLIENTS_MAX + 8;
 /// How long a claim holds its task, in milliseconds.
 pub const LEASE_MILLIS: u64 = 3600 * 1000;
 /// How long one attempt may run, in milliseconds.
@@ -147,6 +151,8 @@ pub struct Task {
     /// Index into the config's roles; `None` when the task has no known role.
     pub role: Option<usize>,
     pub branch: Option<String>,
+    /// The project from the task's channel, once the feed has named it.
+    pub project: Option<String>,
     /// The task's board version: the cursor of the newest event this was learned from.
     pub seen: Cursor,
     /// A claim of the task was refused since it was last learned or the last tick.
@@ -247,6 +253,70 @@ pub enum Stopping {
     Now,
 }
 
+/// A socket connection, as the socket names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClientId(pub u64);
+
+/// What a socket client asks of the core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    Status,
+    Agents,
+    /// Stop: drain, or with `now` stop every agent at once.
+    Down {
+        now: bool,
+    },
+}
+
+/// One open task as `status` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub id: TaskId,
+    /// The project from the task's channel, once the feed has named it.
+    pub project: Option<String>,
+    pub state: TaskState,
+    pub role: Option<String>,
+    /// The profile of the run working it, if any.
+    pub profile: Option<String>,
+    /// How long the run working it has run its attempt, in milliseconds.
+    pub age_millis: Option<u64>,
+    pub branch: Option<String>,
+}
+
+/// What `status` answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusView {
+    pub board: BoardHealth,
+    pub stopping: Stopping,
+    pub running: usize,
+    pub limit: u8,
+    pub untracked: Untracked,
+    pub tasks: Vec<TaskRow>,
+}
+
+/// One run as `agents` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    pub task: TaskId,
+    pub role: String,
+    pub profile: String,
+    pub phase: Phase,
+    pub age_millis: u64,
+}
+
+/// One message to a socket client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply {
+    Status(StatusView),
+    Agents(Vec<AgentRow>),
+    /// A streaming command was accepted; lines follow.
+    Accepted,
+    /// One line of a stream.
+    Line(String),
+    /// The stream ended.
+    End,
+}
+
 /// The board call a `BoardFailed` answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Call {
@@ -306,6 +376,13 @@ pub enum Event {
     BoardFailed(Call),
     /// SIGTERM or SIGINT: the first drains, the next stops now.
     Signal,
+    /// A socket client's request.
+    Client {
+        client: ClientId,
+        request: Request,
+    },
+    /// A socket client disconnected.
+    ClientGone(ClientId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +427,10 @@ pub enum Action {
     },
     ListTasks,
     RestartFeed(Cursor),
+    Reply {
+        client: ClientId,
+        reply: Reply,
+    },
     Exit(i32),
 }
 
@@ -380,6 +461,8 @@ pub struct State {
     feed_restarts: u8,
     feed_since: Timestamp,
     feed_delivered: bool,
+    /// Clients waiting on `down`, told of each run as it ends; at most `CLIENTS_MAX`.
+    down_clients: Vec<ClientId>,
     exited: bool,
 }
 
@@ -407,6 +490,7 @@ impl State {
             feed_restarts: 0,
             feed_since: now,
             feed_delivered: false,
+            down_clients: Vec::new(),
             exited: false,
         };
         assert!(state.runs.is_empty());
@@ -496,12 +580,18 @@ pub fn step(state: &mut State, event: Event) -> Vec<Action> {
         return actions;
     }
     let cursor = state.cursor;
+    let before: Vec<(RunId, TaskId, String)> = state
+        .runs
+        .iter()
+        .map(|run| (run.id, run.task, state.profile(run.role, run.slot)))
+        .collect();
     apply(state, event, &mut actions);
     assert!(state.cursor >= cursor);
     expire_leases(state, &mut actions);
     on_time(state, &mut actions);
     expire_phases(state, &mut actions);
     claim_ready(state, &mut actions);
+    tell_ended(state, &before, &mut actions);
     finish_stopping(state, &mut actions);
     assert!(actions.len() <= ACTIONS_MAX);
     assert!(state.runs.len() <= usize::from(state.config.agents_max));
@@ -539,6 +629,8 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         }
         Event::BoardFailed(call) => board_failed(state, call),
         Event::Signal => signal(state, actions),
+        Event::Client { client, request } => on_request(state, client, request, actions),
+        Event::ClientGone(client) => state.down_clients.retain(|id| *id != client),
         Event::Claimed { run, epoch, until } => on_claimed(state, run, epoch, until, actions),
         Event::ClaimRefused(run) => claim_refused(state, run),
         Event::Prepared { run, branch, role } => on_prepared(state, run, branch, &role, actions),
@@ -603,12 +695,104 @@ fn feed_lost(state: &mut State, actions: &mut Vec<Action>) {
     assert!(state.listing);
 }
 
+fn on_request(state: &mut State, client: ClientId, request: Request, actions: &mut Vec<Action>) {
+    let reply = match request {
+        Request::Status => Reply::Status(status_view(state)),
+        Request::Agents => Reply::Agents(agent_rows(state)),
+        Request::Down { now } => {
+            if !state.down_clients.contains(&client) && state.down_clients.len() < CLIENTS_MAX {
+                state.down_clients.push(client);
+            }
+            let stopping = match (state.stopping, now) {
+                (Stopping::No, false) => Stopping::Drain { since: state.now },
+                (Stopping::Drain { since }, false) => Stopping::Drain { since },
+                (_, true) | (Stopping::Now, false) => Stopping::Now,
+            };
+            stop(state, stopping, actions);
+            Reply::Accepted
+        }
+    };
+    actions.push(Action::Reply { client, reply });
+    assert!(state.down_clients.len() <= CLIENTS_MAX);
+}
+
+fn status_view(state: &State) -> StatusView {
+    let now = state.now;
+    let roles = &state.config.roles;
+    let tasks = state.tasks.iter().map(|task| {
+        let run = state.runs.iter().find(|run| run.task == task.id);
+        TaskRow {
+            id: task.id,
+            project: task.project.clone(),
+            state: task.state,
+            role: task.role.map(|role| roles[role].label.clone()),
+            profile: run.map(|run| state.profile(run.role, run.slot)),
+            age_millis: run.map(|run| now.0.saturating_sub(run.attempt_start.0)),
+            branch: task.branch.clone(),
+        }
+    });
+    let view = StatusView {
+        board: state.board,
+        stopping: state.stopping,
+        running: state.runs.len(),
+        limit: state.config.agents_max,
+        untracked: state.untracked(),
+        tasks: tasks.collect(),
+    };
+    assert!(view.running <= usize::from(view.limit));
+    assert!(view.tasks.len() <= state.config.tasks_max);
+    view
+}
+
+fn agent_rows(state: &State) -> Vec<AgentRow> {
+    let rows: Vec<AgentRow> = (state.runs.iter())
+        .map(|run| AgentRow {
+            task: run.task,
+            role: state.config.roles[run.role].label.clone(),
+            profile: state.profile(run.role, run.slot),
+            phase: run.phase,
+            age_millis: state.now.0.saturating_sub(run.attempt_start.0),
+        })
+        .collect();
+    assert!(rows.len() <= usize::from(state.config.agents_max));
+    assert_eq!(rows.len(), state.runs.len());
+    rows
+}
+
+/// Tells each client waiting on `down` of every run this step removed.
+fn tell_ended(state: &State, before: &[(RunId, TaskId, String)], actions: &mut Vec<Action>) {
+    if state.down_clients.is_empty() {
+        return;
+    }
+    let ended = before
+        .iter()
+        .filter(|(run, _, _)| state.run_index(*run).is_none());
+    for (_, task, profile) in ended {
+        for client in &state.down_clients {
+            let line = format!("#{} {profile} ended", task.0);
+            let reply = Reply::Line(line);
+            actions.push(Action::Reply {
+                client: *client,
+                reply,
+            });
+        }
+    }
+    assert!(before.len() <= usize::from(AGENTS_MAX));
+}
+
 fn signal(state: &mut State, actions: &mut Vec<Action>) {
-    state.stopping = match state.stopping {
+    let stopping = match state.stopping {
         Stopping::No => Stopping::Drain { since: state.now },
         Stopping::Drain { .. } | Stopping::Now => Stopping::Now,
     };
-    if state.stopping == Stopping::Now {
+    stop(state, stopping, actions);
+}
+
+fn stop(state: &mut State, stopping: Stopping, actions: &mut Vec<Action>) {
+    assert!(stopping != Stopping::No);
+    let was_now = state.stopping == Stopping::Now;
+    state.stopping = stopping;
+    if state.stopping == Stopping::Now && !was_now {
         stop_now(state, actions);
     }
     assert!(state.stopping != Stopping::No);
@@ -667,6 +851,9 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         state: task_state,
         role: role_of(&state.config, &feed.labels),
         branch: label(&feed.labels, "branch"),
+        project: (feed.channel.strip_prefix("work/"))
+            .filter(|project| !project.is_empty())
+            .map(str::to_string),
         seen: feed.cursor,
         claim_refused: false,
     };
@@ -777,6 +964,10 @@ fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor, left_out: us
         state.untracked_overflow = None;
     }
     let listed = |id: TaskId| views.iter().find(|view| view.id == id);
+    // A listing names no channel, so a task it replaces keeps the project the feed named.
+    let projects: Vec<(TaskId, String)> = (state.tasks.iter())
+        .filter_map(|task| Some((task.id, task.project.clone()?)))
+        .collect();
     // A task the listing omits is gone unless the feed told of it after the listing began.
     state.tasks.retain(|task| match listed(task.id) {
         Some(view) => view.version <= task.seen,
@@ -814,6 +1005,9 @@ fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor, left_out: us
                 state: view.state,
                 role: role_of(&state.config, &view.labels),
                 branch: label(&view.labels, "branch"),
+                project: (projects.iter())
+                    .find(|(id, _)| *id == view.id)
+                    .map(|(_, project)| project.clone()),
                 seen: view.version,
                 claim_refused: false,
             });
@@ -1434,6 +1628,12 @@ fn finish_stopping(state: &mut State, actions: &mut Vec<Action>) {
         return;
     }
     state.exited = true;
+    for client in state.down_clients.drain(..) {
+        actions.push(Action::Reply {
+            client,
+            reply: Reply::End,
+        });
+    }
     actions.push(Action::Exit(0));
     assert!(state.runs.is_empty());
     assert!(state.pending_claims.is_empty());

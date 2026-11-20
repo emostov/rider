@@ -34,6 +34,7 @@ use crate::run_task::{
     settle_attempt,
 };
 use crate::settle::Verdict;
+use crate::socket::{self, SOCKET_FILE, Socket};
 
 /// Upper bound on the events waiting for the core; sources block when it is full.
 pub const EVENT_QUEUE_MAX: usize = 1024;
@@ -64,8 +65,10 @@ const _: () = assert!(FEED_JOIN_MILLIS_MAX >= STOP_POLL_MILLIS);
 const _: () = assert!(WORKERS_MAX > AGENTS_MAX as usize && TICK_SECONDS > 0);
 const NO_CHANNEL: &str = "channel_not_found";
 const LOCK_FILE: &str = "daemon.lock";
-const LOG_FILE: &str = "daemon.log";
+/// The daemon's log under the Rider home.
+pub const LOG_FILE: &str = "daemon.log";
 const AGENTS_DIR: &str = "agents";
+const LOGS_DIR: &str = "logs";
 const LOCK_BYTES_MAX: u64 = 256;
 const PID_BYTES_MAX: u64 = 32;
 const STEPS_MAX: u64 = u64::MAX;
@@ -293,6 +296,7 @@ struct Shared {
     grace_millis: u64,
     attempts: u8,
     feed: Mutex<FeedSlot>,
+    socket: Socket,
     /// The core has decided to stop now; a settlement checks it before each board write.
     stop_now: AtomicBool,
     log: Log,
@@ -390,9 +394,15 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         }
         Err(error) => log.write(&format!("could not look for leaked vb processes: {error}")),
     }
+    let socket_path = paths.home.join(SOCKET_FILE);
+    let sink_events = events.clone();
+    let sink: socket::Sink = Arc::new(move |event| send(&sink_events, event));
+    let socket = socket::listen(&socket_path, paths.home.join(LOGS_DIR), sink)
+        .map_err(io_error("listen on", &socket_path))?;
     let shared = Arc::new(Shared {
         paths,
         events,
+        socket,
         lease_millis,
         grace_millis: timing.grace_millis,
         attempts: limits.attempts,
@@ -411,6 +421,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
     let code = drive(&mut state, &inputs, &jobs, &shared);
+    shared.socket.close();
     stop_feed(&shared);
     let code = code?;
     assert!(state.exited());
@@ -457,9 +468,14 @@ fn drive(
     let mut pending: Vec<Action> = tick;
     for _ in 0..STEPS_MAX {
         for action in pending.drain(..) {
-            if let Action::Exit(code) = action {
-                return Ok(u8::try_from(code).unwrap_or(1));
-            }
+            let action = match action {
+                Action::Exit(code) => return Ok(u8::try_from(code).unwrap_or(1)),
+                Action::Reply { client, reply } => {
+                    shared.socket.reply(client, reply);
+                    continue;
+                }
+                action => action,
+            };
             if let Some(job) = dispatch(action, &mut contexts, shared) {
                 jobs.try_send(job).map_err(|error| match error {
                     TrySendError::Full(_) => DaemonError::JobsFull,
@@ -603,7 +619,7 @@ fn job(
         } => Box::new(move || release(&shared, run, task, &profile)),
         Action::ListTasks => Box::new(move || list(&shared)),
         Action::RestartFeed(cursor) => Box::new(move || restart_feed(&shared, cursor)),
-        Action::Exit(_) => return Ok(None),
+        Action::Reply { .. } | Action::Exit(_) => return Ok(None),
     };
     Ok(Some(job))
 }

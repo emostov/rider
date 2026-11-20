@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
 use crate::run_task::{Env, Ran, RunError, run_task};
 use crate::settle::Verdict;
+use crate::socket::{Client, ClientError, SOCKET_FILE};
 
 const ENVIRONMENT: &str = r#"environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
@@ -99,6 +101,18 @@ pub enum Command {
     ///
     /// SIGTERM or Ctrl-C drains; a second one stops every agent now.
     Daemon,
+    /// Start the daemon in the background and print its status line.
+    Up,
+    /// Stop the daemon once running agents finish; --now stops them at once.
+    Down {
+        /// Stop every agent now and release its task, its attempt uncounted.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Print the board's state, the running count and every open task by project.
+    Status,
+    /// Print every agent the daemon runs.
+    Agents,
     /// Run worker slots on the channel work/<project>.
     ///
     /// Type stop or press Ctrl-D to stop after running tasks finish.
@@ -330,6 +344,9 @@ pub enum CliError {
     Run(RunError),
     SlotsFailed(usize),
     Daemon(DaemonError),
+    Client(ClientError),
+    /// `rider up` started a daemon that exited or never answered.
+    NotStarted(String),
     Reap(ReapError),
     TooManyUrls,
     ConfigFile(ConfigFileError),
@@ -356,6 +373,8 @@ impl fmt::Display for CliError {
                 write!(f, "the task is no longer claimed; it is {state:?}")
             }
             CliError::Daemon(error) => write!(f, "{error}"),
+            CliError::Client(error) => write!(f, "{error}"),
+            CliError::NotStarted(why) => write!(f, "the daemon did not start: {why}"),
             CliError::Reap(error) => write!(f, "{error}"),
             CliError::TooManyUrls => write!(f, "name at most {REAP_URLS_MAX} boards"),
             CliError::ConfigFile(error) => write!(f, "{error}"),
@@ -399,6 +418,10 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
     match command {
         Command::Serve => serve(config),
         Command::Daemon => daemon(config),
+        Command::Up => up(config),
+        Command::Down { now } => down(config, *now),
+        Command::Status => status(config),
+        Command::Agents => agents(config),
         Command::Pool { project } => pool(project, config),
         Command::Config => print_config(config),
         Command::RunTask { id } => run_one(*id, config),
@@ -502,6 +525,176 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
     };
     assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
+}
+
+/// How long `rider up` waits for the daemon's socket to answer.
+const UP_SECONDS_MAX: u64 = 30;
+const UP_POLL_MILLIS: u64 = 100;
+/// Upper bound on the lines one `rider down` prints.
+const DOWN_LINES_MAX: usize = 4096;
+
+fn up(config: &Config) -> Result<u8, CliError> {
+    if let Ok(mut client) = Client::connect(&config.home) {
+        let data = client.send("status", None).map_err(CliError::Client)?;
+        println!("rider: the daemon is already running");
+        println!("{}", status_line(&data));
+        return Ok(0);
+    }
+    fs::create_dir_all(&config.home).map_err(|error| CliError::Io {
+        action: "create",
+        path: config.home.clone(),
+        message: error.to_string(),
+    })?;
+    let log_path = config.home.join(daemon::LOG_FILE);
+    let io = |action: &'static str, path: &Path| {
+        let path = path.to_path_buf();
+        move |error: io::Error| CliError::Io {
+            action,
+            path,
+            message: error.to_string(),
+        }
+    };
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path);
+    let log = log.map_err(io("open", &log_path))?;
+    let err = log.try_clone().map_err(io("open", &log_path))?;
+    let exe = env::current_exe().map_err(io("find", Path::new("rider")))?;
+    let mut child = Process::new(&exe)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(err)
+        .process_group(0)
+        .spawn()
+        .map_err(io("start", &exe))?;
+    let deadline = Instant::now() + Duration::from_secs(UP_SECONDS_MAX);
+    let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
+    for _ in 0..polls {
+        if let Ok(mut client) = Client::connect(&config.home) {
+            let data = client.send("status", None).map_err(CliError::Client)?;
+            println!("{}", status_line(&data));
+            return Ok(0);
+        }
+        if let Ok(Some(exit)) = child.try_wait() {
+            let why = format!("it exited with {exit}; see {}", log_path.display());
+            return Err(CliError::NotStarted(why));
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(UP_POLL_MILLIS));
+    }
+    let socket = config.home.join(SOCKET_FILE);
+    let why = format!("{} did not answer in {UP_SECONDS_MAX} s", socket.display());
+    Err(CliError::NotStarted(why))
+}
+
+fn down(config: &Config, now: bool) -> Result<u8, CliError> {
+    let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
+    client.send("down", Some(now)).map_err(CliError::Client)?;
+    for _ in 0..DOWN_LINES_MAX {
+        match client.next_line().map_err(CliError::Client)? {
+            Some(line) => say(&line),
+            None => return Ok(0),
+        }
+    }
+    Err(CliError::Client(ClientError::Malformed(format!(
+        "more than {DOWN_LINES_MAX} lines"
+    ))))
+}
+
+fn status(config: &Config) -> Result<u8, CliError> {
+    let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
+    let data = client.send("status", None).map_err(CliError::Client)?;
+    println!("{}", status_line(&data));
+    let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut projects: Vec<&str> = tasks
+        .iter()
+        .map(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE))
+        .collect();
+    projects.sort_unstable();
+    projects.dedup();
+    for project in projects {
+        println!("{project}");
+        let in_project = tasks
+            .iter()
+            .filter(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE) == project);
+        for task in in_project {
+            println!(
+                "  #{} {} {} {} {} {}",
+                task["id"],
+                text(&task["state"]),
+                text(&task["role"]),
+                text(&task["profile"]),
+                age(&task["age_ms"]),
+                text(&task["branch"]),
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn agents(config: &Config) -> Result<u8, CliError> {
+    let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
+    let data = client.send("agents", None).map_err(CliError::Client)?;
+    let rows = data.as_array().map_or(&[][..], Vec::as_slice);
+    if rows.is_empty() {
+        println!("no agents");
+    }
+    for row in rows {
+        let output = match row["output_ms_ago"].as_u64() {
+            Some(_) => format!("output {} ago", age(&row["output_ms_ago"])),
+            None => "no output".to_string(),
+        };
+        println!(
+            "#{} {} {} {} {} {output}",
+            row["task"],
+            text(&row["role"]),
+            text(&row["profile"]),
+            text(&row["phase"]),
+            age(&row["age_ms"]),
+        );
+    }
+    Ok(0)
+}
+
+// The first line of `status`: the board, the running count and limit, and any stop.
+fn status_line(data: &serde_json::Value) -> String {
+    let mut line = format!(
+        "board {}, {} of {} running",
+        text(&data["board"]),
+        data["running"],
+        data["limit"]
+    );
+    match data["stopping"].as_str() {
+        Some("drain") => line.push_str(", draining"),
+        Some("now") => line.push_str(", stopping now"),
+        _ => {}
+    }
+    if let Some(count) = data["untracked"].as_u64().filter(|count| *count > 0) {
+        let floor = if data["untracked_at_least"] == true {
+            "at least "
+        } else {
+            ""
+        };
+        line.push_str(&format!(", {floor}{count} more tasks not tracked"));
+    }
+    line
+}
+
+fn text(value: &serde_json::Value) -> &str {
+    value.as_str().unwrap_or("-")
+}
+
+fn age(value: &serde_json::Value) -> String {
+    match value.as_u64() {
+        None => "-".to_string(),
+        Some(millis) if millis < 60_000 => format!("{}s", millis / 1000),
+        Some(millis) if millis < 3_600_000 => format!("{}m", millis / 60_000),
+        Some(millis) => format!("{}h", millis / 3_600_000),
+    }
 }
 
 fn pool(project: &Project, config: &Config) -> Result<u8, CliError> {
