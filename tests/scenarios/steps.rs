@@ -999,3 +999,47 @@ pub fn when_the_worker_completes(world: &World, profile: &str, task: &str) {
     let output = world.vb_as(profile, &["tasks", "complete", task, "done"], None);
     assert_eq!(output.code, Some(0), "complete {task}: {output:?}");
 }
+
+/// The `vb tail` processes started by process `parent`.
+pub fn feeds_of(parent: u32) -> Vec<u32> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "pid=,ppid=,command="])
+        .stdin(Stdio::null());
+    let output = crate::world::run_bounded(command, None);
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let rows = output.stdout.lines().filter_map(|line| {
+        let mut words = line.split_whitespace();
+        let pid: u32 = words.next()?.parse().ok()?;
+        let ppid: u32 = words.next()?.parse().ok()?;
+        let tail = words.any(|word| word == "tail");
+        (ppid == parent && tail).then_some(pid)
+    });
+    rows.collect()
+}
+
+/// When `rider wait` has started following the board's feed; returns its `vb tail` pids.
+pub fn when_the_wait_follows_the_feed(wait: u32) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS_MAX);
+    loop {
+        let feeds = feeds_of(wait);
+        if !feeds.is_empty() {
+            return feeds;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rider wait never started vb tail"
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When process `pid` is sent `signal`, such as `-TERM`.
+pub fn when_the_process_is_sent(pid: u32, signal: &str) {
+    let status = std::process::Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {signal} {pid}");
+}

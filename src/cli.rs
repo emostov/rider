@@ -4,15 +4,19 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use fs4::{FileExt, TryLockError};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use crate::board::{self, Board, BoardError, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
@@ -72,6 +76,8 @@ const WAIT_EVENTS_MAX: usize = 64;
 const WAIT_ITEMS_MAX: u64 = 1 << 20;
 /// The feed items queued ahead of `rider wait`.
 const WAIT_QUEUED_MAX: usize = 16;
+/// Upper bound on the signals one wait handles.
+const WAIT_SIGNALS_MAX: usize = 64;
 /// Upper bound on the bytes of a wait cursor file.
 const CURSOR_BYTES_MAX: u64 = 64;
 /// The task states that leave a task open.
@@ -357,6 +363,13 @@ pub enum CliError {
     Feed(String),
     /// The file holding `rider wait`'s cursor holds something else.
     BadCursor(PathBuf),
+    /// Another `rider wait` holds the project's lock.
+    Held {
+        path: PathBuf,
+        holder: String,
+    },
+    /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
+    Interrupted,
 }
 
 impl fmt::Display for CliError {
@@ -378,6 +391,10 @@ impl fmt::Display for CliError {
             CliError::NoLog(id) => write!(f, "task #{} has no log", id.0),
             CliError::Board(error) => write!(f, "{error}"),
             CliError::Feed(why) => write!(f, "the board's feed stopped: {why}"),
+            CliError::Held { path, holder } => {
+                write!(f, "{} is held by {holder}", path.display())
+            }
+            CliError::Interrupted => write!(f, "stopped by a signal"),
             CliError::BadCursor(path) => {
                 write!(f, "{} does not hold a board cursor", path.display())
             }
@@ -817,7 +834,11 @@ fn wait(config: &Config, project: &str, minutes: u32, lead: Option<&str>) -> Res
         channel: format!("work/{project}"),
         lead,
     };
-    let path = config.home.join(WAIT_DIR).join(format!("{project}.cursor"));
+    let dir = config.home.join(WAIT_DIR);
+    let _lock = lock_project(&dir, project)?;
+    let (sender, items) = sync_channel(WAIT_QUEUED_MAX);
+    start_signals(sender.clone())?;
+    let path = dir.join(format!("{project}.cursor"));
     let saved = read_cursor(&path)?;
     let open = board.list_labelled(&watch.channel, "board.task", &OPEN_STATES);
     let open = open.map_err(CliError::Board)?;
@@ -828,7 +849,7 @@ fn wait(config: &Config, project: &str, minutes: u32, lead: Option<&str>) -> Res
     } else {
         deadline
     };
-    let (happened, cursor) = follow(&board, &watch, start, until)?;
+    let (happened, cursor) = follow(&board, &watch, start, until, (sender, items))?;
     let mut lines = describe(&board, &happened)?;
     if !happened.is_empty() {
         let open = board.list_labelled(&watch.channel, "board.task", &OPEN_STATES);
@@ -839,27 +860,90 @@ fn wait(config: &Config, project: &str, minutes: u32, lead: Option<&str>) -> Res
     } else if idle {
         lines.push("idle".to_string());
     }
-    write_cursor(&path, cursor)?;
     assert!(cursor >= start);
-    if lines.is_empty() {
-        return Ok(WAIT_TIMED_OUT);
+    let code = if lines.is_empty() {
+        WAIT_TIMED_OUT
+    } else {
+        print_lines(&lines)?;
+        0
+    };
+    write_cursor(&path, cursor)?;
+    Ok(code)
+}
+
+fn print_lines(lines: &[String]) -> Result<(), CliError> {
+    assert!(!lines.is_empty() && lines.len() <= WAIT_EVENTS_MAX + 1);
+    let mut out = io::stdout().lock();
+    let written = lines.iter().try_for_each(|line| writeln!(out, "{line}"));
+    written
+        .and_then(|()| out.flush())
+        .map_err(|error| io_error("write", Path::new("standard output"), &error))
+}
+
+fn lock_project(dir: &Path, project: &str) -> Result<File, CliError> {
+    fs::create_dir_all(dir).map_err(|error| io_error("create", dir, &error))?;
+    let path = dir.join(format!("{project}.lock"));
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path);
+    let mut file = opened.map_err(|error| io_error("open", &path, &error))?;
+    match FileExt::try_lock(&file) {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            let mut text = String::new();
+            let read = (&file).take(CURSOR_BYTES_MAX).read_to_string(&mut text);
+            read.map_err(|error| io_error("read", &path, &error))?;
+            let holder = match board::one_line(&text) {
+                line if line.is_empty() => "a process that has not written its pid".to_string(),
+                line => line,
+            };
+            return Err(CliError::Held { path, holder });
+        }
+        Err(TryLockError::Error(error)) => return Err(io_error("lock", &path, &error)),
     }
-    for line in &lines {
-        say(line);
-    }
-    Ok(0)
+    let text = format!("pid {}\n", std::process::id());
+    let written = file
+        .set_len(0)
+        .and_then(|()| file.write_all(text.as_bytes()));
+    written.map_err(|error| io_error("write", &path, &error))?;
+    assert!(path.starts_with(dir));
+    Ok(file)
+}
+
+fn start_signals(sender: SyncSender<Followed>) -> Result<(), CliError> {
+    let signals = Signals::new([SIGTERM, SIGINT]);
+    let mut signals = signals.map_err(|error| io_error("handle", Path::new("signals"), &error))?;
+    let spawned = thread::Builder::new()
+        .name("wait-signals".into())
+        .spawn(move || {
+            for _ in signals.forever().take(WAIT_SIGNALS_MAX) {
+                if sender.send(Followed::Interrupted).is_err() {
+                    return;
+                }
+            }
+        });
+    spawned.map_err(|error| CliError::Feed(error.to_string()))?;
+    Ok(())
 }
 
 /// The feed as one thread reads it: first its stopper, then each item.
 enum Followed {
     Started(FeedStop),
     Item(Result<FeedItem, FeedError>),
+    Interrupted,
 }
 
-type FeedThread = (JoinHandle<()>, Receiver<Followed>, FeedStop);
+type Channel = (SyncSender<Followed>, Receiver<Followed>);
 
-fn start_feed(board: &VbCli, start: Cursor) -> Result<FeedThread, CliError> {
-    let (sender, items) = sync_channel(WAIT_QUEUED_MAX);
+fn start_feed(
+    board: &VbCli,
+    start: Cursor,
+    sender: SyncSender<Followed>,
+    items: &Receiver<Followed>,
+) -> Result<(JoinHandle<()>, FeedStop, bool), CliError> {
     let feed = VbCli {
         vb: board.vb.clone(),
         url: board.url.clone(),
@@ -884,15 +968,16 @@ fn start_feed(board: &VbCli, start: Cursor) -> Result<FeedThread, CliError> {
             }
         });
     let reader = reader.map_err(|error| CliError::Feed(error.to_string()))?;
-    let started = items.recv();
-    let stop = match started {
-        Ok(Followed::Started(stop)) => stop,
-        Ok(Followed::Item(Err(error))) => return Err(CliError::Feed(error.to_string())),
-        Ok(Followed::Item(Ok(_))) | Err(_) => {
-            return Err(CliError::Feed("the feed did not start".into()));
+    let mut interrupted = false;
+    for _ in 0..=WAIT_QUEUED_MAX {
+        match items.recv() {
+            Ok(Followed::Started(stop)) => return Ok((reader, stop, interrupted)),
+            Ok(Followed::Interrupted) => interrupted = true,
+            Ok(Followed::Item(Err(error))) => return Err(CliError::Feed(error.to_string())),
+            Ok(Followed::Item(Ok(_))) | Err(_) => break,
         }
-    };
-    Ok((reader, items, stop))
+    }
+    Err(CliError::Feed("the feed did not start".into()))
 }
 
 fn follow(
@@ -900,15 +985,24 @@ fn follow(
     watch: &Watch,
     start: Cursor,
     until: Instant,
+    (sender, items): Channel,
 ) -> Result<(Vec<(Happened, TaskId)>, Cursor), CliError> {
-    let (reader, items, stop) = start_feed(board, start)?;
+    let (reader, stop, interrupted) = start_feed(board, start, sender, &items)?;
     let (mut happened, mut cursor, mut until) = (Vec::new(), start, until);
     let mut ended = Err(CliError::Feed(format!("over {WAIT_ITEMS_MAX} feed items")));
-    for _ in 0..WAIT_ITEMS_MAX {
+    if interrupted {
+        ended = Err(CliError::Interrupted);
+    }
+    let rounds = if interrupted { 0 } else { WAIT_ITEMS_MAX };
+    for _ in 0..rounds {
         let left = until.saturating_duration_since(Instant::now());
         let item = match items.recv_timeout(left) {
             Ok(Followed::Item(item)) => item,
             Ok(Followed::Started(_)) => Err(FeedError::Spawn("the feed started twice".into())),
+            Ok(Followed::Interrupted) => {
+                ended = Err(CliError::Interrupted);
+                break;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 ended = Ok(());
                 break;
@@ -1018,7 +1112,7 @@ fn write_cursor(path: &Path, cursor: Cursor) -> Result<(), CliError> {
         .parent()
         .ok_or_else(|| CliError::BadCursor(path.to_path_buf()))?;
     fs::create_dir_all(dir).map_err(|error| io_error("create", dir, &error))?;
-    let partial = path.with_extension("cursor.partial");
+    let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
     let text = format!("{}\n", cursor.0);
     fs::write(&partial, &text).map_err(|error| io_error("write", &partial, &error))?;
     fs::rename(&partial, path).map_err(|error| io_error("rename", &partial, &error))?;
