@@ -66,6 +66,8 @@ pub enum Behaviour {
     LeaveBranch,
     /// Blocks its own task like `Block`, then exits `FAIL_EXIT_CODE`.
     BlockThenExitNonZero,
+    /// Commits like `Commit`, then points a new branch `shared-<task>` at that commit.
+    CommitShared,
 }
 
 impl Behaviour {
@@ -91,6 +93,7 @@ impl Behaviour {
             Behaviour::CommitReportingBlank => "commit-reporting-blank",
             Behaviour::LeaveBranch => "leave-branch",
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
+            Behaviour::CommitShared => "commit-shared",
         }
     }
 }
@@ -229,6 +232,7 @@ case "$behaviour" in
   commit-silently) commit || exit 1; exit 0 ;;
   commit-reporting-blank) commit || exit 1; summary="  " ;;
   leave-branch) git checkout -q -b "elsewhere-$task" && commit || exit 1 ;;
+  commit-shared) commit && git branch "shared-$task" || exit 1 ;;
   block-then-exit-non-zero)
     vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1
     exit {fail} ;;

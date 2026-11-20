@@ -65,6 +65,10 @@ fn each_invalid_brief_is_blocked_with_the_label_to_fix_and_a_hash_of_label_is_ac
                 .to_string(),
         ),
         (
+            implement(&[("repo", &repo), ("base", "##1")]),
+            "Change the `base` label from \"##1\" to a task id such as #812.".to_string(),
+        ),
+        (
             implement(&[("repo", &repo), ("base", "12a")]),
             "Change the `base` label from \"12a\" to a task id such as #812.".to_string(),
         ),
@@ -262,6 +266,94 @@ fn an_agent_that_outlives_a_shortened_attempt_limit_is_failed_for_its_time_limit
         (vec!["failed".to_string()], Some(0))
     );
     then_the_task_failed_with(&world, &task, "the attempt reached its time limit");
+}
+
+#[test]
+fn an_agent_that_outlives_the_runners_limit_is_failed_as_timed_out() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    let timing = "attempt=30000,runner=2000,tick=200";
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, timing)]);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(
+        (states, then_the_daemon_exits(&mut world)),
+        (vec!["failed".to_string()], Some(0))
+    );
+    let read: Value = serde_json::from_str(&task_text(&world, &task)).expect("vb read JSON");
+    let reason = &read["message"]["task"]["reason"];
+    assert_eq!(reason, "timed out after 55 minutes");
+}
+
+#[test]
+fn an_attempt_whose_new_commits_another_branch_also_holds_fails_with_none_of_its_own() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::CommitShared]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
+    let reason = "no committed work: the branch has no commits of its own";
+    then_the_task_failed_with(&world, &task, reason);
+}
+
+#[test]
+fn a_role_removed_or_changed_after_the_claim_is_blocked_naming_every_role() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let roles = "one of implement, light, review, security or qa.";
+    let long = "x".repeat(128);
+    let cut = format!("{}…", "x".repeat(80));
+    let cases = [
+        (None, format!("Set the `role` label to {roles}")),
+        (
+            Some("lead"),
+            format!("Change the `role` label from \"lead\" to {roles}"),
+        ),
+        (
+            Some(long.as_str()),
+            format!("Change the `role` label from {cut:?} to {roles}"),
+        ),
+    ];
+    let ids: Vec<String> = cases
+        .iter()
+        .map(|_| when_the_lead_creates(&world, &an_implement_task(&world, "Add the work.")))
+        .collect();
+    let tasks: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let release = world.root.join("reads-released");
+    given_vb_holds_the_first_read_of(&world, &tasks, &release);
+    given_a_running_daemon(&mut world);
+    for (id, (role, _)) in ids.iter().zip(&cases) {
+        when_the_file_exists(&world, &world.root.join(format!("marker-{id}")));
+        match role {
+            None => world.vb_lead(&["label", id, "--unset", "role"], None),
+            Some(role) => world.vb_lead(&["label", id, &format!("role={role}")], None),
+        };
+    }
+    fs::write(&release, "").expect("release the held reads");
+
+    let states = when_the_tasks_settle(&world, &tasks);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    let blocked = vec!["blocked".to_string(); ids.len()];
+    assert_eq!(
+        (states, then_the_daemon_exits(&mut world)),
+        (blocked, Some(0))
+    );
+    for (id, (_, reason)) in ids.iter().zip(&cases) {
+        let block = Some(("invalid_brief".to_string(), reason.clone()));
+        assert_eq!(task_block(&world, id), block, "{id}");
+    }
+    assert_eq!(agent_runs(&world), vec![]);
 }
 
 #[test]
