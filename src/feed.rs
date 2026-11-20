@@ -1,5 +1,6 @@
 //! The board's event feed: a `vb tail --json` child whose lines become typed events.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::mem;
@@ -12,9 +13,11 @@ use std::time::{Duration, Instant};
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
-use serde_json::{Map, Value};
+use serde::Deserialize;
 
-use crate::board::{BoardError, LABELS_MAX, TaskId, TaskState, VbCli, kill_group};
+use crate::board::{
+    BoardError, LABELS_MAX, TaskId, TaskState, VbCli, WireState, kill_group, nullable,
+};
 
 /// Upper bound on one line of the feed, its newline excluded.
 pub const FEED_LINE_BYTES_MAX: usize = 1024 * 1024;
@@ -462,18 +465,54 @@ fn read_lines(mut stdout: BufReader<ChildStdout>, sender: &SyncSender<Received>)
     let _ = sender.send(Received::End);
 }
 
+/// The fields every line of `vb tail --json` carries, whatever its type.
+#[derive(Deserialize)]
+struct WireHead {
+    cursor: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// `message.task` of a task's event.
+#[derive(Deserialize)]
+struct WireTask {
+    state: WireState,
+}
+
+/// The message an event is about.
+#[derive(Deserialize)]
+struct WireMessage {
+    id: String,
+    #[serde(deserialize_with = "nullable")]
+    re: Option<String>,
+    channel: String,
+    labels: BTreeMap<String, String>,
+    /// Absent or null when the message is not a task.
+    task: Option<WireTask>,
+}
+
+#[derive(Deserialize)]
+struct WireActor {
+    id: String,
+}
+
+/// The rest of an event of a type the feed names.
+#[derive(Deserialize)]
+struct WireEvent {
+    message: WireMessage,
+    /// The board leaves `actor` out of what it does itself, such as expiring a lease.
+    actor: Option<WireActor>,
+}
+
 /// One line of `vb tail --json`: `{cursor, type, payload, message, actor}`.
 pub fn parse_event(line: &str) -> Result<FeedEvent, FeedError> {
     if line.len() > FEED_LINE_BYTES_MAX {
         return Err(FeedError::LineTooLong);
     }
-    let value: Value = serde_json::from_str(line)
-        .map_err(|error| FeedError::Parse(format!("a line that is not JSON: {error}")))?;
-    let Value::Object(event) = value else {
-        return Err(FeedError::Parse("a line that is not a JSON object".into()));
-    };
-    let cursor = parse_number(string_field(&event, "cursor")?, "cursor").map(Cursor)?;
-    let kind = match string_field(&event, "type")? {
+    let head: WireHead = serde_json::from_str(line)
+        .map_err(|error| FeedError::Parse(format!("a line that is not an event: {error}")))?;
+    let cursor = parse_number(&head.cursor, "cursor").map(Cursor)?;
+    let kind = match head.kind.as_str() {
         "task.created" => EventKind::TaskCreated,
         "labels.changed" => EventKind::LabelsChanged,
         "task.claimed" => EventKind::TaskClaimed,
@@ -489,16 +528,33 @@ pub fn parse_event(line: &str) -> Result<FeedEvent, FeedError> {
         "message.posted" => EventKind::MessagePosted,
         _ => return Ok(FeedEvent::Other { cursor }),
     };
-    let message = event.get("message").and_then(Value::as_object);
-    let message = message.ok_or_else(|| field_error(cursor, "no message object"))?;
+    let event: WireEvent = serde_json::from_str(line)
+        .map_err(|error| field_error(cursor, &format!("not a {}: {error}", head.kind)))?;
+    let WireEvent { message, actor } = event;
+    if message.labels.len() > LABELS_MAX {
+        return Err(FeedError::TooManyLabels);
+    }
+    let id = parse_number(&message.id, "message.id")?;
+    // A reply's task is its thread's root; any other message is its own root.
+    let task = match &message.re {
+        None => id,
+        Some(root) => parse_number(root, "message.re")?,
+    };
+    if kind.is_task_only() && task != id {
+        return Err(field_error(cursor, "a task event on a reply"));
+    }
+    let actor = actor.map(|actor| actor.id);
+    if actor.as_ref().is_some_and(String::is_empty) {
+        return Err(field_error(cursor, "an empty actor.id"));
+    }
     let known = BoardEvent {
         cursor,
         kind,
-        task: parse_task(message, kind, cursor)?,
-        channel: string_field(message, "channel")?.to_string(),
-        labels: parse_labels(message)?,
-        state: parse_state(message, cursor)?,
-        actor: parse_actor(&event, cursor)?,
+        task: TaskId(task),
+        channel: message.channel,
+        labels: message.labels.into_iter().collect(),
+        state: message.task.map(|task| TaskState::from(task.state)),
+        actor,
     };
     if kind.is_task_only() && known.state.is_none() {
         return Err(field_error(cursor, "a task event with no message.task"));
@@ -513,12 +569,6 @@ fn field_error(cursor: Cursor, detail: &str) -> FeedError {
     FeedError::Parse(format!("event {}: {detail}", cursor.0))
 }
 
-fn string_field<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, FeedError> {
-    assert!(!key.is_empty());
-    let value = object.get(key).and_then(Value::as_str);
-    value.ok_or_else(|| FeedError::Parse(format!("an event with no string {key}")))
-}
-
 /// A cursor or id as the board prints it: canonical decimal, no sign and no leading zeros.
 fn parse_number(text: &str, name: &str) -> Result<u64, FeedError> {
     let canonical = !text.is_empty()
@@ -529,90 +579,6 @@ fn parse_number(text: &str, name: &str) -> Result<u64, FeedError> {
     let number = number.ok_or_else(|| FeedError::Parse(format!("{name} {text:?}")))?;
     assert_eq!(number.to_string(), text);
     Ok(number)
-}
-
-/// A reply's task is its thread's root; any other message is its own root.
-fn parse_task(
-    message: &Map<String, Value>,
-    kind: EventKind,
-    cursor: Cursor,
-) -> Result<TaskId, FeedError> {
-    let id = parse_number(string_field(message, "id")?, "message.id")?;
-    let task = match message.get("re") {
-        Some(Value::Null) => id,
-        Some(Value::String(root)) => parse_number(root, "message.re")?,
-        _ => {
-            return Err(field_error(
-                cursor,
-                "message.re is neither null nor a string",
-            ));
-        }
-    };
-    if kind.is_task_only() && task != id {
-        return Err(field_error(cursor, "a task event on a reply"));
-    }
-    Ok(TaskId(task))
-}
-
-fn parse_labels(message: &Map<String, Value>) -> Result<Vec<(String, String)>, FeedError> {
-    let labels = message.get("labels").and_then(Value::as_object);
-    let labels = labels.ok_or_else(|| FeedError::Parse("no message.labels object".into()))?;
-    if labels.len() > LABELS_MAX {
-        return Err(FeedError::TooManyLabels);
-    }
-    let mut result: Vec<(String, String)> = Vec::with_capacity(labels.len());
-    for (key, value) in labels.iter().take(LABELS_MAX) {
-        let value = value.as_str();
-        let value = value.ok_or_else(|| FeedError::Parse(format!("label {key} not a string")))?;
-        result.push((key.clone(), value.to_string()));
-    }
-    assert_eq!(result.len(), labels.len(), "no label was dropped");
-    Ok(result)
-}
-
-fn parse_state(
-    message: &Map<String, Value>,
-    cursor: Cursor,
-) -> Result<Option<TaskState>, FeedError> {
-    let task = match message.get("task") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Object(task)) => task,
-        Some(_) => return Err(field_error(cursor, "message.task is not an object")),
-    };
-    let state = task.get("state").and_then(Value::as_str);
-    let state = state.ok_or_else(|| field_error(cursor, "no string message.task.state"))?;
-    let parsed = match state {
-        "waiting" => TaskState::Waiting,
-        "ready" => TaskState::Ready,
-        "claimed" => TaskState::Claimed,
-        "blocked" => TaskState::Blocked,
-        "completed" => TaskState::Completed,
-        "failed" => TaskState::Failed,
-        "canceled" => TaskState::Canceled,
-        _ => {
-            return Err(field_error(
-                cursor,
-                &format!("unknown task state {state:?}"),
-            ));
-        }
-    };
-    Ok(Some(parsed))
-}
-
-fn parse_actor(event: &Map<String, Value>, cursor: Cursor) -> Result<Option<String>, FeedError> {
-    // The board leaves `actor` out of what it does itself, such as expiring a lease.
-    let actor = match event.get("actor") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Object(actor)) => actor,
-        Some(_) => return Err(field_error(cursor, "actor is not an object")),
-    };
-    let id = actor.get("id").and_then(Value::as_str);
-    let id = id.ok_or_else(|| field_error(cursor, "no string actor.id"))?;
-    if id.is_empty() {
-        return Err(field_error(cursor, "an empty actor.id"));
-    }
-    assert!(id.len() <= FEED_LINE_BYTES_MAX);
-    Ok(Some(id.to_string()))
 }
 
 #[cfg(test)]
