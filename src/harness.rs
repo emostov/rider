@@ -121,9 +121,43 @@ impl fmt::Display for HarnessError {
     }
 }
 
-/// The command line that runs `spec` on `prompt` in `dir`; the prompt is last, after `--`.
-pub fn command_for(spec: &RoleSpec, prompt: &str, dir: &Path) -> Result<CommandLine, HarnessError> {
+/// Upper bound on a session id's length.
+pub const SESSION_BYTES_MAX: usize = 128;
+
+/// A Claude Code session id: ASCII letters, digits, and `-`, never starting with `-`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// The id in `text`, or `None` when it is not one.
+    pub fn parse(text: &str) -> Option<SessionId> {
+        let valid = !text.is_empty()
+            && text.len() <= SESSION_BYTES_MAX
+            && !text.starts_with('-')
+            && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        let id = valid.then(|| SessionId(text.to_string()));
+        assert!(id.as_ref().is_none_or(|id| id.0 == text));
+        id
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The command line that runs `spec` on `prompt` in `dir`, starting from a fork of session
+/// `resume` when given (Claude only); the prompt is last, after `--`.
+pub fn command_for(
+    spec: &RoleSpec,
+    prompt: &str,
+    dir: &Path,
+    resume: Option<&SessionId>,
+) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
+    assert!(
+        resume.is_none() || spec.harness == Harness::Claude,
+        "only Claude sessions are resumed"
+    );
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
     assert!(dir.to_str().is_some(), "worktree paths are UTF-8");
     if prompt.len() > PROMPT_BYTES_MAX {
@@ -165,6 +199,14 @@ pub fn command_for(spec: &RoleSpec, prompt: &str, dir: &Path) -> Result<CommandL
         Harness::Tact => ("tact", vec!["--model", model, "--workspace", &dir, "run"]),
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
+    if let Some(session) = resume {
+        // Without `--fork-session` Claude appends to the resumed session in place.
+        args.extend([
+            "--resume".to_string(),
+            session.0.clone(),
+            "--fork-session".to_string(),
+        ]);
+    }
     args.push("--".to_string());
     args.push(prompt.to_string());
     assert!(args.len() <= ARGS_MAX);
@@ -591,18 +633,58 @@ pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
     Some(text)
 }
 
+/// The session id of the first Claude event that carries one, or `None` when there is none.
+pub fn session_id(log: &Path) -> Option<SessionId> {
+    let mut found: Option<Option<SessionId>> = None;
+    let _ = scan(log, |event| {
+        if found.is_none() {
+            found = text_at(event, "/session_id").map(SessionId::parse);
+        }
+    });
+    let id = found.flatten();
+    assert!(id.as_ref().is_none_or(|id| !id.0.is_empty()));
+    id
+}
+
+/// Whether the Claude stream at `log` shows a run that ended in error before its first turn,
+/// as when `--resume` names a session Claude cannot open; false when the log is unreadable.
+pub fn ended_before_any_turn(log: &Path) -> bool {
+    let mut results = 0u64;
+    let mut refused = false;
+    let mut turned = false;
+    let read = scan(log, |event| match text_at(event, "/type") {
+        Some("result") => {
+            results = results.saturating_add(1);
+            let is_error = event.pointer("/is_error").and_then(Value::as_bool);
+            let turns = event.pointer("/num_turns").and_then(Value::as_u64);
+            refused = is_error == Some(true) && turns == Some(0);
+        }
+        Some("assistant" | "user") => turned = true,
+        _ => {}
+    });
+    let before = read && results == 1 && refused && !turned;
+    assert!(results <= LINES_MAX, "scan reads at most LINES_MAX events");
+    before
+}
+
 /// Whether the stream at `log` records a failed run; false when the log is unreadable.
 pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut failed = false;
     let mut last_result_failed = false;
+    let mut last_turn_failed = false;
     // A log cut short still counts for what it showed.
     let _ = scan(log, |event| {
         let kind = text_at(event, "/type");
         match harness {
             // tact exits 0 when cancelled; only the stream says so.
             Harness::Tact => failed |= kind == Some("run.failed"),
-            // `item.type == "error"` inside `item.completed` is a harmless warning.
-            Harness::Codex => failed |= matches!(kind, Some("turn.failed" | "error")),
+            // `item.type == "error"` inside `item.completed` is a harmless warning, and a
+            // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
+            Harness::Codex => match kind {
+                Some("turn.failed" | "error") => last_turn_failed = true,
+                Some("turn.completed") => last_turn_failed = false,
+                _ => {}
+            },
             Harness::Claude if kind == Some("result") => {
                 let is_error = event.pointer("/is_error").and_then(Value::as_bool);
                 let subtype = text_at(event, "/subtype");
@@ -613,7 +695,8 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     });
     assert!(!failed || *harness != Harness::Claude);
     assert!(!last_result_failed || *harness == Harness::Claude);
-    failed || last_result_failed
+    assert!(!last_turn_failed || *harness == Harness::Codex);
+    failed || last_result_failed || last_turn_failed
 }
 
 #[cfg(test)]
@@ -653,7 +736,7 @@ mod tests {
     #[test]
     fn claude_command_matches_the_recorded_form() {
         let spec = role_from_label("implement").unwrap();
-        let c = command_for(spec, PROMPT, Path::new("/w")).unwrap();
+        let c = command_for(spec, PROMPT, Path::new("/w"), None).unwrap();
         assert_eq!(c.program, "claude");
         let expected = [
             "-p",
@@ -673,7 +756,7 @@ mod tests {
     #[test]
     fn codex_command_matches_the_recorded_form() {
         let spec = role_from_label("review").unwrap();
-        let c = command_for(spec, PROMPT, Path::new("/w")).unwrap();
+        let c = command_for(spec, PROMPT, Path::new("/w"), None).unwrap();
         assert_eq!(c.program, "codex");
         let expected = [
             "exec",
@@ -692,7 +775,7 @@ mod tests {
 
     #[test]
     fn tact_command_matches_the_recorded_form() {
-        let c = command_for(&TACT_ROLE, PROMPT, Path::new("/w")).unwrap();
+        let c = command_for(&TACT_ROLE, PROMPT, Path::new("/w"), None).unwrap();
         assert_eq!(c.program, "tact");
         let expected = ["--model", "sol", "--workspace", "/w", "run", "--", PROMPT];
         assert_eq!(c.args, expected);
@@ -704,10 +787,10 @@ mod tests {
         let prompt = "--help me\nplease";
         let security = role_from_label("security").unwrap();
         for spec in [security, &TACT_ROLE] {
-            let c = command_for(spec, prompt, Path::new("/w")).unwrap();
+            let c = command_for(spec, prompt, Path::new("/w"), None).unwrap();
             assert_eq!(c.args[c.args.len() - 2..], ["--", prompt]);
         }
-        let mythos = command_for(security, PROMPT, Path::new("/w")).unwrap();
+        let mythos = command_for(security, PROMPT, Path::new("/w"), None).unwrap();
         assert_eq!(mythos.args[1..3], ["--model", "claude-mythos-5-2"]);
     }
 
@@ -717,7 +800,7 @@ mod tests {
         let codex = role_from_label("review").unwrap();
         for prompt in ["", " \n\t ", "-", "mcp", "doctor", "--help"] {
             for spec in [claude, codex, &TACT_ROLE] {
-                let result = command_for(spec, prompt, Path::new("/w"));
+                let result = command_for(spec, prompt, Path::new("/w"), None);
                 assert!(
                     matches!(result, Err(HarnessError::PromptUnsafe)),
                     "{prompt:?}"
@@ -731,10 +814,10 @@ mod tests {
         let spec = role_from_label("implement").unwrap();
         let prompt = "x ".repeat(PROMPT_BYTES_MAX / 2);
         assert_eq!(prompt.len(), PROMPT_BYTES_MAX);
-        let c = command_for(spec, &prompt, Path::new("/w")).unwrap();
+        let c = command_for(spec, &prompt, Path::new("/w"), None).unwrap();
         assert_eq!(c.args.last(), Some(&prompt));
         let over = format!("{prompt}x");
-        let result = command_for(spec, &over, Path::new("/w"));
+        let result = command_for(spec, &over, Path::new("/w"), None);
         assert!(matches!(
             result,
             Err(HarnessError::PromptTooLarge { bytes }) if bytes == PROMPT_BYTES_MAX + 1
@@ -801,6 +884,16 @@ mod tests {
         let third = ReaderSlot::reserve(&LIVE, 2).unwrap();
         drop((second, third));
         assert_eq!(LIVE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_session_id_is_read_from_the_recorded_claude_stream() {
+        let id = session_id(Path::new("fixtures/harness/claude.jsonl"));
+        let expected = SessionId::parse("20de60af-1a54-4519-8f52-8623adc5d76e");
+        assert_eq!(id, expected);
+        assert_eq!(session_id(Path::new("fixtures/harness/codex.jsonl")), None);
+        let log = scratch_file("session-hostile", "{\"session_id\":\"--help\"}\n");
+        assert_eq!(session_id(&log), None);
     }
 
     #[test]
@@ -871,5 +964,26 @@ mod tests {
         assert!(reports_failure("codex-failed", Harness::Codex, codex));
         let codex = r#"{"type":"error","message":"x"}"#;
         assert!(reports_failure("codex-error", Harness::Codex, codex));
+    }
+
+    #[test]
+    fn a_codex_turn_is_judged_by_how_it_ended() {
+        let path = Path::new("fixtures/harness/codex-reconnect.jsonl");
+        assert!(!stream_reports_failure(&Harness::Codex, path));
+        let recorded = fs::read_to_string(path).unwrap();
+        let cut: Vec<&str> = recorded
+            .lines()
+            .filter(|l| !l.contains("turn.completed"))
+            .collect();
+        assert_eq!(cut.len() + 1, recorded.lines().count());
+        assert_eq!(
+            cut.iter().filter(|l| l.contains("Reconnecting...")).count(),
+            4
+        );
+        assert!(reports_failure(
+            "codex-unfinished",
+            Harness::Codex,
+            &cut.join("\n")
+        ));
     }
 }

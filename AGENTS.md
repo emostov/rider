@@ -2,10 +2,10 @@
 
 Rider is written in TigerStyle and tested thoroughly enough that it can be rewritten with confidence. When a rule here conflicts with a habit from another codebase, this file wins.
 
-- Before every commit: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
+- Before every commit: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`; the lead's small mechanical edit runs only fast checks, with the full checks in CI before the PR is marked ready.
 - Commit `Cargo.lock`. Commit messages are one sentence and name no tool or assistant.
 - Rider is developed with Rider. Changes to this repository are planned by the lead as tasks on the board channel `work/rider` and carried out by `rider pool rider`, so every change exercises the tool. Work done any other way is the exception and says why.
-- When something goes wrong while building or using Rider, file a GitHub issue (`gh issue create`, label `from-review` or `from-use`) written as a brief a stranger could act on: what happens, the fix wanted, the paths owned, and the command that proves it. The lead plans fixes from the open issues.
+- The board is where work is discussed. Findings, problems and deferred work found while building or using Rider go on the board (a finding record, a reply in the task's thread, or the project's deferred-work thread), not to the project's tracker. The tracker (GitHub issues or Linear, whichever the project uses) is for work that must outlive the board: only when a run ends does the lead, or a person, file one issue there for each item still open, written as a brief a stranger could act on: what happens, the fix wanted, the paths owned, the command that proves it.
 - Design: `docs/superpowers/specs/2026-11-19-rider-design.md`. Observed behaviour of Board and of each agent CLI: `docs/board-observed.md`, `docs/harness-observed.md`.
 
 ## TigerStyle
@@ -14,6 +14,8 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 - Assertions are for programming errors only. Anything from the board, an agent, git, or the filesystem is external input: a bad value becomes a returned error, never a panic.
 - Every loop and every collection has an upper bound declared as a named constant. Reaching it is a returned error, not growth.
 - No recursion, no `unsafe`, no async runtime. Threads and bounded channels only.
+- When work has several independent parts (board calls, git calls, agent waits), run them in parallel and join them, not one after another, whenever their order does not matter.
+- Model parallel work as actors: each thread owns its state and talks to others only through bounded channels. A full channel makes the sender wait or shed work (back pressure), never grow.
 - Functions are at most 70 lines; lines are at most 100 columns.
 - Errors are enums, handled at every call site. No `unwrap()` or `expect()` outside tests. No `thiserror` or `anyhow`.
 - TigerStyle's rule against dependencies does not apply. Use a well-maintained crate when it saves writing and maintaining code of our own.

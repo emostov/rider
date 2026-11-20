@@ -23,6 +23,10 @@ claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-sk
 - Final message: the last line, `type == "result"`, `subtype == "success"`, field `result` (string, here `"DONE"`). `is_error` is `false` on success. The same text is also in the last `assistant` event at `message.content[].text`.
 - stderr prints `Warning: no stdin data received in 3s...` when stdin is not redirected. Spawn with stdin set to null (`< /dev/null`) to avoid the 3 s delay.
 - Fixture: `fixtures/harness/claude.jsonl` (opus run, 8.6 KB after redaction). The other three models give the same event shapes.
+- Session id: every event carries `session_id`, the first `system` event (`hook_started`, or `init` without hooks) included.
+- Resume (2026-11-19, Claude Code 2.1.329, `--model haiku`): `claude -p --resume <id> --output-format stream-json --verbose -- "<prompt>"` run from a different directory than the session started in continues the session: it recalled the earlier reply. It still works after the original directory is removed. The `init` event shows the new cwd and the same `session_id`. So a fix task resumes from its own worktree; no same-path worktree is needed.
+- Fork (2026-11-19, Claude Code 2.1.329, `--model haiku`): `claude --help` lists `--fork-session`: "When resuming, create a new session ID instead of reusing the original (use with --resume or --continue)". `claude -p --resume <id> --fork-session ...` recalled the earlier reply, and its `init` and `result` events carried a new `session_id`. A later plain `--resume <id>` still reported `<id>`. Without the flag, Claude appends the resumed run to `<id>` in place, so a failed fix would become part of what later resumes see. Rider always forks, and records the fork's id for the fix task's own attempt.
+- Resume of a missing session (same version): `claude -p --resume 00000000-0000-4000-8000-000000000000 --output-format stream-json --verbose -- hi` exits 1 at once. stderr says `No conversation found with session ID: <id>`. stdout has a single event: `{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"<new id>","errors":["No conversation found ..."],...}`. There is no `system` init event and no `assistant` event. Rider reads an error `result` with `num_turns: 0` and no turn events as a resume that failed before any work, and starts fresh in the same attempt.
 
 ## Codex
 
@@ -39,6 +43,13 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
 - The stream begins with two `item.completed` events of `item.type == "error"` (a deprecation warning from this machine's config). These are not failures. A parser must not treat `item.type == "error"` as a run failure.
 - Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`.
 - Fixture: `fixtures/harness/codex.jsonl` (4 KB).
+- During a provider outage Codex prints top-level events such as
+  `{"type":"error","message":"Reconnecting... 2/5 (unexpected status 503 Service Unavailable ...)"}`
+  mid-turn, numbered up to `5/5`, and carries on. A turn that recovers still ends with
+  `turn.completed`, so a run is judged by its last turn event: `turn.completed` succeeds;
+  `turn.failed`, or a top-level `error` after which no `turn.completed` comes (Codex gave up), fails.
+  Fixture: `fixtures/harness/codex-reconnect.jsonl`, cut from a real review run, with the provider
+  URL and `cf-ray` id redacted.
 
 ## tact
 

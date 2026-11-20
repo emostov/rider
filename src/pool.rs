@@ -32,7 +32,7 @@ const SECONDS_PER_DAY: u64 = 24 * 3600;
 /// Upper bound on the claims one slot makes before it stops.
 pub const SLOT_ROUNDS_MAX: u32 = 1_000_000;
 /// Upper bound on the slots of every role together.
-pub const SLOTS_MAX: usize = 32;
+pub const SLOTS_MAX: usize = 48;
 /// Upper bound, in characters, on the result, reason, or error shown in one event line.
 pub const DETAIL_CHARS_MAX: usize = 120;
 
@@ -778,8 +778,10 @@ mod tests {
             Ok(Verdict::LeaveBlocked)
         };
         let pause = || thread::sleep(Duration::from_millis(5));
-        let idle = ["implement", "light"].map(|label| [slot(label, 1), slot(label, 2)]);
-        let mut contenders: Vec<Slot> = idle.into_iter().flatten().collect();
+        let mut contenders: Vec<Slot> = slots()
+            .into_iter()
+            .filter(|slot| slot.role.label != "review")
+            .collect();
         contenders.push(slot("review", 1));
         assert_eq!(contenders.len(), usize::from(AGENTS_MAX) + 1);
         let started = Instant::now();
