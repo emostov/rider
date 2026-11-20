@@ -8,7 +8,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
-use std::thread;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
@@ -16,7 +17,9 @@ use clap::{Parser, Subcommand};
 use crate::board::{self, Board, BoardError, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
-use crate::feed::{BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader};
+use crate::feed::{
+    BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
+};
 use crate::harness::{CommandLine, LOG_BYTES_MAX};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
@@ -849,19 +852,14 @@ fn wait(config: &Config, project: &str, minutes: u32, lead: Option<&str>) -> Res
 
 /// The feed as one thread reads it: first its stopper, then each item.
 enum Followed {
-    Started(crate::feed::FeedStop),
+    Started(FeedStop),
     Item(Result<FeedItem, FeedError>),
 }
 
-// Follows the feed from `start` until `until`, or until it is quiet for `WAIT_SETTLE` after
-// the first event that ends the wait; returns those events and the cursor of the last read.
-fn follow(
-    board: &VbCli,
-    watch: &Watch,
-    start: Cursor,
-    until: Instant,
-) -> Result<(Vec<(Happened, TaskId)>, Cursor), CliError> {
-    let (sender, items) = std::sync::mpsc::sync_channel(WAIT_QUEUED_MAX);
+type FeedThread = (JoinHandle<()>, Receiver<Followed>, FeedStop);
+
+fn start_feed(board: &VbCli, start: Cursor) -> Result<FeedThread, CliError> {
+    let (sender, items) = sync_channel(WAIT_QUEUED_MAX);
     let feed = VbCli {
         vb: board.vb.clone(),
         url: board.url.clone(),
@@ -886,20 +884,36 @@ fn follow(
             }
         });
     let reader = reader.map_err(|error| CliError::Feed(error.to_string()))?;
-    let (mut happened, mut cursor, mut stop) = (Vec::new(), start, None);
-    let mut until = until;
-    let ended = loop {
+    let started = items.recv();
+    let stop = match started {
+        Ok(Followed::Started(stop)) => stop,
+        Ok(Followed::Item(Err(error))) => return Err(CliError::Feed(error.to_string())),
+        Ok(Followed::Item(Ok(_))) | Err(_) => {
+            return Err(CliError::Feed("the feed did not start".into()));
+        }
+    };
+    Ok((reader, items, stop))
+}
+
+fn follow(
+    board: &VbCli,
+    watch: &Watch,
+    start: Cursor,
+    until: Instant,
+) -> Result<(Vec<(Happened, TaskId)>, Cursor), CliError> {
+    let (reader, items, stop) = start_feed(board, start)?;
+    let (mut happened, mut cursor, mut until) = (Vec::new(), start, until);
+    let mut ended = Err(CliError::Feed(format!("over {WAIT_ITEMS_MAX} feed items")));
+    for _ in 0..WAIT_ITEMS_MAX {
         let left = until.saturating_duration_since(Instant::now());
         let item = match items.recv_timeout(left) {
-            Ok(Followed::Started(stopper)) => {
-                stop = Some(stopper);
-                continue;
-            }
             Ok(Followed::Item(item)) => item,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break Ok(()),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(CliError::Feed("the feed's reader ended".into()));
+            Ok(Followed::Started(_)) => Err(FeedError::Spawn("the feed started twice".into())),
+            Err(RecvTimeoutError::Timeout) => {
+                ended = Ok(());
+                break;
             }
+            Err(RecvTimeoutError::Disconnected) => Err(FeedError::Ended),
         };
         let event = match item {
             Ok(FeedItem::Event(FeedEvent::Known(event))) => event,
@@ -912,35 +926,36 @@ fn follow(
                 continue;
             }
             Ok(FeedItem::Exited { code }) => {
-                break Err(CliError::Feed(format!("vb tail exited with {code:?}")));
+                ended = Err(CliError::Feed(format!("vb tail exited with {code:?}")));
+                break;
             }
-            Err(error) => break Err(CliError::Feed(error.to_string())),
+            Err(error) => {
+                ended = Err(CliError::Feed(error.to_string()));
+                break;
+            }
         };
-        let Some(what) = watch.happened(&event) else {
-            cursor = cursor.max(event.cursor);
-            continue;
-        };
-        if happened.len() == WAIT_EVENTS_MAX {
-            break Ok(());
+        let what = watch.happened(&event);
+        if what.is_some() && happened.len() == WAIT_EVENTS_MAX {
+            ended = Ok(());
+            break;
         }
         cursor = cursor.max(event.cursor);
-        if !happened.contains(&(what, event.task)) {
-            happened.push((what, event.task));
+        if let Some(what) = what {
+            if !happened.contains(&(what, event.task)) {
+                happened.push((what, event.task));
+            }
+            until = Instant::now() + WAIT_SETTLE;
         }
-        until = Instant::now() + WAIT_SETTLE;
-    };
-    if let Some(stop) = stop {
-        stop.stop()
-            .map_err(|error| CliError::Feed(error.to_string()))?;
     }
+    let stopped = stop.stop();
     drop(items);
     let _ = reader.join();
     ended?;
+    stopped.map_err(|error| CliError::Feed(error.to_string()))?;
     assert!(happened.len() <= WAIT_EVENTS_MAX && cursor >= start);
     Ok((happened, cursor))
 }
 
-// One line for each event, its task's first line read from the board, all reads at once.
 fn describe(board: &VbCli, happened: &[(Happened, TaskId)]) -> Result<Vec<String>, CliError> {
     assert!(happened.len() <= WAIT_EVENTS_MAX);
     let lines: Vec<Result<String, BoardError>> = thread::scope(|scope| {
@@ -1007,7 +1022,7 @@ fn write_cursor(path: &Path, cursor: Cursor) -> Result<(), CliError> {
     let text = format!("{}\n", cursor.0);
     fs::write(&partial, &text).map_err(|error| io_error("write", &partial, &error))?;
     fs::rename(&partial, path).map_err(|error| io_error("rename", &partial, &error))?;
-    assert!(text.len() as u64 <= CURSOR_BYTES_MAX);
+    assert!(u64::try_from(text.len()).is_ok_and(|len| len <= CURSOR_BYTES_MAX));
     Ok(())
 }
 

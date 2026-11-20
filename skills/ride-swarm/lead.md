@@ -235,12 +235,15 @@ task of its own.
 9. Wait for the board in the background, never in the foreground. Run this as one background
    command (in Claude Code, the Bash tool with `run_in_background`, which notifies the session
    when the command exits):
-   `for i in 1 2 3 4 5 6; do o=$(vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json 2>&1); echo "$o" | jq -e '.reason == "timeout"' >/dev/null 2>&1 || break; done; echo "$o"`
-   The loop repeats the 9-minute wait only when the output's own top-level `reason` is
-   `"timeout"` (nothing happened; an event's `reason` is nested, so it never matches), at most 6
-   times (54 minutes), so a quiet board does not end it early and an error never spins. Any event, even a reply of yours in a finished task's thread,
-   ends it. While it runs, answer the owner. When it ends, read its output and take the next turn; if it ended on
-   an error, report it to the owner. Never run the wait in the foreground and never sleep-poll.
+   `rider wait <project> --as lead-fable-5-2`
+   It blocks until something needs you and prints one line for each thing that happened since
+   the last wait: `completed`, `failed` or `blocked` with the task's id and first line (a
+   completed review also names its blocking-finding count), `answered` for a decision, and
+   `idle` when no task in `work/<project>` is open. Your own events never end it, and it keeps
+   its own cursor, so no event is named twice. After 54 minutes with nothing to report it
+   prints nothing and exits 3: start it again. While it runs, answer the owner. When it ends,
+   read its output and take the next turn; if it ended on an error, report it to the owner.
+   Never run the wait in the foreground and never sleep-poll.
 
 ## What Rider leaves on the board
 
