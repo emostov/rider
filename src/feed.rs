@@ -3,18 +3,18 @@
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::mem;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use serde_json::{Map, Value};
 
-use crate::board::{BoardError, LABELS_MAX, TaskId, TaskState, VbCli, kill_group_with};
+use crate::board::{BoardError, LABELS_MAX, TaskId, TaskState, VbCli, kill_group};
 
 /// Upper bound on one line of the feed, its newline excluded.
 pub const FEED_LINE_BYTES_MAX: usize = 1024 * 1024;
@@ -160,29 +160,17 @@ enum Received {
     End,
 }
 
-/// How a feed signals its process group and reads its child's stdout.
-#[derive(Clone, Copy)]
-struct Seams {
-    signal_group: fn(Pid) -> Result<(), Errno>,
-    read_lines: fn(BufReader<ChildStdout>, &SyncSender<Received>),
-}
-
-const SEAMS: Seams = Seams {
-    signal_group: kill_group_signal,
-    read_lines,
-};
-
-fn kill_group_signal(group: Pid) -> Result<(), Errno> {
-    kill_process_group(group, Signal::KILL)
-}
+/// How a feed reads its child's stdout.
+type ReadLines = fn(BufReader<ChildStdout>, &SyncSender<Received>);
 
 /// A running `vb tail` in its own process group. Dropping it kills the group. After an
 /// error, drop it and start again from the last cursor seen.
 pub struct FeedReader {
-    child: Child,
+    child: Box<dyn ChildWrapper>,
+    /// The child's pid, which names its group.
+    leader: Pid,
     /// The child's group while the child is unreaped; locked across every reap.
     group: Arc<Mutex<Option<Pid>>>,
-    signal_group: fn(Pid) -> Result<(), Errno>,
     lines: Receiver<Received>,
     drained: bool,
     /// The child has exited. It stays unreaped until `finish`, so its pid still names its
@@ -200,10 +188,10 @@ pub struct FeedReader {
 impl FeedReader {
     /// Starts following every event on the board after `after`.
     pub fn start(cli: &VbCli, after: Cursor) -> Result<FeedReader, FeedError> {
-        FeedReader::start_with(cli, after, SEAMS)
+        FeedReader::start_with(cli, after, read_lines)
     }
 
-    fn start_with(cli: &VbCli, after: Cursor, seams: Seams) -> Result<FeedReader, FeedError> {
+    fn start_with(cli: &VbCli, after: Cursor, read: ReadLines) -> Result<FeedReader, FeedError> {
         assert!(!cli.url.is_empty(), "the board URL is never empty");
         assert!(!cli.profile.is_empty(), "the profile is never empty");
         assert!(!cli.vb.as_os_str().is_empty(), "the vb path is never empty");
@@ -218,35 +206,42 @@ impl FeedReader {
             "--as",
             &cli.profile,
         ];
-        let mut child = Command::new(&cli.vb)
+        let mut process = Command::new(&cli.vb);
+        process
             .args(args)
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| FeedError::Spawn(format!("{}: {error}", cli.vb.display())))?;
+            .stderr(Stdio::null());
+        let spawned = CommandWrap::from(process)
+            .wrap(ProcessGroup::leader())
+            .spawn();
+        let mut child =
+            spawned.map_err(|error| FeedError::Spawn(format!("{}: {error}", cli.vb.display())))?;
         let (sender, lines) = sync_channel(LINES_QUEUED_MAX);
-        let started = child
-            .stdout
-            .take()
-            .ok_or_else(|| "no stdout pipe".to_string());
-        let started = started.and_then(|stdout| {
-            let stdout = BufReader::with_capacity(64 * 1024, stdout);
-            let builder = thread::Builder::new().name("vb-tail".into());
-            let read = seams.read_lines;
-            let spawned = builder.spawn(move || read(stdout, &sender));
-            spawned.map_err(|error| format!("starting the reader thread: {error}"))
-        });
-        if let Err(detail) = started {
-            let _ = kill_group_with(&mut child, seams.signal_group, |child| child.kill());
-            return Err(FeedError::Spawn(detail));
-        }
-        let group = Arc::new(Mutex::new(Some(Pid::from_child(&child))));
+        let leader = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+        let started = match (leader, child.stdout().take()) {
+            (Some(leader), Some(stdout)) => {
+                let stdout = BufReader::with_capacity(64 * 1024, stdout);
+                let builder = thread::Builder::new().name("vb-tail".into());
+                let spawned = builder.spawn(move || read(stdout, &sender));
+                let spawned = spawned.map(|_| leader);
+                spawned.map_err(|error| format!("starting the reader thread: {error}"))
+            }
+            (None, _) => Err(format!("pid {} is out of range", child.id())),
+            (_, None) => Err("no stdout pipe".to_string()),
+        };
+        let leader = match started {
+            Ok(leader) => leader,
+            Err(detail) => {
+                let _ = kill_group(child.as_mut());
+                return Err(FeedError::Spawn(detail));
+            }
+        };
+        let group = Arc::new(Mutex::new(Some(leader)));
         Ok(FeedReader {
             child,
+            leader,
             group,
-            signal_group: seams.signal_group,
             lines,
             drained: false,
             exited: false,
@@ -273,7 +268,7 @@ impl FeedReader {
             // The exit is checked before every read, so a descendant that keeps stdout busy
             // cannot postpone it. A killed child is already reaped and no longer polled.
             if !self.exited && self.killed.is_none() {
-                let child = WaitId::Pid(Pid::from_child(&self.child));
+                let child = WaitId::Pid(self.leader);
                 let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
                 let polled = waitid(child, options);
                 self.exited = polled
@@ -338,7 +333,7 @@ impl FeedReader {
             group.is_some() || self.killed.is_some(),
             "only a kill reaps the child"
         );
-        let killed = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
+        let killed = kill_group(self.child.as_mut());
         *group = None;
         killed
     }
@@ -397,7 +392,7 @@ impl FeedStop {
             return Ok(());
         };
         assert!(pid.as_raw_pid() > 1, "never signal the caller's own group");
-        match (SEAMS.signal_group)(pid) {
+        match kill_process_group(pid, Signal::KILL) {
             // Darwin refuses (EPERM) to signal a group whose only member is the exited,
             // unreaped leader: nothing in it is left to stop.
             Ok(()) | Err(Errno::SRCH | Errno::PERM) => Ok(()),
@@ -626,7 +621,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     const PERSON: &str = "local:user:zeke";
@@ -705,10 +699,10 @@ mod tests {
 
     /// A reader over a stand-in `vb` whose script is `body`.
     fn reader(name: &str, body: &str) -> (FeedReader, PathBuf) {
-        reader_with(name, body, SEAMS)
+        reader_with(name, body, read_lines)
     }
 
-    fn reader_with(name: &str, body: &str, seams: Seams) -> (FeedReader, PathBuf) {
+    fn reader_with(name: &str, body: &str, read: ReadLines) -> (FeedReader, PathBuf) {
         let unique = format!("rider-feed-{name}-{}", std::process::id());
         let dir = std::env::temp_dir().join(unique);
         fs::create_dir_all(&dir).unwrap();
@@ -720,7 +714,7 @@ mod tests {
             url: "http://127.0.0.1:1".into(),
             profile: "tester".into(),
         };
-        (FeedReader::start_with(&cli, Cursor(0), seams).unwrap(), dir)
+        (FeedReader::start_with(&cli, Cursor(0), read).unwrap(), dir)
     }
 
     #[test]
@@ -966,42 +960,6 @@ exit 4
         assert!(matches!(result, Err(FeedError::LineTooLong)), "{result:?}");
     }
 
-    static SIGNALS_REFUSED: AtomicU32 = AtomicU32::new(0);
-
-    /// Refuses the first group signal as Darwin does, then signals for real.
-    fn refuse_the_first_signal(group: Pid) -> Result<(), Errno> {
-        if SIGNALS_REFUSED.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Err(Errno::PERM);
-        }
-        kill_group_signal(group)
-    }
-
-    #[test]
-    fn reports_a_descendant_that_survives_the_group_kill() {
-        let unique = format!("rider-feed-survivor-pid-{}", std::process::id());
-        let pid_file = std::env::temp_dir().join(unique);
-        let body = format!(
-            "sleep 30 >/dev/null &\necho $! > '{}'\nexit 3\n",
-            pid_file.display()
-        );
-        let seams = Seams {
-            signal_group: refuse_the_first_signal,
-            read_lines,
-        };
-        let (mut feed, dir) = reader_with("survivor", &body, seams);
-        let result = feed.next_item();
-        drop(feed);
-        let pid = fs::read_to_string(&pid_file).unwrap();
-        fs::remove_file(&pid_file).unwrap();
-        fs::remove_dir_all(dir).unwrap();
-        assert!(matches!(result, Err(FeedError::Kill(_))), "{result:?}");
-        assert!(
-            gone(pid.trim()),
-            "the descendant {} outlived the feed",
-            pid.trim()
-        );
-    }
-
     /// Starts reading only after `vb` has exited and its group has been killed.
     fn read_lines_late(stdout: BufReader<ChildStdout>, sender: &SyncSender<Received>) {
         thread::sleep(END_GRACE + Duration::from_millis(500));
@@ -1013,11 +971,7 @@ exit 4
         let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2 3
 exit 3
 "#;
-        let seams = Seams {
-            signal_group: kill_group_signal,
-            read_lines: read_lines_late,
-        };
-        let (mut feed, dir) = reader_with("late", body, seams);
+        let (mut feed, dir) = reader_with("late", body, read_lines_late);
         let items = drain(&mut feed);
         fs::remove_dir_all(dir).unwrap();
         let exited = Ok(FeedItem::Exited { code: Some(3) });

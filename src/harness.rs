@@ -3,13 +3,14 @@
 
 use crate::board::one_line;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
+use rustix::process::Signal;
 use serde_json::Value;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -322,26 +323,13 @@ fn start_reader(
     Ok(())
 }
 
-fn signal_group(pgid: u32, signal: &str) {
-    // `kill -s KILL -- -1` would reach every process rider may signal.
-    assert!(pgid > 1, "the group of a child rider started");
-    assert!(signal == "TERM" || signal == "KILL");
-    let target = format!("-{pgid}");
-    // An empty group has nothing left to stop, so whether `kill` reached anyone is moot.
-    let _ = Command::new("kill")
-        .args(["-s", signal, "--", &target])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-fn kill_and_reap(child: &mut Child, pgid: u32) -> Result<ExitStatus, HarnessError> {
-    assert!(pgid > 1);
-    assert!(pgid == child.id());
-    signal_group(pgid, "KILL");
-    // Fails only when the agent already exited.
-    let _ = child.kill();
+fn kill_and_reap(child: &mut dyn ChildWrapper) -> Result<ExitStatus, HarnessError> {
+    assert!(child.id() > 1, "the group of a child rider started");
+    // An empty group has nothing left to stop. The leader is killed on its own when its
+    // group refuses the signal; that fails only when the agent already exited.
+    if child.start_kill().is_err() {
+        let _ = child.inner_mut().start_kill();
+    }
     let status = child.wait();
     status.map_err(|error| HarnessError::Wait(format!("{error}")))
 }
@@ -359,13 +347,12 @@ fn timed_out(
 }
 
 fn supervise(
-    child: &mut Child,
-    pgid: u32,
+    child: &mut dyn ChildWrapper,
     shared: &Shared,
     seconds_max: u64,
 ) -> Result<(ExitStatus, bool), HarnessError> {
     assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
-    assert!(pgid == child.id());
+    assert!(child.id() > 1, "the group of a child rider started");
     let start = (Instant::now(), SystemTime::now());
     let limit = Duration::from_secs(seconds_max);
     let grace = Duration::from_secs(KILL_GRACE_SECONDS);
@@ -374,7 +361,7 @@ fn supervise(
         let polled = match child.try_wait() {
             Ok(polled) => polled,
             Err(error) => {
-                let _ = kill_and_reap(child, pgid);
+                let _ = kill_and_reap(child);
                 return Err(HarnessError::Wait(format!("{error}")));
             }
         };
@@ -382,7 +369,7 @@ fn supervise(
             return Ok((status, term_sent.is_some()));
         }
         if let Some(message) = shared.error() {
-            let _ = kill_and_reap(child, pgid);
+            let _ = kill_and_reap(child);
             return Err(HarnessError::Log(message));
         }
         let now = (Instant::now(), SystemTime::now());
@@ -394,20 +381,21 @@ fn supervise(
             None => {
                 let (monotonic, wall) = since(start);
                 if timed_out(monotonic, wall, limit) {
-                    signal_group(pgid, "TERM");
+                    // An empty group has nothing left to stop.
+                    let _ = child.signal(Signal::TERM.as_raw());
                     term_sent = Some(now);
                 }
             }
             Some(sent) => {
                 let (monotonic, wall) = since(sent);
                 if timed_out(monotonic, wall, grace) {
-                    return Ok((kill_and_reap(child, pgid)?, true));
+                    return Ok((kill_and_reap(child)?, true));
                 }
             }
         }
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
-    let _ = kill_and_reap(child, pgid);
+    let _ = kill_and_reap(child);
     Err(HarnessError::Wait(format!(
         "the agent outlived {POLLS_MAX} polls"
     )))
@@ -430,7 +418,7 @@ fn drain(done: &Receiver<Result<(), String>>) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Child, HarnessError> {
+fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, HarnessError> {
     assert!(!cmd.program.is_empty());
     assert!(cmd.args.len() <= ARGS_MAX && cmd.env.len() <= ENV_MAX);
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
@@ -441,26 +429,26 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Child, HarnessError> {
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let spawned = process.spawn();
+        .stderr(Stdio::piped());
+    let spawned = CommandWrap::from(process)
+        .wrap(ProcessGroup::leader())
+        .spawn();
     spawned.map_err(|error| HarnessError::Spawn(format!("{}: {error}", cmd.program)))
 }
 
 fn start_readers(
-    child: &mut Child,
+    child: &mut dyn ChildWrapper,
     slots: [ReaderSlot; READERS],
     shared: &Arc<Shared>,
     done: &SyncSender<Result<(), String>>,
 ) -> Result<(), HarnessError> {
-    assert!(child.stdout.is_some() && child.stderr.is_some());
     let missing = |name: &str| HarnessError::Spawn(format!("the agent has no {name}"));
-    let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
+    let stdout = child.stdout().take().ok_or_else(|| missing("stdout"))?;
+    let stderr = child.stderr().take().ok_or_else(|| missing("stderr"))?;
     let [stdout_slot, stderr_slot] = slots;
     start_reader(stdout, "stdout", stdout_slot, shared, done)?;
     start_reader(stderr, "stderr", stderr_slot, shared, done)?;
-    assert!(child.stdout.is_none() && child.stderr.is_none());
+    assert!(child.stdout().is_none() && child.stderr().is_none());
     Ok(())
 }
 
@@ -482,18 +470,20 @@ pub fn run(
     let slots = [reserve()?, reserve()?];
     let shared = open_log(log, log_bytes_max)?;
     let mut child = spawn(cmd, dir)?;
-    let pgid = child.id();
-    assert!(pgid > 1, "a spawned child is never init or the scheduler");
+    assert!(
+        child.id() > 1,
+        "a spawned child is never init or the scheduler"
+    );
     let (done, finished) = mpsc::sync_channel(READERS);
-    if let Err(error) = start_readers(&mut child, slots, &shared, &done) {
-        let _ = kill_and_reap(&mut child, pgid);
+    if let Err(error) = start_readers(child.as_mut(), slots, &shared, &done) {
+        let _ = kill_and_reap(child.as_mut());
         shared.close();
         return Err(error);
     }
     drop(done);
-    let outcome = supervise(&mut child, pgid, &shared, seconds_max);
+    let outcome = supervise(child.as_mut(), &shared, seconds_max);
     // The leader is reaped; leftover members of its group would hold the pipes open.
-    signal_group(pgid, "KILL");
+    let _ = child.start_kill();
     let drained = drain(&finished);
     let logged = shared.close();
     let (status, timed_out) = outcome?;

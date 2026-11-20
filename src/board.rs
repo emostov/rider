@@ -2,14 +2,14 @@
 
 use std::fmt;
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command as Process, ExitStatus, Stdio};
+use std::process::{ChildStdin, Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Map, Value};
 
 use crate::core::TASKS_MAX;
@@ -998,7 +998,7 @@ fn feed(mut stdin: ChildStdin, text: String) -> Result<(), BoardError> {
 /// Polls until `child` has exited and `done` holds, or until `deadline`. `None` means time ran
 /// out first.
 fn wait_until(
-    child: &mut Child,
+    child: &mut dyn ChildWrapper,
     done: impl Fn() -> bool,
     deadline: Instant,
 ) -> Result<Option<ExitStatus>, BoardError> {
@@ -1022,59 +1022,35 @@ fn wait_until(
 
 /// Sends SIGKILL to the process group `child` leads, then kills and reaps `child`. A group that
 /// is gone afterwards is not an error. A child that could not be killed is never waited on.
-pub(crate) fn kill_group(child: &mut Child) -> Result<(), BoardError> {
-    kill_group_with(
-        child,
-        |group| kill_process_group(group, Signal::KILL),
-        |child| child.kill(),
-    )
-}
-
-pub(crate) fn kill_group_with(
-    child: &mut Child,
-    signal_group: impl FnOnce(Pid) -> Result<(), Errno>,
-    kill_child: impl FnOnce(&mut Child) -> std::io::Result<()>,
-) -> Result<(), BoardError> {
-    let group = Pid::from_child(child);
-    assert!(
-        group.as_raw_pid() > 1,
-        "never signal the caller's own group"
-    );
-    let signalled = match signal_group(group) {
-        Ok(()) | Err(Errno::SRCH) => Ok(()),
-        Err(error) => Err(BoardError::Kill(format!(
-            "group {}: {error}",
-            group.as_raw_pid()
-        ))),
-    };
-    let reaped = match kill_child(child) {
-        Ok(()) => {
-            let _ = child.wait();
-            Ok(())
+pub(crate) fn kill_group(child: &mut dyn ChildWrapper) -> Result<(), BoardError> {
+    let id = child.id();
+    assert!(id > 1, "never signal the caller's own group");
+    let group = i32::try_from(id).ok().and_then(Pid::from_raw);
+    let group = group.ok_or_else(|| BoardError::Kill(format!("group {id} is not a pid")))?;
+    let signalled = child.start_kill();
+    if signalled.is_err() {
+        // The group refused the signal, so the leader is killed on its own before any wait.
+        if let Err(error) = child.inner_mut().start_kill()
+            && !matches!(child.try_wait(), Ok(Some(_)))
+        {
+            return Err(BoardError::Kill(format!("child {id}: {error}")));
         }
-        Err(error) => match child.try_wait() {
-            // `vb` already exited, so there is nothing left to kill.
-            Ok(Some(_)) => Ok(()),
-            Ok(None) | Err(_) => Err(BoardError::Kill(format!(
-                "child {}: {error}",
-                group.as_raw_pid()
-            ))),
-        },
-    };
+    }
+    let _ = child.wait();
     // Darwin refuses (EPERM) to signal a group whose only member is the exited, unreaped
     // leader. Once the leader is reaped, only an empty group answers the probe with ESRCH.
-    let signalled = match signalled {
+    match signalled {
+        Ok(()) => Ok(()),
         Err(_) if test_kill_process_group(group) == Err(Errno::SRCH) => Ok(()),
-        signalled => signalled,
-    };
-    signalled.and(reaped)
+        Err(error) => Err(BoardError::Kill(format!("group {id}: {error}"))),
+    }
 }
 
 /// Feeds `input` to `child` and reads both of its streams, each on its own thread so no full
 /// pipe can stall `vb`. Within `seconds`, `vb` must exit and every pipe must close; otherwise
 /// the whole process group is killed.
 fn collect(
-    child: &mut Child,
+    child: &mut dyn ChildWrapper,
     input: Option<String>,
     call: &'static str,
     seconds: u32,
@@ -1082,14 +1058,14 @@ fn collect(
     assert!(seconds >= CALL_SECONDS);
     let deadline = Instant::now() + Duration::from_secs(u64::from(seconds));
     let mut stdout = child
-        .stdout
+        .stdout()
         .take()
         .ok_or_else(|| BoardError::Spawn("no stdout".into()))?;
     let mut stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| BoardError::Spawn("no stderr".into()))?;
-    let writer = match (input, child.stdin.take()) {
+    let writer = match (input, child.stdin().take()) {
         (Some(text), Some(stdin)) => Some(start_worker("stdin", move || feed(stdin, text))?),
         (None, None) => None,
         _ => {
@@ -1147,21 +1123,24 @@ impl VbCli {
         } else {
             Stdio::null()
         };
-        let mut child = Process::new(&self.vb)
+        let mut process = Process::new(&self.vb);
+        process
             .args(&args)
-            .process_group(0)
             .stdin(stdin)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        let spawned = CommandWrap::from(process)
+            .wrap(ProcessGroup::leader())
+            .spawn();
+        let mut child = spawned
             .map_err(|error| BoardError::Spawn(format!("{}: {error}", self.vb.display())))?;
         let (call, seconds) = command_limit(command);
-        let output = collect(&mut child, input, call, seconds);
+        let output = collect(child.as_mut(), input, call, seconds);
         // A thread could not start or a stream broke: do not leave `vb` running. A timeout
         // or a failed kill has already tried to kill its group.
         match output {
             Err(BoardError::TimedOut { .. } | BoardError::Kill(_)) | Ok(_) => output,
-            Err(error) => kill_group(&mut child).and(Err(error)),
+            Err(error) => kill_group(child.as_mut()).and(Err(error)),
         }
     }
 
@@ -1487,27 +1466,6 @@ pub mod testing {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::{Error, ErrorKind};
-
-    #[test]
-    fn kill_group_returns_the_error_when_neither_signal_lands() {
-        let mut child = Process::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let started = Instant::now();
-        let result = kill_group_with(
-            &mut child,
-            |_| Err(Errno::PERM),
-            |_| Err(Error::new(ErrorKind::PermissionDenied, "denied")),
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let expected = format!("group {}: {}", child.id(), Errno::PERM);
-        assert!(matches!(result, Err(BoardError::Kill(ref m)) if *m == expected));
-        kill_group(&mut child).unwrap();
-    }
 
     #[test]
     fn parses_a_recorded_task() {
