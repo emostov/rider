@@ -23,7 +23,10 @@ channel while the rest of the work goes on.
 at once. `rider config` prints the settings in effect: the built-in roles and limits with the
 file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI) or
 `tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
-for the roles that use it.
+for the roles that use it. A role may list `skills = ["<name>", ...]` (only on `claude`); its
+worker runs each one, in order, over the task's whole PR range and fixes what it reports
+before completing. A `[repo."<absolute path>".roles.<role>]` table overrides that role's keys
+for that repository's tasks only, and `rider config --repo <path>` prints the table they see.
 
 ## Getting started
 

@@ -201,8 +201,6 @@ pub fn table() -> &'static [RoleSpec] {
 pub fn role_in_repo(role: &'static RoleSpec, repo: &Path) -> &'static RoleSpec {
     assert!(repo.is_absolute());
     let repos = TABLE.get().map_or(&[][..], |installed| installed.repos);
-    // The repository may have moved or gone since the label was written; then it matches
-    // only by the path as written.
     let canonical = repo.canonicalize().ok();
     let found = repos
         .iter()

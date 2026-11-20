@@ -280,7 +280,6 @@ pub fn load(home: &Path) -> Result<Settings, ConfigFileError> {
     })
 }
 
-// Each `[repo."<path>"]` table's roles merged over the file's, keyed by the canonical path.
 fn repo_settings(
     path: &Path,
     home: &Path,
@@ -300,7 +299,6 @@ fn repo_settings(
             let problem = "must be an absolute path".to_string();
             return Err(field_error(path, format!("repo.{key:?}"), problem));
         }
-        // A repository not cloned yet is kept as written.
         let canonical = written.canonicalize().unwrap_or(written);
         if out.iter().any(|seen| seen.roles.repo == canonical) {
             let problem = "names a repository another key already names".to_string();
@@ -510,7 +508,11 @@ fn skills_for(harness: Harness, skills: &[String]) -> Result<&'static [&'static 
             ));
         }
         if !harness.runs_skills() {
-            let harness = format!("{harness:?}").to_lowercase();
+            let harness = match harness {
+                Harness::Claude => "claude",
+                Harness::Codex => "codex",
+                Harness::Tact => "tact",
+            };
             return Err(format!(
                 "names the skill {skill:?}, which the {harness} harness cannot run"
             ));
