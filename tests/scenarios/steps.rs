@@ -23,8 +23,14 @@ pub const SETTLED: [&str; 4] = ["completed", "failed", "blocked", "canceled"];
 const POLL_MILLIS: u64 = 200;
 const LIST_LIMIT: &str = "500";
 const SCHEMAS: [(&str, &str); 2] = [
-    ("rider-result@1", "schemas/rider-result.json"),
-    ("rider-finding@1", "schemas/rider-finding.json"),
+    (
+        "rider-result@1",
+        "skills/ride-swarm/schemas/rider-result.json",
+    ),
+    (
+        "rider-finding@1",
+        "skills/ride-swarm/schemas/rider-finding.json",
+    ),
 ];
 
 /// A task as the lead would create it; `role` is set last, and only when present.
