@@ -113,6 +113,17 @@ Everything is under `~/.rider`, or `$RIDER_HOME` when it is set.
   limit and names the whole log; `rider logs <id>` prints it.
 - **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
   `vb label`, then `vb tasks unblock <id>`.
+- **A task is blocked as `rider_error`: "Rider will not reuse the worktree ... was not made
+  for this board".** Worktrees are named by task id, so after the board's data is replaced a
+  new task can reuse the id of an old task whose worktree is still there. Each worktree Rider
+  makes records which board it is for in a `.rider-board` file in the worktree's git
+  directory. The board's identity is the oldest post in the board's own `rider/identity`
+  channel, a random id Rider posts there when the channel is empty, so wiping, replacing, or
+  switching the board gives it a new one. The daemon reads it once when it starts: restart it
+  after replacing the board, and do not post in or delete `rider/identity`. A worktree with no
+  record, or with another board's, is left as it is. Keep what you need from the directory
+  the reason names, remove it with `git worktree remove <dir>` from the repository, then
+  `vb tasks unblock <id>`.
 - **Many `node ... vb` processes are left running.** `rider reap` lists Board CLI processes
   whose board no longer answers; `rider reap --yes` stops them.
 

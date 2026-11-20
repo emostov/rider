@@ -83,6 +83,7 @@ worker take it again.
 | `onto` | you | id of a task whose existing branch this task works on directly |
 | `of` | you, required for `review`, `security`, and `qa` | id of the task under review |
 | `resume` | you | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
+| `restack` | you | `1` on a restack task: it may rebase its `onto` branch and leave the branch's starting commit behind |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |
@@ -96,23 +97,28 @@ always the last label a task gets (see "Creating a plan").
 Rider checks these before starting a worker, and blocks the task as `invalid_brief` when one
 fails: `role` is present and known; `repo` is absolute and a git repository; `base`, `onto`,
 and `of` are task ids; `base` and `onto` are not both set; `review`, `security`, and `qa`
-have `of`; `from` is a valid branch name; the task named by `base`, `onto`, or `of` has a
-`branch` label that names a local branch. Only a task's own `branch` label that names a branch other
-than the one its worktree is on blocks as `rider_error`. A branch checked out in another
-task's worktree blocks as `branch_busy`.
+have `of`; `from` is a valid branch name; `resume` and `restack` are `1` when set, and
+`restack` comes with `onto`; the task named by `base`, `onto`, or `of` has a `branch` label
+that names a local branch. It also checks the order of work:
+
+- `base` must be one of the task's `needs`, so the task never starts before its base has
+  finished.
+- An `onto` task must `need` every unfinished task on that branch, unless that task waits
+  for it, so two workers never change one branch.
+- A `review`, `security`, or `qa` task must `need` its `of` task, so it never reviews
+  unfinished work.
+
+Only a task's own `branch` label that names a branch other than the one its worktree is on
+blocks as `rider_error`. A branch checked out in another task's worktree blocks as
+`branch_busy`. An `onto` task whose branch no longer contains its starting commit fails,
+unless it has `restack=1`.
 
 These rules are yours to keep. Rider does not check them:
 
-- `base` must also be one of the task's `needs`. Otherwise the task can start before its
-  base has finished, and is cut from a half-done branch or blocked for a missing `branch`.
-  Without `base`, the branch is cut from `from`. Set `from=<the agreed base branch>` on
+- Without `base`, the branch is cut from `from`. Set `from=<the agreed base branch>` on
   every task that has neither `base` nor `onto`, in the plan file. A task without any of
   the three is cut from `origin/HEAD`, and is blocked as `invalid_brief` in a repository
   that has none.
-- An `onto` task must `need` every unfinished task on that branch. Otherwise two workers
-  change one branch, and one is blocked or builds on the other's half-done work.
-- A `review`, `security`, or `qa` task must `need` its `of` task. Otherwise it reviews unfinished
-  work, or is blocked for a missing `branch`.
 - Stacks are linear: a task sees only its base's ancestry, and Rider never merges. If a task
   needs code from two sibling branches, sequence them into one stack.
 
@@ -269,9 +275,10 @@ same case once its changes are understood. `rider clean` (issue #60) will replac
 
 A branch moves after children were cut from it only when an `onto` task completes on it.
 The `behind` field of that task's `rider-result@2` record names the children whose branches
-lack its new head. Then restack each child branch, bottom up, one task at a time: `role=light` (or
-`implement`), `onto=<the child's task>`, needing the task that moved its parent. Its brief
-names the commit to rebase onto (the parent's new head, from the `rider-result@2` record of
+lack its new head. Then restack each child branch, bottom up, one task at a time:
+`role=light` (or `implement`), `onto=<the child's task>`, `restack=1`, needing the task that
+moved its parent. Its brief names the commit to rebase onto (the parent's new head, from the
+`rider-result@2` record of
 the task that moved it) and the proof command. That head does not exist until the restack
 below completes, so create each restack only after the one below it has completed, never as
 one batch.
