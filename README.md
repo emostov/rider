@@ -15,16 +15,9 @@ the workers' questions, checks their results, and keeps you updated. It never
 writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
-**The swarm** runs as many agents at once as the task graph allows, up to 32:
-
-| Role        | Model           | Job                                         |
-| ----------- | --------------- | ------------------------------------------- |
-| `implement` | Opus 5.5        | Builds a task and commits it                |
-| `light`     | Sonnet 5.5      | Builds a task whose brief says exactly what to change |
-| `review`    | Sol 6.1 (Codex) | Reviews another task's work                 |
-| `polish`    | Sonnet 5.5      | Tidies a branch without changing behaviour  |
-| `security`  | Mythos 5.2      | Reviews the finished stack                  |
-| `qa`        | Opus 5.5        | Optional: uses another task's work like a person would |
+**The swarm** runs agents in roles you configure in `~/.rider/rider.toml`. Each role sets
+its agents' model and prompt and how many replicas run at once. `rider config` prints the
+settings in effect.
 
 ## Getting started
 
