@@ -17,7 +17,7 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 - Assertions are for programming errors only. Anything from the board, an agent, git, or the filesystem is external input: a bad value becomes a returned error, never a panic.
 - Every loop and every collection has an upper bound declared as a named constant. Reaching it is a returned error, not growth.
 - No recursion, no `unsafe`, no async runtime. Threads and bounded channels only.
-- When work has several independent parts (board calls, git calls, agent waits), run them in parallel and join them, not one after another, whenever their order does not matter. Look for sequential independent calls and make them parallel.
+- When work has several independent parts (board calls, git calls, agent waits), run them in parallel and join them, not one after another, whenever their order does not matter.
 - Model parallel work as actors: each thread owns its state and talks to others only through bounded channels. A full channel makes the sender wait or shed work (back pressure), never grow.
 - Functions are at most 70 lines; lines are at most 100 columns.
 - Errors are enums, handled at every call site. No `unwrap()` or `expect()` outside tests. No `thiserror` or `anyhow`.
