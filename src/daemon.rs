@@ -4,7 +4,9 @@ use std::cell::Cell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -22,7 +24,7 @@ use crate::board::{
     Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
     parse_failure_reason,
 };
-use crate::cli::with_vb_on_path;
+use crate::cli::{board_serve, with_vb_on_path};
 use crate::config::Limits;
 use crate::core::{
     self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, AgentRecord, Call, Config, Event, LEASE_MILLIS,
@@ -72,6 +74,12 @@ const NO_CHANNEL: &str = "channel_not_found";
 const LOCK_FILE: &str = "daemon.lock";
 /// The daemon's log under the Rider home.
 pub const LOG_FILE: &str = "daemon.log";
+/// The output of the board the daemon started, under the Rider home.
+pub const BOARD_LOG_FILE: &str = "board.log";
+/// The daemon log's line naming the board process the daemon started.
+pub const BOARD_STARTED: &str = "started the board, pid";
+/// How long a board the daemon started is given to end after SIGTERM before SIGKILL.
+const BOARD_STOP_MILLIS_MAX: u64 = 10_000;
 const AGENTS_DIR: &str = "agents";
 /// The directory under the Rider home holding each task's attempt logs.
 pub const LOGS_DIR: &str = "logs";
@@ -328,6 +336,8 @@ struct Shared {
     grace_millis: u64,
     attempts: u8,
     feed: Mutex<FeedSlot>,
+    /// The board process the daemon started, if it had to.
+    served: Mutex<ServedSlot>,
     socket: Socket,
     /// The core has decided to stop now; a settlement checks it before each board write.
     stop_now: AtomicBool,
@@ -344,6 +354,15 @@ struct FeedSlot {
     /// The daemon is exiting: no feed starts and none reports its loss.
     stopping: bool,
     stop: Option<FeedStop>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The board process the daemon started and the thread waiting on it.
+#[derive(Default)]
+struct ServedSlot {
+    /// The daemon is exiting: no board starts and none reports its exit.
+    stopping: bool,
+    group: Option<Pid>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -383,6 +402,11 @@ impl Shared {
     fn feed(&self) -> MutexGuard<'_, FeedSlot> {
         // Every holder leaves the slot whole between its statements.
         self.feed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn served(&self) -> MutexGuard<'_, ServedSlot> {
+        // Every holder leaves the slot whole between its statements.
+        self.served.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn pid_file(&self, task: TaskId) -> PathBuf {
@@ -453,6 +477,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         grace_millis: timing.grace_millis,
         attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
+        served: Mutex::new(ServedSlot::default()),
         stop_now: AtomicBool::new(false),
         log,
         recorder,
@@ -469,13 +494,121 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
     state.leave_to_lease(unaccounted);
+    serve_if_down(&shared);
     let code = drive(&mut state, &inputs, &jobs, &shared);
     save_cursor(&shared, state.cursor());
     shared.socket.close();
     stop_feed(&shared);
+    stop_board(&shared);
     let code = code?;
     assert!(state.exited());
     Ok(code)
+}
+
+// Starts the board as the daemon's own when it does not answer and its URL is on this host;
+// a board that answers is left to whoever started it.
+fn serve_if_down(shared: &Arc<Shared>) {
+    let url = &shared.paths.board_url;
+    let Some(port) = local_port(url) else { return };
+    match shared.board(DAEMON_PROFILE).list_open(SUBTREE) {
+        Err(error) if call_failed(&error) => {}
+        _ => return,
+    }
+    assert!(port.is_none_or(|port| !port.is_empty()));
+    if let Err(error) = start_board(shared) {
+        shared
+            .log
+            .write(&format!("starting the board failed: {error}"));
+        send(&shared.events, Event::BoardExited);
+    }
+}
+
+// The port of a board URL on this host, `Some(None)` when it names none; `None` for any
+// other host.
+fn local_port(url: &str) -> Option<Option<&str>> {
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(':') => (host, Some(port)),
+        _ => (authority, None),
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return None;
+    }
+    let port = port.filter(|port| !port.is_empty());
+    let valid = port.is_none_or(|port| port.parse::<u16>().is_ok_and(|number| number > 0));
+    valid.then_some(port)
+}
+
+// Starts `vb serve` in a process group of its own, with a thread that reports its exit
+// unless the daemon is exiting.
+fn start_board(shared: &Arc<Shared>) -> Result<(), DaemonError> {
+    let mut slot = shared.served();
+    if slot.stopping {
+        return Ok(());
+    }
+    let home = &shared.paths.home;
+    let path = home.join(BOARD_LOG_FILE);
+    let log = OpenOptions::new().create(true).append(true).open(&path);
+    let log = log.map_err(io_error("open", &path))?;
+    let err = log.try_clone().map_err(io_error("share", &path))?;
+    let vb = &shared.paths.vb;
+    let mut command = board_serve(home, vb).map_err(io_error("create the board under", home))?;
+    if let Some(Some(port)) = local_port(&shared.paths.board_url) {
+        command.arg("--port").arg(port);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(err)
+        .process_group(0);
+    let mut child = command.spawn().map_err(io_error("run", vb))?;
+    let group = Pid::from_child(&child);
+    let watcher = Arc::clone(shared);
+    let builder = thread::Builder::new().name("board".into());
+    let spawned = builder.spawn(move || {
+        let _ = child.wait();
+        let mut slot = watcher.served();
+        slot.group = None;
+        if !slot.stopping {
+            drop(slot);
+            send(&watcher.events, Event::BoardExited);
+        }
+    });
+    let spawned = spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
+    shared
+        .log
+        .write(&format!("{BOARD_STARTED} {}", group.as_raw_nonzero()));
+    slot.group = Some(group);
+    slot.thread = Some(spawned);
+    assert!(!slot.stopping && slot.group.is_some());
+    Ok(())
+}
+
+// Stops the board the daemon started, SIGKILL after `BOARD_STOP_MILLIS_MAX`, and waits for
+// its thread to reap it.
+fn stop_board(shared: &Shared) {
+    let (group, waiter) = {
+        let mut slot = shared.served();
+        slot.stopping = true;
+        (slot.group.take(), slot.thread.take())
+    };
+    let (Some(group), Some(waiter)) = (group, waiter) else {
+        return;
+    };
+    let _ = kill_process_group(group, Signal::TERM);
+    let polls = BOARD_STOP_MILLIS_MAX / STOP_POLL_MILLIS;
+    for _ in 0..polls {
+        if waiter.is_finished() {
+            let _ = waiter.join();
+            return;
+        }
+        thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
+    }
+    let _ = kill_process_group(group, Signal::KILL);
+    shared
+        .log
+        .write("the board did not end after SIGTERM; sent SIGKILL");
 }
 
 // Kills the feed's group and waits up to `FEED_JOIN_MILLIS_MAX` for its thread to end, so
@@ -684,6 +817,15 @@ fn job(
         } => Box::new(move || release(&shared, run, task, &profile)),
         Action::ListTasks => Box::new(move || list(&shared)),
         Action::RestartFeed(cursor) => Box::new(move || restart_feed(&shared, cursor)),
+        Action::RestartBoard => Box::new(move || match start_board(&shared) {
+            Ok(()) => Input::plain(Event::BoardRestarted),
+            Err(error) => {
+                shared
+                    .log
+                    .write(&format!("restarting the board failed: {error}"));
+                Input::plain(Event::BoardExited)
+            }
+        }),
         Action::Reply { .. } | Action::Exit(_) => return Ok(None),
     };
     Ok(Some(job))

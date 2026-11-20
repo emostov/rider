@@ -49,6 +49,11 @@ pub const FEED_RESTARTS_MAX: u8 = 10;
 /// How long a feed must stay up, without delivering an event, for its loss not to count as
 /// a restart in a row, in milliseconds.
 pub const FEED_UPTIME_MILLIS_MIN: u64 = 60 * 1000;
+/// How many restarts in a row of a board the daemon started are allowed before it is left down.
+pub const BOARD_RESTARTS_MAX: u8 = 5;
+/// How long a restarted board must stay up for its exit not to count as a restart in a row,
+/// in milliseconds.
+pub const BOARD_UPTIME_MILLIS_MIN: u64 = 60 * 1000;
 
 /// The failure reason of a task whose agent the owner killed.
 /// Upper bound on the agent records and pid files a crashed daemon's recovery reads.
@@ -409,6 +414,10 @@ pub enum Event {
     Settled(RunId),
     /// A board call timed out or could not connect.
     BoardFailed(Call),
+    /// The board process the daemon started exited, or a `RestartBoard` could not start it.
+    BoardExited,
+    /// A `RestartBoard` started the board process again.
+    BoardRestarted,
     /// SIGTERM or SIGINT: the first drains, the next stops now.
     Signal,
     /// A socket client's request.
@@ -469,6 +478,9 @@ pub enum Action {
     },
     ListTasks,
     RestartFeed(Cursor),
+    /// Starts again the board process the daemon started; answered by `BoardRestarted` or
+    /// `BoardExited`.
+    RestartBoard,
     Reply {
         client: ClientId,
         reply: Reply,
@@ -503,6 +515,9 @@ pub struct State {
     feed_restarts: u8,
     feed_since: Timestamp,
     feed_delivered: bool,
+    /// Restarts in a row of the board process the daemon started.
+    board_restarts: u8,
+    board_since: Timestamp,
     /// Clients waiting on `down`, told of each run as it ends; at most `CLIENTS_MAX`.
     down_clients: Vec<ClientId>,
     /// Clients following a task's log, told when its agent is gone; at most `CLIENTS_MAX`.
@@ -539,6 +554,8 @@ impl State {
             feed_restarts: 0,
             feed_since: now,
             feed_delivered: false,
+            board_restarts: 0,
+            board_since: now,
             down_clients: Vec::new(),
             log_clients: Vec::new(),
             recovered: false,
@@ -701,6 +718,8 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             }
         }
         Event::BoardFailed(call) => board_failed(state, call),
+        Event::BoardExited => board_exited(state, actions),
+        Event::BoardRestarted => state.board_since = state.now,
         Event::Signal => signal(state, actions),
         Event::Client { client, request } => on_request(state, client, request, actions),
         Event::ClientGone(client) => {
@@ -769,6 +788,22 @@ fn feed_lost(state: &mut State, actions: &mut Vec<Action>) {
         actions.push(Action::ListTasks);
     }
     assert!(state.listing);
+}
+
+/// The owned board is restarted unless it has already been restarted `BOARD_RESTARTS_MAX`
+/// times in a row; an exit after it stayed up long starts the count again.
+fn board_exited(state: &mut State, actions: &mut Vec<Action>) {
+    let uptime = state.now.0.saturating_sub(state.board_since.0);
+    if uptime >= BOARD_UPTIME_MILLIS_MIN {
+        state.board_restarts = 0;
+    }
+    mark_down(state);
+    if state.board_restarts < BOARD_RESTARTS_MAX {
+        state.board_restarts += 1;
+        actions.push(Action::RestartBoard);
+    }
+    assert!(state.board_restarts <= BOARD_RESTARTS_MAX);
+    assert!(state.board != BoardHealth::Up);
 }
 
 fn on_request(state: &mut State, client: ClientId, request: Request, actions: &mut Vec<Action>) {

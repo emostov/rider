@@ -733,6 +733,59 @@ fn a_complete_that_fails_twice_is_retried_and_the_task_completes_with_one_agent_
 }
 
 #[test]
+fn a_vb_that_hangs_on_claim_marks_the_board_down_after_the_call_limit_and_holds_no_slot() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let marker = world.root.join("claim-started");
+    given_vb_runs_slowly(&world, "claim", &marker, 60);
+    given_a_running_daemon(&mut world);
+
+    let down = when_rider_status_shows_within(&world, "board down, 0 of", 60);
+
+    assert!(
+        down,
+        "rider status never said the board was down:\n{}",
+        world.pool_log()
+    );
+    assert!(marker.exists(), "no claim began");
+    assert_eq!(agents_running(&world), 0);
+    assert!(boards_the_daemon_started(&world).is_empty());
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_board_the_daemon_started_is_restarted_when_killed_and_its_running_task_completes() {
+    let Some(mut world) = World::new() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    let first = when_the_daemon_has_started_boards(&world, 1, 5)[0];
+    given_the_schemas_and_a_repository(&world);
+    let task = a_task_given_its_role_after(&world, "Add the work.", Behaviour::Hold);
+    let run = when_the_agent_has_started(&world, &task);
+
+    when_the_group_is_killed(first);
+    let boards = when_the_daemon_has_started_boards(&world, 2, 30);
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+    let next = a_task_given_its_role_after(&world, "Add more work.", Behaviour::Commit);
+    let later = when_the_tasks_settle(&world, &[&next]);
+
+    assert_eq!(states, vec!["completed"]);
+    assert_eq!(later, vec!["completed"]);
+    assert_eq!(agent_runs_for(&world, &task), vec![run]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(
+        !is_alive(boards[1]),
+        "the board the daemon started outlived it"
+    );
+}
+
+#[test]
 fn a_daemon_log_that_is_a_fifo_is_refused_and_the_daemon_exits() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
@@ -980,6 +1033,17 @@ fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].harness, "codex");
     assert_eq!(agent_model(&world, &fix, 0), "gpt-test-implement");
+}
+
+/// An implement task whose agent will `behave`, given its role only then, so a running
+/// daemon cannot claim it before.
+fn a_task_given_its_role_after(world: &World, text: &str, behave: Behaviour) -> String {
+    let mut new = an_implement_task(world, text);
+    new.role = None;
+    let task = when_the_lead_creates(world, &new);
+    given_the_agent_will(world, &task, &[behave]);
+    world.vb_lead(&["label", &task, "role=implement"], None);
+    task
 }
 
 /// A fix of task `onto` that waits for `after`, resuming `onto`'s session when `resume`.

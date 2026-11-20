@@ -44,12 +44,15 @@ fn more_seeds_hold_every_invariant() {
     }
     let mut restarted_in = BTreeSet::new();
     let mut down_in = BTreeSet::new();
+    let mut given_up = 0_u64;
     for seed in SEEDS..SEEDS + MORE_SEEDS {
         let world = run_seed(seed);
         assert!(!world.trace.is_empty());
         restarted_in.extend(world.restarted_in);
         down_in.extend(world.down_in);
+        given_up += u64::from(world.board_given_up);
     }
+    assert!(given_up > 0, "no seed's owned board died past its restarts");
     let expected: BTreeSet<String> = PHASES.iter().map(|phase| phase.to_string()).collect();
     assert_eq!(restarted_in, expected, "the phases a restart came in");
     assert_eq!(down_in, expected, "the phases a board outage came in");

@@ -514,21 +514,26 @@ fn serve(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    fs::create_dir_all(&dir).map_err(io("create", dir.clone()))?;
     let vb = config.vb_dir().join("vb");
+    let mut command = board_serve(&config.home, &vb).map_err(io("create", dir.clone()))?;
     // The board runs in the foreground, so it shares rider's terminal, standard input included.
-    let status = Process::new(&vb)
-        .arg("serve")
-        .arg("--dir")
-        .arg(&dir)
-        .arg("--no-open")
-        .status()
-        .map_err(io("run", vb))?;
+    let status = command.status().map_err(io("run", vb))?;
     assert!(dir.is_absolute());
     Ok(status
         .code()
         .and_then(|code| u8::try_from(code).ok())
         .unwrap_or(1))
+}
+
+/// The `vb serve` command keeping the board of the Rider home `home`; makes its directory.
+pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
+    assert!(home.is_absolute() && vb.is_absolute());
+    let dir = home.join(BOARD_DIR);
+    fs::create_dir_all(&dir)?;
+    let mut command = Process::new(vb);
+    command.arg("serve").arg("--dir").arg(&dir).arg("--no-open");
+    assert!(dir.starts_with(home));
+    Ok(command)
 }
 
 fn daemon(config: &Config) -> Result<u8, CliError> {

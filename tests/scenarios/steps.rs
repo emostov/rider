@@ -78,6 +78,12 @@ impl NewTask {
 pub fn given_a_board_and_a_repository() -> Option<World> {
     let mut world = World::new()?;
     world.start_board();
+    given_the_schemas_and_a_repository(&world);
+    Some(world)
+}
+
+/// Given the board answers: Rider's schemas on it, and a scratch repository with one commit.
+pub fn given_the_schemas_and_a_repository(world: &World) {
     for (name, file) in SCHEMAS {
         let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
         let file = file.to_str().expect("UTF-8 path");
@@ -97,7 +103,6 @@ pub fn given_a_board_and_a_repository() -> Option<World> {
     world.git_ok(&["add", "README.md"]);
     world.git_ok(&["commit", "-q", "-m", "Start the scratch repository"]);
     assert_eq!(world.git_ok(&["branch", "--show-current"]), MAIN);
-    Some(world)
 }
 
 /// An implement task in the world's repository, cut from `main`.
@@ -450,6 +455,8 @@ pub const DAEMON_STARTED: &str = "rider daemon: following";
 
 /// The test-only setting that shortens the daemon's lease, attempt limit, tick and kill grace.
 pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
+/// The daemon log's line naming a board process the daemon started, before its pid.
+pub const BOARD_STARTED: &str = "started the board, pid";
 
 /// Given a running `rider daemon` that follows the board.
 pub fn given_a_running_daemon(world: &mut World) {
@@ -916,4 +923,40 @@ pub fn agent_prompt(world: &World, task: &str, attempt: u32) -> String {
     let args = fake_agent::args(&world.root, task, attempt);
     let (_, prompt) = args.split_once("\n--\n").expect("the prompt follows --");
     prompt.to_string()
+}
+
+/// The pids of the board processes the daemon started, oldest first, from its log.
+pub fn boards_the_daemon_started(world: &World) -> Vec<u32> {
+    let log = fs::read_to_string(world.home.join("daemon.log")).unwrap_or_default();
+    (log.lines())
+        .filter(|line| line.contains(BOARD_STARTED))
+        .filter_map(|line| line.rsplit(' ').next()?.parse().ok())
+        .collect()
+}
+
+/// Waits up to `seconds` until the daemon has started `count` board processes; returns them.
+pub fn when_the_daemon_has_started_boards(world: &World, count: usize, seconds: u64) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let boards = boards_the_daemon_started(world);
+        if boards.len() >= count {
+            return boards;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon started {boards:?}, not {count} boards:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When the process group led by `pid` is sent SIGKILL.
+pub fn when_the_group_is_killed(pid: u32) {
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "killing group {pid} failed: {status}");
 }

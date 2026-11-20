@@ -4,9 +4,10 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rider::board::{Claim, ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
-    ACTIONS_MAX, Action, AgentRecord, BoardHealth, Call, ClientId, Config, Event,
-    FEED_RESTARTS_MAX, FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase, PidFile, Reply, Request,
-    RunId, Settlement, State, StopReason, Stopping, Unaccounted, Untracked, recover, step,
+    ACTIONS_MAX, Action, AgentRecord, BOARD_RESTARTS_MAX, BOARD_UPTIME_MILLIS_MIN, BoardHealth,
+    Call, ClientId, Config, Event, FEED_RESTARTS_MAX, FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase,
+    PidFile, Reply, Request, RunId, Settlement, State, StopReason, Stopping, Unaccounted,
+    Untracked, recover, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -40,6 +41,12 @@ const LISTING_TASKS_MAX: usize = 24;
 const LISTING_LAG_MAX: u64 = 4;
 /// One flapping fault in this many is a burst of feeds that exit at once.
 const FLAP_EVERY: u32 = 4;
+/// One seed in this many runs a board the core's daemon started, which may die.
+const OWNED_BOARD_EVERY: u64 = 2;
+/// One restart of a dead board in this many fails at once.
+const BOARD_RESTART_FAILS_EVERY: u32 = 2;
+/// Upper bound, in minutes, on how long a board left dead stays so until the owner starts it.
+const BOARD_DEAD_MINUTES_MAX: u64 = 12;
 
 /// The newest version of one task the core was told, by cursor.
 #[derive(Debug)]
@@ -131,6 +138,15 @@ pub struct World {
     leftovers: Vec<Agent>,
     next_group: i32,
     down_until: Timestamp,
+    /// The daemon started the board: it may die, and the core restarts it.
+    owns_board: bool,
+    /// The board process is dead until then, unless a restart starts it sooner.
+    dead_until: Timestamp,
+    /// Board restarts in a row, by the rule the core must follow.
+    board_restarts: u8,
+    board_since: Timestamp,
+    /// The core left the board dead after `BOARD_RESTARTS_MAX` restarts in a row.
+    pub board_given_up: bool,
     /// Actions not yet answered, by run (`None` for a listing or a feed restart).
     outstanding: Vec<(u64, Option<RunId>, &'static str)>,
     next_action: u64,
@@ -191,6 +207,11 @@ impl World {
             leftovers: Vec::new(),
             next_group: 2,
             down_until: now,
+            owns_board: seed.is_multiple_of(OWNED_BOARD_EVERY),
+            dead_until: now,
+            board_restarts: 0,
+            board_since: now,
+            board_given_up: false,
             outstanding: Vec::new(),
             next_action: 0,
             log: HashMap::new(),
@@ -311,6 +332,7 @@ impl World {
             80..=87 => self.create_task(),
             88..=89 => self.lose_claim(),
             90..=91 => self.crash_agent(),
+            92 if self.owns_board && self.rng.bool() => self.board_dies(),
             92 => self.board_outage(),
             93 => self.lose_feed(),
             94..=95 => self.unblock(),
@@ -336,6 +358,20 @@ impl World {
         self.down_until = Timestamp(self.now.0 + self.rng.u64(1..10) * MINUTE);
         self.trace
             .push(format!("board down until {:?}", self.down_until));
+    }
+
+    /// The board process the daemon started dies; it stays dead until a restart or the owner
+    /// starts it.
+    fn board_dies(&mut self) {
+        for run in self.core.runs() {
+            self.down_in.insert(phase_name(run.phase));
+        }
+        let minutes = self.rng.u64(1..=BOARD_DEAD_MINUTES_MAX);
+        self.dead_until = Timestamp(self.now.0 + minutes * MINUTE);
+        self.trace
+            .push(format!("board dead until {:?}", self.dead_until));
+        let id = self.expect(None, "board");
+        self.reply(id, Event::BoardExited);
     }
 
     /// Asks the core, as the owner, to kill a task's agent or to follow its log, sometimes for
@@ -433,6 +469,10 @@ impl World {
         self.feed_restarts = 0;
         self.feed_since = self.now;
         self.feed_delivered = false;
+        // The restarted daemon starts the board again if it is dead.
+        self.dead_until = self.now;
+        self.board_restarts = 0;
+        self.board_since = self.now;
         self.stopped_now = false;
         self.feed = (self.history.iter())
             .filter(|event| event.cursor > saved)
@@ -660,9 +700,45 @@ impl World {
                 self.feed_restarts
             ));
         }
+        self.check_board(&event, &actions)?;
         self.check(&actions)?;
         for action in actions {
             self.perform(action)?;
+        }
+        Ok(())
+    }
+
+    /// Counts board restarts in a row as the core must, and checks it restarts the board it
+    /// started no more than `BOARD_RESTARTS_MAX` times in a row and counts it down meanwhile.
+    fn check_board(&mut self, event: &Event, actions: &[Action]) -> Result<(), String> {
+        let restarts = (actions.iter())
+            .filter(|action| matches!(action, Action::RestartBoard))
+            .count();
+        match event {
+            Event::BoardRestarted => self.board_since = self.now,
+            Event::BoardExited if !self.core.exited() => {
+                let uptime = self.now.0.saturating_sub(self.board_since.0);
+                if uptime >= BOARD_UPTIME_MILLIS_MIN {
+                    self.board_restarts = 0;
+                }
+                let expected = usize::from(self.board_restarts < BOARD_RESTARTS_MAX);
+                if restarts != expected {
+                    return Err(format!(
+                        "the board exited after {} restarts in a row, and the core asked for \
+                         {restarts} restarts",
+                        self.board_restarts
+                    ));
+                }
+                if self.core.board() == BoardHealth::Up {
+                    return Err("the board exited, but it still counts as up".to_string());
+                }
+                self.board_given_up |= expected == 0;
+                self.board_restarts += u8::try_from(expected).expect("zero or one");
+            }
+            _ if restarts > 0 => {
+                return Err(format!("{event:?} asked for a board restart"));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -794,7 +870,7 @@ impl World {
     }
 
     fn board_fails(&mut self) -> bool {
-        self.now < self.down_until || self.rng.u32(0..20) == 0
+        self.now < self.down_until || self.now < self.dead_until || self.rng.u32(0..20) == 0
     }
 
     fn perform(&mut self, action: Action) -> Result<(), String> {
@@ -869,6 +945,15 @@ impl World {
                 run, task, epoch, ..
             } => self.close(run, task, epoch, None)?,
             Action::ListTasks => self.list(),
+            Action::RestartBoard => {
+                let id = self.expect(None, "board");
+                if self.rng.u32(0..BOARD_RESTART_FAILS_EVERY) == 0 {
+                    self.reply(id, Event::BoardExited);
+                } else {
+                    self.dead_until = self.now;
+                    self.reply(id, Event::BoardRestarted);
+                }
+            }
             Action::RestartFeed(cursor) => {
                 let id = self.expect(None, "feed");
                 self.reply(id, Event::FeedResumed(cursor));
