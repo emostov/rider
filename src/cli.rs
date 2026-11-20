@@ -39,12 +39,14 @@ pub const PROJECT_LEN_MAX: usize = 64;
 pub const ARGS_MAX: usize = 4;
 /// Upper bound on what `rider pool` reads from standard input before it stops.
 pub const STDIN_BYTES_MAX: u64 = 1024 * 1024;
-/// Every role's prompt file, once each, built into the binary.
-pub const PROMPTS: [(&str, &str); 4] = [
+/// Every role's prompt file and the files they read, once each, built into the binary.
+pub const PROMPTS: [(&str, &str); 6] = [
     ("implement.md", include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
     ("polish.md", include_str!("../prompts/polish.md")),
     ("security.md", include_str!("../prompts/security.md")),
+    ("slop-rules.md", include_str!("../prompts/slop-rules.md")),
+    ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
@@ -852,7 +854,7 @@ mod tests {
     fn every_role_has_an_embedded_prompt() {
         for (index, (name, _)) in PROMPTS.iter().enumerate() {
             assert!(
-                ROLES.iter().any(|role| role.prompt_file == *name),
+                *name == "slop-rules.md" || ROLES.iter().any(|role| role.prompt_file == *name),
                 "{name} is unused"
             );
             assert!(!PROMPTS[..index].iter().any(|(earlier, _)| earlier == name));

@@ -46,6 +46,7 @@ yours: decide, say why in one line, and move.
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
 | `polish` | Sonnet 5.5 | `polish-<n>-sonnet-5-5` | Polish <n> (Sonnet 5.5) | yes |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
+| `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
 `light` is a cheaper implementer with the same instructions as `implement`. Use it only
 when the brief already says exactly what to change and how to prove it: a restack, a rename,
@@ -62,12 +63,12 @@ worker take it again.
 
 | Label | Set by | Value |
 |---|---|---|
-| `role` | you, required | `implement`, `light`, `review`, `polish`, or `security` |
+| `role` | you, required | `implement`, `light`, `review`, `polish`, `security`, or `qa` |
 | `repo` | you, required | absolute path of the target git repository |
 | `base` | you | id of the task whose branch this one is cut from |
 | `from` | you, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | you | id of a task whose existing branch this task works on directly |
-| `of` | you, required for `review` and `security` | id of the task under review |
+| `of` | you, required for `review`, `security`, and `qa` | id of the task under review |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |
@@ -80,9 +81,9 @@ always the last label a task gets (see "Creating a plan").
 
 Rider checks these before starting a worker, and blocks the task as `invalid_brief` when one
 fails: `role` is present and known; `repo` is absolute and a git repository; `base`, `onto`,
-and `of` are task ids; `base` and `onto` are not both set; `review` and `security` have `of`;
-`from` is a valid branch name; the task named by `base`, `onto`, or `of` has a `branch`
-label that names a local branch. Only a task's own `branch` label that names a branch other
+and `of` are task ids; `base` and `onto` are not both set; `review`, `security`, and `qa`
+have `of`; `from` is a valid branch name; the task named by `base`, `onto`, or `of` has a
+`branch` label that names a local branch. Only a task's own `branch` label that names a branch other
 than the one its worktree is on blocks as `rider_error`. A branch checked out in another
 task's worktree blocks as `branch_busy`.
 
@@ -96,7 +97,7 @@ These rules are yours to keep. Rider does not check them:
   that has none.
 - An `onto` task must `need` every unfinished task on that branch. Otherwise two workers
   change one branch, and one is blocked or builds on the other's half-done work.
-- A `review` or `security` task must `need` its `of` task. Otherwise it reviews unfinished
+- A `review`, `security`, or `qa` task must `need` its `of` task. Otherwise it reviews unfinished
   work, or is blocked for a missing `branch`.
 - Stacks are linear: a task sees only its base's ancestry, and Rider never merges. If a task
   needs code from two sibling branches, sequence them into one stack.
@@ -110,11 +111,17 @@ These rules are yours to keep. Rider does not check them:
   `needs`.
 - At most three deliverables per task. More is two tasks.
 - A worker is stopped after 55 minutes. Size tasks well inside that.
-- Every `implement` or `light` task gets a `review` task with `of` set to it, and three or
-  four specific things to attack. Say what to attack, not the commit range: the reviewer
-  finds the range from the reviewed task's `start` label.
+- Sizing: changes that each take under about ten minutes and touch the same files go in one
+  task, not several.
+- Review policy: every task with behaviour or judgment in it gets a `review` task with `of`
+  set to it, and three or four specific things to attack. This covers every `implement` or
+  `light` task and every fix task for a blocking finding. A purely mechanical change (a
+  rename, a one-line fix a reviewer spelled out, a doc link) gets none: read its diff
+  yourself. Say what to attack, not the commit range: the reviewer finds the range from the
+  reviewed task's `start` label.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the
-  reviewed task>`, needing every unfinished task on that branch, and its own review.
+  reviewed task>`, needing every unfinished task on that branch, and its own review unless it is purely
+  mechanical.
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.
 - `polish` is one task per branch, after that branch's blocking findings are fixed:
@@ -122,6 +129,10 @@ These rules are yours to keep. Rider does not check them:
 - `security` is one task per stack, after polish, and for any task you judge sensitive:
   `of=<the top task>`, and `needs` every polish task in the stack, so it never runs while
   polish still moves a branch. Name the range in the brief, such as `main..HEAD`.
+- `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI. It
+  runs after the task's review: `of=<the task under test>`, and `needs` that task and its
+  review. Its brief names the flows to exercise and the unhappy paths that matter. It builds
+  the work and uses it from the outside, and reports `rider-finding@1` records like a review.
 - A completed task is a claim, not proof. Its review, or its proof command, is the check.
 
 ## Creating a plan
@@ -205,10 +216,15 @@ Then `vb label <review-fix> of=<fix> --as lead-fable-5-2`, then
 7. Check open decisions: `vb tasks decisions --state blocked --json`, and `vb read <id>` for
    each. Record any that the owner has answered (see "Questions for the owner").
 8. Keep the queue full: create the next tasks with their `needs`.
-9. Wait from your place, with the Bash tool's timeout at 600000 ms:
-   `vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json`
-   Exit 1 with `reason: "timeout"` means nothing happened: run the same wait again. Any event,
-   even a reply of yours in a finished task's thread, starts the next turn.
+9. Wait for the board in the background, never in the foreground. Run this as one background
+   command (in Claude Code, the Bash tool with `run_in_background`, which notifies the session
+   when the command exits):
+   `for i in 1 2 3 4 5 6; do o=$(vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json 2>&1); echo "$o" | jq -e '.reason == "timeout"' >/dev/null 2>&1 || break; done; echo "$o"`
+   The loop repeats the 9-minute wait only when the output's own top-level `reason` is
+   `"timeout"` (nothing happened; an event's `reason` is nested, so it never matches), at most 6
+   times (54 minutes), so a quiet board does not end it early and an error never spins. Any event, even a reply of yours in a finished task's thread,
+   ends it. While it runs, answer the owner. When it ends, read its output and take the next turn; if it ended on
+   an error, report it to the owner. Never run the wait in the foreground and never sleep-poll.
 
 ## What Rider leaves on the board
 
@@ -225,6 +241,15 @@ Then `vb label <review-fix> of=<fix> --as lead-fable-5-2`, then
 
 `vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
 "<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.
+
+Worktrees are large, mostly the Rust `target/` directory, so remove one once nothing will
+use it again. Rider removes a task's worktree when the task completes, and keeps it when
+the task fails or blocks so a retry can reuse it. When you cancel a task, or give up on a
+failed or blocked one, remove its worktree: `git -C <repo> worktree remove
+~/.rider/worktrees/<repository directory name>/<task id>`. It refuses when there are
+modified or untracked files: then tell the owner rather than forcing. Never `--force`,
+never delete the branch. A completed task whose thread says "Kept the worktree" is the
+same case once its changes are understood. `rider clean` (issue #60) will replace this rule.
 
 A branch moves after children were cut from it only when an `onto` task completes on it.
 Then restack each child branch, bottom up, one task at a time: `role=light` (or
@@ -251,6 +276,17 @@ Carry on with work that does not depend on it. The wait covers only `work/<proje
 check `decisions` each turn (step 7). When the owner answers, record it:
 `vb tasks unblock <id>`, `vb tasks claim <id>`, then `vb tasks complete <id> -- "<answer>"`,
 each with `--as lead-fable-5-2`. `decisions` is the record of what was decided.
+
+## Closing resolved issues
+
+By default, as work resolves an issue, close it or link it to the PR that closes it:
+
+- Work you merge into a local base branch: close each GitHub issue it resolves with
+  `gh issue close <n> --comment "<text>"` naming the commit and how it was checked. Close a
+  Linear issue with the Linear MCP tools when they are available.
+- Work that ships as a PR: put one `Closes #<n>` line per resolved GitHub issue in the PR
+  description, so merging closes them. Link a Linear issue through the Linear MCP.
+- An issue only partly resolved stays open, with a comment saying what remains.
 
 ## Telling the owner where it stands
 

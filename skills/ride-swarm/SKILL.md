@@ -62,9 +62,9 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    terminal they keep open. It stops when its standard input closes, so it cannot run as
    your background command.
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
-   `lead-fable-5-2`. Do its "Each turn" steps, but run step 9's `vb wait` as a background
-   command so the user can keep talking to you, and take the next turn when it returns.
-   Answer the user before anything else.
+   `lead-fable-5-2`. Answer the user before anything else.
+
+To push a finished branch, open its PR, and get CI green, follow the `ship-swarm` skill.
 
 ## Stop the swarm
 
