@@ -32,7 +32,7 @@ const ORIGIN_PREFIX: &str = "origin/";
 const HEADS_PREFIX: &str = "refs/heads/";
 const BRANCH_FIELD: &[u8] = b"branch refs/heads/";
 // Set when rider starts from a git hook, these would point git at another repository.
-const ENV_REMOVED: [&str; 8] = [
+pub const ENV_REMOVED: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
