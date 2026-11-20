@@ -14,6 +14,7 @@ use serde_json::json;
 
 use fake_agent::Behaviour;
 use steps::*;
+use world::MAIN;
 
 #[test]
 fn an_implement_task_completes_with_its_commit_and_a_result_record() {
@@ -70,4 +71,49 @@ fn a_stacked_task_is_cut_from_its_base_tasks_branch() {
     let stacked_parent = world.git_ok(&["rev-parse", &format!("refs/heads/{stacked_branch}^")]);
     assert_eq!(stacked_parent, base_head);
     then_only_the_repository_is_a_worktree(&world);
+}
+
+#[test]
+fn a_qa_task_tests_a_completed_task_in_claude_and_completes_without_commits() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let qa = when_the_lead_creates(&world, &a_qa_task(&world, &built, "Run the new work."));
+    given_the_agent_will(&world, &qa, &[Behaviour::CommitNothing]);
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &qa]);
+
+    assert_eq!(
+        states,
+        vec!["completed".to_string(), "completed".to_string()]
+    );
+    assert_eq!(exit, Some(0));
+    let runs = agent_runs_for(&world, &qa);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].harness, "claude");
+    assert_eq!(runs[0].dir, worktree_dir(&world, &qa));
+    let branch = then_the_branch_has_the_agents_commit(&world, &built, 0);
+    assert_eq!(task_label(&world, &qa, "branch"), None);
+    assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
+    then_the_worktree_is_removed(&world, &qa);
+    then_only_the_repository_is_a_worktree(&world);
+}
+
+#[test]
+fn a_qa_agent_that_commits_fails_and_leaves_the_tested_branch_alone() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let qa = when_the_lead_creates(&world, &a_qa_task(&world, &built, "Run the new work."));
+    given_the_agent_will(&world, &qa, &[Behaviour::Commit]);
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &qa]);
+
+    assert_eq!(states, vec!["completed".to_string(), "failed".to_string()]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_runs_for(&world, &qa).len(), 1);
+    let branch = then_the_branch_has_the_agents_commit(&world, &built, 0);
+    assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
 }

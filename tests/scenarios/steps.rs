@@ -106,6 +106,15 @@ pub fn an_implement_task(world: &World, text: &str) -> NewTask {
         .role("implement")
 }
 
+/// A qa task in the world's repository that tests the work of task `of` once it is done.
+pub fn a_qa_task(world: &World, of: &str, text: &str) -> NewTask {
+    NewTask::new(text)
+        .label("repo", world.repo_label())
+        .label("of", of)
+        .needs(of)
+        .role("qa")
+}
+
 /// Given the fake agent of `task` behaves as `plan[n]` on attempt n, the last repeating.
 pub fn given_the_agent_will(world: &World, task: &str, plan: &[Behaviour]) {
     fake_agent::plan(&world.root, task, plan);
