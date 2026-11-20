@@ -1,27 +1,17 @@
 use std::env;
+use std::ffi::OsString;
 use std::process::ExitCode;
 
-use rider::cli::{self, ARGS_MAX, Command, USAGE};
+use clap::Parser;
+use rider::cli::{self, ARGS_MAX, Cli};
 
 fn main() -> ExitCode {
-    // Every command takes at most two words, so the bound still keeps an extra one to report.
-    let args: Vec<String> = env::args_os()
-        .skip(1)
-        .take(ARGS_MAX)
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    assert!(args.len() <= ARGS_MAX);
-    let command = match cli::parse(&args) {
-        Ok(command) => command,
-        Err(error) => {
-            eprintln!("rider: {error}\n{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
-    if command == Command::Help {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
+    let args: Vec<OsString> = env::args_os().take(ARGS_MAX.saturating_add(2)).collect();
+    if args.len() > ARGS_MAX.saturating_add(1) {
+        eprintln!("rider: more than {ARGS_MAX} arguments");
+        return ExitCode::from(2);
     }
+    let cli = Cli::parse_from(args);
     let config = match cli::config(cli::read_vars()) {
         Ok(config) => config,
         Err(error) => {
@@ -29,7 +19,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match cli::execute(&command, &config) {
+    match cli::execute(&cli.command, &config) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("rider: {error}");

@@ -9,6 +9,8 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::fake_agent::{self, Behaviour, Run};
@@ -134,14 +136,10 @@ pub fn when_the_lead_creates(world: &World, task: &NewTask) -> String {
         args.extend(task.needs.iter().cloned());
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let created: Value = parse(&world.vb_lead(&args, Some(&task.text)));
-    let id = created
-        .pointer("/task/id")
-        .or_else(|| created.pointer("/message/id"));
-    let id = id
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("no id in {created}"));
-    let id = id.to_string();
+    let output = world.vb_lead(&args, Some(&task.text));
+    let created: Created = parse(&output);
+    let id = created.task.or(created.message);
+    let id = id.unwrap_or_else(|| panic!("no id in {output}")).id;
     if let Some(role) = &task.role {
         world.vb_lead(&["label", &id, &format!("role={role}")], None);
     }
@@ -220,33 +218,80 @@ pub fn when_the_pool_runs_until_settled(
     (states, exit)
 }
 
-fn parse(json: &str) -> Value {
-    serde_json::from_str(json).unwrap_or_else(|error| panic!("not JSON ({error}): {json}"))
+#[derive(Deserialize)]
+struct Created {
+    task: Option<Id>,
+    message: Option<Id>,
 }
 
-/// A task's `vb read <id> --json`: `{message, replies, cursor, schedules}`.
-pub fn read_task(world: &World, id: &str) -> Value {
+#[derive(Deserialize)]
+struct Id {
+    id: String,
+}
+
+/// A task's `vb read <id> --json`, naming the fields scenarios read.
+#[derive(Deserialize)]
+pub struct TaskRead {
+    message: TaskMessage,
+    replies: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct TaskMessage {
+    labels: BTreeMap<String, String>,
+    task: TaskFields,
+}
+
+#[derive(Deserialize)]
+struct TaskFields {
+    state: String,
+    claim: Option<Claim>,
+}
+
+#[derive(Deserialize)]
+struct Claim {
+    until: String,
+}
+
+#[derive(Deserialize)]
+struct Reply {
+    blocks: Vec<Block>,
+}
+
+#[derive(Deserialize)]
+struct Block {
+    schema: String,
+    data: Value,
+}
+
+#[derive(Deserialize)]
+struct Listing {
+    tasks: Vec<Listed>,
+}
+
+#[derive(Deserialize)]
+struct Listed {
+    message: Id,
+}
+
+fn parse<T: DeserializeOwned>(json: &str) -> T {
+    serde_json::from_str(json)
+        .unwrap_or_else(|error| panic!("not the expected JSON ({error}): {json}"))
+}
+
+/// A task's `vb read <id> --json`.
+pub fn read_task(world: &World, id: &str) -> TaskRead {
     parse(&world.vb_lead(&["read", id, "--json"], None))
 }
 
 /// A task's state: `ready`, `claimed`, `completed`, `failed`, `blocked`, or `canceled`.
 pub fn task_state(world: &World, id: &str) -> String {
-    let read = read_task(world, id);
-    let state = read.pointer("/message/task/state").and_then(Value::as_str);
-    state
-        .unwrap_or_else(|| panic!("task {id} has no state: {read}"))
-        .to_string()
+    read_task(world, id).message.task.state
 }
 
 /// A task's labels.
 pub fn task_labels(world: &World, id: &str) -> BTreeMap<String, String> {
-    let read = read_task(world, id);
-    let labels = read.pointer("/message/labels").and_then(Value::as_object);
-    let labels = labels.unwrap_or_else(|| panic!("task {id} has no labels: {read}"));
-    labels
-        .iter()
-        .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
-        .collect()
+    read_task(world, id).message.labels
 }
 
 /// One label of a task, or `None` when it has no such label.
@@ -256,25 +301,23 @@ pub fn task_label(world: &World, id: &str, key: &str) -> Option<String> {
 
 /// The replies in a task's thread, oldest first, as the board returns them.
 pub fn task_replies(world: &World, id: &str) -> Vec<Value> {
-    let read = read_task(world, id);
-    let replies = read.pointer("/replies").and_then(Value::as_array);
-    replies
-        .unwrap_or_else(|| panic!("task {id} has no replies list: {read}"))
-        .clone()
+    read_task(world, id).replies
 }
 
 /// The data of every structured record of `schema` (such as `rider-result`) in a thread.
 pub fn task_records(world: &World, id: &str, schema: &str) -> Vec<Value> {
     let replies = task_replies(world, id);
-    let blocks = replies
+    let count = replies.len();
+    let records: Vec<Value> = replies
         .iter()
-        .filter_map(|reply| reply.pointer("/blocks")?.as_array());
-    let records: Vec<Value> = blocks
-        .flatten()
-        .filter(|block| block.pointer("/schema").and_then(Value::as_str) == Some(schema))
-        .filter_map(|block| block.pointer("/data").cloned())
+        .map(|reply| {
+            Reply::deserialize(reply).unwrap_or_else(|error| panic!("a reply ({error}): {reply}"))
+        })
+        .flat_map(|reply| reply.blocks)
+        .filter(|block| block.schema == schema)
+        .map(|block| block.data)
         .collect();
-    assert!(records.len() <= replies.len().max(1) * 8);
+    assert!(records.len() <= count.max(1) * 8);
     records
 }
 
@@ -284,14 +327,8 @@ pub fn tasks_in_state(world: &World, state: &str) -> Vec<String> {
     let args = [
         "tasks", &channel, "--state", state, "--limit", LIST_LIMIT, "--json",
     ];
-    let list = parse(&world.vb_lead(&args, None));
-    let tasks = list.pointer("/tasks").and_then(Value::as_array);
-    let tasks = tasks.unwrap_or_else(|| panic!("no tasks list: {list}"));
-    tasks
-        .iter()
-        .map(|task| task.pointer("/message/id").and_then(Value::as_str))
-        .map(|id| id.expect("a listed task has an id").to_string())
-        .collect()
+    let list: Listing = parse(&world.vb_lead(&args, None));
+    list.tasks.into_iter().map(|task| task.message.id).collect()
 }
 
 /// The repository's local branches, sorted.
@@ -536,11 +573,11 @@ pub fn is_alive(pid: u32) -> bool {
 
 /// A task's claim lease end, as the board shows it; `None` when it is not claimed.
 pub fn task_claim_until(world: &World, id: &str) -> Option<String> {
-    let read = read_task(world, id);
-    let until = read
-        .pointer("/message/task/claim/until")
-        .and_then(Value::as_str);
-    until.map(str::to_string)
+    read_task(world, id)
+        .message
+        .task
+        .claim
+        .map(|claim| claim.until)
 }
 
 /// Waits up to `seconds` for process `pid` to end; returns whether it did.
@@ -734,4 +771,67 @@ pub fn line_for_pid(output: &str, pid: u32) -> Option<String> {
     let rest = &line[prefix.len()..];
     let (_, command) = rest.split_once(' ')?;
     Some(format!("{prefix}<age> {command}"))
+}
+
+/// Given the lead sets `task`'s role to `role` as a slot of `claimed` first reads it, and the
+/// first `vb tasks release` of `task` fails; every release is logged as a line in `releases`.
+pub fn given_the_role_changes_after_the_claim_and_one_release_fails(
+    world: &World,
+    task: &str,
+    claimed: &str,
+    role: &str,
+    releases: &Path,
+) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let changed = world.root.join("role-changed");
+    let failed = world.root.join("release-failed");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = read ] && [ "$2" = '{task}' ] && [ ! -e '{changed}' ]; then
+  case " $* " in *" --as {claimed}-"*)
+    : > '{changed}'
+    '{real}' label '{task}' role={role} --url '{url}' --as '{lead}' > /dev/null || exit 1 ;;
+  esac
+fi
+if [ "$1" = tasks ] && [ "$2" = release ] && [ "$3" = '{task}' ]; then
+  echo release >> '{releases}'
+  if [ ! -e '{failed}' ]; then
+    : > '{failed}'
+    echo 'injected release failure' >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"#,
+        changed = changed.display(),
+        failed = failed.display(),
+        releases = releases.display(),
+        real = real.display(),
+        url = world.url,
+        lead = crate::world::LEAD,
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given `text` as the rider home's `rider.toml`.
+pub fn given_a_rider_toml(world: &World, text: &str) {
+    let path = world.home.join("rider.toml");
+    fs::write(&path, text).expect("write rider.toml");
+    assert!(path.is_file());
+}
+
+/// The model attempt `attempt` of `task`'s agent was started with.
+pub fn agent_model(world: &World, task: &str, attempt: u32) -> String {
+    let args = fake_agent::args(&world.root, task, attempt);
+    let mut lines = args.lines().skip_while(|line| *line != "--model");
+    assert_eq!(lines.next(), Some("--model"), "{args}");
+    lines.next().expect("a model follows --model").to_string()
+}
+
+/// The prompt attempt `attempt` of `task`'s agent was started with: everything after `--`.
+pub fn agent_prompt(world: &World, task: &str, attempt: u32) -> String {
+    let args = fake_agent::args(&world.root, task, attempt);
+    let (_, prompt) = args.split_once("\n--\n").expect("the prompt follows --");
+    prompt.to_string()
 }

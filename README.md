@@ -31,8 +31,9 @@ channel while the rest of the work goes on.
 Paste this into your coding agent:
 
 ```
-Install Rider: run `cargo install swarm-rider`, which installs the `rider` binary.
-Then run `npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
+Install Rider: clone https://github.com/emostov/rider if you don't have it yet, then run
+`cargo install --locked --path <that clone>`, which installs the `rider` binary. Then run
+`npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
 ```
 
 Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a

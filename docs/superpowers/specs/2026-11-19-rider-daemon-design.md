@@ -252,14 +252,16 @@ not contain the new head. The result record says so, and the lead gets a
 
 ## Bounds
 
-Every one is a named constant. Values are Calls; the first three exist today.
+Every one is a named constant. Values are Calls; the first five exist today. The limits
+`rider.toml` sets are shown with their defaults; `rider config` prints the effective ones.
 
 | Constant | Value | When reached |
 |---|---|---|
-| `AGENTS_MAX` | 4 | ready tasks wait |
-| per-role `slots` | 2, 2, 2, 1, 1 | ready tasks of that role wait |
-| `ATTEMPT_SECONDS_MAX` | 55 min | the agent is stopped; the task fails |
-| `ATTEMPTS_MAX` | 3 | blocked as `attempts_exhausted` |
+| `AGENTS_MAX` | 32 (`limits.agents` in `rider.toml` may lower it) | ready tasks wait |
+| per-role `slots` | none by default; set per role in `rider.toml` | ready tasks of that role wait |
+| `BUILDERS_DEFAULT` | 4 (`limits.builders_at_once`, 1 to 32) | ready tasks of building roles wait |
+| `ATTEMPT_SECONDS_MAX` | 55 min (`limits.attempt_minutes`, 1 to 55; default 55) | the agent is stopped; the task fails |
+| `ATTEMPTS_DEFAULT` | 3 (`limits.attempts`, 1 to `ATTEMPTS_MAX` = 9) | blocked as `attempts_exhausted` |
 | `TASKS_MAX` | 256 | further tasks are not tracked or claimed; `rider status` says how many; they are picked up as others finish |
 | `PROJECTS_MAX` | 8 | `rider chat` for a ninth project is refused |
 | `WAKEUPS_MAX` | 64 per lead | the oldest wake-up for the same task is dropped; if none, the oldest of any; the next message says "some events were dropped: re-read the channel" |

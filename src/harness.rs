@@ -3,13 +3,15 @@
 
 use crate::board::one_line;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
-use serde_json::Value;
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
+use rustix::process::Signal;
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -364,26 +366,13 @@ fn start_reader(
     Ok(())
 }
 
-fn signal_group(pgid: u32, signal: &str) {
-    // `kill -s KILL -- -1` would reach every process rider may signal.
-    assert!(pgid > 1, "the group of a child rider started");
-    assert!(signal == "TERM" || signal == "KILL");
-    let target = format!("-{pgid}");
-    // An empty group has nothing left to stop, so whether `kill` reached anyone is moot.
-    let _ = Command::new("kill")
-        .args(["-s", signal, "--", &target])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-fn kill_and_reap(child: &mut Child, pgid: u32) -> Result<ExitStatus, HarnessError> {
-    assert!(pgid > 1);
-    assert!(pgid == child.id());
-    signal_group(pgid, "KILL");
-    // Fails only when the agent already exited.
-    let _ = child.kill();
+fn kill_and_reap(child: &mut dyn ChildWrapper) -> Result<ExitStatus, HarnessError> {
+    assert!(child.id() > 1, "the group of a child rider started");
+    // An empty group has nothing left to stop. The leader is killed on its own when its
+    // group refuses the signal; that fails only when the agent already exited.
+    if child.start_kill().is_err() {
+        let _ = child.inner_mut().start_kill();
+    }
     let status = child.wait();
     status.map_err(|error| HarnessError::Wait(format!("{error}")))
 }
@@ -401,13 +390,12 @@ fn timed_out(
 }
 
 fn supervise(
-    child: &mut Child,
-    pgid: u32,
+    child: &mut dyn ChildWrapper,
     shared: &Shared,
     seconds_max: u64,
 ) -> Result<(ExitStatus, bool), HarnessError> {
     assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
-    assert!(pgid == child.id());
+    assert!(child.id() > 1, "the group of a child rider started");
     let start = (Instant::now(), SystemTime::now());
     let limit = Duration::from_secs(seconds_max);
     let grace = Duration::from_secs(KILL_GRACE_SECONDS);
@@ -416,7 +404,7 @@ fn supervise(
         let polled = match child.try_wait() {
             Ok(polled) => polled,
             Err(error) => {
-                let _ = kill_and_reap(child, pgid);
+                let _ = kill_and_reap(child);
                 return Err(HarnessError::Wait(format!("{error}")));
             }
         };
@@ -424,7 +412,7 @@ fn supervise(
             return Ok((status, term_sent.is_some()));
         }
         if let Some(message) = shared.error() {
-            let _ = kill_and_reap(child, pgid);
+            let _ = kill_and_reap(child);
             return Err(HarnessError::Log(message));
         }
         let now = (Instant::now(), SystemTime::now());
@@ -436,20 +424,21 @@ fn supervise(
             None => {
                 let (monotonic, wall) = since(start);
                 if timed_out(monotonic, wall, limit) {
-                    signal_group(pgid, "TERM");
+                    // An empty group has nothing left to stop.
+                    let _ = child.signal(Signal::TERM.as_raw());
                     term_sent = Some(now);
                 }
             }
             Some(sent) => {
                 let (monotonic, wall) = since(sent);
                 if timed_out(monotonic, wall, grace) {
-                    return Ok((kill_and_reap(child, pgid)?, true));
+                    return Ok((kill_and_reap(child)?, true));
                 }
             }
         }
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
-    let _ = kill_and_reap(child, pgid);
+    let _ = kill_and_reap(child);
     Err(HarnessError::Wait(format!(
         "the agent outlived {POLLS_MAX} polls"
     )))
@@ -472,7 +461,7 @@ fn drain(done: &Receiver<Result<(), String>>) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Child, HarnessError> {
+fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, HarnessError> {
     assert!(!cmd.program.is_empty());
     assert!(cmd.args.len() <= ARGS_MAX && cmd.env.len() <= ENV_MAX);
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
@@ -483,26 +472,26 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Child, HarnessError> {
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let spawned = process.spawn();
+        .stderr(Stdio::piped());
+    let spawned = CommandWrap::from(process)
+        .wrap(ProcessGroup::leader())
+        .spawn();
     spawned.map_err(|error| HarnessError::Spawn(format!("{}: {error}", cmd.program)))
 }
 
 fn start_readers(
-    child: &mut Child,
+    child: &mut dyn ChildWrapper,
     slots: [ReaderSlot; READERS],
     shared: &Arc<Shared>,
     done: &SyncSender<Result<(), String>>,
 ) -> Result<(), HarnessError> {
-    assert!(child.stdout.is_some() && child.stderr.is_some());
     let missing = |name: &str| HarnessError::Spawn(format!("the agent has no {name}"));
-    let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
+    let stdout = child.stdout().take().ok_or_else(|| missing("stdout"))?;
+    let stderr = child.stderr().take().ok_or_else(|| missing("stderr"))?;
     let [stdout_slot, stderr_slot] = slots;
     start_reader(stdout, "stdout", stdout_slot, shared, done)?;
     start_reader(stderr, "stderr", stderr_slot, shared, done)?;
-    assert!(child.stdout.is_none() && child.stderr.is_none());
+    assert!(child.stdout().is_none() && child.stderr().is_none());
     Ok(())
 }
 
@@ -524,18 +513,20 @@ pub fn run(
     let slots = [reserve()?, reserve()?];
     let shared = open_log(log, log_bytes_max)?;
     let mut child = spawn(cmd, dir)?;
-    let pgid = child.id();
-    assert!(pgid > 1, "a spawned child is never init or the scheduler");
+    assert!(
+        child.id() > 1,
+        "a spawned child is never init or the scheduler"
+    );
     let (done, finished) = mpsc::sync_channel(READERS);
-    if let Err(error) = start_readers(&mut child, slots, &shared, &done) {
-        let _ = kill_and_reap(&mut child, pgid);
+    if let Err(error) = start_readers(child.as_mut(), slots, &shared, &done) {
+        let _ = kill_and_reap(child.as_mut());
         shared.close();
         return Err(error);
     }
     drop(done);
-    let outcome = supervise(&mut child, pgid, &shared, seconds_max);
+    let outcome = supervise(child.as_mut(), &shared, seconds_max);
     // The leader is reaped; leftover members of its group would hold the pipes open.
-    signal_group(pgid, "KILL");
+    let _ = child.start_kill();
     let drained = drain(&finished);
     let logged = shared.close();
     let (status, timed_out) = outcome?;
@@ -567,9 +558,86 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
     false
 }
 
-// Visits each line of `log` that is JSON; skips other lines and those over `LINE_BYTES_MAX`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Field<T> {
+    Valid(T),
+    Malformed(IgnoredAny),
+}
+
+fn valid<T>(field: Option<Field<T>>) -> Option<T> {
+    match field? {
+        Field::Valid(value) => Some(value),
+        Field::Malformed(_) => None,
+    }
+}
+
+// Agent streams gain fields and event types often: only what Rider reads is named.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeEvent {
+    #[serde(rename = "result")]
+    Result {
+        result: Option<Field<String>>,
+        subtype: Option<Field<String>>,
+        is_error: Option<Field<bool>>,
+        num_turns: Option<Field<u64>>,
+    },
+    #[serde(rename = "assistant")]
+    Assistant,
+    #[serde(rename = "user")]
+    User,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct SessionLine {
+    session_id: Option<Field<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum CodexEvent {
+    #[serde(rename = "item.completed")]
+    ItemCompleted { item: Option<Field<CodexItem>> },
+    #[serde(rename = "turn.failed")]
+    TurnFailed,
+    #[serde(rename = "turn.completed")]
+    TurnCompleted,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct CodexItem {
+    #[serde(rename = "type")]
+    kind: Option<Field<String>>,
+    text: Option<Field<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum TactEvent {
+    #[serde(rename = "assistant.message")]
+    AssistantMessage { payload: Option<Field<TactPayload>> },
+    #[serde(rename = "run.failed")]
+    RunFailed,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct TactPayload {
+    phase: Option<Field<String>>,
+    text: Option<Field<String>>,
+}
+
+// Visits each line of `log` that is an `E`; skips other lines and those over `LINE_BYTES_MAX`.
 // Returns whether the whole log was read.
-fn scan(log: &Path, mut visit: impl FnMut(&Value)) -> bool {
+fn scan<E: DeserializeOwned>(log: &Path, mut visit: impl FnMut(E)) -> bool {
     assert!(!log.as_os_str().is_empty());
     let Ok(file) = File::open(log) else {
         return false;
@@ -592,45 +660,49 @@ fn scan(log: &Path, mut visit: impl FnMut(&Value)) -> bool {
             }
             continue;
         }
-        if let Ok(event) = serde_json::from_slice::<Value>(&line) {
-            visit(&event);
+        if let Ok(event) = serde_json::from_slice::<E>(&line) {
+            visit(event);
         }
     }
     false
 }
 
-fn text_at<'a>(event: &'a Value, pointer: &str) -> Option<&'a str> {
-    assert!(pointer.starts_with('/'));
-    let text = event.pointer(pointer).and_then(Value::as_str);
-    assert!(text.is_none_or(|t| t.len() <= LINE_BYTES_MAX));
-    text
-}
-
-// `Some(text)` when `event` is where `harness` puts its final message, `text` being `None`
-// when that event carries no string; `None` for any other event.
-fn final_text<'a>(harness: &Harness, event: &'a Value) -> Option<Option<&'a str>> {
-    let kind = text_at(event, "/type")?;
-    let found = match harness {
-        Harness::Claude => (kind == "result").then(|| text_at(event, "/result")),
-        Harness::Codex => (kind == "item.completed"
-            && text_at(event, "/item/type") == Some("agent_message"))
-        .then(|| text_at(event, "/item/text")),
-        Harness::Tact => (kind == "assistant.message"
-            && text_at(event, "/payload/phase") == Some("final_answer"))
-        .then(|| text_at(event, "/payload/text")),
-    };
-    assert!(found.flatten().is_none_or(|t| t.len() <= LINE_BYTES_MAX));
-    found
-}
-
 /// The agent's trimmed final message, or `None` when the log is unreadable or has none.
 pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
     let mut last: Option<String> = None;
-    let complete = scan(log, |event| {
-        if let Some(text) = final_text(harness, event) {
-            last = text.map(str::to_string);
-        }
-    });
+    let mut set = |text: Option<String>| {
+        assert!(text.as_ref().is_none_or(|t| t.len() <= LINE_BYTES_MAX));
+        last = text;
+    };
+    let complete = match harness {
+        Harness::Claude => scan(log, |event| {
+            if let ClaudeEvent::Result { result, .. } = event {
+                set(valid(result));
+            }
+        }),
+        Harness::Codex => scan(log, |event| {
+            let CodexEvent::ItemCompleted { item } = event else {
+                return;
+            };
+            let Some(item) = valid(item) else {
+                return;
+            };
+            if valid(item.kind).as_deref() == Some("agent_message") {
+                set(valid(item.text));
+            }
+        }),
+        Harness::Tact => scan(log, |event| {
+            let TactEvent::AssistantMessage { payload } = event else {
+                return;
+            };
+            let Some(payload) = valid(payload) else {
+                return;
+            };
+            if valid(payload.phase).as_deref() == Some("final_answer") {
+                set(valid(payload.text));
+            }
+        }),
+    };
     if !complete {
         return None;
     }
@@ -646,9 +718,9 @@ pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
 /// The session id of the first Claude event that carries one, or `None` when there is none.
 pub fn session_id(log: &Path) -> Option<SessionId> {
     let mut found: Option<Option<SessionId>> = None;
-    let _ = scan(log, |event| {
+    let _ = scan(log, |line: SessionLine| {
         if found.is_none() {
-            found = text_at(event, "/session_id").map(SessionId::parse);
+            found = valid(line.session_id).map(|id| SessionId::parse(&id));
         }
     });
     let id = found.flatten();
@@ -662,15 +734,17 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
     let mut results = 0u64;
     let mut refused = false;
     let mut turned = false;
-    let read = scan(log, |event| match text_at(event, "/type") {
-        Some("result") => {
+    let read = scan(log, |event| match event {
+        ClaudeEvent::Result {
+            is_error,
+            num_turns,
+            ..
+        } => {
             results = results.saturating_add(1);
-            let is_error = event.pointer("/is_error").and_then(Value::as_bool);
-            let turns = event.pointer("/num_turns").and_then(Value::as_u64);
-            refused = is_error == Some(true) && turns == Some(0);
+            refused = valid(is_error) == Some(true) && valid(num_turns) == Some(0);
         }
-        Some("assistant" | "user") => turned = true,
-        _ => {}
+        ClaudeEvent::Assistant | ClaudeEvent::User => turned = true,
+        ClaudeEvent::Other => {}
     });
     let before = read && results == 1 && refused && !turned;
     assert!(results <= LINES_MAX, "scan reads at most LINES_MAX events");
@@ -683,26 +757,27 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut last_result_failed = false;
     let mut last_turn_failed = false;
     // A log cut short still counts for what it showed.
-    let _ = scan(log, |event| {
-        let kind = text_at(event, "/type");
-        match harness {
-            // tact exits 0 when cancelled; only the stream says so.
-            Harness::Tact => failed |= kind == Some("run.failed"),
-            // `item.type == "error"` inside `item.completed` is a harmless warning, and a
-            // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
-            Harness::Codex => match kind {
-                Some("turn.failed" | "error") => last_turn_failed = true,
-                Some("turn.completed") => last_turn_failed = false,
-                _ => {}
-            },
-            Harness::Claude if kind == Some("result") => {
-                let is_error = event.pointer("/is_error").and_then(Value::as_bool);
-                let subtype = text_at(event, "/subtype");
-                last_result_failed = is_error == Some(true) || subtype != Some("success");
+    let _ = match harness {
+        // tact exits 0 when cancelled; only the stream says so.
+        Harness::Tact => scan(log, |event| failed |= matches!(event, TactEvent::RunFailed)),
+        // `item.type == "error"` inside `item.completed` is a harmless warning, and a
+        // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
+        Harness::Codex => scan(log, |event| match event {
+            CodexEvent::TurnFailed | CodexEvent::Error => last_turn_failed = true,
+            CodexEvent::TurnCompleted => last_turn_failed = false,
+            CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
+        }),
+        Harness::Claude => scan(log, |event| {
+            if let ClaudeEvent::Result {
+                subtype, is_error, ..
+            } = event
+            {
+                let subtype = valid(subtype);
+                last_result_failed =
+                    valid(is_error) == Some(true) || subtype.as_deref() != Some("success");
             }
-            Harness::Claude => {}
-        }
-    });
+        }),
+    };
     assert!(!failed || *harness != Harness::Claude);
     assert!(!last_result_failed || *harness == Harness::Claude);
     assert!(!last_turn_failed || *harness == Harness::Codex);
@@ -720,10 +795,13 @@ mod tests {
         harness: Harness::Tact,
         model: "sol",
         commits_expected: false,
+        needs_of: true,
+        builds: false,
         title: "Tact-test",
         model_name: "Sol",
         model_slug: "sol",
         slots: 1,
+        pool_slots: 1,
         prompt_file: "none.md",
     };
 

@@ -5,8 +5,11 @@ use std::fmt;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as Process, Stdio};
+use std::process::{Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 
 use crate::board;
 
@@ -16,6 +19,12 @@ pub const OUTPUT_BYTES_MAX: usize = 4 * 1024 * 1024;
 pub const REF_BYTES_MAX: usize = 255;
 /// Upper bound on the worktrees of one repository that rider reads.
 pub const WORKTREES_MAX: usize = 256;
+const GIT_DEADLINE: Duration = Duration::from_secs(300);
+const POLL_MILLIS: u64 = 2;
+const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
+const POLLS_MAX: u64 = GIT_DEADLINE.as_secs() * 1000 / POLL_MILLIS + 1;
+const READERS_JOIN_WAIT: Duration = Duration::from_secs(2);
+const READERS_JOIN_POLLS_MAX: u64 = READERS_JOIN_WAIT.as_secs() * 1000 / POLL_MILLIS + 1;
 const WORKTREE_FIELDS_MAX: usize = 8;
 const ARGS_MAX: usize = 12;
 const COMMIT_HEX_LENS: [usize; 2] = [40, 64];
@@ -47,6 +56,11 @@ pub enum GitError {
     OutputTooLarge {
         args: String,
     },
+    /// `git` did not exit and close its output within its deadline.
+    TimedOut {
+        args: String,
+        seconds: u64,
+    },
     /// Reading from `git` failed.
     Io(String),
     /// `git` succeeded but printed something rider cannot use.
@@ -72,6 +86,9 @@ impl fmt::Display for GitError {
             GitError::OutputTooLarge { args } => {
                 write!(f, "git {args} printed more than {OUTPUT_BYTES_MAX} bytes")
             }
+            GitError::TimedOut { args, seconds } => {
+                write!(f, "git {args} did not finish within {seconds} seconds")
+            }
             GitError::Io(message) => {
                 write!(f, "reading from git failed: {}", board::one_line(message))
             }
@@ -85,6 +102,8 @@ impl fmt::Display for GitError {
         }
     }
 }
+
+type Reader = JoinHandle<Result<Vec<u8>, GitError>>;
 
 struct Output {
     code: Option<i32>,
@@ -130,7 +149,7 @@ fn shown(args: &[&OsStr]) -> String {
     line
 }
 
-fn read_bounded(stream: &mut impl Read, args: &str) -> Result<Vec<u8>, GitError> {
+fn read_bounded(stream: impl Read, args: &str) -> Result<Vec<u8>, GitError> {
     assert!(!args.is_empty());
     let limit = u64::try_from(OUTPUT_BYTES_MAX + 1).unwrap_or(u64::MAX);
     let mut bytes: Vec<u8> = Vec::new();
@@ -144,28 +163,125 @@ fn read_bounded(stream: &mut impl Read, args: &str) -> Result<Vec<u8>, GitError>
     Ok(bytes)
 }
 
-fn collect(child: &mut Child, args: &str) -> Result<Output, GitError> {
-    let missing = |name: &str| GitError::Spawn(format!("git {args}: no {name}"));
-    let mut stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
-    let mut stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
+// A reader that stops at the bound drops its pipe, so git dies writing instead of blocking.
+fn start_reader(stream: impl Read + Send + 'static, args: &str) -> Result<Reader, GitError> {
+    assert!(!args.is_empty());
     let owned = args.to_string();
-    let builder = thread::Builder::new().name("git-stderr".to_string());
-    let reader: JoinHandle<Result<Vec<u8>, GitError>> = builder
-        .spawn(move || read_bounded(&mut stderr, &owned))
-        .map_err(|error| GitError::Spawn(format!("starting the stderr thread: {error}")))?;
-    let stdout = read_bounded(&mut stdout, args);
-    if stdout.is_err() {
-        // Killing can fail only when the child already exited, which is the goal anyway.
-        let _ = child.kill();
+    let builder = thread::Builder::new().name("git-output".to_string());
+    let reader = builder.spawn(move || read_bounded(stream, &owned));
+    reader.map_err(|error| GitError::Spawn(format!("starting a reader thread: {error}")))
+}
+
+fn finish_reader(reader: Reader) -> Result<Vec<u8>, GitError> {
+    assert!(
+        reader.is_finished(),
+        "a reader is joined once its pipe closed"
+    );
+    let joined = reader.join();
+    joined.map_err(|_| GitError::Io("a reader thread panicked".to_string()))?
+}
+
+/// Starts a reader on each of `child`'s output streams: stdout first, then stderr.
+fn start_readers(child: &mut dyn ChildWrapper, args: &str) -> Result<[Reader; 2], GitError> {
+    assert!(!args.is_empty());
+    let missing = |name: &str| GitError::Spawn(format!("git {args}: no {name}"));
+    let stdout = child.stdout().take().ok_or_else(|| missing("stdout"))?;
+    let stderr = child.stderr().take().ok_or_else(|| missing("stderr"))?;
+    let readers = [start_reader(stdout, args)?, start_reader(stderr, args)?];
+    assert!(child.stdout().is_none() && child.stderr().is_none());
+    Ok(readers)
+}
+
+// `try_wait` reaps the leader, so it is called only once both streams have closed. On every
+// error the leader is therefore unreaped, and its id still names its process group.
+fn poll(
+    child: &mut dyn ChildWrapper,
+    readers: &mut [Option<Reader>; 2],
+    bytes: &mut [Vec<u8>; 2],
+    deadline: Instant,
+) -> Result<Option<ExitStatus>, GitError> {
+    for _ in 0..POLLS_MAX {
+        for (slot, out) in readers.iter_mut().zip(bytes.iter_mut()) {
+            if let Some(reader) = slot.take_if(|reader| reader.is_finished()) {
+                *out = finish_reader(reader)?;
+            }
+        }
+        if readers.iter().all(Option::is_none) {
+            let polled = child.try_wait();
+            let status =
+                polled.map_err(|error| GitError::Io(format!("waiting for git: {error}")))?;
+            if status.is_some() {
+                assert!(bytes.iter().all(|out| out.len() <= OUTPUT_BYTES_MAX));
+                return Ok(status);
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(POLL_INTERVAL);
     }
-    let status = child.wait();
-    let status = status.map_err(|error| GitError::Io(format!("waiting for git: {error}")))?;
-    let stderr = reader.join();
-    let stderr = stderr.map_err(|_| GitError::Io("the stderr thread panicked".to_string()))?;
+    Ok(None)
+}
+
+/// Kills `child`'s whole group, which may outlive its leader, then joins the readers that
+/// close within `READERS_JOIN_WAIT`.
+fn end(
+    child: &mut dyn ChildWrapper,
+    readers: [Option<Reader>; 2],
+    args: &str,
+) -> Result<(), GitError> {
+    assert!(!args.is_empty());
+    let killed = board::kill_group(child);
+    let deadline = Instant::now() + READERS_JOIN_WAIT;
+    let mut open = readers;
+    for _ in 0..READERS_JOIN_POLLS_MAX {
+        for slot in &mut open {
+            if let Some(reader) = slot.take_if(|reader| reader.is_finished()) {
+                // The call has already failed, so what the killed group printed is not wanted.
+                let _ = reader.join();
+            }
+        }
+        if open.iter().all(Option::is_none) || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    // A reader still open here is held by a process that left the group; it is detached.
+    killed.map_err(|error| GitError::Io(format!("ending git {args}: {error}")))
+}
+
+/// Reads both streams of `child` until it exits and they close, or until `limit` passes.
+/// Unless it ends that way, the whole process group is killed.
+fn collect(child: &mut dyn ChildWrapper, args: &str, limit: Duration) -> Result<Output, GitError> {
+    assert!(!args.is_empty());
+    assert!(limit <= GIT_DEADLINE, "the poll bound covers the deadline");
+    let deadline = Instant::now() + limit;
+    let mut readers = [None, None];
+    let mut bytes = [Vec::new(), Vec::new()];
+    let polled = match start_readers(child, args) {
+        Ok(started) => {
+            readers = started.map(Some);
+            poll(child, &mut readers, &mut bytes, deadline)
+        }
+        Err(error) => Err(error),
+    };
+    let status = match polled {
+        Ok(Some(status)) => status,
+        unfinished => {
+            end(child, readers, args)?;
+            let seconds = limit.as_secs();
+            let timed_out = GitError::TimedOut {
+                args: args.to_string(),
+                seconds,
+            };
+            return Err(unfinished.err().unwrap_or(timed_out));
+        }
+    };
+    let [stdout, stderr] = bytes;
     let output = Output {
         code: status.code(),
-        stdout: stdout?,
-        stderr: stderr?,
+        stdout,
+        stderr,
     };
     assert!(output.stdout.len() <= OUTPUT_BYTES_MAX);
     assert!(output.stderr.len() <= OUTPUT_BYTES_MAX);
@@ -188,6 +304,50 @@ fn command(dir: &Path, args: &[&OsStr]) -> Process {
     command
 }
 
+/// Runs `process` in its own process group, feeding it `input` if given, and kills the group
+/// unless it ends within `limit`.
+fn spawn_and_collect(
+    process: Process,
+    line: &str,
+    limit: Duration,
+    input: Option<Vec<u8>>,
+) -> Result<Output, GitError> {
+    assert!(!line.is_empty());
+    let spawned = CommandWrap::from(process)
+        .wrap(ProcessGroup::leader())
+        .spawn();
+    let mut child = spawned.map_err(|error| GitError::Spawn(format!("git {line}: {error}")))?;
+    let writer = match (input, child.stdin().take()) {
+        (Some(bytes), Some(mut stdin)) => {
+            // Written from its own thread so git can't block on a full stdout meanwhile.
+            let builder = thread::Builder::new().name("git-stdin".to_string());
+            match builder.spawn(move || stdin.write_all(&bytes)) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    let _ = board::kill_group(child.as_mut());
+                    return Err(GitError::Spawn(format!("git {line}: {error}")));
+                }
+            }
+        }
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            let _ = board::kill_group(child.as_mut());
+            return Err(GitError::Spawn(format!("git {line}: stdin is not set up")));
+        }
+    };
+    assert!(child.stdin().is_none());
+    let output = collect(child.as_mut(), line, limit);
+    // Git has exited or its group was killed, so the writer's pipe has no reader left.
+    let written = writer.map(JoinHandle::join);
+    match (output, written) {
+        // A git that exits without reading all its input reports its own failure.
+        (Ok(done), Some(Ok(Err(_)) | Err(_))) if done.code == Some(0) => {
+            Err(GitError::Io(format!("writing to git {line}")))
+        }
+        (output, _) => output,
+    }
+}
+
 fn run(dir: &Path, args: &[&OsStr]) -> Result<Output, GitError> {
     run_fed(dir, args, None)
 }
@@ -199,44 +359,7 @@ fn run_fed(dir: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Output
     if input.is_some() {
         process.stdin(Stdio::piped());
     }
-    let spawned = process.spawn();
-    let mut child = spawned.map_err(|error| GitError::Spawn(format!("git {line}: {error}")))?;
-    let writer = match (input, child.stdin.take()) {
-        (Some(bytes), Some(mut stdin)) => {
-            // Written from its own thread so git can't block on a full stdout meanwhile.
-            let builder = thread::Builder::new().name("git-stdin".to_string());
-            let started = builder.spawn(move || stdin.write_all(&bytes));
-            let started = started.map_err(|error| GitError::Spawn(format!("git {line}: {error}")));
-            match started {
-                Ok(handle) => Some(handle),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
-            }
-        }
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(GitError::Spawn(format!("git {line}: stdin is not set up")));
-        }
-    };
-    let mut output = collect(&mut child, &line);
-    let written = writer.map(|handle| handle.join());
-    if let (Ok(done), Some(Ok(Err(_)) | Err(_))) = (&output, written) {
-        // A git that exits without reading all its input reports its own failure.
-        if done.code == Some(0) {
-            output = Err(GitError::Io(format!("writing to git {line}")));
-        }
-    }
-    if output.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    assert!(output.as_ref().is_err() || child.try_wait().is_ok_and(|s| s.is_some()));
-    output
+    spawn_and_collect(process, &line, GIT_DEADLINE, input)
 }
 
 fn exit_error(args: &[&OsStr], output: &Output) -> GitError {
@@ -706,61 +829,64 @@ pub fn remove_worktree(repo: &Path, dir: &Path) -> Result<(), GitError> {
 
 #[cfg(test)]
 pub mod testing {
-    //! Real repositories under the system temp dir, for tests in this crate.
+    //! Real repositories in temporary directories, for tests in this crate.
 
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use tempfile::TempDir;
+
+    use super::{Output, command, shown, spawn_and_collect};
 
     // Config from the environment outranks repository config and may sign commits or run hooks.
-    fn test_git(dir: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new("git");
-        command.arg("-C").arg(dir).args(args);
-        command.env_remove("GIT_CONFIG_COUNT");
-        command.env_remove("GIT_CONFIG_PARAMETERS");
-        command
+    fn test_git(dir: &Path, args: &[&str]) -> Output {
+        let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        let mut process = command(dir, &args);
+        process.env_remove("GIT_CONFIG_COUNT");
+        process.env_remove("GIT_CONFIG_PARAMETERS");
+        spawn_and_collect(process, &shown(&args), super::GIT_DEADLINE, None).unwrap()
     }
 
     /// Runs `git -C <dir> <args>`, asserts it succeeded, and returns its trimmed stdout.
     pub fn git(dir: &Path, args: &[&str]) -> String {
-        let output = test_git(dir, args).stdin(Stdio::null()).output().unwrap();
+        let output = test_git(dir, args);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "git {args:?} failed: {stderr}");
+        assert_eq!(output.code, Some(0), "git {args:?} failed: {stderr}");
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     /// Whether `git -C <dir> <args>` succeeds.
     pub fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
-        let status = test_git(dir, args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        status.success()
+        test_git(dir, args).code == Some(0)
     }
 
-    /// A temp directory with a one-commit repository `repo` and an empty `home`, removed on drop.
+    /// A temporary directory with a one-commit repository `repo` and an empty `home`.
     pub struct Fixture {
         pub root: PathBuf,
         pub repo: PathBuf,
         pub home: PathBuf,
+        _dir: TempDir,
     }
 
     impl Fixture {
         pub fn new(name: &str) -> Fixture {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let unique = format!("rider-{name}-{}-{n}", std::process::id());
-            let root = std::env::temp_dir().join(unique);
-            let _ = fs::remove_dir_all(&root);
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("rider-{name}-"))
+                .tempdir()
+                .unwrap();
+            let root = dir.path().to_path_buf();
             let repo = root.join("repo");
             let home = root.join("home");
             fs::create_dir_all(&repo).unwrap();
             fs::create_dir_all(&home).unwrap();
             init_repo(&repo);
-            Fixture { root, repo, home }
+            Fixture {
+                root,
+                repo,
+                home,
+                _dir: dir,
+            }
         }
 
         /// Commits a change to `file` on the current branch of `dir` and returns the commit.
@@ -797,12 +923,6 @@ pub mod testing {
         fs::write(dir.join("README"), "hello\n").unwrap();
         git(dir, &["add", "README"]);
         git(dir, &["commit", "-q", "-m", "Start."]);
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
     }
 }
 
@@ -996,5 +1116,88 @@ worktree /v\0HEAD 0123\0branch refs/heads/rider/2-y\0\0";
         fs::create_dir_all(&other).unwrap();
         init_repo(&other);
         assert!(is_clean(&other).unwrap());
+    }
+
+    fn is_gone(pid: i32) -> bool {
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        for _ in 0..1000 {
+            if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn a_hook_left_holding_output_is_killed_at_the_deadline() {
+        let fixture = Fixture::new("git-hook");
+        let hooks = fixture.root.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let pid_file = fixture.root.join("sleeper.pid");
+        let hook = format!(
+            "#!/bin/sh\nsleep 60 &\necho $! > '{}'\n",
+            pid_file.display()
+        );
+        let hook_path = hooks.join("post-checkout");
+        fs::write(&hook_path, hook).unwrap();
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&hook_path, executable).unwrap();
+        git(
+            &fixture.repo,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        let linked = fixture.root.join("linked");
+        let args = [OsStr::new("worktree"), OsStr::new("add"), OsStr::new("-q")];
+        let args = [
+            args[0],
+            args[1],
+            args[2],
+            OsStr::new("--"),
+            linked.as_os_str(),
+        ];
+        let limit = Duration::from_secs(5);
+        let started = Instant::now();
+        let result = spawn_and_collect(command(&fixture.repo, &args), &shown(&args), limit, None);
+        let elapsed = started.elapsed();
+        let error = result.err();
+        assert!(
+            matches!(error, Some(GitError::TimedOut { seconds: 5, .. })),
+            "{error:?}"
+        );
+        assert!(elapsed < limit * 3, "returned after {elapsed:?}");
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            is_gone(pid),
+            "the hook's background sleep {pid} outlived the call"
+        );
+    }
+
+    #[test]
+    fn output_past_the_bound_fails_without_waiting_for_the_deadline() {
+        let fixture = Fixture::new("git-overflow");
+        let mut process = Process::new("sh");
+        let script = format!("head -c {} /dev/zero; exec sleep 60", OUTPUT_BYTES_MAX + 1);
+        process.arg("-c").arg(script).current_dir(&fixture.root);
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let result = spawn_and_collect(process, "overflow", Duration::from_secs(60), None);
+        let elapsed = started.elapsed();
+        let error = result.err();
+        assert!(
+            matches!(&error, Some(GitError::OutputTooLarge { args }) if args == "overflow"),
+            "{error:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "returned after {elapsed:?}"
+        );
     }
 }

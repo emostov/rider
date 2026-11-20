@@ -52,6 +52,8 @@ yours: decide, say why in one line, and move.
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
 | `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
+This table is the default; the user's `$RIDER_HOME/rider.toml` may change or add roles, so read the effective table with `rider config`.
+
 `light` is a cheaper implementer with the same instructions as `implement`. Use it only
 when the brief already says exactly what to change and how to prove it: a restack, a rename,
 a reviewer's specific fix, a test that is spelled out. Use `implement` when the task needs
@@ -115,7 +117,8 @@ These rules are yours to keep. Rider does not check them:
 - No two tasks that can run at once touch the same files. Split by path or connect them with
   `needs`.
 - At most three deliverables per task. More is two tasks.
-- A worker is stopped after 55 minutes. Size tasks well inside that.
+- A worker is stopped after `attempt_minutes`: 55 by default, and `rider config` prints the
+  effective value. Size tasks well inside that.
 - Sizing: changes that each take under about ten minutes and touch the same files go in one
   task, not several.
 - Review policy: each pull request gets one holistic `review` of its whole diff. Each
@@ -239,7 +242,7 @@ task of its own.
 | blocked `needs_input` | a worker asked a question | Answer in the thread, then `vb tasks unblock <id> --as lead-fable-5-2`. The next worker follows your answer as part of the brief, so make it a complete, specific instruction |
 | blocked `invalid_brief` | the reason names the label to fix | Fix it with `vb label`, then unblock. If the reason is that another task has no `branch` label, that task has not run yet: add it to this task's needs with `vb tasks needs`, then unblock. Never write another task's `branch` label |
 | blocked `branch_busy` | another task's worktree has the branch checked out | If that task is unfinished, add the missing need with `vb tasks needs <id> <every id it needs>`, or wait, then unblock. If it is a completed task, its thread says "Kept the worktree at <dir>": waiting will not help. Tell the owner, naming that directory |
-| blocked `attempts_exhausted` | three attempts failed | Read the thread. Split the task, rewrite the brief, change its role, or ask the owner. To retry: `vb label <id> attempt=0`, then unblock |
+| blocked `attempts_exhausted` | the task failed `attempts` times (3 by default; `rider config` prints it) | Read the thread. Split the task, rewrite the brief, change its role, or ask the owner. To retry: `vb label <id> attempt=0`, then unblock |
 | blocked `rider_error` | Rider could not run the task (git, prompt file, harness) | Tell the owner. Do not retry blindly |
 | failed | the reason and the log tail are in the thread | Read them. Reply with what the next attempt must do, then `vb tasks reopen <id> --as lead-fable-5-2` retries in the same worktree. The next worker follows your latest reply over the brief, so make it a complete, specific instruction. If the correction changes what the task is, rewrite the brief instead: `vb edit <id> - --as lead-fable-5-2` with the new text on standard input, then reopen. Dependents keep waiting |
 | blocked `awaiting_approval`, in `decisions` | waiting for the owner | Nothing until they answer |

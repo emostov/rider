@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::board::{Board, TaskId, one_line};
-use crate::roles::{AGENTS_MAX, ROLES, RoleSpec, display_name, profile_name};
-use crate::run_task::RunError;
+use crate::board::{Board, BoardError, TaskId, one_line};
+use crate::core::{LEASE_MILLIS, ROLES_MAX};
+use crate::roles::{AGENTS_MAX, RoleSpec, display_name, profile_name};
+use crate::run_task::{Ran, RunError};
 use crate::settle::Verdict;
 
 /// The wait of every claim: none, because a claiming slot holds a gate place, and a place
@@ -29,10 +30,17 @@ pub const GATE_WAITS_MAX: u32 = 2 * 3600;
 // `rest` counts its pause steps as seconds.
 const _: () = assert!(PAUSE_STEP_MILLIS == 1000);
 const SECONDS_PER_DAY: u64 = 24 * 3600;
+/// The pause after a failed release before the next try.
+pub const RELEASE_RETRY_PAUSE_SECONDS: u64 = 5;
+/// Tries to release a task, one every `RELEASE_RETRY_PAUSE_SECONDS`, until its lease has lapsed.
+pub const RELEASE_TRIES_MAX: u64 = LEASE_MILLIS / 1000 / RELEASE_RETRY_PAUSE_SECONDS;
+/// A run of failed releases is reported on its first failure and on every this-many after.
+pub const RELEASE_ERRORS_REPORTED_EVERY: u64 = 60;
+const _: () = assert!(RELEASE_TRIES_MAX > 1 && RELEASE_ERRORS_REPORTED_EVERY > 1);
 /// Upper bound on the claims one slot makes before it stops.
 pub const SLOT_ROUNDS_MAX: u32 = 1_000_000;
 /// Upper bound on the slots of every role together.
-pub const SLOTS_MAX: usize = 48;
+pub const SLOTS_MAX: usize = ROLES_MAX * AGENTS_MAX as usize;
 /// Upper bound, in characters, on the result, reason, or error shown in one event line.
 pub const DETAIL_CHARS_MAX: usize = 120;
 
@@ -45,11 +53,12 @@ pub struct Slot {
     pub name: String,
 }
 
-/// One slot per `RoleSpec::slots` of every role, in table order.
-pub fn slots() -> Vec<Slot> {
+/// One slot per `RoleSpec::pool_slots` of every role in `table`, in table order.
+pub fn slots(table: &'static [RoleSpec]) -> Vec<Slot> {
+    assert!(!table.is_empty() && table.len() <= ROLES_MAX);
     let mut all = Vec::with_capacity(SLOTS_MAX);
-    for role in ROLES.iter() {
-        for number in 1..=role.slots {
+    for role in table {
+        for number in 1..=role.pool_slots {
             all.push(Slot {
                 role,
                 number,
@@ -58,58 +67,68 @@ pub fn slots() -> Vec<Slot> {
             });
         }
     }
-    assert!(all.len() <= SLOTS_MAX);
-    assert!(all.len() >= usize::from(AGENTS_MAX));
+    assert!(all.len() <= SLOTS_MAX && all.len() >= table.len());
     all
 }
 
-/// A counting gate that lets at most `AGENTS_MAX` holders through at once.
+/// A counting gate that lets at most its limit of holders through at once, and at most its
+/// builders limit of holders that build.
 pub struct Gate {
-    running: Mutex<u8>,
+    limit: u8,
+    builders_limit: u8,
+    running: Mutex<Running>,
     freed: Condvar,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Running {
+    all: u8,
+    builders: u8,
 }
 
 /// A place in the gate, given back when dropped, a panic's unwinding included.
 pub struct GatePass<'a> {
     gate: &'a Gate,
+    builds: bool,
 }
 
 impl Gate {
-    pub fn new() -> Gate {
+    /// A gate that lets at most `limit` holders, of which at most `builders_limit` build,
+    /// through at once.
+    pub fn new(limit: u8, builders_limit: u8) -> Gate {
+        assert!(limit > 0 && limit <= AGENTS_MAX);
+        assert!(builders_limit > 0 && builders_limit <= AGENTS_MAX);
         Gate {
-            running: Mutex::new(0),
+            limit,
+            builders_limit,
+            running: Mutex::new(Running::default()),
             freed: Condvar::new(),
         }
     }
 
-    /// Waits for a free place and takes it, or returns `None` once `stop` is set or the wait
-    /// passes `GATE_WAITS_MAX` waits.
-    pub fn enter_unless(&self, stop: &AtomicBool) -> Option<GatePass<'_>> {
-        // The count is changed only by `enter_unless` and `drop`, which cannot panic while
-        // holding the lock except on a broken invariant, so a poisoned lock still holds a true
-        // count.
+    /// Waits for a free place, and a free builder place when `builds`, and takes it; or returns
+    /// `None` once `stop` is set or the wait passes `GATE_WAITS_MAX` waits.
+    pub fn enter_unless(&self, stop: &AtomicBool, builds: bool) -> Option<GatePass<'_>> {
+        // The counts are changed only by `enter_unless` and `drop`, which cannot panic while
+        // holding the lock except on a broken invariant, so a poisoned lock still holds true
+        // counts.
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..GATE_WAITS_MAX {
             if stop.load(Ordering::SeqCst) {
                 return None;
             }
-            if *running < AGENTS_MAX {
-                *running += 1;
-                assert!(*running <= AGENTS_MAX);
-                return Some(GatePass { gate: self });
+            if running.all < self.limit && (!builds || running.builders < self.builders_limit) {
+                running.all += 1;
+                running.builders += u8::from(builds);
+                assert!(running.all <= self.limit && running.builders <= self.builders_limit);
+                return Some(GatePass { gate: self, builds });
             }
             let wait = Duration::from_millis(GATE_WAIT_MILLIS);
             let waited = self.freed.wait_timeout(running, wait);
             running = waited.unwrap_or_else(PoisonError::into_inner).0;
         }
-        assert!(*running <= AGENTS_MAX);
+        assert!(running.all <= self.limit);
         None
-    }
-}
-
-impl Default for Gate {
-    fn default() -> Gate {
-        Gate::new()
     }
 }
 
@@ -120,10 +139,13 @@ impl Drop for GatePass<'_> {
             .running
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        assert!(*running > 0 && *running <= AGENTS_MAX);
-        *running -= 1;
+        assert!(running.all > 0 && running.all <= self.gate.limit);
+        assert!(!self.builds || running.builders > 0);
+        running.all -= 1;
+        running.builders -= u8::from(self.builds);
         drop(running);
-        self.gate.freed.notify_one();
+        // A waiter that builds and one that does not may both wait; wake every one to recheck.
+        self.gate.freed.notify_all();
     }
 }
 
@@ -134,6 +156,8 @@ pub enum Event<'a> {
     Completed(&'a str),
     Failed(&'a str),
     Blocked,
+    /// The task was handed back unrun, for the reason given.
+    Released(&'a str),
     Error(&'a str),
 }
 
@@ -154,6 +178,7 @@ pub fn event_line(event: Event, id: Option<TaskId>, name: &str, now: SystemTime)
         Event::Completed(result) => ("completed", Some(result)),
         Event::Failed(reason) => ("failed", Some(reason)),
         Event::Blocked => ("blocked", None),
+        Event::Released(reason) => ("released", Some(reason)),
         Event::Error(message) => ("error", Some(message)),
     };
     let mut line = match id {
@@ -180,7 +205,7 @@ pub enum SlotEnd {
 /// What a slot does besides reaching the board: run a claimed task, pause for one step of
 /// `PAUSE_STEP_MILLIS`, and report one line.
 pub struct Effects<'a> {
-    pub run: &'a dyn Fn(TaskId) -> Result<Verdict, RunError>,
+    pub run: &'a dyn Fn(TaskId) -> Result<Ran, RunError>,
     pub pause: &'a dyn Fn(),
     pub say: &'a dyn Fn(&str),
     pub now: &'a dyn Fn() -> SystemTime,
@@ -204,7 +229,7 @@ pub fn slot_loop(
     for _ in 0..SLOT_ROUNDS_MAX {
         // The place is taken before the claim, so a claimed task starts at once and its lease
         // cannot run out while it waits for a place.
-        let Some(pass) = gate.enter_unless(stop) else {
+        let Some(pass) = gate.enter_unless(stop, slot.role.builds) else {
             if stop.load(Ordering::SeqCst) {
                 return SlotEnd::Stopped;
             }
@@ -243,19 +268,61 @@ pub fn slot_loop(
         let ran = (effects.run)(id);
         drop(pass);
         match ran {
-            Ok(Verdict::Complete { result }) => say(Event::Completed(&result), Some(id)),
-            Ok(Verdict::Fail { reason }) => say(Event::Failed(&reason), Some(id)),
-            Ok(Verdict::LeaveBlocked) => say(Event::Blocked, Some(id)),
+            Ok(Ran::Settled(Verdict::Complete { result })) => {
+                say(Event::Completed(&result), Some(id))
+            }
+            Ok(Ran::Settled(Verdict::Fail { reason })) => say(Event::Failed(&reason), Some(id)),
+            Ok(Ran::Settled(Verdict::LeaveBlocked)) => say(Event::Blocked, Some(id)),
             Err(RunError::Board(error)) => say(Event::Error(&error.to_string()), Some(id)),
             Err(RunError::LostClaim(state)) => {
                 let message = format!("the task is no longer claimed; it is {state:?}");
                 say(Event::Error(&message), Some(id));
+            }
+            // It goes back to be claimed by a slot of its new role, under that role's gate.
+            Ok(Ran::RoleChanged { claimed, found }) => {
+                let reason = format!("claimed as {claimed}, it is now {found}");
+                release(board, id, &reason, &say, effects.pause);
             }
         }
     }
     let message = format!("{SLOT_ROUNDS_MAX} claims made; this slot stops");
     say(Event::Error(&message), None);
     SlotEnd::RoundsExhausted
+}
+
+/// Releases claimed task `id` for `reason`, retrying a failed release, stopping or not, until
+/// the board takes it or the claim's lease has lapsed.
+fn release(
+    board: &dyn Board,
+    id: TaskId,
+    reason: &str,
+    say: &dyn Fn(Event, Option<TaskId>),
+    pause: &dyn Fn(),
+) {
+    assert!(!reason.is_empty());
+    for tries in 1..=RELEASE_TRIES_MAX {
+        match board.release(id) {
+            Ok(()) => {
+                say(Event::Released(reason), Some(id));
+                return;
+            }
+            Err(error @ BoardError::ClaimLost { .. }) => {
+                let message = format!("{error} (the claim is gone; not retried)");
+                say(Event::Error(&message), Some(id));
+                return;
+            }
+            Err(error) if tries % RELEASE_ERRORS_REPORTED_EVERY == 1 => {
+                let message = format!("{error} (release try {tries}; it is retried)");
+                say(Event::Error(&message), Some(id));
+            }
+            Err(_) => {}
+        }
+        for _ in 0..RELEASE_RETRY_PAUSE_SECONDS {
+            pause();
+        }
+    }
+    let message = format!("{RELEASE_TRIES_MAX} releases failed; the claim lapses with its lease");
+    say(Event::Error(&message), Some(id));
 }
 
 /// Pauses for `seconds` in steps, returning early once `stop` is set.
@@ -279,9 +346,10 @@ mod tests {
     use super::*;
     use crate::board::testing::FakeBoard;
     use crate::board::{BoardError, TaskState, TaskView};
+    use crate::roles::ROLES;
 
     fn slot(label: &str, number: u8) -> Slot {
-        let found = slots()
+        let found = slots(&ROLES)
             .into_iter()
             .find(|slot| slot.role.label == label && slot.number == number);
         found.unwrap_or_else(|| panic!("no slot {label} {number}"))
@@ -403,8 +471,8 @@ mod tests {
 
     #[test]
     fn slots_follow_the_role_table() {
-        let all = slots();
-        let expected: usize = ROLES.iter().map(|role| usize::from(role.slots)).sum();
+        let all = slots(&ROLES);
+        let expected: usize = ROLES.iter().map(|role| usize::from(role.pool_slots)).sum();
         assert_eq!(all.len(), expected);
         assert!(all.iter().any(|s| s.profile == "implement-2-opus-5-5"));
         assert!(all.iter().any(|s| s.profile == "security-1-mythos-5-2"));
@@ -418,12 +486,12 @@ mod tests {
     fn never_more_than_four_tasks_run_at_once() {
         const TASKS: u64 = 12;
         let board = QueueBoard::new((1..=TASKS).map(Step::Task).collect());
-        let gate = Gate::new();
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
         let stop = AtomicBool::new(false);
         let running = &board.running;
         let running_max = AtomicUsize::new(0);
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             let now = running.fetch_add(1, Ordering::SeqCst) + 1;
             running_max.fetch_max(now, Ordering::SeqCst);
             // Wait, within a bound, for a second task to start, so the test shows real overlap.
@@ -440,9 +508,9 @@ mod tests {
             if ran.len() == usize::try_from(TASKS).unwrap() {
                 stop.store(true, Ordering::SeqCst);
             }
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
-        let all = slots();
+        let all = slots(&ROLES);
         let ends: Vec<SlotEnd> = thread::scope(|scope| {
             let handles: Vec<_> = all
                 .iter()
@@ -483,12 +551,12 @@ mod tests {
         board.claims.borrow_mut().push_back(TaskId(7));
         let stop = AtomicBool::new(false);
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             ran.lock().unwrap().push(id.0);
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::Complete {
+            Ok(Ran::Settled(Verdict::Complete {
                 result: "done".to_string(),
-            })
+            }))
         };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
@@ -499,7 +567,14 @@ mod tests {
             now: &epoch,
         };
         let review = slot("review", 1);
-        let end = slot_loop(&review, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &review,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         assert_eq!(
             *board.calls.borrow(),
@@ -518,15 +593,15 @@ mod tests {
     #[test]
     fn stop_ends_every_loop() {
         let stop = AtomicBool::new(true);
-        let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+        let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
         let effects = Effects {
             run: &run,
             pause: &no_pause,
             say: &quiet,
             now: &epoch,
         };
-        let gate = Gate::new();
-        for slot in slots() {
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
+        for slot in slots(&ROLES) {
             let board = FakeBoard::new(Vec::new());
             board.claims.borrow_mut().push_back(TaskId(1));
             let end = slot_loop(&slot, "work/demo", &board, &gate, &stop, &effects);
@@ -541,12 +616,12 @@ mod tests {
         board.claims.borrow_mut().extend([TaskId(3), TaskId(4)]);
         let stop = AtomicBool::new(false);
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             stop.store(true, Ordering::SeqCst);
             ran.lock().unwrap().push(id.0);
-            Ok(Verdict::Fail {
+            Ok(Ran::Settled(Verdict::Fail {
                 reason: "tests failed".to_string(),
-            })
+            }))
         };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
@@ -561,7 +636,7 @@ mod tests {
             &implement,
             "work/demo",
             &board,
-            &Gate::new(),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -590,10 +665,10 @@ mod tests {
                 board.failing.borrow_mut().clear();
             }
         };
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             assert_eq!(id, TaskId(9));
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
@@ -604,7 +679,14 @@ mod tests {
             now: &epoch,
         };
         let polish = slot("polish", 1);
-        let end = slot_loop(&polish, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &polish,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         let steps = usize::try_from(CLAIM_RETRY_PAUSE_SECONDS).unwrap();
         assert_eq!(pauses.load(Ordering::SeqCst), 2 * steps);
@@ -628,7 +710,7 @@ mod tests {
         let pause = || {
             pauses.fetch_add(1, Ordering::SeqCst);
         };
-        let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+        let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
         let effects = Effects {
@@ -642,7 +724,7 @@ mod tests {
             &security,
             "work/demo",
             &board,
-            &Gate::new(),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -670,7 +752,7 @@ mod tests {
         let board = FakeBoard::new(Vec::new());
         board.claims.borrow_mut().extend([TaskId(5), TaskId(6)]);
         let stop = AtomicBool::new(false);
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             if id == TaskId(5) {
                 return Err(RunError::LostClaim(TaskState::Ready));
             }
@@ -686,7 +768,14 @@ mod tests {
             now: &epoch,
         };
         let review = slot("review", 2);
-        let end = slot_loop(&review, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &review,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         assert_eq!(
             lines.into_inner().unwrap(),
@@ -697,6 +786,49 @@ mod tests {
                 concat!(
                     "00:00:00Z error #6 Review 2 (Sol 6.1): ",
                     "reading from or writing to vb failed: pipe closed"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_task_relabeled_after_its_claim_is_released_unrun() {
+        let board = FakeBoard::new(Vec::new());
+        board.claims.borrow_mut().push_back(TaskId(5));
+        let stop = AtomicBool::new(false);
+        let run = |_: TaskId| -> Result<Ran, RunError> {
+            stop.store(true, Ordering::SeqCst);
+            Ok(Ran::RoleChanged {
+                claimed: "review",
+                found: "implement",
+            })
+        };
+        let lines = Mutex::new(Vec::new());
+        let say = |line: &str| lines.lock().unwrap().push(line.to_string());
+        let effects = Effects {
+            run: &run,
+            pause: &no_pause,
+            say: &say,
+            now: &epoch,
+        };
+        let end = slot_loop(
+            &slot("review", 2),
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
+            &stop,
+            &effects,
+        );
+        assert_eq!(end, SlotEnd::Stopped);
+        let calls = ["claim_ready work/demo review 0", "release 5"];
+        assert_eq!(*board.calls.borrow(), calls.map(str::to_string));
+        assert_eq!(
+            lines.into_inner().unwrap(),
+            vec![
+                "00:00:00Z claimed #5 Review 2 (Sol 6.1)",
+                concat!(
+                    "00:00:00Z released #5 Review 2 (Sol 6.1): ",
+                    "claimed as review, it is now implement"
                 ),
             ]
         );
@@ -715,10 +847,10 @@ mod tests {
             pauses.fetch_add(1, Ordering::SeqCst);
         };
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             ran.lock().unwrap().push(id.0);
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
         let effects = Effects {
             run: &run,
@@ -731,7 +863,7 @@ mod tests {
             &implement,
             "work/demo",
             &board,
-            &Gate::new(),
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -744,46 +876,86 @@ mod tests {
 
     #[test]
     fn the_gate_admits_at_most_its_capacity_and_frees_a_place_on_panic() {
-        let gate = Gate::new();
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
         let panicked = thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _pass = gate.enter_unless(&AtomicBool::new(false));
+                    let _pass = gate.enter_unless(&AtomicBool::new(false), true);
                     panic!("an agent run panicked");
                 })
                 .join()
         });
         assert!(panicked.is_err());
-        assert_eq!(*gate.running.lock().unwrap(), 0);
+        assert_eq!(*gate.running.lock().unwrap(), Running::default());
         let go = AtomicBool::new(false);
-        let passes: Vec<Option<GatePass>> =
-            (0..AGENTS_MAX).map(|_| gate.enter_unless(&go)).collect();
+        let passes: Vec<Option<GatePass>> = (0..AGENTS_MAX)
+            .map(|_| gate.enter_unless(&go, false))
+            .collect();
         assert!(passes.iter().all(Option::is_some));
-        assert_eq!(*gate.running.lock().unwrap(), AGENTS_MAX);
+        let full = Running {
+            all: AGENTS_MAX,
+            builders: 0,
+        };
+        assert_eq!(*gate.running.lock().unwrap(), full);
         drop(passes);
-        assert_eq!(*gate.running.lock().unwrap(), 0);
+        assert_eq!(*gate.running.lock().unwrap(), Running::default());
+    }
+
+    #[test]
+    fn a_full_builders_limit_holds_back_builders_but_not_others() {
+        let gate = Gate::new(4, 2);
+        let go = AtomicBool::new(false);
+        let builders: Vec<Option<GatePass>> =
+            (0..2).map(|_| gate.enter_unless(&go, true)).collect();
+        assert!(builders.iter().all(Option::is_some));
+        let stop = AtomicBool::new(false);
+        let third = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(100));
+                stop.store(true, Ordering::SeqCst);
+            });
+            gate.enter_unless(&stop, true).is_some()
+        });
+        assert!(!third, "a third builder entered a gate that allows two");
+        let other = gate.enter_unless(&go, false);
+        assert!(other.is_some());
+        assert_eq!(
+            *gate.running.lock().unwrap(),
+            Running {
+                all: 3,
+                builders: 2
+            }
+        );
+        drop(builders);
+        let builder = gate.enter_unless(&go, true);
+        assert!(builder.is_some());
+        assert_eq!(
+            *gate.running.lock().unwrap(),
+            Running {
+                all: 2,
+                builders: 1
+            }
+        );
     }
 
     #[test]
     fn a_role_with_ready_work_gets_a_place_from_idle_slots() {
         let mut board = QueueBoard::new(vec![Step::Task(1)]);
         board.role = Some("review");
-        let gate = Gate::new();
+        let gate = Gate::new(4, 4);
         let stop = AtomicBool::new(false);
         let ran = AtomicBool::new(false);
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             assert_eq!(id, TaskId(1));
             ran.store(true, Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
         let pause = || thread::sleep(Duration::from_millis(5));
-        let mut contenders: Vec<Slot> = slots()
-            .into_iter()
-            .filter(|slot| slot.role.label != "review")
-            .collect();
+        let idle = ["implement", "light"].map(|label| [slot(label, 1), slot(label, 2)]);
+        let mut contenders: Vec<Slot> = idle.into_iter().flatten().collect();
         contenders.push(slot("review", 1));
-        assert_eq!(contenders.len(), usize::from(AGENTS_MAX) + 1);
+        assert_eq!(contenders.len(), usize::from(gate.limit) + 1);
         let started = Instant::now();
         thread::scope(|scope| {
             for contender in &contenders {
@@ -826,7 +998,7 @@ mod tests {
             pauses.fetch_add(1, Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
         };
-        let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+        let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
         let effects = Effects {
             run: &run,
             pause: &pause,
@@ -834,7 +1006,14 @@ mod tests {
             now: &epoch,
         };
         let polish = slot("polish", 1);
-        let end = slot_loop(&polish, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &polish,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         const { assert!(IDLE_PAUSE_SECONDS > 1) };
         assert_eq!(pauses.load(Ordering::SeqCst), 1);
@@ -846,16 +1025,18 @@ mod tests {
 
     #[test]
     fn a_stopped_gate_gives_no_place() {
-        let gate = Gate::new();
-        assert!(gate.enter_unless(&AtomicBool::new(true)).is_none());
-        assert_eq!(*gate.running.lock().unwrap(), 0);
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
+        assert!(gate.enter_unless(&AtomicBool::new(true), false).is_none());
+        assert_eq!(*gate.running.lock().unwrap(), Running::default());
     }
 
     #[test]
     fn a_slot_waiting_for_a_place_returns_soon_after_stop() {
-        let gate = Gate::new();
+        let gate = Gate::new(AGENTS_MAX, AGENTS_MAX);
         let go = AtomicBool::new(false);
-        let full: Vec<Option<GatePass>> = (0..AGENTS_MAX).map(|_| gate.enter_unless(&go)).collect();
+        let full: Vec<Option<GatePass>> = (0..AGENTS_MAX)
+            .map(|_| gate.enter_unless(&go, false))
+            .collect();
         assert!(full.iter().all(Option::is_some));
         let stop = AtomicBool::new(false);
         let started = Instant::now();
@@ -863,7 +1044,7 @@ mod tests {
             let waiting = scope.spawn(|| {
                 let board = FakeBoard::new(Vec::new());
                 board.claims.borrow_mut().push_back(TaskId(1));
-                let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+                let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
                 let effects = Effects {
                     run: &run,
                     pause: &no_pause,
