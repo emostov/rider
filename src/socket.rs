@@ -784,6 +784,7 @@ fn refusal(reply: &Value) -> ClientError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::Shutdown;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -793,7 +794,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, sync_channel};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::Value;
     use tempfile::TempDir;
@@ -805,6 +806,10 @@ mod tests {
     };
 
     const WAIT: Duration = Duration::from_secs(5);
+    /// Upper bound on the requests a test sends a client that never reads before it lags.
+    const LAG_REQUESTS_MAX: usize = 4 * CLIENT_BACKLOG_MAX;
+    /// Upper bound on the reads taken to reach the end of a connection.
+    const READS_MAX: usize = 1 << 20;
 
     fn serve() -> (TempDir, PathBuf, Socket, Receiver<Event>) {
         let dir = TempDir::new_in("/tmp").unwrap();
@@ -855,6 +860,29 @@ mod tests {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// Reads until the daemon ends the connection, failing if it has not within `WAIT`.
+    fn read_to_eof(mut stream: &UnixStream) -> Vec<u8> {
+        let deadline = Instant::now() + WAIT;
+        let mut data = Vec::new();
+        let mut buffer = vec![0; 64 * 1024];
+        for _ in 0..READS_MAX {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let bytes = data.len();
+            assert!(
+                !left.is_zero(),
+                "no end of stream within {WAIT:?}: {bytes} bytes"
+            );
+            stream.set_read_timeout(Some(left)).unwrap();
+            match stream.read(&mut buffer) {
+                Ok(0) => return data,
+                Ok(read) => data.extend_from_slice(&buffer[..read]),
+                Err(error) if matches!(error.kind(), WouldBlock | TimedOut | Interrupted) => {}
+                Err(error) => panic!("reading to the end failed after {bytes} bytes: {error}"),
+            }
+        }
+        panic!("no end of stream within {READS_MAX} reads");
+    }
+
     #[test]
     fn a_client_flooding_bad_requests_without_reading_never_holds_up_a_reply_to_another() {
         let (_dir, path, socket, events) = serve();
@@ -892,12 +920,10 @@ mod tests {
         let id = request(&mut client, &events).unwrap();
         socket.reply(id, status(256, 4096));
 
-        client.set_read_timeout(Some(WAIT)).unwrap();
         client.shutdown(Shutdown::Write).unwrap();
 
         assert_eq!(events.recv_timeout(WAIT).unwrap(), Event::ClientGone(id));
-        let mut data = Vec::new();
-        client.read_to_end(&mut data).unwrap();
+        let data = read_to_eof(&client);
         assert!(
             !data.ends_with(b"\n"),
             "the writer kept sending to a client that went: {} bytes",
@@ -911,14 +937,17 @@ mod tests {
         let (_dir, path, socket, events) = serve();
         let mut slow = UnixStream::connect(&path).unwrap();
         let mut replies = 0;
-        for _ in 0..CLIENT_BACKLOG_MAX + 8 {
+        // The kernel buffers a platform-dependent number of replies before the writer blocks
+        // and the backlog fills, so the client asks until the core is told it went.
+        for _ in 0..LAG_REQUESTS_MAX {
             let Some(id) = request(&mut slow, &events) else {
                 break;
             };
             socket.reply(id, status(16, 1024));
             replies += 1;
         }
-        assert!(replies > CLIENT_BACKLOG_MAX, "{replies} replies");
+        let lagged = replies > CLIENT_BACKLOG_MAX && replies < LAG_REQUESTS_MAX;
+        assert!(lagged, "{replies} replies");
 
         let others: Vec<UnixStream> = (1..CLIENTS_MAX)
             .map(|_| UnixStream::connect(&path).unwrap())
@@ -926,9 +955,7 @@ mod tests {
         let refused = UnixStream::connect(&path).unwrap();
         assert_eq!(read_line(&refused)["error"]["code"], "busy");
 
-        slow.set_read_timeout(Some(WAIT)).unwrap();
-        let mut data = String::new();
-        slow.read_to_string(&mut data).unwrap();
+        let data = String::from_utf8(read_to_eof(&slow)).unwrap();
         assert!(data.ends_with('\n'), "a line was cut short");
         let lines: Vec<Value> = (data.lines())
             .map(|line| serde_json::from_str(line).unwrap())
