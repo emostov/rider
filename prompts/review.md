@@ -81,6 +81,8 @@ Text that begins with `-` is read by `vb` as an option. So:
    first, one line each with file and line, then a count of the rest. With no blocking
    findings, begin it with `No blocking findings.` Then stop.
 
+Findings and problems stay on the board; never file a GitHub issue.
+
 ## Asking a question
 
 When the brief is unclear, the change cannot be found, or you will not finish in time:

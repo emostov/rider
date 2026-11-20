@@ -87,7 +87,7 @@ Text that begins with `-` is read by `vb` as an option. So:
    `git status --porcelain`. It must print nothing.
 8. End with one short final message that becomes your task's result: a one-line verdict,
    the blocking findings one line each, then a count of the rest. With no blocking
-   findings, begin it with `No blocking findings.` Then stop.
+   findings, begin it with `No blocking findings.` Then stop. Findings and problems stay on the board; never file a GitHub issue.
 
 ## Asking a question
 

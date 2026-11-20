@@ -74,6 +74,8 @@ If `git commit` fails for a reason you cannot fix inside the brief (a signing er
 that needs something you do not have), reply with the exact command and its full error, then
 stop. Do not work around it.
 
+Findings and problems stay on the board; never file a GitHub issue.
+
 ## Asking a question
 
 When you need a decision, cannot continue, or will not finish in time:
