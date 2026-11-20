@@ -34,7 +34,8 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
 In the commands below, `<repo>` is the repository, `<branch>` the branch being shipped (its
 task's `branch` label; the lowest first in a stack), `<top>` the id of the last task that
 moved it, `<n>` its PR, `<base>` its parent branch.
-Every `gh` command takes `-R <owner>/<name>`, left out below to keep them short.
+`gh pr`, `gh run` and `gh issue` commands take `-R <owner>/<name>`, left out below to keep
+them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>` and `<name>`.
 
 ## 1. Open the PR
 
@@ -57,12 +58,23 @@ CI is green.
 
 ## 2. Watch CI
 
-Run as a background command: `gh pr checks <n> --watch --interval 30`. It exits 0 when
-every check passed and non-zero when one failed. Right after a push it may report no checks
-yet: run it again in the background. When it returns, list the result with
-`gh pr checks <n> --json name,bucket,link`.
+Choose `<cap>`, the most minutes to wait for CI (the longest the workflows normally run,
+doubled). Run as one background command a loop of
+`gh pr checks <n> --watch --fail-fast --interval 30` calls, repeated while a call returns
+before `<cap>` with no checks yet (right after a push) or with a check still pending.
+`--fail-fast` returns on the first failure, so a stuck check cannot hide it. Exit 0 is not
+proof of green: cancelled or skipped required checks can pass the watch. When the loop ends,
+read `gh pr checks <n> --json name,bucket,link`:
 
-All passed: step 4. Any failed: step 3. The board wait from `lead.md` runs alongside it.
+- Green is `pass`, and `skipping` only for a check that is not required
+  (`gh pr checks <n> --required --json name,bucket` lists the required ones).
+- `fail`: step 3.
+- `cancel`: rerun it once as in step 3, watch again, and report it to the owner if it is
+  cancelled again.
+- `pending` once `<cap>` is reached: a stuck check. Report it to the owner with its link.
+  Do not wait longer or rerun it.
+
+All green: step 4. The board wait from `lead.md` runs alongside it.
 
 ## 3. A failed check: flake or real
 
@@ -93,12 +105,19 @@ once per branch from the bottom up. After each completes, push with
 ## 4. Review comments
 
 1. List the threads, and keep those with `isResolved: false`. Also read
-   `gh pr view <n> --comments` for review summaries and top-level comments.
+   `gh pr view <n> --comments` for review summaries and top-level comments. `--paginate`
+   follows `pageInfo` through every page of threads. A thread with more than 20 comments
+   (`hasNextPage` true) is an error: stop and tell the owner.
 
    ```sh
-   gh api graphql -f query='query { repository(owner: "<owner>", name: "<name>") {
-     pullRequest(number: <n>) { reviewThreads(first: 100) { nodes { id isResolved path line
-     comments(first: 20) { nodes { databaseId author { login } body } } } } } } }'
+   gh api graphql --paginate -F owner=<owner> -F name=<name> -F n=<n> -f query='
+     query($owner: String!, $name: String!, $n: Int!, $endCursor: String) {
+       repository(owner: $owner, name: $name) { pullRequest(number: $n) {
+         reviewThreads(first: 50, after: $endCursor) {
+           pageInfo { hasNextPage endCursor }
+           nodes { id isResolved path line comments(first: 20) {
+             pageInfo { hasNextPage }
+             nodes { databaseId author { login } body } } } } } } }'
    ```
 
 2. For each thread, decide:
@@ -106,7 +125,9 @@ once per branch from the bottom up. After each completes, push with
      as in step 3.4, its brief quoting the comment, the file and line, and the PR. Fix
      tasks for several threads on one branch run one after another: each `needs` the one
      before, since they share the branch.
-   - **A question** the code already answers: reply with the answer, no task.
+   - **A question** the code already answers: reply with the answer, no task, and resolve
+     the thread when the answer needs no change. Leave it open only when the owner must
+     decide.
    - **A disagreement or a change of scope**: ask the owner. Do not reply on their behalf.
 3. Push each fix as in step 3.5 and watch CI. Only after the fix is pushed **and** CI is
    green, reply in the thread naming the commit, then resolve it:
