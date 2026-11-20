@@ -22,7 +22,8 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
   on that branch only. Never force-push the base branch or a branch the swarm did not
   create, and never use a bare `--force`.
 - Git work with judgment in it is a board task for a worker: a restack, a rebase with
-  conflicts, splitting or squashing commits, and every code change. Quick steps (pushing a
+  conflicts, splitting or squashing commits, and code changes beyond the small mechanical edit
+  `lead.md` allows the lead. Quick steps (pushing a
   finished branch, `gh pr create`) you run yourself. Rider has no built-in ship command.
 - Never leave a review on a PR: no `gh pr review`, no review comments. Reviewer findings
   stay on the board. Replying to a human's review thread, and resolving it once its fix is
@@ -91,10 +92,10 @@ All green: step 4. The board wait from `lead.md` runs alongside it.
      failing assertion, a formatting check.
 4. A real failure becomes a fix task, created as `lead.md` describes:
    `role=implement` (or `light` when the log says exactly what to change, as a lint does),
-   `onto=<top>`, `needs` every unfinished task on that branch, and its own `review` unless
-   the fix is purely mechanical (read its diff). The brief carries the check's name, the failing log lines, and the local command that
+   `onto=<top>`, `needs` every unfinished task on that branch, and no `review` of its own
+   (read its diff; the PR's holistic review covers it). The brief carries the check's name, the failing log lines, and the local command that
    reproduces the check (from the workflow file under `.github/workflows/`).
-5. When the fix and its review complete, read the result, then push: `git -C <repo> push
+5. When the fix task completes, read the result, then push: `git -C <repo> push
    origin <branch>`. `<top>` is now the fix task. Watch again (step 2).
 
 If CI fails because the base branch moved, or a lower branch in the stack changed, make a
@@ -159,7 +160,7 @@ When every check is green and no thread is unresolved:
 4. Remove the worktree of each task that is cancelled or given up on, as `lead.md` says:
    never with `--force`, and never delete the branch.
 5. Tell the owner: each PR's link, that CI is green and no thread is open, the fix task ids,
-   and the issues closed. Merging is theirs.
+   and the issues closed. Merging is theirs. End with the `Your move:` line from `lead.md`.
 
 ## Common mistakes
 

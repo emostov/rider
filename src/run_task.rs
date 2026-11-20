@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::json;
 
@@ -13,8 +14,9 @@ use crate::brief::{Brief, echo, label, parse_brief};
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
-    command_for,
+    SESSION_BYTES_MAX, SessionId, command_for,
 };
+use crate::roles::Harness;
 use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, Checkout, WorktreeError};
 
@@ -39,6 +41,11 @@ const ATTEMPT_DIGITS_MAX: usize = 3;
 const RESULT_SCHEMA: &str = "rider-result@1";
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
+// Beside a task's logs: the Claude session id of its latest completed attempt on one line,
+// then the repository it ran in.
+const SESSION_FILE: &str = "session";
+const SESSION_FILE_BYTES_MAX: usize = 4096;
+const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as the \
                           last attempt left them, uncommitted changes included.";
 
@@ -131,6 +138,18 @@ pub struct Attempt {
     reference: String,
     cmd: CommandLine,
     log: PathBuf,
+    // Why the task resumes, or starts fresh though `resume=1` asked otherwise.
+    resume_note: Option<String>,
+    // When `cmd` resumes a session: that session, and the command that starts fresh instead.
+    fallback: Option<Fallback>,
+    // The log of the fresh start, set once `launch` has given up the resumed session.
+    fresh_log: OnceLock<PathBuf>,
+}
+
+struct Fallback {
+    session: SessionId,
+    cmd: CommandLine,
+    home: PathBuf,
 }
 
 impl Attempt {
@@ -148,7 +167,23 @@ impl Attempt {
     ) -> Result<Exit, HarnessError> {
         assert!(self.checkout.dir.is_absolute() && self.log.is_absolute());
         assert!(!self.cmd.program.is_empty());
-        launch(&self.cmd, &self.checkout.dir, &self.log)
+        assert!(self.fresh_log.get().is_none(), "an attempt launches once");
+        let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
+        let refused =
+            !matches!(launched, Ok(Exit::Code(0))) && harness::ended_before_any_turn(&self.log);
+        match self.fallback.as_ref().filter(|_| refused) {
+            Some(fresh) => {
+                let log = log_path(&fresh.home, self.brief.id, self.failed + 1);
+                let log = self.fresh_log.get_or_init(|| log);
+                launch(&fresh.cmd, &self.checkout.dir, log)
+            }
+            None => launched,
+        }
+    }
+
+    // The log of the agent run whose work the attempt is judged by.
+    fn log(&self) -> &Path {
+        self.fresh_log.get().unwrap_or(&self.log)
     }
 }
 
@@ -202,6 +237,10 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
             board.set_label(id, START_LABEL, &attempt.checkout.start_head)?;
         }
     }
+    if let Some(note) = &attempt.resume_note {
+        // The note only informs; losing it must not stop the attempt.
+        let _ = board.reply(id, note);
+    }
     Ok(Prepared::Ready(Box::new(attempt)))
 }
 
@@ -212,6 +251,17 @@ pub fn judge_attempt(
     attempt: &Attempt,
     launched: Result<Exit, HarnessError>,
 ) -> Result<Judgement, RunError> {
+    if let Some(fresh) = attempt.fallback.as_ref()
+        && attempt.fresh_log.get().is_some()
+    {
+        let note = format!(
+            "Claude could not resume session {} before doing any work, so the attempt ran \
+             again starting fresh.",
+            fresh.session.as_str()
+        );
+        // The note only informs; losing it must not stop the attempt.
+        let _ = board.reply(id, &note);
+    }
     let (verdict, work) = inspect(id, board, attempt, launched)?;
     assert!(!matches!(verdict, Verdict::Complete { .. }) || work.is_some());
     Ok(Judgement { verdict, work })
@@ -313,19 +363,38 @@ fn prepare(
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
     let retry = fs::symlink_metadata(&dir).is_ok();
     let prompt = build_prompt(env, &brief, retry)?;
-    let mut cmd = command_for(brief.role, &prompt, &dir).map_err(|error| {
-        let reason = format!(
-            "Rider cannot build the agent's command: {}.",
-            harness_reason(&error)
-        );
-        Block::new("rider_error", reason)
-    })?;
+    let session = brief.resume.then(|| resume_session(&brief, &env.home));
+    let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
+        (Ok(_), Some(onto)) => format!("Resuming the Claude session of task #{}.", onto.0),
+        (Ok(_), None) => panic!("a session is only resumed from an `onto` task"),
+        (Err(why), _) => format!("Starting a fresh session despite `resume=1`: {why}."),
+    });
+    let resume = session.and_then(Result::ok);
     let id = brief.id.0.to_string();
-    cmd.env.extend([
-        ("BOARD_TASK".to_string(), id.clone()),
-        ("BOARD_PROFILE".to_string(), env.profile.clone()),
-        ("BOARD_URL".to_string(), env.board_url.clone()),
-    ]);
+    let command = |resume: Option<&SessionId>| {
+        let mut cmd = command_for(brief.role, &prompt, &dir, resume).map_err(|error| {
+            let reason = format!(
+                "Rider cannot build the agent's command: {}.",
+                harness_reason(&error)
+            );
+            Block::new("rider_error", reason)
+        })?;
+        cmd.env.extend([
+            ("BOARD_TASK".to_string(), id.clone()),
+            ("BOARD_PROFILE".to_string(), env.profile.clone()),
+            ("BOARD_URL".to_string(), env.board_url.clone()),
+        ]);
+        Ok::<CommandLine, Block>(cmd)
+    };
+    let cmd = command(resume.as_ref())?;
+    let fallback = match resume {
+        Some(session) => Some(Fallback {
+            session,
+            cmd: command(None)?,
+            home: env.home.clone(),
+        }),
+        None => None,
+    };
     let checkout = worktree::prepare(&brief, board, &env.home);
     let checkout = checkout.map_err(|error| worktree_block(&error))?;
     assert!(checkout.dir == dir);
@@ -342,7 +411,93 @@ fn prepare(
         checkout,
         cmd,
         log,
+        resume_note,
+        fallback,
+        fresh_log: OnceLock::new(),
     })
+}
+
+fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
+    assert!(brief.resume && home.is_absolute());
+    if !RESUMABLE_ROLES.contains(&brief.role.label) {
+        return Err(format!(
+            "role {} is not implement or light",
+            brief.role.label
+        ));
+    }
+    assert!(brief.role.harness == Harness::Claude);
+    let onto = brief.onto.ok_or("the task has no `onto` label")?;
+    let path = session_path(home, onto);
+    let mut text = String::new();
+    let read = File::open(&path).and_then(|file| {
+        file.take(SESSION_FILE_BYTES_MAX as u64 + 1)
+            .read_to_string(&mut text)
+    });
+    match read {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "task #{} has no completed Claude attempt with a recorded session",
+                onto.0
+            ));
+        }
+        Err(error) => return Err(format!("rider cannot read {}: {error}", path.display())),
+    }
+    let malformed = || {
+        format!(
+            "task #{}'s recorded session in {} is malformed",
+            onto.0,
+            path.display()
+        )
+    };
+    let (session, repo) = text.split_once('\n').ok_or_else(malformed)?;
+    let repo = repo.strip_suffix('\n').filter(|repo| !repo.is_empty());
+    let repo = Path::new(repo.ok_or_else(malformed)?);
+    let session = SessionId::parse(session).ok_or_else(malformed)?;
+    if repo != brief.repo {
+        return Err(format!(
+            "task #{}'s session was recorded in repository {}, not this task's {}",
+            onto.0,
+            repo.display(),
+            brief.repo.display()
+        ));
+    }
+    assert!(session.as_str().len() <= SESSION_BYTES_MAX);
+    Ok(session)
+}
+
+fn session_path(home: &Path, id: TaskId) -> PathBuf {
+    assert!(home.is_absolute());
+    let path = home
+        .join(LOGS_DIR)
+        .join(id.0.to_string())
+        .join(SESSION_FILE);
+    assert!(path.starts_with(home));
+    path
+}
+
+fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
+    let path = session_path(home, attempt.brief.id);
+    let session = match attempt.brief.role.harness {
+        Harness::Claude => harness::session_id(attempt.log()),
+        Harness::Codex | Harness::Tact => None,
+    };
+    // A repository the file cannot hold is not recorded, so nothing resumes into it.
+    let fits = |repo: &&str| repo.len() < SESSION_FILE_BYTES_MAX - SESSION_BYTES_MAX - 2;
+    let repo = attempt
+        .brief
+        .repo
+        .to_str()
+        .filter(|repo| !repo.contains('\n'))
+        .filter(fits);
+    let written = match (&session, repo) {
+        (Some(session), Some(repo)) => fs::write(&path, format!("{}\n{repo}\n", session.as_str())),
+        (None, _) | (_, None) => match fs::remove_file(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    written.map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn log_path(home: &Path, id: TaskId, attempt: u16) -> PathBuf {
@@ -500,11 +655,11 @@ fn inspect(
         }
     };
     let harness = &attempt.brief.role.harness;
-    let last_message = harness::last_message(harness, &attempt.log);
+    let last_message = harness::last_message(harness, attempt.log());
     let outcome = Outcome {
         exit,
         state_after,
-        stream_failed: harness::stream_reports_failure(harness, &attempt.log),
+        stream_failed: harness::stream_reports_failure(harness, attempt.log()),
         clean: evidence.clean,
         branch: attempt.checkout.branch.as_deref(),
         on_branch: evidence.on_branch,
@@ -590,6 +745,10 @@ fn complete(
         "summary": summary,
     });
     let record = record.to_string();
+    if let Err(error) = record_session(attempt, &env.home) {
+        let note = format!("Rider could not record the agent's session: {error}.");
+        let _ = board.reply(id, &one_line(&note));
+    }
     // The record and the note below only inform; losing them must not undo finished work.
     if board.post_structured(id, RESULT_SCHEMA, &record).is_err() {
         let _ = board.reply(id, &record);
@@ -622,8 +781,8 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
         "a failure always states its reason"
     );
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
-    let header = format!("The whole log: {}", attempt.log.display());
-    let tail = log_tail(&attempt.log);
+    let header = format!("The whole log: {}", attempt.log().display());
+    let tail = log_tail(attempt.log());
     let budget = TAIL_REPLY_CHARS_MAX.saturating_sub(header.chars().count() + 1);
     let tail = if tail.trim().is_empty() {
         NO_OUTPUT
