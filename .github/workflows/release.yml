@@ -40,7 +40,11 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match the swarm-rider version $manifest_version" >&2
             exit 1
           fi
-          if ! git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main; then
+          if ! git ls-remote --exit-code --heads origin refs/heads/main >/dev/null; then
+            echo "The remote has no branch refs/heads/main" >&2
+            exit 1
+          fi
+          if ! git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main; then
             echo "Could not fetch main" >&2
             exit 1
           fi
