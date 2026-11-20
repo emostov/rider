@@ -267,6 +267,16 @@ These come from the first end-to-end run (see `docs/milestone-0-run.md`).
 
 - **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
   `vb label`, then `vb tasks unblock <id> --as lead-fable-5-2`.
+- **A task is blocked as `rider_error`: "Rider will not reuse the worktree ... was not made
+  for this board".** Worktrees are named by task id, so after the board's data is replaced a
+  new task can reuse the id of an old task whose worktree is still there. Each worktree Rider
+  makes records which board it is for (the path of `~/.rider/board/local.db` and when that
+  file was created, or the board URL when the board's data is elsewhere) in a `.rider-board`
+  file in the worktree's git directory. A worktree with no record, or with another board's,
+  is left as it is. Keep what you need from the directory the reason names, remove it with
+  `git worktree remove <dir>` from the repository, then
+  `vb tasks unblock <id> --as lead-fable-5-2`. Worktrees made before Rider kept this record
+  are blocked the same way.
 - **A Codex log starts with "Reading additional input from stdin...".** This is harmless.
 - **Many `node ... vb` processes are left running.** A Board CLI process whose parent exited
   and whose board stopped answering keeps running. `rider reap` lists them (pid, age,
