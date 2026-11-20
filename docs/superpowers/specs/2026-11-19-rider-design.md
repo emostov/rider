@@ -293,7 +293,7 @@ which are blocking, and exit.
 
 Launch forms, flags to be confirmed in milestone 0:
 
-| Harness | Headless form | Output |
+| Harness | Non-interactive form | Output |
 |---|---|---|
 | Claude Code | `claude -p --model <model>` with stream JSON output | JSONL |
 | Codex | `codex exec --model <model>` with JSON output | JSONL |
@@ -421,7 +421,7 @@ Each one is usable on real work.
 `vb serve`; write the lead's instructions, the worker and reviewer
 prompts, the role table, and the result and finding schemas; run the lead
 by hand in a Claude session and workers through `vb tasks run` with the
-three models. This proves the CLI behaviour, the headless flags, the
+three models. This proves the CLI behaviour, the non-interactive flags, the
 prompts, and the label scheme, and Zeke can use it the same day. Worktrees
 are made by hand or by the lead at this stage.
 
