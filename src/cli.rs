@@ -31,8 +31,9 @@ pub const USAGE: &str = r#"usage:
   rider pool <project>     run worker slots on the channel work/<project>;
                            type stop or press Ctrl-D to stop after running tasks finish
   rider run-task <id>      one attempt at a task already claimed by $BOARD_PROFILE
-  rider reap [--yes]       list orphaned vb processes whose board no longer answers;
-                           --yes stops them
+  rider reap [--url <board>]... [--yes]
+                           list orphaned vb processes whose board no longer answers,
+                           only those on the given boards if any; --yes stops them
 
 environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
@@ -41,8 +42,10 @@ environment:
 
 /// The longest project name.
 pub const PROJECT_LEN_MAX: usize = 64;
-/// Upper bound on the arguments rider looks at; every command takes at most one.
-pub const ARGS_MAX: usize = 4;
+/// Upper bound on the boards one `rider reap` names.
+pub const REAP_URLS_MAX: usize = 8;
+/// Upper bound on the arguments rider looks at: the longest command, plus one to report.
+pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 3;
 /// Upper bound on what `rider pool` reads from standard input before it stops.
 pub const STDIN_BYTES_MAX: u64 = 1024 * 1024;
 /// Every role's prompt file and the files they read, once each, built into the binary.
@@ -94,8 +97,10 @@ pub enum Command {
     Daemon,
     Pool(Project),
     RunTask(TaskId),
-    /// Lists leaked Board CLI processes; `yes` stops them too.
+    /// Lists leaked Board CLI processes, only those on `urls` unless it is empty; `yes` stops
+    /// them too.
     Reap {
+        urls: Vec<String>,
         yes: bool,
     },
 }
@@ -109,6 +114,7 @@ pub enum UsageError {
     ExtraArgument(String),
     BadProject(String),
     BadTaskId(String),
+    TooManyUrls,
 }
 
 impl fmt::Display for UsageError {
@@ -129,6 +135,7 @@ impl fmt::Display for UsageError {
                     "{text:?} is not a task id: use its number, such as 42 or #42"
                 )
             }
+            UsageError::TooManyUrls => write!(f, "name at most {REAP_URLS_MAX} boards"),
         }
     }
 }
@@ -150,10 +157,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             let project = rest.first().ok_or(UsageError::MissingArgument("project"))?;
             (Command::Pool(Project::parse(project)?), 1)
         }
-        "reap" => match rest.first().map(String::as_str) {
-            Some("--yes") => (Command::Reap { yes: true }, 1),
-            _ => (Command::Reap { yes: false }, 0),
-        },
+        "reap" => (parse_reap(rest)?, rest.len()),
         "run-task" => {
             let id = rest.first().ok_or(UsageError::MissingArgument("task id"))?;
             (Command::RunTask(parse_task_id(id)?), 1)
@@ -165,6 +169,36 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     }
     assert!(rest.len() == used);
     Ok(command)
+}
+
+fn parse_reap(rest: &[String]) -> Result<Command, UsageError> {
+    assert!(rest.len() < ARGS_MAX);
+    let mut urls: Vec<String> = Vec::new();
+    let mut yes = false;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let url = match word.as_str() {
+            "--yes" if !yes => {
+                yes = true;
+                continue;
+            }
+            "--url" => words
+                .next()
+                .ok_or(UsageError::MissingArgument("board URL"))?,
+            other => other
+                .strip_prefix("--url=")
+                .ok_or_else(|| UsageError::ExtraArgument(word.clone()))?,
+        };
+        if url.is_empty() {
+            return Err(UsageError::MissingArgument("board URL"));
+        }
+        if urls.len() == REAP_URLS_MAX {
+            return Err(UsageError::TooManyUrls);
+        }
+        urls.push(url.to_string());
+    }
+    assert!(urls.len() <= REAP_URLS_MAX);
+    Ok(Command::Reap { urls, yes })
 }
 
 fn parse_task_id(text: &str) -> Result<TaskId, UsageError> {
@@ -403,12 +437,12 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Daemon => daemon(config),
         Command::Pool(project) => pool(project, config),
         Command::RunTask(id) => run_one(*id, config),
-        Command::Reap { yes } => reap_leaks(*yes, config),
+        Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
     }
 }
 
-fn reap_leaks(yes: bool, config: &Config) -> Result<u8, CliError> {
-    let leaks = reap::find_leaks(&config.board_url).map_err(CliError::Reap)?;
+fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliError> {
+    let leaks = reap::find_leaks_on(&config.board_url, urls).map_err(CliError::Reap)?;
     for leak in &leaks {
         say(&reap::leak_line(leak));
     }

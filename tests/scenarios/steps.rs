@@ -678,15 +678,25 @@ impl Drop for Orphans {
 
 /// Given a `vb tail` on `url` whose parent has exited, so its parent is now process 1.
 pub fn given_an_orphaned_vb_tail(world: &World, orphans: &mut Orphans, url: &str) -> u32 {
+    given_an_orphaned_vb(
+        world,
+        orphans,
+        &["tail", "--url", url, "--as", "rider-daemon"],
+    )
+}
+
+/// Given `vb` run with `args` whose parent has exited, so its parent is now process 1.
+pub fn given_an_orphaned_vb(world: &World, orphans: &mut Orphans, args: &[&str]) -> u32 {
     let mut command = world.command(Path::new("/bin/sh"));
     command
         .args([
             "-c",
-            r#""$0" tail --url "$1" --as rider-daemon </dev/null >/dev/null 2>&1 &
+            r#""$@" </dev/null >/dev/null 2>&1 &
 echo $!"#,
+            "sh",
         ])
         .arg(&world.vb)
-        .arg(url);
+        .args(args);
     let output = crate::world::run_bounded(command, None);
     assert_eq!(output.code, Some(0), "{output:?}");
     let pid: u32 = output.stdout.trim().parse().expect("sh printed the pid");
@@ -697,6 +707,15 @@ echo $!"#,
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
     pid
+}
+
+/// A board URL on a local port that nothing listens on.
+pub fn an_unused_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let port = listener.local_addr().expect("read the bound port").port();
+    drop(listener);
+    assert!(port != 0 && port != 4100, "never the live board's port");
+    format!("http://127.0.0.1:{port}/api/board")
 }
 
 fn parent_of(pid: u32) -> Option<u32> {

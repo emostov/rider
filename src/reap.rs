@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ const POLL_MILLIS: u64 = 50;
 const INIT_PID: usize = 1;
 const VB_SUFFIX: &str = "/node_modules/.bin/vb";
 const URL_FLAG: &str = "--url";
+const SERVE: &str = "serve";
 
 /// A Board CLI process, orphaned, whose board does not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +94,13 @@ impl fmt::Display for ReapError {
 
 /// The leaked Board CLI processes of the current user, by pid; never one on `configured_url`.
 pub fn find_leaks(configured_url: &str) -> Result<Vec<Leak>, ReapError> {
+    find_leaks_on(configured_url, &[])
+}
+
+/// As `find_leaks`, but only those on one of `only` unless it is empty.
+pub fn find_leaks_on(configured_url: &str, only: &[String]) -> Result<Vec<Leak>, ReapError> {
     assert!(!configured_url.is_empty());
+    assert!(only.iter().all(|url| !url.is_empty()));
     let mut system = System::new().map_err(|error| ReapError::Table(error.to_string()))?;
     let kind = ProcessRefreshKind::nothing()
         .with_cmd(UpdateKind::Always)
@@ -114,7 +121,8 @@ pub fn find_leaks(configured_url: &str) -> Result<Vec<Leak>, ReapError> {
         let Some((url, command)) = board_client(process.cmd()) else {
             continue;
         };
-        if same_board(&url, configured_url) {
+        let named = only.is_empty() || only.iter().any(|wanted| same_board(&url, wanted));
+        if !named || same_board(&url, configured_url) {
             continue;
         }
         if candidates.len() == CANDIDATES_MAX {
@@ -143,6 +151,8 @@ pub fn find_leaks(configured_url: &str) -> Result<Vec<Leak>, ReapError> {
     Ok(leaks)
 }
 
+// A process whose arguments name `serve` is spared: it may be a Board server, which listens on
+// its own port whatever `--url` says.
 fn board_client(cmd: &[OsString]) -> Option<(String, String)> {
     let at = cmd
         .iter()
@@ -152,17 +162,23 @@ fn board_client(cmd: &[OsString]) -> Option<(String, String)> {
         .iter()
         .filter_map(|arg| arg.to_str())
         .collect();
-    let url = args.iter().enumerate().find_map(|(index, arg)| {
-        if let Some(value) = arg.strip_prefix("--url=") {
-            return Some(value);
+    let options = args
+        .iter()
+        .position(|arg| *arg == "--")
+        .unwrap_or(args.len());
+    let mut url = None;
+    let mut words = args[..options].iter();
+    while let Some(word) = words.next() {
+        if *word == SERVE {
+            return None;
         }
-        (*arg == URL_FLAG)
-            .then(|| args.get(index + 1).copied())
-            .flatten()
-    })?;
-    if url.is_empty() {
-        return None;
+        if *word == URL_FLAG {
+            url = Some(*words.next()?);
+        } else if let Some(value) = word.strip_prefix("--url=") {
+            url = Some(value);
+        }
     }
+    let url = url.filter(|url| !url.is_empty())?;
     let mut command = String::from("vb");
     for arg in &args {
         command.push(' ');
@@ -202,7 +218,8 @@ fn silent_boards<'a>(urls: &[&'a str]) -> Result<BTreeSet<&'a str>, ReapError> {
     Ok(silent)
 }
 
-// A URL that cannot be read counts as answering, so its process is left alone.
+// A URL that cannot be read, or names a host rather than an IP address, counts as answering, so
+// its process is left alone; resolving a name has no deadline.
 fn answers(url: &str) -> bool {
     let (rest, default_port) = if let Some(rest) = url.strip_prefix("http://") {
         (rest, 80)
@@ -213,22 +230,15 @@ fn answers(url: &str) -> bool {
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let authority = authority.rsplit('@').next().unwrap_or(authority);
-    if authority.is_empty() {
-        return true;
-    }
-    let has_port = authority
-        .rsplit_once(':')
-        .is_some_and(|(_, port)| !port.contains(']'));
-    let address = if has_port {
-        authority.to_string()
-    } else {
-        format!("{authority}:{default_port}")
-    };
-    let Ok(mut resolved) = address.to_socket_addrs() else {
-        return false;
-    };
-    let Some(socket) = resolved.next() else {
-        return false;
+    let socket = match authority.parse::<SocketAddr>() {
+        Ok(socket) => socket,
+        Err(_) => {
+            let host = authority.trim_start_matches('[').trim_end_matches(']');
+            let Ok(ip) = host.parse::<IpAddr>() else {
+                return true;
+            };
+            SocketAddr::new(ip, default_port)
+        }
     };
     TcpStream::connect_timeout(&socket, Duration::from_millis(PROBE_MILLIS)).is_ok()
 }
