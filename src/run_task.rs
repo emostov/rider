@@ -10,7 +10,9 @@ use serde::Serialize;
 use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
-use crate::brief::{Brief, echo, label, parse_brief};
+use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
+use crate::core::TASKS_MAX;
+use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
@@ -261,9 +263,14 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
     let start_label = label(&view, START_LABEL);
     // A label that is malformed, or names no commit here, is ignored: never fatal.
     let start = start_label.filter(|value| git::is_commit_id(value));
-    let prepared = validate(&view, env.attempts)
-        .and_then(|(brief, failed)| prepare(brief, failed, start, env, board));
-    let attempt = match prepared {
+    let (brief, failed) = match validate(&view, env.attempts) {
+        Ok(validated) => validated,
+        Err(block) => return Ok(block.prepared()),
+    };
+    if let Some(error) = unneeded_on_branch(&brief, &view, board)? {
+        return Ok(Block::new("invalid_brief", error.to_string()).prepared());
+    }
+    let attempt = match prepare(brief, failed, start, env, board) {
         Ok(attempt) => attempt,
         Err(block) => return Ok(block.prepared()),
     };
@@ -380,6 +387,59 @@ fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
     assert!(failed < u16::from(attempts));
     assert!(brief.id == view.id);
     Ok((brief, failed))
+}
+
+// An open task on the branch an `onto` task works must be one it needs, or one that waits for
+// it; any other would race it on the branch.
+fn unneeded_on_branch(
+    brief: &Brief,
+    view: &TaskView,
+    board: &dyn Board,
+) -> Result<Option<BriefError>, RunError> {
+    assert!(brief.id == view.id);
+    let Some(onto) = brief.onto else {
+        return Ok(None);
+    };
+    let target = board.read_task(onto)?;
+    let branch = label(&target, BRANCH_LABEL);
+    let open = board.list_open(SUBTREE)?.tasks;
+    let on_branch = closure(&open, onto, |task, members| {
+        let works_onto = parse_id_label(task, "onto").ok().flatten();
+        branch.is_some() && label(task, BRANCH_LABEL) == branch
+            || works_onto.is_some_and(|id| members.contains(&id))
+    });
+    let after = closure(&open, view.id, |task, members| {
+        task.needs.iter().any(|need| members.contains(need))
+    });
+    let unneeded = open
+        .iter()
+        .map(|task| task.id)
+        .find(|id| on_branch.contains(id) && !after.contains(id) && !view.needs.contains(id));
+    assert!(unneeded != Some(view.id));
+    Ok(unneeded.map(|unfinished| BriefError::OntoNotNeeded { unfinished, onto }))
+}
+
+// `seed` and every task in `open` that `joins` the members found so far, until none joins.
+fn closure(
+    open: &[TaskView],
+    seed: TaskId,
+    joins: impl Fn(&TaskView, &[TaskId]) -> bool,
+) -> Vec<TaskId> {
+    assert!(open.len() <= TASKS_MAX);
+    let mut members = vec![seed];
+    for _ in 0..=open.len() {
+        let joining: Vec<TaskId> = open
+            .iter()
+            .filter(|task| !members.contains(&task.id) && joins(task, &members))
+            .map(|task| task.id)
+            .collect();
+        if joining.is_empty() {
+            break;
+        }
+        members.extend(joining);
+    }
+    assert!(members.len() <= open.len() + 1);
+    members
 }
 
 fn parse_attempts(value: &str) -> Option<u16> {
@@ -752,9 +812,8 @@ fn evidence(attempt: &Attempt) -> Result<Evidence, String> {
                 ));
             }
             let head = git::commit_of(dir, &full).map_err(text)?;
-            // A restack rebases its branch, so only it may leave its starting commit behind.
-            let restacks = attempt.brief.onto.is_some();
-            let keeps_start = restacks || git::is_ancestor(dir, start, &head).map_err(text)?;
+            let keeps_start =
+                attempt.brief.restack || git::is_ancestor(dir, start, &head).map_err(text)?;
             let commits = git::own_commit_count(dir, branch, &head, start).map_err(text)?;
             (
                 current.as_deref() == Some(branch),
@@ -956,6 +1015,11 @@ mod tests {
         view(ID.0, &labels, TaskState::Claimed)
     }
 
+    fn needing(mut view: TaskView, need: u64) -> TaskView {
+        view.needs.push(TaskId(need));
+        view
+    }
+
     fn start_call(fixture: &Fixture, rev: &str) -> String {
         format!(
             "set_label 7 start={}",
@@ -1062,7 +1126,7 @@ mod tests {
     fn a_base_task_without_a_branch_blocks_as_an_invalid_brief() {
         let (fixture, env) = setup("run-base");
         let base = view(3, &[], TaskState::Completed);
-        let board = FakeBoard::new(vec![task(&fixture, &[("base", "#3")]), base]);
+        let board = FakeBoard::new(vec![needing(task(&fixture, &[("base", "#3")]), 3), base]);
         assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
         let reason = "Set the `branch` label on task #3 to its branch, or remove the `base` \
                       label from this task.";
@@ -1557,37 +1621,22 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_rewritten_below_its_start_fails_unless_the_task_restacks() {
+    fn a_branch_rewritten_below_its_start_fails() {
         let (fixture, env) = setup("run-rewrite-base");
         let base = base_task(&fixture);
-        let board = FakeBoard::new(vec![task(&fixture, &[("base", "#3")]), base]);
+        let board = FakeBoard::new(vec![needing(task(&fixture, &[("base", "#3")]), 3), base]);
         let reason = "no committed work: the branch no longer contains its starting commit";
         let expected = Verdict::Fail {
             reason: reason.to_string(),
         };
         assert_eq!(run(&env, &board, &rewriting_agent(&fixture)), expected);
-
-        let (fixture, env) = setup("run-rewrite-onto");
-        let base = base_task(&fixture);
-        let board = FakeBoard::new(vec![task(&fixture, &[("onto", "#3")]), base]);
-        let start = start_call(&fixture, "rider/3-store");
-        let verdict = run(&env, &board, &rewriting_agent(&fixture));
-        assert_eq!(verdict, completed("Extracted the store."));
-        let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
-        let expected = vec![
-            "set_label 7 branch=rider/3-store".to_string(),
-            start,
-            record(Some("rider/3-store"), &head, 1, "Extracted the store."),
-            "complete 7 Extracted the store.".to_string(),
-        ];
-        assert_eq!(calls(&board), expected);
     }
 
     #[test]
     fn a_review_that_commits_fails() {
         let (fixture, env) = setup("run-review");
         let base = base_task(&fixture);
-        let mut review = task(&fixture, &[("of", "#3")]);
+        let mut review = needing(task(&fixture, &[("of", "#3")]), 3);
         review.labels[0].1 = "review".to_string();
         let board = FakeBoard::new(vec![review, base]);
         let expected = Verdict::Fail {
@@ -1597,7 +1646,7 @@ mod tests {
 
         let (fixture, env) = setup("run-review-ok");
         let base = base_task(&fixture);
-        let mut review = task(&fixture, &[("of", "#3")]);
+        let mut review = needing(task(&fixture, &[("of", "#3")]), 3);
         review.labels[0].1 = "review".to_string();
         let board = FakeBoard::new(vec![review, base]);
         let reading = |_: &CommandLine, _: &Path, log: &Path| {
@@ -1766,30 +1815,11 @@ mod tests {
     }
 
     #[test]
-    fn a_restack_completes_when_it_rebases_and_fails_when_it_only_drops() {
-        let (fixture, env) = setup("run-restack");
-        let base = base_task(&fixture);
-        fixture.commit(&fixture.repo, "main.txt", "main moved on");
-        let board = FakeBoard::new(vec![task(&fixture, &[("onto", "#3")]), base]);
-        let rebase = |_: &CommandLine, dir: &Path, log: &Path| {
-            git(dir, &["rebase", "-q", "main"]);
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(
-            run(&env, &board, &rebase),
-            completed("Extracted the store.")
-        );
-        let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
-        let last = calls(&board)[2].clone();
-        assert_eq!(
-            last,
-            record(Some("rider/3-store"), &head, 1, "Extracted the store.")
-        );
-
+    fn a_restack_that_only_drops_commits_fails() {
         let (fixture, env) = setup("run-restack-drop");
         let base = base_task(&fixture);
-        let board = FakeBoard::new(vec![task(&fixture, &[("onto", "#3")]), base]);
+        let restack = task(&fixture, &[("onto", "#3"), ("restack", "1")]);
+        let board = FakeBoard::new(vec![restack, base]);
         let drop = |_: &CommandLine, dir: &Path, log: &Path| {
             git(dir, &["reset", "-q", "--hard", "HEAD~1"]);
             write_log(log, &format!("{DONE_STREAM}\n"));

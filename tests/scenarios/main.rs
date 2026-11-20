@@ -1208,3 +1208,153 @@ fn the_daemon_blocks_a_task_whose_worktree_has_no_board_record_and_leaves_it_unt
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
+
+#[test]
+fn a_task_based_on_a_task_it_does_not_need_is_blocked_as_an_invalid_brief() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let stacked = NewTask::new("Add the stacked work.")
+        .label("repo", world.repo_label())
+        .label("base", &built)
+        .role("implement");
+    let stacked = when_the_lead_creates(&world, &stacked);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&built, &stacked]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["completed", "blocked"]);
+    let reason = format!(
+        "Add task #{built} to this task's needs, or remove the `base` label: a task is cut \
+         from its `base` task's branch only once that task is done."
+    );
+    assert_eq!(
+        task_block(&world, &stacked),
+        Some(("invalid_brief".to_string(), reason))
+    );
+    assert_eq!(agent_runs_for(&world, &stacked), vec![]);
+}
+
+#[test]
+fn an_onto_task_that_does_not_need_an_unfinished_task_on_its_branch_is_blocked() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let asking = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    given_the_agent_will(&world, &asking, &[Behaviour::Block]);
+    when_the_pool_starts(&mut world);
+    assert_eq!(
+        when_the_tasks_settle(&world, &[&built, &asking]),
+        vec!["completed", "blocked"]
+    );
+
+    let racing = a_fix(&world, "Fix the work again.", &built, &built, false);
+    let racing = when_the_lead_creates(&world, &racing);
+    let states = when_the_tasks_settle(&world, &[&racing]);
+    let exit = when_the_pool_is_stopped(&mut world);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = format!(
+        "Add task #{asking} to this task's needs: it is unfinished on the branch of task \
+         #{built}, which this task works `onto`."
+    );
+    assert_eq!(
+        task_block(&world, &racing),
+        Some(("invalid_brief".to_string(), reason))
+    );
+    assert_eq!(agent_runs_for(&world, &racing), vec![]);
+}
+
+#[test]
+fn a_review_that_does_not_need_the_task_it_checks_is_blocked_by_the_pool_and_the_daemon() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = |world: &World, text: &str| {
+        NewTask::new(text)
+            .label("repo", world.repo_label())
+            .label("of", &built)
+            .role("review")
+    };
+    let by_pool = when_the_lead_creates(&world, &review(&world, "Review the work."));
+    when_the_pool_starts(&mut world);
+    let pool_states = when_the_tasks_settle(&world, &[&built, &by_pool]);
+    assert_eq!(when_the_pool_is_stopped(&mut world), Some(0));
+    let by_daemon = when_the_lead_creates(&world, &review(&world, "Review the work again."));
+    given_a_running_daemon(&mut world);
+    let daemon_states = when_the_tasks_settle(&world, &[&by_daemon]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(pool_states, vec!["completed", "blocked"]);
+    assert_eq!(daemon_states, vec!["blocked"]);
+    let reason = format!(
+        "Add task #{built} to this task's needs, or change the `of` label: a task checks \
+         the work of its `of` task only once that task is done."
+    );
+    for task in [&by_pool, &by_daemon] {
+        assert_eq!(
+            task_block(&world, task),
+            Some(("invalid_brief".to_string(), reason.clone()))
+        );
+        assert_eq!(agent_runs_for(&world, task), vec![]);
+    }
+}
+
+#[test]
+fn an_onto_task_that_rebases_away_its_branchs_earlier_commits_fails() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    given_the_agent_will(&world, &fix, &[Behaviour::DropEarlier]);
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+
+    assert_eq!(states, vec!["completed", "failed"]);
+    assert_eq!(exit, Some(0));
+    let text = task_text(&world, &fix);
+    let reason = "no committed work: the branch no longer contains its starting commit";
+    assert!(text.contains(reason), "{text}");
+}
+
+#[test]
+fn a_restack_task_that_rebases_onto_the_named_commit_completes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    when_the_pool_starts(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
+    fs::write(world.repo.join("moved.txt"), "main moved on\n").expect("write to main");
+    world.git_ok(&["add", "moved.txt"]);
+    world.git_ok(&["commit", "-q", "-m", "Move main on."]);
+    let moved = world.git_ok(&["rev-parse", MAIN]);
+
+    let restack =
+        a_fix(&world, "Restack the work onto main.", &built, &built, false).label("restack", "1");
+    let restack = when_the_lead_creates(&world, &restack);
+    given_the_agent_will(&world, &restack, &[Behaviour::RebaseOntoMain]);
+    let states = when_the_tasks_settle(&world, &[&restack]);
+    let exit = when_the_pool_is_stopped(&mut world);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let branch = task_label(&world, &built, "branch").expect("the built task's branch");
+    assert!(is_ancestor(&world, &moved, &branch), "{branch} has {moved}");
+    assert_eq!(
+        branch_head_subject(&world, &branch),
+        fake_agent::work_subject(&restack, 0)
+    );
+}

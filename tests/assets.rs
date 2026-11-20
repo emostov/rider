@@ -169,10 +169,10 @@ fn reviewers_find_their_range_from_the_start_label() {
 }
 
 #[test]
-fn only_a_task_with_onto_may_rebase() {
+fn only_a_task_with_restack_may_rebase() {
     let prompt = asset("prompts/implement.md");
-    assert!(prompt.contains("the task has an `onto` label"));
-    assert!(prompt.contains("Without an `onto` label, never rebase"));
+    assert!(prompt.contains("the task has the labels `onto` and `restack=1`"));
+    assert!(prompt.contains("Without\n  `restack=1`, never rebase"));
 }
 
 #[test]

@@ -605,6 +605,7 @@ mod tests {
             of: None,
             from: Some("main".to_string()),
             resume: false,
+            restack: false,
             text: text.to_string(),
         }
     }

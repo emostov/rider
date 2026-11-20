@@ -277,6 +277,13 @@ struct TaskMessage {
 struct TaskFields {
     state: String,
     claim: Option<Claim>,
+    blocked: Option<Blocked>,
+}
+
+#[derive(Deserialize)]
+struct Blocked {
+    kind: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -313,6 +320,12 @@ fn parse<T: DeserializeOwned>(json: &str) -> T {
 /// A task's `vb read <id> --json`.
 pub fn read_task(world: &World, id: &str) -> TaskRead {
     parse(&world.vb_lead(&["read", id, "--json"], None))
+}
+
+/// A blocked task's block kind and reason, or `None` when it is not blocked.
+pub fn task_block(world: &World, id: &str) -> Option<(String, String)> {
+    let blocked = read_task(world, id).message.task.blocked;
+    blocked.map(|blocked| (blocked.kind, blocked.reason))
 }
 
 /// A task's state: `ready`, `claimed`, `completed`, `failed`, `blocked`, or `canceled`.

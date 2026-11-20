@@ -42,6 +42,10 @@ pub enum Behaviour {
     RefuseResume,
     /// Like `RefuseResume`, but only after working for `SLOW_SECONDS`.
     RefuseResumeSlowly,
+    /// Resets its branch to the commit below `HEAD`, then commits like `Commit`.
+    DropEarlier,
+    /// Rebases its branch onto `main`, then commits like `Commit`.
+    RebaseOntoMain,
 }
 
 impl Behaviour {
@@ -56,6 +60,8 @@ impl Behaviour {
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::RefuseResume => "refuse-resume",
             Behaviour::RefuseResumeSlowly => "refuse-resume-slowly",
+            Behaviour::DropEarlier => "drop-earlier",
+            Behaviour::RebaseOntoMain => "rebase-onto-main",
         }
     }
 }
@@ -150,6 +156,8 @@ commit() {{
 case "$behaviour" in
   commit) commit || exit 1 ;;
   commit-nothing) ;;
+  drop-earlier) git reset -q --hard HEAD~1 && commit || exit 1 ;;
+  rebase-onto-main) git rebase -q main && commit || exit 1 ;;
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
