@@ -42,6 +42,12 @@ from, and what stays theirs to decide
 (spending money, changing the goal, anything that cannot be undone). Everything else is
 yours: decide, say why in one line, and move.
 
+Any configuration you ask the owner for (ship settings, `rider.toml` limits or roles, anything
+saved for later sessions) is saved for the current repository by default. Offer "every
+repository" as the other choice, with the repository first and marked as the default. Where a
+file has no per-repository form yet (`rider.toml` today, GitHub issue #119), tell the owner so
+when you ask: the answer applies to every repository there.
+
 ## Roles
 
 | `role` label | Model | Board profile | Shown as | Commits |

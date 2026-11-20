@@ -17,7 +17,9 @@ channel while the rest of the work goes on.
 
 **The swarm** runs agents in roles you configure in `~/.rider/rider.toml`. Each role sets
 its agents' model and prompt and how many replicas run at once. `rider config` prints the
-settings in effect.
+settings in effect. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI)
+or `tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
+for the roles that use it.
 
 ## Getting started
 

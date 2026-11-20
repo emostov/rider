@@ -177,7 +177,13 @@ pub fn when_the_pool_starts(world: &mut World) {
 
 /// When `tasks` have all settled, within `SETTLE_SECONDS_MAX`; returns their states in order.
 pub fn when_the_tasks_settle(world: &World, tasks: &[&str]) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    when_the_tasks_settle_within(world, tasks, SETTLE_SECONDS_MAX)
+}
+
+/// When `tasks` have all settled, within `seconds`; returns their states in order.
+pub fn when_the_tasks_settle_within(world: &World, tasks: &[&str], seconds: u64) -> Vec<String> {
+    assert!(!tasks.is_empty() && seconds >= SETTLE_SECONDS_MAX);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let states: Vec<String> = tasks.iter().map(|id| task_state(world, id)).collect();
         if states.iter().all(|state| SETTLED.contains(&state.as_str())) {
@@ -185,7 +191,7 @@ pub fn when_the_tasks_settle(world: &World, tasks: &[&str]) -> Vec<String> {
         }
         if Instant::now() >= deadline {
             panic!(
-                "tasks {tasks:?} were {states:?} after {SETTLE_SECONDS_MAX} seconds; pool log:\n{}",
+                "tasks {tasks:?} were {states:?} after {seconds} seconds; pool log:\n{}",
                 world.pool_log()
             );
         }
@@ -215,13 +221,17 @@ pub fn when_the_pool_is_stopped(world: &mut World) -> Option<i32> {
     status.code()
 }
 
-/// When the pool runs until `tasks` settle and is then stopped; returns the states and exit.
+/// When the pool runs until `tasks` settle, each within `SETTLE_SECONDS_MAX` of the one before,
+/// and is then stopped; returns the states and exit.
 pub fn when_the_pool_runs_until_settled(
     world: &mut World,
     tasks: &[&str],
 ) -> (Vec<String>, Option<i32>) {
     when_the_pool_starts(world);
-    let states = when_the_tasks_settle(world, tasks);
+    let states: Vec<String> = tasks
+        .iter()
+        .flat_map(|task| when_the_tasks_settle(world, &[task]))
+        .collect();
     let exit = when_the_pool_is_stopped(world);
     assert_eq!(states.len(), tasks.len());
     (states, exit)
@@ -649,6 +659,24 @@ pub fn when_agents_json_names(world: &World, pid: u32) {
         assert!(
             Instant::now() < deadline,
             "agents.json never named {pid}: {text}"
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When `id`'s claim has been renewed past `first`, within `SETTLE_SECONDS_MAX`; returns its end.
+pub fn when_the_claim_moves_past(world: &World, id: &str, first: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    loop {
+        let until = task_claim_until(world, id);
+        let until = until.unwrap_or_else(|| panic!("task {id} is no longer claimed"));
+        if until.as_str() > first {
+            return until;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the claim on task {id} stayed until {until}:\n{}",
+            world.pool_log()
         );
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
