@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,8 +25,11 @@ const COMMAND_SECONDS_MAX: u64 = 30;
 const OUTPUT_BYTES_MAX: u64 = 4 << 20;
 const BOARD_START_SECONDS_MAX: u64 = 30;
 const POLL_MILLIS: u64 = 100;
-const STREAMS: usize = 2;
+const REAP_SECONDS_MAX: u64 = 5;
+const EVENTS_MAX: usize = 3;
 const AGENT_PIDS_MAX: usize = 256;
+const PROCESSES_MAX: usize = 65_536;
+const DROP_FAILURES_MAX: usize = 4;
 const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const INSTALL_HINT: &str = "install Node 22 and the Board CLI: \
                             npm install --prefix ~/.rider/node @vercel/board";
@@ -46,6 +49,7 @@ pub struct World {
     pub vb: PathBuf,
     pub(crate) board: Option<Child>,
     pub(crate) pool: Option<Pool>,
+    owns_root: bool,
 }
 
 /// A running `rider pool` and the standard input that stops it.
@@ -99,7 +103,7 @@ pub fn find_tools() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-fn scratch_root() -> PathBuf {
+fn scratch_path() -> PathBuf {
     let n = WORLDS.fetch_add(1, Ordering::SeqCst);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,8 +111,7 @@ fn scratch_root() -> PathBuf {
     let name = format!("rider-scenario-{}-{n}-{nanos}", std::process::id());
     let temp = std::env::temp_dir().canonicalize();
     let root = temp.expect("resolve the temporary directory").join(name);
-    fs::create_dir(&root).expect("create the scenario's directory");
-    assert!(root.is_absolute() && root.is_dir());
+    assert!(root.is_absolute());
     root
 }
 
@@ -131,9 +134,9 @@ impl World {
     pub fn new() -> Option<World> {
         let (installed_vb, node) = find_tools()?;
         let url = format!("http://127.0.0.1:{}/api/board", free_port());
-        let root = scratch_root();
-        // Built before any further setup so a failure from here on unwinds through Drop.
-        let world = World {
+        let root = scratch_path();
+        // Built before the root exists so a failure from its creation on unwinds through Drop.
+        let mut world = World {
             repo: root.join("repo"),
             vb: root.join("rider-home/node/node_modules/.bin/vb"),
             home: root.join("rider-home"),
@@ -143,7 +146,12 @@ impl World {
             url,
             board: None,
             pool: None,
+            owns_root: false,
         };
+        if let Err(error) = fs::create_dir(&world.root) {
+            panic!("create the scenario's directory: {error}");
+        }
+        world.owns_root = true;
         let vb_dir = world.vb.parent().expect("vb has a directory");
         for dir in [
             vb_dir,
@@ -267,19 +275,37 @@ impl World {
 pub enum RunError {
     Spawn(std::io::Error),
     Wait(std::io::Error),
-    /// The command, or a descendant holding its output, outlived `COMMAND_SECONDS_MAX`.
+    /// Writing the command's standard input failed.
+    Input(std::io::Error),
+    /// Reading the command's standard output or error failed.
+    Read(std::io::Error),
+    /// The command printed more than `OUTPUT_BYTES_MAX` bytes on one stream.
+    OutputTooLong,
+    /// The command, or a descendant holding its input or output, outlived `COMMAND_SECONDS_MAX`.
     TimedOut,
+    /// The command was still running `REAP_SECONDS_MAX` after it was killed.
+    Unkilled,
 }
 
-enum Stream {
+enum Event {
     Stdout(String),
     Stderr(String),
+    Written,
+    Failed(RunError),
 }
 
-fn read_all(stream: impl Read, send: SyncSender<Stream>, wrap: fn(String) -> Stream) {
+fn read_all(stream: impl Read, send: SyncSender<Event>, wrap: fn(String) -> Event) {
     let mut bytes = Vec::new();
-    let _ = stream.take(OUTPUT_BYTES_MAX).read_to_end(&mut bytes);
-    let _ = send.send(wrap(String::from_utf8_lossy(&bytes).into_owned()));
+    let read = stream.take(OUTPUT_BYTES_MAX + 1).read_to_end(&mut bytes);
+    let event = match read {
+        Err(error) => Event::Failed(RunError::Read(error)),
+        Ok(_) if u64::try_from(bytes.len()).map_or(true, |n| n > OUTPUT_BYTES_MAX) => {
+            Event::Failed(RunError::OutputTooLong)
+        }
+        Ok(_) => wrap(String::from_utf8_lossy(&bytes).into_owned()),
+    };
+    // The receiver is gone only once the command has already been judged.
+    let _ = send.send(event);
 }
 
 /// Runs `command` to its end within `COMMAND_SECONDS_MAX`, panicking when it cannot.
@@ -289,13 +315,17 @@ pub fn run_bounded(command: Command, input: Option<&str>) -> Output {
         Ok(output) => return output,
         Err(RunError::Spawn(error)) => format!("could not start: {error}"),
         Err(RunError::Wait(error)) => format!("could not be polled: {error}"),
+        Err(RunError::Input(error)) => format!("could not be given its input: {error}"),
+        Err(RunError::Read(error)) => format!("could not be read: {error}"),
+        Err(RunError::OutputTooLong) => format!("printed over {OUTPUT_BYTES_MAX} bytes"),
         Err(RunError::TimedOut) => format!("outlived {COMMAND_SECONDS_MAX} seconds"),
+        Err(RunError::Unkilled) => format!("outlived its kill by {REAP_SECONDS_MAX} seconds"),
     };
     panic!("{shown} {why}");
 }
 
 /// Runs `command` in its own process group, feeding `input` and reading both outputs, and
-/// kills the group when the whole exchange outlives `COMMAND_SECONDS_MAX`.
+/// kills it and its group when the whole exchange fails or outlives `COMMAND_SECONDS_MAX`.
 pub fn run_within(mut command: Command, input: Option<&str>) -> Result<Output, RunError> {
     if input.is_some() {
         command.stdin(Stdio::piped());
@@ -306,54 +336,82 @@ pub fn run_within(mut command: Command, input: Option<&str>) -> Result<Output, R
         .process_group(0);
     let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS_MAX);
     let mut child = command.spawn().map_err(RunError::Spawn)?;
+    let (send, receive) = sync_channel(EVENTS_MAX);
+    let mut events = 0;
     if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
-        let text = text.to_string();
-        thread::spawn(move || stdin.write_all(text.as_bytes()));
+        let (text, send) = (text.to_string(), send.clone());
+        thread::spawn(move || {
+            let event = match stdin.write_all(text.as_bytes()) {
+                Ok(()) => Event::Written,
+                Err(error) => Event::Failed(RunError::Input(error)),
+            };
+            drop(stdin);
+            let _ = send.send(event);
+        });
+        events += 1;
     }
-    let (send, receive) = sync_channel(STREAMS);
     if let Some(stdout) = child.stdout.take() {
         let send = send.clone();
-        thread::spawn(move || read_all(stdout, send, Stream::Stdout));
+        thread::spawn(move || read_all(stdout, send, Event::Stdout));
+        events += 1;
     }
     if let Some(stderr) = child.stderr.take() {
-        thread::spawn(move || read_all(stderr, send, Stream::Stderr));
+        thread::spawn(move || read_all(stderr, send, Event::Stderr));
+        events += 1;
     }
-    let finished = finish_within(&mut child, &receive, deadline);
-    if finished.is_err() {
-        kill(child.id(), true);
-        let _ = child.wait();
+    assert!(events <= EVENTS_MAX);
+    let finished = finish_within(&mut child, &receive, events, deadline);
+    match finished {
+        Ok(output) => Ok(output),
+        Err(_) if !reap(&mut child) => Err(RunError::Unkilled),
+        Err(error) => Err(error),
     }
-    finished
 }
 
 fn finish_within(
     child: &mut Child,
-    receive: &Receiver<Stream>,
+    receive: &Receiver<Event>,
+    mut events: usize,
     deadline: Instant,
 ) -> Result<Output, RunError> {
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(RunError::Wait)? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            return Err(RunError::TimedOut);
-        }
-        thread::sleep(Duration::from_millis(POLL_MILLIS / 10));
-    };
+    let step = Duration::from_millis(POLL_MILLIS / 10);
     let mut output = Output {
-        code: status.code(),
+        code: None,
         stdout: String::new(),
         stderr: String::new(),
     };
-    for _ in 0..STREAMS {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match receive.recv_timeout(left) {
-            Ok(Stream::Stdout(text)) => output.stdout = text,
-            Ok(Stream::Stderr(text)) => output.stderr = text,
-            Err(_) => return Err(RunError::TimedOut),
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait().map_err(RunError::Wait)?;
         }
+        if let (Some(status), 0) = (status, events) {
+            output.code = status.code();
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(RunError::TimedOut);
+        }
+        if events == 0 {
+            thread::sleep(step.min(left));
+            continue;
+        }
+        let event = match receive.recv_timeout(step.min(left)) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => panic!("a command's I/O thread vanished"),
+        };
+        match event {
+            Event::Stdout(text) => output.stdout = text,
+            Event::Stderr(text) => output.stderr = text,
+            Event::Written => {}
+            Event::Failed(error) => return Err(error),
+        }
+        events -= 1;
     }
-    assert!(output.stdout.len() as u64 <= OUTPUT_BYTES_MAX * 3);
+    let within = |text: &str| u64::try_from(text.len()).is_ok_and(|n| n <= OUTPUT_BYTES_MAX);
+    assert!(within(&output.stdout) && within(&output.stderr));
     Ok(output)
 }
 
@@ -364,6 +422,7 @@ fn kill(pid: u32, group: bool) {
     } else {
         pid.to_string()
     };
+    // The target may already be gone; whoever needs it dead checks that afterwards.
     let _ = Command::new("/bin/kill")
         .args(["-KILL", "--", &target])
         .stdin(Stdio::null())
@@ -372,49 +431,104 @@ fn kill(pid: u32, group: bool) {
         .status();
 }
 
-// An agent's command line names its script, a path only this world uses, from the moment it
-// starts, before it can log anything.
-fn agent_pids(world: &World) -> Vec<u32> {
-    let marker = format!("{}/", world.agents.display());
-    let mut command = Command::new("/usr/bin/pgrep");
-    command.args(["-f", "--", &marker]).stdin(Stdio::null());
-    let Ok(output) = run_within(command, None) else {
-        return Vec::new();
-    };
-    let pids: Vec<u32> = output
-        .stdout
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .filter(|pid| *pid > 1)
-        .take(AGENT_PIDS_MAX)
-        .collect();
+/// Kills `child` and its process group; whether it was reaped within `REAP_SECONDS_MAX`.
+fn reap(child: &mut Child) -> bool {
+    kill(child.id(), true);
+    // A child that left its group is missed by the group signal.
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => thread::sleep(Duration::from_millis(POLL_MILLIS / 10)),
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// The pids of processes running this world's fake agents, found by their scripts' literal
+/// paths as whole words of their command lines.
+fn agent_pids(world: &World) -> Result<Vec<u32>, String> {
+    let scripts = ["claude", "codex"].map(|name| world.agents.join(name).display().to_string());
+    let mut command = Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "pid=,command="])
+        .stdin(Stdio::null());
+    let output = run_within(command, None).map_err(|error| format!("ps failed: {error:?}"))?;
+    if output.code != Some(0) {
+        return Err(format!("ps exited {:?}: {}", output.code, output.stderr));
+    }
+    let mut pids = Vec::new();
+    for (index, line) in output.stdout.lines().enumerate() {
+        if index >= PROCESSES_MAX {
+            return Err(format!("ps listed over {PROCESSES_MAX} processes"));
+        }
+        let line = line.trim_start();
+        let (pid, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let pid: u32 = pid
+            .parse()
+            .map_err(|_| format!("unrecognised ps line {line:?}"))?;
+        let runs_agent = scripts.iter().any(|script| {
+            rest.match_indices(script.as_str()).any(|(at, _)| {
+                let after = &rest[at..][script.len()..];
+                (at == 0 || rest[..at].ends_with(' '))
+                    && (after.is_empty() || after.starts_with(' '))
+            })
+        });
+        if runs_agent && pid > 1 {
+            if pids.len() == AGENT_PIDS_MAX {
+                return Err(format!("over {AGENT_PIDS_MAX} fake agents are running"));
+            }
+            pids.push(pid);
+        }
+    }
     assert!(pids.len() <= AGENT_PIDS_MAX);
-    pids
+    Ok(pids)
 }
 
 impl Drop for World {
     fn drop(&mut self) {
-        if let Some(mut pool) = self.pool.take() {
-            kill(pool.child.id(), true);
-            let _ = pool.child.wait();
+        let mut failures: Vec<String> = Vec::with_capacity(DROP_FAILURES_MAX);
+        if let Some(mut pool) = self.pool.take()
+            && !reap(&mut pool.child)
+        {
+            failures.push("the pool outlived its kill".to_string());
         }
         // After the pool is dead no new agent can start, so one sweep finds them all.
         for pid in fake_agent::running_pids(&self.root) {
             kill(pid, true);
         }
-        for pid in agent_pids(self) {
-            kill(pid, true);
-            kill(pid, false);
+        match agent_pids(self) {
+            Ok(pids) => {
+                for pid in pids {
+                    kill(pid, true);
+                    kill(pid, false);
+                }
+            }
+            Err(why) => failures.push(why),
         }
-        if let Some(mut board) = self.board.take() {
-            kill(board.id(), true);
-            let _ = board.wait();
-        }
-        if self
-            .root
-            .starts_with(std::env::temp_dir().canonicalize().unwrap_or_default())
+        if let Some(mut board) = self.board.take()
+            && !reap(&mut board)
         {
-            let _ = fs::remove_dir_all(&self.root);
+            failures.push("the board outlived its kill".to_string());
+        }
+        let temp = std::env::temp_dir().canonicalize();
+        if self.owns_root
+            && temp.is_ok_and(|temp| self.root.starts_with(temp))
+            && let Err(error) = fs::remove_dir_all(&self.root)
+        {
+            failures.push(format!("removing {}: {error}", self.root.display()));
+        }
+        assert!(failures.len() <= DROP_FAILURES_MAX);
+        if failures.is_empty() {
+            return;
+        }
+        let why = format!("the scenario world was not cleaned up: {failures:?}\n");
+        if thread::panicking() {
+            let _ = std::io::stderr().write_all(why.as_bytes());
+        } else {
+            panic!("{why}");
         }
     }
 }
