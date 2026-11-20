@@ -78,17 +78,14 @@ impl Block {
         );
         Block { reason, kind }
     }
-}
 
-struct Attempt {
-    brief: Brief,
-    failed: u16,
-    retry: bool,
-    checkout: Checkout,
-    // Where the task's branch started: its `start` label, else where this attempt started.
-    reference: String,
-    cmd: CommandLine,
-    log: PathBuf,
+    fn prepared(self) -> Prepared {
+        assert!(!self.kind.is_empty());
+        Prepared::Blocked {
+            kind: self.kind,
+            reason: self.reason,
+        }
+    }
 }
 
 struct Work {
@@ -111,6 +108,64 @@ pub fn run_task(
     board: &dyn Board,
     launch: &dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError>,
 ) -> Result<Verdict, RunError> {
+    let attempt = match prepare_attempt(id, env, board)? {
+        Prepared::Ready(attempt) => attempt,
+        Prepared::Blocked { kind, reason } => {
+            board.block(id, &reason, kind)?;
+            return Ok(Verdict::LeaveBlocked);
+        }
+    };
+    let launched = attempt.launch(launch);
+    let judgement = judge_attempt(id, board, &attempt, launched)?;
+    settle_attempt(id, env, board, &attempt, &judgement)?;
+    Ok(judgement.verdict)
+}
+
+/// An attempt whose brief was checked and whose worktree is ready for its agent.
+pub struct Attempt {
+    brief: Brief,
+    failed: u16,
+    retry: bool,
+    checkout: Checkout,
+    // Where the task's branch started: its `start` label, else where this attempt started.
+    reference: String,
+    cmd: CommandLine,
+    log: PathBuf,
+}
+
+impl Attempt {
+    /// The branch the attempt works on, when the task has one.
+    pub fn branch(&self) -> Option<&str> {
+        let branch = self.checkout.branch.as_deref();
+        assert!(branch.is_none_or(|branch| !branch.is_empty()));
+        branch
+    }
+
+    /// Runs the attempt's agent in its worktree through `launch`, logging to its own log.
+    pub fn launch(
+        &self,
+        launch: &dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError>,
+    ) -> Result<Exit, HarnessError> {
+        assert!(self.checkout.dir.is_absolute() && self.log.is_absolute());
+        assert!(!self.cmd.program.is_empty());
+        launch(&self.cmd, &self.checkout.dir, &self.log)
+    }
+}
+
+/// What preparing an attempt came to: an attempt to run, or a block to write instead.
+pub enum Prepared {
+    Ready(Box<Attempt>),
+    Blocked { kind: &'static str, reason: String },
+}
+
+/// How an attempt's agent did, judged from its exit, its log and its worktree.
+pub struct Judgement {
+    pub verdict: Verdict,
+    work: Option<Work>,
+}
+
+/// Checks a claimed task's brief and readies its worktree, labelling its branch and start.
+pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepared, RunError> {
     assert!(env.home.is_absolute() && env.home.to_str().is_some());
     assert!(!env.profile.is_empty() && !env.board_url.is_empty());
     let view = board.read_task(id)?;
@@ -124,31 +179,49 @@ pub fn run_task(
         validate(&view).and_then(|(brief, failed)| prepare(brief, failed, start, env, board));
     let attempt = match prepared {
         Ok(attempt) => attempt,
-        Err(block) => {
-            board.block(id, &block.reason, block.kind)?;
-            return Ok(Verdict::LeaveBlocked);
-        }
+        Err(block) => return Ok(block.prepared()),
     };
     if let Some(branch) = &attempt.checkout.branch {
         if let Some(block) = label_branch(id, board, &view, branch)? {
-            board.block(id, &block.reason, block.kind)?;
-            return Ok(Verdict::LeaveBlocked);
+            return Ok(block.prepared());
         }
         if !attempt.retry && start_label.is_none() {
             board.set_label(id, START_LABEL, &attempt.checkout.start_head)?;
         }
     }
-    let launched = launch(&attempt.cmd, &attempt.checkout.dir, &attempt.log);
-    let (verdict, work) = inspect(id, board, &attempt, launched)?;
-    match (&verdict, work) {
+    Ok(Prepared::Ready(Box::new(attempt)))
+}
+
+/// Judges an attempt once its agent has ended, from the task's state and the worktree.
+pub fn judge_attempt(
+    id: TaskId,
+    board: &dyn Board,
+    attempt: &Attempt,
+    launched: Result<Exit, HarnessError>,
+) -> Result<Judgement, RunError> {
+    let (verdict, work) = inspect(id, board, attempt, launched)?;
+    assert!(!matches!(verdict, Verdict::Complete { .. }) || work.is_some());
+    Ok(Judgement { verdict, work })
+}
+
+/// Writes a judged attempt to the board: completes or fails the task, or leaves it blocked.
+pub fn settle_attempt(
+    id: TaskId,
+    env: &Env,
+    board: &dyn Board,
+    attempt: &Attempt,
+    judgement: &Judgement,
+) -> Result<(), RunError> {
+    assert!(attempt.brief.id == id);
+    match (&judgement.verdict, &judgement.work) {
         (Verdict::Complete { result }, Some(work)) => {
-            complete(id, env, board, &attempt, result, &work)?
+            complete(id, env, board, attempt, result, work)?
         }
         (Verdict::Complete { .. }, None) => panic!("a completion always has inspected work"),
-        (Verdict::Fail { reason }, _) => fail(id, board, &attempt, reason)?,
+        (Verdict::Fail { reason }, _) => fail(id, board, attempt, reason)?,
         (Verdict::LeaveBlocked, _) => {}
     }
-    Ok(verdict)
+    Ok(())
 }
 
 // A task's `branch` label is written once and never changed to another branch.

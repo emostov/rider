@@ -403,3 +403,109 @@ impl World {
         fake_agent::most_at_once(&self.root)
     }
 }
+
+/// How long a scenario waits for the daemon to say it is following the board.
+pub const DAEMON_START_SECONDS_MAX: u64 = 30;
+/// The line the daemon prints once it follows the board.
+pub const DAEMON_STARTED: &str = "rider daemon: following";
+
+/// Given a running `rider daemon` that follows the board.
+pub fn given_a_running_daemon(world: &mut World) {
+    assert!(world.pool.is_none(), "one daemon per world");
+    let log = fs::File::create(world.root.join("pool.log")).expect("create the daemon output");
+    let err = log.try_clone().expect("share the daemon output");
+    let child = world
+        .command(Path::new(env!("CARGO_BIN_EXE_rider")))
+        .arg("daemon")
+        .stdout(log)
+        .stderr(err)
+        .process_group(0)
+        .spawn()
+        .expect("start rider daemon");
+    world.pool = Some(Pool { child, stdin: None });
+    let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
+    while !world.pool_log().contains(DAEMON_STARTED) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not start within {DAEMON_START_SECONDS_MAX} seconds:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When the daemon is sent SIGTERM.
+pub fn when_the_daemon_is_sent_sigterm(world: &World) {
+    let pool = world.pool.as_ref().expect("the daemon was started");
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-TERM", &pool.child.id().to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success());
+}
+
+/// Then the daemon exits within `POOL_STOP_SECONDS_MAX`; returns its exit code.
+pub fn then_the_daemon_exits(world: &mut World) -> Option<i32> {
+    let pool = world.pool.as_mut().expect("the daemon was started");
+    let deadline = Instant::now() + Duration::from_secs(POOL_STOP_SECONDS_MAX);
+    let status = loop {
+        if let Some(status) = pool.child.try_wait().expect("poll the daemon") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not exit within {POOL_STOP_SECONDS_MAX} seconds:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    };
+    world.pool = None;
+    status.code()
+}
+
+/// Waits up to `seconds` for `task` to leave `ready`; returns the state it was found in.
+pub fn when_the_task_leaves_ready_within(world: &World, task: &str, seconds: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let state = task_state(world, task);
+        if state != "ready" || Instant::now() >= deadline {
+            return state;
+        }
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// Waits until a fake agent has started on `task`; returns its run.
+pub fn when_the_agent_has_started(world: &World, task: &str) -> Run {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    loop {
+        if let Some(run) = agent_runs_for(world, task).into_iter().next() {
+            return run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no agent started on task {task}:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// Runs `rider <args>` on the world's home to its end.
+pub fn when_rider_runs(world: &World, args: &[&str]) -> crate::world::Output {
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command.args(args);
+    crate::world::run_bounded(command, None)
+}
+
+/// Whether process `pid` still exists.
+pub fn is_alive(pid: u32) -> bool {
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run kill");
+    status.success()
+}
