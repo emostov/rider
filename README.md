@@ -132,7 +132,7 @@ Everything is under `~/.rider`, or `$RIDER_HOME` when it is set.
 Bump `version` in `Cargo.toml`, refresh `Cargo.lock` with
 `cargo update -p swarm-rider --offline`, and merge it to `main` once CI passes. Then tag the
 merge commit `v<version>` and push the tag; the release workflow checks the tag against the
-manifest, runs CI again, and creates the GitHub release. Publishing to crates.io is manual.
+manifest, runs CI again, and creates the GitHub release. Publishing to crates.io is manual. See [RELEASING.md](RELEASING.md).
 
 ## Status
 
