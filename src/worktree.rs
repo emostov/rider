@@ -1116,6 +1116,47 @@ mod tests {
         assert!(!checkout.dir.exists());
     }
 
+    fn detached_review(fixture: &Fixture) -> Checkout {
+        fixture.branch_ahead(BASE_BRANCH);
+        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let mut review = brief(fixture, "review", "Review");
+        review.of = Some(TaskId(3));
+        prepare(&review, &board, &fixture.home).unwrap()
+    }
+
+    #[test]
+    fn release_refuses_a_head_only_it_reaches_when_head_is_not_logged() {
+        let fixture = Fixture::new("wt-release-unlogged");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "false"]);
+        let checkout = detached_review(&fixture);
+        git(&fixture.repo, &["branch", "-q", "-D", BASE_BRANCH]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &checkout.start_head]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
+    }
+
+    #[test]
+    fn release_refuses_a_commit_only_an_old_id_in_its_head_reflog_reaches() {
+        let fixture = Fixture::new("wt-release-old-id");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "false"]);
+        let checkout = detached_review(&fixture);
+        let orphan = fixture.commit(&checkout.dir, "orphan.txt", "orphan");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "true"]);
+        let start = checkout.start_head.as_str();
+        git(&checkout.dir, &["checkout", "-q", "--detach", start]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &orphan]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
+    }
+
     #[test]
     fn release_removes_a_worktree_holding_ignored_build_output_and_keeps_its_branch() {
         let fixture = Fixture::new("wt-release-ignored");

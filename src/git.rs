@@ -2,7 +2,8 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::thread::{self, JoinHandle};
@@ -393,14 +394,58 @@ fn reflog_commits(dir: &Path, log_args: &[&str]) -> Result<Vec<String>, GitError
     Ok(commits)
 }
 
-/// The commits `dir`'s own HEAD reflog reaches that no local branch nor any branch's reflog
-/// does: the commits lost when the worktree, and with it that reflog, is removed.
+// A reflog record is `<old id> <new id> <identity>\t<message>`; a ref's first record has an
+// all-zero old id. Neither id is guaranteed to be reachable from anything else.
+fn head_reflog_ids(dir: &Path) -> Result<Vec<String>, GitError> {
+    let words = [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "logs/HEAD",
+    ];
+    let args = words.map(OsStr::new);
+    let stdout = run_ok(dir, &args)?;
+    let path = absolute_path(&args, &stdout)?;
+    let shown_path = path.display().to_string();
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(GitError::Io(format!("opening {shown_path}: {error}"))),
+    };
+    let bytes = read_bounded(&mut file, &shown_path)?;
+    let malformed = |line: &[u8]| GitError::Parse {
+        args: shown_path.clone(),
+        stdout: String::from_utf8_lossy(line).into_owned(),
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for line in bytes.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+        let mut fields = line.splitn(3, |&b| b == b' ');
+        for _ in 0..2 {
+            let field = fields.next().ok_or_else(|| malformed(line))?;
+            let id = std::str::from_utf8(field).map_err(|_| malformed(line))?;
+            if !is_commit_id(id) {
+                return Err(malformed(line));
+            }
+            if id.bytes().any(|b| b != b'0') {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    assert!(ids.len() <= bytes.len());
+    assert!(ids.iter().all(|id| is_commit_id(id)));
+    Ok(ids)
+}
+
+/// The commits `dir`'s own HEAD, or either id of any record of its HEAD reflog, reaches that
+/// no local branch nor any branch's reflog does: the commits lost when the worktree, and with
+/// it that reflog, is removed.
 pub fn head_reflog_only_commit_count(dir: &Path) -> Result<u64, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
-    let reached = reflog_commits(dir, &["log", "-g", "--format=%H", "HEAD", "--"])?;
-    if reached.is_empty() {
-        return Ok(0);
-    }
+    let mut reached = head_reflog_ids(dir)?;
+    reached.push(head(dir)?);
+    reached.sort_unstable();
+    reached.dedup();
+    assert!(!reached.is_empty());
     let kept = reflog_commits(dir, &["log", "-g", "--format=%H", "--branches", "--"])?;
     let mut input = String::new();
     for commit in &reached {
@@ -413,7 +458,16 @@ pub fn head_reflog_only_commit_count(dir: &Path) -> Result<u64, GitError> {
         input.push('\n');
     }
     assert!(input.lines().count() == reached.len() + kept.len());
-    let args = ["rev-list", "--count", "--stdin", "--not", "--branches"].map(OsStr::new);
+    // A record's id may name a commit already pruned, which removal can no longer lose.
+    let words = [
+        "rev-list",
+        "--count",
+        "--ignore-missing",
+        "--stdin",
+        "--not",
+        "--branches",
+    ];
+    let args = words.map(OsStr::new);
     let output = run_fed(dir, &args, Some(input.into_bytes()))?;
     if output.code != Some(0) {
         return Err(exit_error(&args, &output));
