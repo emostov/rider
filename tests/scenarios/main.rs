@@ -11,10 +11,12 @@ mod steps;
 mod world;
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1288,6 +1290,102 @@ fn rider_status_shows_a_running_and_a_waiting_task_and_rider_agents_the_running_
     when_the_daemon_is_sent_sigterm(&world);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn rider_logs_prints_a_completed_tasks_log_and_follows_a_running_one_until_its_agent_exits() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let done = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let running = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
+    given_the_agent_will(&world, &running, &[Behaviour::HoldTalking]);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&done]), vec!["completed"]);
+    when_the_agent_has_started(&world, &running);
+
+    let logs = when_rider_runs(&world, &["logs", &done]);
+    let mut follow = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    follow.args(["logs", "-f", &running]).stdout(Stdio::piped());
+    let mut follower = follow.spawn().expect("start rider logs -f");
+    let lines = lines_of(follower.stdout.take().expect("rider logs -f output"));
+
+    assert_eq!(logs.code, Some(0), "{logs:?}");
+    assert!(
+        logs.stdout.contains(&fake_agent::summary(&done, 0)),
+        "{logs:?}"
+    );
+    let first = lines.recv_timeout(Duration::from_secs(10));
+    assert_eq!(first, Ok(fake_agent::hold_line(&running)));
+    assert_eq!(follower.try_wait().expect("poll rider logs -f"), None);
+    world.release_agent(&running);
+    let rest: Vec<String> = lines.iter().collect();
+    let status = follower.wait().expect("wait for rider logs -f");
+    assert_eq!(status.code(), Some(0));
+    let summary = fake_agent::summary(&running, 0);
+    assert!(rest.iter().any(|line| line.contains(&summary)), "{rest:?}");
+    assert_eq!(
+        when_the_tasks_settle(&world, &[&running]),
+        vec!["completed"]
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let without = when_rider_runs(&world, &["logs", &running]);
+    assert_eq!(without.code, Some(0), "{without:?}");
+    assert!(without.stdout.contains(&summary), "{without:?}");
+}
+
+#[test]
+fn rider_kill_stops_the_agent_and_fails_its_task_killed_by_the_owner() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nbuilders_at_once = 1\n");
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let waiting = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_the_agent_will(&world, &waiting, &[Behaviour::Hold]);
+    given_a_running_daemon(&mut world);
+    let run = when_the_agent_has_started(&world, &task);
+
+    let not_running = when_rider_runs(&world, &["kill", &waiting]);
+    let unknown = when_rider_runs(&world, &["kill", "999999"]);
+    let kill = when_rider_runs(&world, &["kill", &task]);
+
+    assert_eq!(kill.code, Some(0), "{kill:?}");
+    assert!(
+        when_the_process_ends_within(run.pid, 10),
+        "the agent {} still runs",
+        run.pid
+    );
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let read = world.vb_lead(&["read", &task, "--json"], None);
+    assert!(read.contains("killed by the owner"), "{read}");
+    assert_eq!(not_running.code, Some(1), "{not_running:?}");
+    assert!(
+        not_running.stderr.contains("not_running"),
+        "{not_running:?}"
+    );
+    assert_eq!(unknown.code, Some(1), "{unknown:?}");
+    assert!(unknown.stderr.contains("unknown_task"), "{unknown:?}");
+    world.release_agent(&waiting);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+/// The lines `output` prints, as they come, until it closes.
+fn lines_of(output: impl Read + Send + 'static) -> Receiver<String> {
+    let (lines, received) = sync_channel(1024);
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    received
 }
 
 fn daemon_pid(world: &World) -> u32 {

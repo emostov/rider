@@ -37,6 +37,8 @@ pub enum Behaviour {
     Hold,
     /// Like `Hold`, but ignores SIGTERM.
     HoldIgnoringTerm,
+    /// Prints `hold_line(task)` to its output stream, then holds like `Hold`.
+    HoldTalking,
     /// As `claude --resume` of a session Claude no longer has: reports the refusal and exits 1
     /// when started with `--resume`; otherwise commits like `Commit`.
     RefuseResume,
@@ -54,6 +56,7 @@ impl Behaviour {
             Behaviour::ExitNonZero => "exit-non-zero",
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
+            Behaviour::HoldTalking => "hold-talking",
             Behaviour::RefuseResume => "refuse-resume",
             Behaviour::RefuseResumeSlowly => "refuse-resume-slowly",
         }
@@ -89,6 +92,11 @@ pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}"));
     let text = fs::read_to_string(&path).expect("read an agent's recorded arguments");
     text.lines().map(str::to_string).collect()
+}
+
+/// The line a `HoldTalking` agent prints before it holds.
+pub fn hold_line(task: &str) -> String {
+    format!(r#"{{"type":"fake","text":"holding task {task}"}}"#)
 }
 
 /// The final message a fake agent reports; it becomes the task's result.
@@ -162,8 +170,9 @@ case "$behaviour" in
       exit 1
     fi
     commit || exit 1 ;;
-  hold|hold-ignoring-term)
-    [ "$behaviour" = hold ] || trap '' TERM
+  hold|hold-ignoring-term|hold-talking)
+    [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
+    [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
     step=0
     while [ ! -e "$world/{RELEASES_DIR}/$task" ]; do
       step=$((step + 1))
