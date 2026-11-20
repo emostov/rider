@@ -54,7 +54,7 @@ Never post a secret, token, or key you find. Name the file and line instead.
    line is a change to a tracked file: do not touch it; ask (see below).
 2. Read your brief and your whole thread: `vb read "$BOARD_TASK"`. The `of=<id>` label on
    your task names the task at the top of the change. Read its brief and thread:
-   `vb read <id>`. Its `rider-result@1` record gives its branch, head, and summary.
+   `vb read <id>`. Its `rider-result@2` record gives its branch, head, and summary.
 3. Find the change. Use the range the brief names: a security review usually covers a whole
    stack. If it names none, use the task's `start` label, the commit its branch was at when
    it first started: `start=$(vb read <id> --json | jq -r '.message.labels.start // empty')`,

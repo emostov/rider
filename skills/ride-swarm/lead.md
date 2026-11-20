@@ -253,7 +253,7 @@ task of its own.
 | blocked `rider_error` | Rider could not run the task (git, prompt file, harness) | Tell the owner. Do not retry blindly |
 | failed | the reason and the log tail are in the thread | Read them. Reply with what the next attempt must do, then `vb tasks reopen <id> --as lead-fable-5-2` retries in the same worktree. The next worker follows your latest reply over the brief, so make it a complete, specific instruction. If the correction changes what the task is, rewrite the brief instead: `vb edit <id> - --as lead-fable-5-2` with the new text on standard input, then reopen. Dependents keep waiting |
 | blocked `awaiting_approval`, in `decisions` | waiting for the owner | Nothing until they answer |
-| completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@2` record (`rider-result@1` from older runs): branch, head, commits, summary, and `behind`, the stacked tasks whose branches lack the new head |
+| completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@2` record: branch, head, commits, summary, and `behind`, the stacked tasks whose branches lack the new head |
 
 `vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
 "<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.

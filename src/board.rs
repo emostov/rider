@@ -1711,10 +1711,10 @@ mod tests {
         assert_eq!(command_stdin(&reply), Some("-tail\n-of a log"));
         let post = Command::Post {
             id,
-            schema: "rider-result@1",
+            schema: "rider-result@2",
             json: "{}",
         };
-        expect_with_text(post, &["post", "2", "--schema", "rider-result@1"], "{}");
+        expect_with_text(post, &["post", "2", "--schema", "rider-result@2"], "{}");
         let complete = Command::Complete {
             id,
             result: "-done\n  line",

@@ -57,7 +57,7 @@ Text that begins with `-` is read by `vb` as an option. So:
    Any other line is a change to a tracked file: do not touch it; ask (see below).
 2. Read your brief and your whole thread: `vb read "$BOARD_TASK"`. The `of=<id>` label on
    your task names the task under test. Read its brief and thread: `vb read <id>`. Its
-   `rider-result@1` record gives its branch, its head, and its summary. If
+   `rider-result@2` record gives its branch, its head, and its summary. If
    `git rev-parse HEAD` is not the record's head, say so.
 3. Reply with your plan: the flows you will exercise, the unhappy paths you will try, and
    how you will build the work.
