@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
 use crate::roles::{AGENTS_MAX, Harness, PROFILE_LEN_MAX, ROLES, RoleSpec};
+use crate::run_task::{ATTEMPTS_DEFAULT, ATTEMPTS_MAX};
 
 /// The file's name under the Rider home.
 pub const FILE_NAME: &str = "rider.toml";
@@ -21,6 +22,8 @@ const _: () =
     assert!(ATTEMPT_MINUTES_MAX > 0 && ATTEMPT_MINUTES_MAX * 60_000 <= ATTEMPT_MILLIS_MAX);
 const PROMPT_SUFFIX: &str = ".md";
 const SLOT_DIGITS_MAX: usize = 2;
+const POOL_SLOTS_NEW_ROLE: u8 = 2;
+const MISSING: &str = "is missing for a role that is not built in";
 const _: () = assert!(AGENTS_MAX < 100);
 
 /// The limits the daemon and pool run under.
@@ -29,6 +32,8 @@ pub struct Limits {
     /// Agents running at once, across every role.
     pub agents: u8,
     pub attempt_millis: u64,
+    /// Failed attempts after which a task is blocked instead of run again.
+    pub attempts: u8,
 }
 
 /// The effective role table and limits, and the TOML that states them.
@@ -103,6 +108,8 @@ struct LimitsShape {
     agents: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempts: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -132,6 +139,8 @@ struct RoleShape {
     #[serde(skip_serializing_if = "Option::is_none")]
     commits: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    needs_of: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     slots: Option<u8>,
 }
 
@@ -152,6 +161,7 @@ impl RoleShape {
             model_slug: Some(spec.model_slug.to_string()),
             prompt: prompt.map(str::to_string),
             commits: Some(spec.commits_expected),
+            needs_of: Some(spec.needs_of),
             slots: None,
         }
     }
@@ -165,6 +175,7 @@ impl RoleShape {
             model_slug,
             prompt,
             commits,
+            needs_of,
             slots,
         } = over;
         self.harness = harness.or(self.harness);
@@ -174,6 +185,7 @@ impl RoleShape {
         self.model_slug = model_slug.or(self.model_slug.take());
         self.prompt = prompt.or(self.prompt.take());
         self.commits = commits.or(self.commits);
+        self.needs_of = needs_of.or(self.needs_of);
         self.slots = slots.or(self.slots);
     }
 }
@@ -273,9 +285,15 @@ fn limits(path: &Path, shape: &LimitsShape) -> Result<Limits, ConfigFileError> {
             problem,
         ));
     }
+    let attempts = shape.attempts.unwrap_or(ATTEMPTS_DEFAULT);
+    if !(1..=ATTEMPTS_MAX).contains(&attempts) {
+        let problem = format!("must be from 1 to {ATTEMPTS_MAX}, not {attempts}");
+        return Err(field_error(path, "limits.attempts".to_string(), problem));
+    }
     let limits = Limits {
         agents,
         attempt_millis: minutes * 60_000,
+        attempts,
     };
     assert!(limits.attempt_millis > 0 && limits.attempt_millis <= ATTEMPT_MILLIS_MAX);
     Ok(limits)
@@ -298,19 +316,10 @@ fn role_spec(
 ) -> Result<RoleSpec, ConfigFileError> {
     let error =
         |name: &str, problem: String| field_error(path, format!("roles.{label}.{name}"), problem);
-    let missing = |name: &str| {
-        error(
-            name,
-            "is missing for a role that is not built in".to_string(),
-        )
-    };
+    let missing = |name: &str| error(name, MISSING.to_string());
     if !is_name(label) {
         let problem = "must be lowercase letters, digits and '-', starting with a letter";
-        return Err(field_error(
-            path,
-            format!("roles.{label}"),
-            problem.to_string(),
-        ));
+        return Err(field_error(path, format!("roles.{label}"), problem.into()));
     }
     let harness = match role.harness.ok_or_else(|| missing("harness"))? {
         HarnessName::Claude => Harness::Claude,
@@ -325,17 +334,13 @@ fn role_spec(
     if !title.eq_ignore_ascii_case(label) {
         return Err(error("title", format!("must be {label:?} in any case")));
     }
-    let model_name = role
-        .model_name
-        .clone()
-        .ok_or_else(|| missing("model_name"))?;
+    let model_name = role.model_name.clone();
+    let model_name = model_name.ok_or_else(|| missing("model_name"))?;
     if model_name.trim().is_empty() {
         return Err(error("model_name", "must not be empty".to_string()));
     }
-    let model_slug = role
-        .model_slug
-        .clone()
-        .ok_or_else(|| missing("model_slug"))?;
+    let model_slug = role.model_slug.clone();
+    let model_slug = model_slug.ok_or_else(|| missing("model_slug"))?;
     let profile_len = label.len() + model_slug.len() + 2 + SLOT_DIGITS_MAX;
     if !is_name(&model_slug) || profile_len > PROFILE_LEN_MAX {
         let problem = format!(
@@ -347,25 +352,45 @@ fn role_spec(
     let prompt = role.prompt.as_deref().ok_or_else(|| missing("prompt"))?;
     let prompt_file = prompt_file(home, prompt).map_err(|problem| error("prompt", problem))?;
     let commits = role.commits.ok_or_else(|| missing("commits"))?;
-    let slots = role.slots.unwrap_or(agents);
-    if !(1..=AGENTS_MAX).contains(&slots) {
-        return Err(error(
-            "slots",
-            format!("must be from 1 to {AGENTS_MAX}, not {slots}"),
-        ));
+    let needs_of = role.needs_of.unwrap_or(!commits);
+    if !commits && !needs_of {
+        let problem = "must be true for a role that does not commit".to_string();
+        return Err(error("needs_of", problem));
     }
+    let (slots, pool_slots) =
+        slot_counts(label, role.slots, agents).map_err(|problem| error("slots", problem))?;
     // Validated once here; the table lives for the rest of the process.
     Ok(RoleSpec {
         label: String::leak(label.to_string()),
         harness,
         model: String::leak(model),
         commits_expected: commits,
+        needs_of,
         title: String::leak(title),
         model_name: String::leak(model_name),
         model_slug: String::leak(model_slug),
         slots,
+        pool_slots,
         prompt_file: String::leak(prompt_file),
     })
+}
+
+// The role's slots in the daemon and in `rider pool`, which starts a thread per slot and so
+// keeps the built-in counts unless the file sets them.
+fn slot_counts(label: &str, set: Option<u8>, agents: u8) -> Result<(u8, u8), String> {
+    assert!(agents > 0 && agents <= AGENTS_MAX);
+    let slots = set.unwrap_or(agents);
+    if !(1..=AGENTS_MAX).contains(&slots) {
+        return Err(format!("must be from 1 to {AGENTS_MAX}, not {slots}"));
+    }
+    let built_in = ROLES.iter().find(|spec| spec.label == label);
+    let pool_slots = match (set, built_in) {
+        (Some(set), _) => set,
+        (None, Some(spec)) => spec.pool_slots.min(slots),
+        (None, None) => POOL_SLOTS_NEW_ROLE.min(slots),
+    };
+    assert!(pool_slots > 0 && pool_slots <= slots);
+    Ok((slots, pool_slots))
 }
 
 // A built-in prompt's file name, or the absolute path of the user's own prompt file.
@@ -401,6 +426,7 @@ fn render(
     let shape = LimitsShape {
         agents: Some(limits.agents),
         attempt_minutes: Some(limits.attempt_millis / 60_000),
+        attempts: Some(limits.attempts),
     };
     let mut out = format!("[limits]\n{}", to_toml(path, &shape)?);
     for (label, role) in roles {

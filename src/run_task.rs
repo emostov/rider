@@ -18,8 +18,11 @@ use crate::harness::{
 use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, Checkout, WorktreeError};
 
-/// The failed attempts after which a task is blocked instead of run again.
-pub const ATTEMPTS_MAX: u8 = 3;
+/// Upper bound on the failed attempts after which a task is blocked instead of run again.
+pub const ATTEMPTS_MAX: u8 = 9;
+/// The failed attempts after which a task is blocked, unless the configuration sets them.
+pub const ATTEMPTS_DEFAULT: u8 = 3;
+const _: () = assert!(ATTEMPTS_DEFAULT > 0 && ATTEMPTS_DEFAULT <= ATTEMPTS_MAX);
 /// Upper bound on the bytes read from the end of a failed attempt's log.
 pub const LOG_TAIL_BYTES_MAX: u64 = 16 * 1024;
 /// The lines of a failed attempt's log replied to its task.
@@ -48,6 +51,8 @@ pub struct Env {
     pub prompts: PathBuf,
     pub profile: String,
     pub board_url: String,
+    /// Failed attempts after which a task is blocked instead of run again.
+    pub attempts: u8,
 }
 
 /// A failure of rider itself that left the task unsettled.
@@ -188,8 +193,8 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
     let start_label = label(&view, START_LABEL);
     // A label that is malformed, or names no commit here, is ignored: never fatal.
     let start = start_label.filter(|value| git::is_commit_id(value));
-    let prepared =
-        validate(&view).and_then(|(brief, failed)| prepare(brief, failed, start, env, board));
+    let prepared = validate(&view, env.attempts)
+        .and_then(|(brief, failed)| prepare(brief, failed, start, env, board));
     let attempt = match prepared {
         Ok(attempt) => attempt,
         Err(block) => return Ok(block.prepared()),
@@ -268,7 +273,8 @@ pub fn launch_agent(cmd: &CommandLine, dir: &Path, log: &Path) -> Result<Exit, H
     harness::run(cmd, dir, log, ATTEMPT_SECONDS_MAX, LOG_BYTES_MAX)
 }
 
-fn validate(view: &TaskView) -> Result<(Brief, u16), Block> {
+fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
+    assert!(attempts > 0 && attempts <= ATTEMPTS_MAX);
     let invalid = |reason: String| Block::new("invalid_brief", reason);
     let brief = parse_brief(view).map_err(|error| invalid(error.to_string()))?;
     let failed = match label(view, ATTEMPT_LABEL) {
@@ -281,14 +287,14 @@ fn validate(view: &TaskView) -> Result<(Brief, u16), Block> {
             ))
         })?,
     };
-    if failed >= u16::from(ATTEMPTS_MAX) {
+    if failed >= u16::from(attempts) {
         let reason = format!(
             "The task has failed {failed} attempts; change its brief or role and set the \
              `attempt` label to 0 before reopening it."
         );
         return Err(Block::new("attempts_exhausted", reason));
     }
-    assert!(failed < u16::from(ATTEMPTS_MAX));
+    assert!(failed < u16::from(attempts));
     assert!(brief.id == view.id);
     Ok((brief, failed))
 }
@@ -717,6 +723,7 @@ mod tests {
             prompts,
             profile: "implement-1-opus-5-5".to_string(),
             board_url: "http://127.0.0.1:4100".to_string(),
+            attempts: ATTEMPTS_DEFAULT,
         };
         (fixture, env)
     }

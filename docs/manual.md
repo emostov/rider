@@ -125,15 +125,18 @@ file they use the built-in roles and limits. `rider config` prints the effective
 configuration, built-in plus file, in the file's own form, so you can start a file from it.
 
 A role in the file overrides a built-in role field by field, or adds a new role (at most 16
-roles in all). A new role sets every field but `slots`. `prompt` is a built-in prompt name
-(`implement`, `review`, `polish`, `security`, `qa`) or a path to your own prompt file,
-relative to `$RIDER_HOME` or absolute. A role that does not commit needs an `of` label.
-`slots` caps how many agents of the role run at once; unset, only `limits.agents` does.
+roles in all). A new role sets every field but `needs_of` and `slots`. `prompt` is a built-in
+prompt name (`implement`, `review`, `polish`, `security`, `qa`) or a path to your own prompt
+file, relative to `$RIDER_HOME` or absolute. `needs_of` makes a task of the role name the task
+it checks in an `of` label; it defaults to `true` for a role that does not commit and must be
+`true` for one. `slots` caps how many agents of the role run at once; unset, only
+`limits.agents` does in `rider daemon`, and `rider pool` keeps its built-in slot counts.
 
 ```toml
 [limits]
 agents = 8           # agents at once, 1 to 32 (default 32)
 attempt_minutes = 30 # one attempt's time limit, 1 to 55 (default 55)
+attempts = 2         # failed attempts before a task is blocked, 1 to 9 (default 3)
 
 [roles.review]
 model = "gpt-6.1-sol-mini"

@@ -290,6 +290,7 @@ struct Shared {
     events: SyncSender<Input>,
     lease_millis: u64,
     grace_millis: u64,
+    attempts: u8,
     feed: Mutex<FeedSlot>,
     /// The core has decided to stop now; a settlement checks it before each board write.
     stop_now: AtomicBool,
@@ -324,6 +325,7 @@ impl Shared {
             prompts: self.paths.prompts.clone(),
             profile: profile.to_string(),
             board_url: self.paths.board_url.clone(),
+            attempts: self.attempts,
         }
     }
 
@@ -379,6 +381,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         events,
         lease_millis,
         grace_millis: timing.grace_millis,
+        attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
         stop_now: AtomicBool::new(false),
         log,

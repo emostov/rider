@@ -374,6 +374,23 @@ commits = true
 }
 
 #[test]
+fn a_rider_toml_allowing_one_attempt_blocks_a_task_that_failed_once_without_running_it() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nattempts = 1\n");
+    let failed_once = an_implement_task(&world, "Add the work.").label("attempt", "1");
+    let task = when_the_lead_creates(&world, &failed_once);
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["blocked"]);
+
+    assert_eq!(agent_runs_for(&world, &task).len(), 0);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
 fn an_unknown_field_in_rider_toml_stops_the_daemon_naming_the_field() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;

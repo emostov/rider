@@ -491,6 +491,7 @@ fn run_slot(
         prompts: config.prompts(),
         profile: slot.profile.clone(),
         board_url: config.board_url.clone(),
+        attempts: limits.attempts,
     };
     let launch = launcher(config, limits);
     let run = |id: TaskId| run_task(id, &env, &board, &launch);
@@ -519,6 +520,7 @@ fn run_one(id: TaskId, config: &Config) -> Result<u8, CliError> {
         prompts: config.prompts(),
         profile: profile.clone(),
         board_url: config.board_url.clone(),
+        attempts: limits.attempts,
     };
     let verdict = run_task(id, &env, &board, &launcher(config, limits)).map_err(CliError::Run)?;
     let now = SystemTime::now();

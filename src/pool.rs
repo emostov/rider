@@ -46,12 +46,12 @@ pub struct Slot {
     pub name: String,
 }
 
-/// One slot per `RoleSpec::slots` of every role in `table`, in table order.
+/// One slot per `RoleSpec::pool_slots` of every role in `table`, in table order.
 pub fn slots(table: &'static [RoleSpec]) -> Vec<Slot> {
     assert!(!table.is_empty() && table.len() <= ROLES_MAX);
     let mut all = Vec::with_capacity(SLOTS_MAX);
     for role in table {
-        for number in 1..=role.slots {
+        for number in 1..=role.pool_slots {
             all.push(Slot {
                 role,
                 number,
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn slots_follow_the_role_table() {
         let all = slots(&ROLES);
-        let expected: usize = ROLES.iter().map(|role| usize::from(role.slots)).sum();
+        let expected: usize = ROLES.iter().map(|role| usize::from(role.pool_slots)).sum();
         assert_eq!(all.len(), expected);
         assert!(all.iter().any(|s| s.profile == "implement-2-opus-5-5"));
         assert!(all.iter().any(|s| s.profile == "security-1-mythos-5-2"));

@@ -17,6 +17,8 @@ pub struct RoleSpec {
     pub harness: Harness,
     pub model: &'static str,
     pub commits_expected: bool,
+    /// A task of this role must name, in its `of` label, the task whose work it checks.
+    pub needs_of: bool,
     /// The role's name for people, such as "Implement" or "QA".
     pub title: &'static str,
     /// The model's name for people, such as "Opus 5.5".
@@ -24,6 +26,8 @@ pub struct RoleSpec {
     /// The model's name inside a Board profile, such as "opus-5-5".
     pub model_slug: &'static str,
     pub slots: u8,
+    /// Slot threads `rider pool` starts for the role, at most `slots`.
+    pub pool_slots: u8,
     /// A file name under `prompts/`, or an absolute path to the user's own prompt.
     pub prompt_file: &'static str,
 }
@@ -39,10 +43,12 @@ pub const ROLES: [RoleSpec; 6] = [
         harness: Harness::Claude,
         model: "claude-opus-5-5",
         commits_expected: true,
+        needs_of: false,
         title: "Implement",
         model_name: "Opus 5.5",
         model_slug: "opus-5-5",
         slots: AGENTS_MAX,
+        pool_slots: 12,
         prompt_file: "implement.md",
     },
     RoleSpec {
@@ -50,10 +56,12 @@ pub const ROLES: [RoleSpec; 6] = [
         harness: Harness::Claude,
         model: "claude-sonnet-5-5",
         commits_expected: true,
+        needs_of: false,
         title: "Light",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
         slots: AGENTS_MAX,
+        pool_slots: 12,
         prompt_file: "implement.md",
     },
     RoleSpec {
@@ -61,10 +69,12 @@ pub const ROLES: [RoleSpec; 6] = [
         harness: Harness::Codex,
         model: "gpt-6.1-sol",
         commits_expected: false,
+        needs_of: true,
         title: "Review",
         model_name: "Sol 6.1",
         model_slug: "sol-6-1",
         slots: AGENTS_MAX,
+        pool_slots: 8,
         prompt_file: "review.md",
     },
     RoleSpec {
@@ -72,10 +82,12 @@ pub const ROLES: [RoleSpec; 6] = [
         harness: Harness::Claude,
         model: "claude-sonnet-5-5",
         commits_expected: true,
+        needs_of: false,
         title: "Polish",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
         slots: AGENTS_MAX,
+        pool_slots: 4,
         prompt_file: "polish.md",
     },
     RoleSpec {
@@ -83,10 +95,12 @@ pub const ROLES: [RoleSpec; 6] = [
         harness: Harness::Claude,
         model: "claude-mythos-5-2",
         commits_expected: false,
+        needs_of: true,
         title: "Security",
         model_name: "Mythos 5.2",
         model_slug: "mythos-5-2",
         slots: AGENTS_MAX,
+        pool_slots: 2,
         prompt_file: "security.md",
     },
     RoleSpec {
@@ -94,20 +108,26 @@ pub const ROLES: [RoleSpec; 6] = [
         harness: Harness::Claude,
         model: "claude-opus-5-5",
         commits_expected: false,
+        needs_of: true,
         title: "QA",
         model_name: "Opus 5.5",
         model_slug: "opus-5-5",
         slots: AGENTS_MAX,
+        pool_slots: 2,
         prompt_file: "qa.md",
     },
 ];
 
-// The built-in table is checked when the crate compiles: every role has a slot.
+// The built-in table is checked when the crate compiles: every role has a slot, and a role
+// without commits works in the branch of the task its `of` names.
 const _: () = {
     let mut index = 0;
     while index < ROLES.len() {
         assert!(ROLES[index].slots > 0);
         assert!(ROLES[index].slots <= AGENTS_MAX);
+        assert!(ROLES[index].pool_slots > 0);
+        assert!(ROLES[index].pool_slots <= ROLES[index].slots);
+        assert!(ROLES[index].commits_expected || ROLES[index].needs_of);
         index += 1;
     }
 };
