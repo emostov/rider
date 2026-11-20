@@ -110,6 +110,10 @@ These rules are yours to keep. Rider does not check them:
   `needs`.
 - At most three deliverables per task. More is two tasks.
 - A worker is stopped after 55 minutes. Size tasks well inside that.
+- Sizing: changes that each take under about ten minutes and touch the same files go in one
+  task, not several. A purely mechanical change (a rename, a one-line fix a reviewer spelled
+  out, a doc link) gets no separate review task: read its diff yourself. Everything with
+  behaviour or judgment in it keeps its review.
 - Every `implement` or `light` task gets a `review` task with `of` set to it, and three or
   four specific things to attack. Say what to attack, not the commit range: the reviewer
   finds the range from the reviewed task's `start` label.
@@ -226,6 +230,15 @@ Then `vb label <review-fix> of=<fix> --as lead-fable-5-2`, then
 `vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
 "<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.
 
+Worktrees are large, mostly the Rust `target/` directory, so remove one once nothing will
+use it again. Rider removes a task's worktree when the task completes, and keeps it when
+the task fails or blocks so a retry can reuse it. When you cancel a task, or give up on a
+failed or blocked one, remove its worktree: `git -C <repo> worktree remove
+~/.rider/worktrees/<repository directory name>/<task id>`. It refuses when there are
+modified or untracked files: then tell the owner rather than forcing. Never `--force`,
+never delete the branch. A completed task whose thread says "Kept the worktree" is the
+same case once its changes are understood. `rider clean` (issue #60) will replace this rule.
+
 A branch moves after children were cut from it only when an `onto` task completes on it.
 Then restack each child branch, bottom up, one task at a time: `role=light` (or
 `implement`), `onto=<the child's task>`, needing the task that moved its parent. Its brief
@@ -251,6 +264,17 @@ Carry on with work that does not depend on it. The wait covers only `work/<proje
 check `decisions` each turn (step 7). When the owner answers, record it:
 `vb tasks unblock <id>`, `vb tasks claim <id>`, then `vb tasks complete <id> -- "<answer>"`,
 each with `--as lead-fable-5-2`. `decisions` is the record of what was decided.
+
+## Closing resolved issues
+
+By default, as work resolves an issue, close it or link it to the PR that closes it:
+
+- Work you merge into a local base branch: close each GitHub issue it resolves with
+  `gh issue close <n> --comment "<text>"` naming the commit and how it was checked. Close a
+  Linear issue with the Linear MCP tools when they are available.
+- Work that ships as a PR: put one `Closes #<n>` line per resolved GitHub issue in the PR
+  description, so merging closes them. Link a Linear issue through the Linear MCP.
+- An issue only partly resolved stays open, with a comment saying what remains.
 
 ## Telling the owner where it stands
 
