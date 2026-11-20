@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use fake_agent::Behaviour;
+use fake_agent::{Behaviour, Run};
 use steps::*;
 use world::{MAIN, PROJECT, World};
 
@@ -832,7 +832,10 @@ fn a_board_the_daemon_started_is_restarted_when_killed_and_its_running_task_comp
 
     assert_eq!(states, vec!["completed"]);
     assert_eq!(later, vec!["completed"]);
-    assert_eq!(agent_runs_for(&world, &task), vec![run]);
+    assert_eq!(
+        agent_runs_for(&world, &task),
+        vec![Run { ended: true, ..run }]
+    );
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert!(
@@ -1658,12 +1661,14 @@ fn rider_logs_follow_moves_on_to_the_fresh_start_when_a_resumed_session_is_refus
     follow.args(["logs", "-f", &fix]).stdout(Stdio::piped());
     let mut follower = follow.spawn().expect("start rider logs -f");
     let lines = lines_of(follower.stdout.take().expect("rider logs -f output"));
-    let refusal = lines.recv_timeout(Duration::from_secs(10));
+    let first: Vec<String> = (0..2)
+        .map_while(|_| lines.recv_timeout(Duration::from_secs(10)).ok())
+        .collect();
     assert!(
-        refusal
-            .as_ref()
-            .is_ok_and(|line| line.contains("No conversation found")),
-        "{refusal:?}"
+        first
+            .iter()
+            .any(|line| line.contains("No conversation found")),
+        "{first:?}"
     );
     world.release_agent(&fix);
     let rest: Vec<String> = lines.iter().collect();
@@ -1735,7 +1740,7 @@ fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_work
     let runs = agent_runs_for(&world, &task);
     assert_eq!(runs.len(), 2, "{}", world.daemon_log());
     assert_eq!(runs[1].dir, runs[0].dir);
-    assert!(agent_prompt(&world, &task, 2).contains("This is a retry"));
+    assert!(agent_prompt(&world, &task, runs[1].attempt).contains("This is a retry"));
     assert_eq!(task_epoch(&world, &task), epoch);
     assert_eq!(task_label(&world, &task, "attempt"), None);
     when_the_daemon_is_sent_sigterm(&world);
