@@ -24,7 +24,7 @@ use crate::pool::{
 };
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
-use crate::run_task::{Env, Ran, RunError, run_task};
+use crate::run_task::{Env, Ran, RunError, board_identity, run_task};
 use crate::settle::Verdict;
 
 const ENVIRONMENT: &str = r#"environment:
@@ -512,6 +512,20 @@ fn pool(project: &Project, config: &Config) -> Result<u8, CliError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_stdin(Arc::clone(&stop));
     let all = slots(table);
+    assert!(!all.is_empty());
+    let first = &all[0];
+    let reader = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: first.profile.clone(),
+    };
+    // Read before any slot claims, so no attempt spends its lease on it; a failure here is
+    // retried by the first attempt.
+    if let Err(error) = board_identity(&config.board_url, &reader) {
+        say(&format!(
+            "rider pool: could not read the board's identity: {error}"
+        ));
+    }
     say(&format!(
         "rider pool: {} slots on {channel}, at most {} agents at once; \
          type stop or press Ctrl-D to stop after running tasks finish",
