@@ -515,6 +515,19 @@ fn a_prompt_file_named_directly_under_the_rider_home_is_accepted() {
 }
 
 #[test]
+fn a_role_can_select_the_tact_harness() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nharness = \"tact\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert!(output.stdout.contains("harness = \"tact\""), "{output:?}");
+}
+
+#[test]
 fn a_model_name_with_a_newline_is_refused_naming_the_field() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
