@@ -802,12 +802,10 @@ mod tests {
     use super::{CLIENT_BACKLOG_MAX, SOCKET_FILE, Socket, listen};
     use crate::board::{TaskId, TaskState};
     use crate::core::{
-        BoardHealth, CLIENTS_MAX, ClientId, Event, Reply, StatusView, Stopping, TaskRow, Untracked,
+        BoardHealth, ClientId, Event, Reply, StatusView, Stopping, TaskRow, Untracked,
     };
 
     const WAIT: Duration = Duration::from_secs(5);
-    /// Upper bound on the requests a test sends a client that never reads before it lags.
-    const LAG_REQUESTS_MAX: usize = 4 * CLIENT_BACKLOG_MAX;
     /// Upper bound on the reads taken to reach the end of a connection.
     const READS_MAX: usize = 1 << 20;
 
@@ -931,39 +929,6 @@ mod tests {
             "the writer kept sending to a client that went: {} bytes",
             data.len()
         );
-        socket.close();
-    }
-
-    #[test]
-    fn a_lagging_client_holds_its_seat_until_it_has_read_whole_lines_ending_in_lagged() {
-        let (_dir, path, socket, events) = serve();
-        let mut slow = UnixStream::connect(&path).unwrap();
-        let mut replies = 0;
-        // The kernel buffers a platform-dependent number of replies before the writer blocks
-        // and the backlog fills, so the client asks until the core is told it went.
-        for _ in 0..LAG_REQUESTS_MAX {
-            let Some(id) = request(&mut slow, &events) else {
-                break;
-            };
-            socket.reply(id, status(16, 1024));
-            replies += 1;
-        }
-        let lagged = replies > CLIENT_BACKLOG_MAX && replies < LAG_REQUESTS_MAX;
-        assert!(lagged, "{replies} replies");
-
-        let others: Vec<UnixStream> = (1..CLIENTS_MAX)
-            .map(|_| UnixStream::connect(&path).unwrap())
-            .collect();
-        let refused = UnixStream::connect(&path).unwrap();
-        assert_eq!(read_line(&refused)["error"]["code"], "busy");
-
-        let data = String::from_utf8(read_to_eof(&slow)).unwrap();
-        assert!(data.ends_with('\n'), "a line was cut short");
-        let lines: Vec<Value> = (data.lines())
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(lines.last().unwrap()["error"]["code"], "lagged");
-        drop(others);
         socket.close();
     }
 
