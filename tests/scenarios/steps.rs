@@ -212,13 +212,17 @@ pub fn when_the_pool_is_stopped(world: &mut World) -> Option<i32> {
     status.code()
 }
 
-/// When the pool runs until `tasks` settle and is then stopped; returns the states and exit.
+/// When the pool runs until `tasks` settle, each within `SETTLE_SECONDS_MAX` of the one before,
+/// and is then stopped; returns the states and exit.
 pub fn when_the_pool_runs_until_settled(
     world: &mut World,
     tasks: &[&str],
 ) -> (Vec<String>, Option<i32>) {
     when_the_pool_starts(world);
-    let states = when_the_tasks_settle(world, tasks);
+    let states: Vec<String> = tasks
+        .iter()
+        .flat_map(|task| when_the_tasks_settle(world, &[task]))
+        .collect();
     let exit = when_the_pool_is_stopped(world);
     assert_eq!(states.len(), tasks.len());
     (states, exit)
@@ -584,6 +588,24 @@ pub fn task_claim_until(world: &World, id: &str) -> Option<String> {
         .task
         .claim
         .map(|claim| claim.until)
+}
+
+/// When `id`'s claim has been renewed past `first`, within `SETTLE_SECONDS_MAX`; returns its end.
+pub fn when_the_claim_moves_past(world: &World, id: &str, first: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    loop {
+        let until = task_claim_until(world, id);
+        let until = until.unwrap_or_else(|| panic!("task {id} is no longer claimed"));
+        if until.as_str() > first {
+            return until;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the claim on task {id} stayed until {until}:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
 }
 
 /// Waits up to `seconds` for process `pid` to end; returns whether it did.

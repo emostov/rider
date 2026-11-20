@@ -593,13 +593,12 @@ fn an_agent_running_past_a_third_of_a_shortened_lease_sees_the_claim_renewed() {
     };
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_the_agent_will(&world, &task, &[Behaviour::Hold]);
-    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=3000,tick=200")]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=15000,tick=200")]);
     when_the_agent_has_started(&world, &task);
     let first = task_claim_until(&world, &task).expect("the task is claimed");
 
-    thread::sleep(Duration::from_secs(4));
+    let later = when_the_claim_moves_past(&world, &task, &first);
 
-    let later = task_claim_until(&world, &task).expect("the task is still claimed");
     assert!(later > first, "until moved from {first} to {later}");
     world.release_agent(&task);
     assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
