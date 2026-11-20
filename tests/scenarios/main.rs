@@ -1521,6 +1521,9 @@ fn rider_kill_of_a_task_the_owner_canceled_writes_nothing_to_the_task() {
 }
 
 const LOG_POLL_MILLIS: u64 = 50;
+/// The board's shortest lease, with time for it to notice the lapse.
+const LEASE_LAPSE_SECONDS_MAX: u64 = 90;
+const LEASE_POLL_MILLIS: u64 = 500;
 
 #[test]
 fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_worktree() {
@@ -1568,10 +1571,11 @@ fn a_daemon_that_crashes_past_its_shortened_lease_claims_the_task_afresh_and_com
     let epoch = task_epoch(&world, &task);
     let holder = task_claim_profile(&world, &task).expect("the task is claimed");
     when_the_daemon_crashes(&mut world);
-    thread::sleep(Duration::from_secs(4));
-    // The board keeps its own hour-long lease, so its lapse is played by giving the task back.
-    let released = world.vb_as(&holder, &["tasks", "release", &task, "--json"], None);
-    assert_eq!(released.code, Some(0), "{released:?}");
+    // Rider claims for an hour; the board's shortest lease is 30 s.
+    let renew = ["tasks", "renew", &task, "--lease", "30s", "--json"];
+    let renewed = world.vb_as(&holder, &renew, None);
+    assert_eq!(renewed.code, Some(0), "{renewed:?}");
+    when_the_board_lease_lapses(&world, &task);
 
     given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=3000,tick=200")]);
 
@@ -1587,6 +1591,19 @@ fn a_daemon_that_crashes_past_its_shortened_lease_claims_the_task_afresh_and_com
     assert_eq!(task_label(&world, &task, "attempt"), None);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+/// Waits until the board has let the claim on `task` lapse and shows it ready.
+fn when_the_board_lease_lapses(world: &World, task: &str) {
+    let deadline = Instant::now() + Duration::from_secs(LEASE_LAPSE_SECONDS_MAX);
+    while task_state(world, task) != "ready" {
+        assert!(
+            Instant::now() < deadline,
+            "#{task}'s claim never lapsed: {}",
+            task_state(world, task)
+        );
+        thread::sleep(Duration::from_millis(LEASE_POLL_MILLIS));
+    }
 }
 
 /// Waits until the first attempt log of `task` contains `text`.

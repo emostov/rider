@@ -4,9 +4,9 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rider::board::{Claim, ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
-    ACTIONS_MAX, Action, BoardHealth, Call, ClientId, Config, Event, FEED_RESTARTS_MAX,
-    FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase, Reply, Request, RunId, Settlement, State,
-    StopReason, Stopping, Untracked, step,
+    ACTIONS_MAX, Action, AgentRecord, BoardHealth, Call, ClientId, Config, Event,
+    FEED_RESTARTS_MAX, FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase, PidFile, Reply, Request,
+    RunId, Settlement, State, StopReason, Stopping, Unaccounted, Untracked, recover, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -67,6 +67,10 @@ struct FakeTask {
 
 struct Agent {
     run: RunId,
+    task: TaskId,
+    /// The agent's process group, and when its leader started, in seconds.
+    group: i32,
+    start: u64,
     /// The id of the `Spawn` the agent's exit answers.
     spawn: u64,
     exit_at: Timestamp,
@@ -123,6 +127,9 @@ pub struct World {
     /// A result is not delivered before its time.
     results: Vec<(Event, u64, Timestamp)>,
     agents: Vec<Agent>,
+    /// Agents of the core before the last restart that its recovery left running.
+    leftovers: Vec<Agent>,
+    next_group: i32,
     down_until: Timestamp,
     /// Actions not yet answered, by run (`None` for a listing or a feed restart).
     outstanding: Vec<(u64, Option<RunId>, &'static str)>,
@@ -181,6 +188,8 @@ impl World {
             cursor: 0,
             results: Vec::new(),
             agents: Vec::new(),
+            leftovers: Vec::new(),
+            next_group: 2,
             down_until: now,
             outstanding: Vec::new(),
             next_action: 0,
@@ -390,6 +399,7 @@ impl World {
             .drain(..)
             .partition(|agent| agent.exit_at <= now);
         self.agents = running;
+        self.leftovers.retain(|agent| agent.exit_at > now);
         for agent in done {
             self.reply(agent.spawn, Event::AgentExited(agent.run));
         }
@@ -404,11 +414,13 @@ impl World {
             self.restarted_in.insert(phase_name(run.phase));
         }
         let saved = self.core.cursor();
+        let crashed = std::mem::take(&mut self.agents);
+        let unaccounted = self.recover(crashed)?;
         self.core = State::new(self.config.clone(), self.now);
+        self.core.leave_to_lease(unaccounted);
         self.generation += 1;
         self.results.clear();
         self.outstanding.clear();
-        self.agents.clear();
         self.log.clear();
         self.spawned.clear();
         self.refused.clear();
@@ -429,6 +441,65 @@ impl World {
         self.feed_up = true;
         self.trace.push(format!("restart from {saved:?}"));
         self.deliver(Event::Tick(self.now))
+    }
+
+    /// The restarted daemon's recovery, from files that may be unreadable or lost and pids
+    /// that may have been reused: every live agent of the crashed core must be stopped or have
+    /// its task left to its lease, and no reused pid may be stopped.
+    fn recover(&mut self, crashed: Vec<Agent>) -> Result<Unaccounted, String> {
+        let (reused, live): (Vec<Agent>, Vec<Agent>) =
+            crashed.into_iter().partition(|_| self.rng.u32(0..10) == 0);
+        let record = |agent: &Agent| AgentRecord {
+            task: agent.task,
+            group: agent.group,
+            start: agent.start,
+        };
+        let all: Vec<&Agent> = live.iter().chain(&reused).collect();
+        let records: Vec<AgentRecord> = all.iter().map(|agent| record(agent)).collect();
+        let mut pid_files = Vec::new();
+        for agent in &all {
+            pid_files.push(PidFile {
+                task: agent.task,
+                group: (self.rng.u32(0..8) != 0).then_some(agent.group),
+                ack: (self.rng.u32(0..4) != 0).then_some(record(agent)),
+            });
+        }
+        let records_read = (self.rng.u32(0..4) != 0).then_some(&records[..]);
+        let pid_files_read = (self.rng.u32(0..6) != 0).then_some(&pid_files[..]);
+        let started = |group: i32| {
+            let alive = live.iter().find(|agent| agent.group == group);
+            let stranger = reused.iter().find(|agent| agent.group == group);
+            alive
+                .map(|agent| agent.start)
+                .or(stranger.map(|agent| agent.start + 1))
+        };
+        let recovery = recover(records_read, pid_files_read, &started);
+        self.trace.push(format!("recovered {recovery:?}"));
+        if let Some(record) =
+            (recovery.stop.iter()).find(|r| reused.iter().any(|a| a.group == r.group))
+        {
+            return Err(format!("recovery stopped {record:?}, a reused pid"));
+        }
+        self.leftovers.clear();
+        for agent in live {
+            let stopped = recovery
+                .stop
+                .iter()
+                .any(|record| record.group == agent.group);
+            let left = match &recovery.unaccounted {
+                Unaccounted::Every => true,
+                Unaccounted::Tasks(tasks) => tasks.contains(&agent.task),
+            };
+            if left && !stopped {
+                self.leftovers.push(agent);
+            } else if !stopped {
+                return Err(format!(
+                    "recovery neither stopped nor accounted for {:?}'s agent, group {}",
+                    agent.task, agent.group
+                ));
+            }
+        }
+        Ok(recovery.unaccounted)
     }
 
     fn create_task(&mut self) {
@@ -747,13 +818,18 @@ impl World {
                 };
                 self.reply(id, event);
             }
-            Action::Spawn { run, .. } => {
+            Action::Spawn { run, task, .. } => {
                 let spawn = self.expect(Some(run), "spawn");
                 self.spawned.insert(run);
                 let exit_at = Timestamp(self.now.0 + self.rng.u64(MINUTE..70 * MINUTE));
                 let stubborn = self.rng.u32(0..6) == 0;
+                let group = self.next_group;
+                self.next_group += 1;
                 self.agents.push(Agent {
                     run,
+                    task,
+                    group,
+                    start: self.now.0 / SECOND,
                     spawn,
                     exit_at,
                     stubborn,
@@ -1106,10 +1182,16 @@ impl World {
                     }
                     (*run, true)
                 }
-                Action::Resume { run, profile, .. } => {
+                Action::Resume { run, task, profile } => {
                     self.log.entry(*run).or_default().profile = Some(profile.clone());
                     if blocked {
                         return Err(format!("invariant 9: {action:?} while down or stopping"));
+                    }
+                    if let Some(agent) = self.leftovers.iter().find(|a| a.task == *task) {
+                        return Err(format!(
+                            "{action:?} resumes beside group {}, an agent from before",
+                            agent.group
+                        ));
                     }
                     (*run, true)
                 }
