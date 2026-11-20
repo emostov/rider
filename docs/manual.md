@@ -128,6 +128,7 @@ once, in `src/roles.rs`.
 | `from` | lead, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | lead | id of a task whose existing branch this task works on directly |
 | `of` | lead, required for `review`, `security`, and `qa` | id of the task under review |
+| `resume` | lead | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |
@@ -136,6 +137,12 @@ The lead sets `from` to the base branch you agreed on every task that has neithe
 `onto`. A task without any of the three is cut from `origin/HEAD`, and is blocked as
 `invalid_brief` in a repository that has none. The full rules, including what Rider checks
 before it starts a worker, are in `skills/ride-swarm/lead.md`.
+
+## Using the skills
+
+In a Claude Code session with the skills installed, say "ride a swarm to <goal>" to start work,
+"check my swarm" for status, and "stop the swarm" to stop it. When a stack of work is
+finished, the `ship-swarm` skill opens its pull requests and keeps CI green when you ask.
 
 ## Watching
 

@@ -584,10 +584,11 @@ fn parse_number(text: &str, name: &str) -> Result<u64, FeedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::write_executable;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
 
     const PERSON: &str = "local:user:zeke";
     const WORKER: &str = "local:user:zeke+w-1";
@@ -664,17 +665,14 @@ mod tests {
     }
 
     /// A reader over a stand-in `vb` whose script is `body`.
-    fn reader(name: &str, body: &str) -> (FeedReader, PathBuf) {
-        reader_with(name, body, read_lines)
+    fn reader(body: &str) -> (FeedReader, TempDir) {
+        reader_with(body, read_lines)
     }
 
-    fn reader_with(name: &str, body: &str, read: ReadLines) -> (FeedReader, PathBuf) {
-        let unique = format!("rider-feed-{name}-{}", std::process::id());
-        let dir = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&dir).unwrap();
-        let vb = dir.join("vb");
-        fs::write(&vb, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
+    fn reader_with(body: &str, read: ReadLines) -> (FeedReader, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let vb = dir.path().join("vb");
+        write_executable(&vb, &format!("#!/bin/sh\n{body}"));
         let cli = VbCli {
             vb,
             url: "http://127.0.0.1:1".into(),
@@ -689,9 +687,8 @@ mod tests {
             "head -c {} /dev/zero | tr '\\0' x\necho\n",
             FEED_LINE_BYTES_MAX + 1
         );
-        let (mut feed, dir) = reader("long", &body);
+        let (mut feed, _dir) = reader(&body);
         let result = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert!(matches!(result, Err(FeedError::LineTooLong)), "{result:?}");
     }
 
@@ -701,9 +698,8 @@ mod tests {
             "head -c {} /dev/zero | tr '\\0' x\necho\n",
             FEED_LINE_BYTES_MAX
         );
-        let (mut feed, dir) = reader("bound", &body);
+        let (mut feed, _dir) = reader(&body);
         let result = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert!(matches!(result, Err(FeedError::Parse(_))), "{result:?}");
     }
 
@@ -715,7 +711,7 @@ mod tests {
             path.join("tail-task-expired.json").display(),
             path.join("tail-task-ready.json").display()
         );
-        let (mut feed, dir) = reader("exit", &body);
+        let (mut feed, _dir) = reader(&body);
         let expired = fixture("tail-task-expired.json");
         assert_eq!(feed.next_item().unwrap(), FeedItem::Event(expired));
         let ready = fixture("tail-task-ready.json");
@@ -725,7 +721,6 @@ mod tests {
             FeedItem::Exited { code: Some(3) }
         );
         assert!(matches!(feed.next_item(), Err(FeedError::Ended)));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -736,10 +731,9 @@ mod tests {
             r#"{"cursor":"999","type":"future.event"}"#,
             r#"{"cursor":"8","type":"future.event"}"#,
         );
-        let (mut feed, dir) = reader("skip", &body);
+        let (mut feed, _dir) = reader(&body);
         let first = feed.next_item();
         let second = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert!(matches!(first, Err(FeedError::LineTooLong)), "{first:?}");
         let other = FeedEvent::Other { cursor: Cursor(8) };
         assert_eq!(second.unwrap(), FeedItem::Event(other));
@@ -769,20 +763,18 @@ mod tests {
 
     #[test]
     fn reports_a_signalled_exit_once() {
-        let (mut feed, dir) = reader("signal", "kill -9 $$\n");
+        let (mut feed, _dir) = reader("kill -9 $$\n");
         let exited = feed.next_item();
         let after = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!(exited.unwrap(), FeedItem::Exited { code: None });
         assert!(matches!(after, Err(FeedError::Ended)), "{after:?}");
     }
 
     #[test]
     fn reports_the_exit_while_a_descendant_holds_stdout() {
-        let (mut feed, dir) = reader("descendant", "sleep 30 &\nexit 3\n");
+        let (mut feed, _dir) = reader("sleep 30 &\nexit 3\n");
         let started = Instant::now();
         let exited = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!(exited.unwrap(), FeedItem::Exited { code: Some(3) });
         assert!(started.elapsed() < Duration::from_secs(10));
     }
@@ -790,14 +782,11 @@ mod tests {
     #[test]
     fn reports_the_exit_while_a_descendant_keeps_printing() {
         const CALLS_MAX: u32 = 10_000_000;
-        let unique = format!("rider-feed-chatty-pid-{}", std::process::id());
-        let pid_file = std::env::temp_dir().join(unique);
         let body = format!(
-            "while :; do echo '{}'; done &\necho $! > '{}'\nexit 3\n",
+            "while :; do echo '{}'; done &\necho $! > \"$0.pid\"\nexit 3\n",
             r#"{"cursor":"8","type":"future.event"}"#,
-            pid_file.display(),
         );
-        let (mut feed, dir) = reader("chatty", &body);
+        let (mut feed, dir) = reader(&body);
         let started = Instant::now();
         let mut exits = Vec::new();
         for _ in 0..CALLS_MAX {
@@ -812,9 +801,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         drop(feed);
-        let pid = fs::read_to_string(&pid_file).unwrap();
-        fs::remove_file(&pid_file).unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        let pid = fs::read_to_string(dir.path().join("vb.pid")).unwrap();
         assert_eq!(exits, [FeedItem::Exited { code: Some(3) }]);
         assert!(
             elapsed < END_GRACE + Duration::from_secs(2),
@@ -852,12 +839,11 @@ mod tests {
         let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2 3
 exit 3
 "#;
-        let (mut feed, dir) = reader("slow", body);
+        let (mut feed, _dir) = reader(body);
         thread::sleep(Duration::from_millis(400));
         let first = feed.next_item().map_err(|error| error.to_string());
         thread::sleep(END_GRACE + Duration::from_millis(200));
         let rest = drain(&mut feed);
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!(first, other(1));
         let exited = Ok(FeedItem::Exited { code: Some(3) });
         assert_eq!(rest, [other(2), other(3), exited]);
@@ -868,13 +854,12 @@ exit 3
         let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2
 exit 4
 "#;
-        let (mut feed, dir) = reader("zombie", body);
+        let (mut feed, _dir) = reader(body);
         thread::sleep(Duration::from_millis(400));
         let first = feed.next_item().map_err(|error| error.to_string());
         thread::sleep(END_GRACE + Duration::from_millis(200));
         let second = feed.next_item().map_err(|error| error.to_string());
         let rest = drain(&mut feed);
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!([first, second], [other(1), other(2)]);
         assert_eq!(rest, [Ok(FeedItem::Exited { code: Some(4) })]);
     }
@@ -897,22 +882,17 @@ exit 4
 
     #[test]
     fn dropping_the_feed_kills_its_process_group() {
-        let unique = format!("rider-feed-group-pid-{}", std::process::id());
-        let pid_file = std::env::temp_dir().join(unique);
         let body = format!(
-            "sleep 30 >/dev/null &\necho $! > '{}'\ncat '{}'\nsleep 30\n",
-            pid_file.display(),
+            "sleep 30 >/dev/null &\necho $! > \"$0.pid\"\ncat '{}'\nsleep 30\n",
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures/board/tail-task-ready.json")
                 .display()
         );
-        let (mut feed, dir) = reader("group", &body);
+        let (mut feed, dir) = reader(&body);
         let ready = fixture("tail-task-ready.json");
         assert_eq!(feed.next_item().unwrap(), FeedItem::Event(ready));
         drop(feed);
-        let pid = fs::read_to_string(&pid_file).unwrap();
-        fs::remove_file(&pid_file).unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        let pid = fs::read_to_string(dir.path().join("vb.pid")).unwrap();
         assert!(
             gone(pid.trim()),
             "the descendant {} outlived the feed",
@@ -937,9 +917,8 @@ exit 4
         let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2 3
 exit 3
 "#;
-        let (mut feed, dir) = reader_with("late", body, read_lines_late);
+        let (mut feed, _dir) = reader_with(body, read_lines_late);
         let items = drain(&mut feed);
-        fs::remove_dir_all(dir).unwrap();
         let exited = Ok(FeedItem::Exited { code: Some(3) });
         assert_eq!(items, [other(1), other(2), other(3), exited]);
     }

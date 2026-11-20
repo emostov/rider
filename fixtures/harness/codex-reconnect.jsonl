@@ -1,0 +1,12 @@
+{"type":"thread.started","thread_id":"01a1f64a-7e98-7bc3-8c86-8071841e7d67"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`[features].multi_agent` is deprecated. It still controls the V1 fallback. `[agents].enabled = false` disables subagent tools even when the model selects a subagent version, unless `[features].multi_agent_v2` is enabled."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`[features].multi_agent` is deprecated. It still controls the V1 fallback. `[agents].enabled = false` disables subagent tools even when the model selects a subagent version, unless `[features].multi_agent_v2` is enabled."}}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: Transport error: network error: error decoding response body)"}
+{"type":"error","message":"Reconnecting... 2/5 (unexpected status 503 Service Unavailable: no available server, url: https://<provider>/v1/responses, cf-ray: <ray>)"}
+{"type":"error","message":"Reconnecting... 3/5 (unexpected status 503 Service Unavailable: no available server, url: https://<provider>/v1/responses, cf-ray: <ray>)"}
+{"type":"error","message":"Reconnecting... 4/5 (unexpected status 503 Service Unavailable: no available server, url: https://<provider>/v1/responses, cf-ray: <ray>)"}
+{"type":"item.started","item":{"id":"item_59","type":"command_execution","command":"/bin/zsh -lc 'git status --porcelain'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_59","type":"command_execution","command":"/bin/zsh -lc 'git status --porcelain'","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_60","type":"agent_message","text":"Blocking: `tests/scenarios/world.rs:454` — C-locale Unicode paths cause agent leaks.\nBlocking: `tests/scenarios/world.rs:509` — discovery errors abandon agent cleanup.\n\n3 non-blocking findings."}}
+{"type":"turn.completed","usage":{"input_tokens":2017433,"cached_input_tokens":1909622,"cache_write_input_tokens":107473,"output_tokens":19901,"reasoning_output_tokens":8725}}

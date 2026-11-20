@@ -2,7 +2,8 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::Read;
+use std::fs::File;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
@@ -303,20 +304,62 @@ fn command(dir: &Path, args: &[&OsStr]) -> Process {
     command
 }
 
-/// Runs `process` in its own process group, killing the group unless it ends within `limit`.
-fn spawn_and_collect(process: Process, line: &str, limit: Duration) -> Result<Output, GitError> {
+/// Runs `process` in its own process group, feeding it `input` if given, and kills the group
+/// unless it ends within `limit`.
+fn spawn_and_collect(
+    process: Process,
+    line: &str,
+    limit: Duration,
+    input: Option<Vec<u8>>,
+) -> Result<Output, GitError> {
     assert!(!line.is_empty());
     let spawned = CommandWrap::from(process)
         .wrap(ProcessGroup::leader())
         .spawn();
     let mut child = spawned.map_err(|error| GitError::Spawn(format!("git {line}: {error}")))?;
-    collect(child.as_mut(), line, limit)
+    let writer = match (input, child.stdin().take()) {
+        (Some(bytes), Some(mut stdin)) => {
+            // Written from its own thread so git can't block on a full stdout meanwhile.
+            let builder = thread::Builder::new().name("git-stdin".to_string());
+            match builder.spawn(move || stdin.write_all(&bytes)) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    let _ = board::kill_group(child.as_mut());
+                    return Err(GitError::Spawn(format!("git {line}: {error}")));
+                }
+            }
+        }
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            let _ = board::kill_group(child.as_mut());
+            return Err(GitError::Spawn(format!("git {line}: stdin is not set up")));
+        }
+    };
+    assert!(child.stdin().is_none());
+    let output = collect(child.as_mut(), line, limit);
+    // Git has exited or its group was killed, so the writer's pipe has no reader left.
+    let written = writer.map(JoinHandle::join);
+    match (output, written) {
+        // A git that exits without reading all its input reports its own failure.
+        (Ok(done), Some(Ok(Err(_)) | Err(_))) if done.code == Some(0) => {
+            Err(GitError::Io(format!("writing to git {line}")))
+        }
+        (output, _) => output,
+    }
 }
 
 fn run(dir: &Path, args: &[&OsStr]) -> Result<Output, GitError> {
+    run_fed(dir, args, None)
+}
+
+fn run_fed(dir: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Output, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
     let line = shown(args);
-    spawn_and_collect(command(dir, args), &line, GIT_DEADLINE)
+    let mut process = command(dir, args);
+    if input.is_some() {
+        process.stdin(Stdio::piped());
+    }
+    spawn_and_collect(process, &line, GIT_DEADLINE, input)
 }
 
 fn exit_error(args: &[&OsStr], output: &Output) -> GitError {
@@ -458,6 +501,104 @@ pub fn own_commit_count(
     let digits = line.bytes().all(|b| b.is_ascii_digit());
     let count = line.parse::<u64>().ok().filter(|_| digits);
     count.ok_or_else(|| parse_error(&args, &stdout))
+}
+
+fn reflog_commits(dir: &Path, log_args: &[&str]) -> Result<Vec<String>, GitError> {
+    let args: Vec<&OsStr> = log_args.iter().map(OsStr::new).collect();
+    let stdout = run_ok(dir, &args)?;
+    let text = std::str::from_utf8(&stdout).map_err(|_| parse_error(&args, &stdout))?;
+    let mut commits: Vec<String> = text.lines().map(str::to_string).collect();
+    if !commits.iter().all(|commit| is_commit_id(commit)) {
+        return Err(parse_error(&args, &stdout));
+    }
+    commits.sort_unstable();
+    commits.dedup();
+    assert!(commits.len() <= stdout.len());
+    Ok(commits)
+}
+
+// A reflog record is `<old id> <new id> <identity>\t<message>`; a ref's first record has an
+// all-zero old id. Neither id is guaranteed to be reachable from anything else.
+fn head_reflog_ids(dir: &Path) -> Result<Vec<String>, GitError> {
+    let words = [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "logs/HEAD",
+    ];
+    let args = words.map(OsStr::new);
+    let stdout = run_ok(dir, &args)?;
+    let path = absolute_path(&args, &stdout)?;
+    let shown_path = path.display().to_string();
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(GitError::Io(format!("opening {shown_path}: {error}"))),
+    };
+    let bytes = read_bounded(&mut file, &shown_path)?;
+    let malformed = |line: &[u8]| GitError::Parse {
+        args: shown_path.clone(),
+        stdout: String::from_utf8_lossy(line).into_owned(),
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for line in bytes.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+        let mut fields = line.splitn(3, |&b| b == b' ');
+        for _ in 0..2 {
+            let field = fields.next().ok_or_else(|| malformed(line))?;
+            let id = std::str::from_utf8(field).map_err(|_| malformed(line))?;
+            if !is_commit_id(id) {
+                return Err(malformed(line));
+            }
+            if id.bytes().any(|b| b != b'0') {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    assert!(ids.len() <= bytes.len());
+    assert!(ids.iter().all(|id| is_commit_id(id)));
+    Ok(ids)
+}
+
+/// The commits `dir`'s own HEAD, or either id of any record of its HEAD reflog, reaches that
+/// no local branch nor any branch's reflog does: the commits lost when the worktree, and with
+/// it that reflog, is removed.
+pub fn head_reflog_only_commit_count(dir: &Path) -> Result<u64, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let mut reached = head_reflog_ids(dir)?;
+    reached.push(head(dir)?);
+    reached.sort_unstable();
+    reached.dedup();
+    assert!(!reached.is_empty());
+    let kept = reflog_commits(dir, &["log", "-g", "--format=%H", "--branches", "--"])?;
+    let mut input = String::new();
+    for commit in &reached {
+        input.push_str(commit);
+        input.push('\n');
+    }
+    for commit in &kept {
+        input.push('^');
+        input.push_str(commit);
+        input.push('\n');
+    }
+    assert!(input.lines().count() == reached.len() + kept.len());
+    // A record's id may name a commit already pruned, which removal can no longer lose.
+    let words = [
+        "rev-list",
+        "--count",
+        "--ignore-missing",
+        "--stdin",
+        "--not",
+        "--branches",
+    ];
+    let args = words.map(OsStr::new);
+    let output = run_fed(dir, &args, Some(input.into_bytes()))?;
+    if output.code != Some(0) {
+        return Err(exit_error(&args, &output));
+    }
+    let line = one_line(&args, &output.stdout)?;
+    let digits = line.bytes().all(|b| b.is_ascii_digit());
+    let count = line.parse::<u64>().ok().filter(|_| digits);
+    count.ok_or_else(|| parse_error(&args, &output.stdout))
 }
 
 /// Whether `commit` names a commit in `dir`'s repository.
@@ -704,7 +845,7 @@ pub mod testing {
         let mut process = command(dir, &args);
         process.env_remove("GIT_CONFIG_COUNT");
         process.env_remove("GIT_CONFIG_PARAMETERS");
-        spawn_and_collect(process, &shown(&args), super::GIT_DEADLINE).unwrap()
+        spawn_and_collect(process, &shown(&args), super::GIT_DEADLINE, None).unwrap()
     }
 
     /// Runs `git -C <dir> <args>`, asserts it succeeded, and returns its trimmed stdout.
@@ -1017,7 +1158,7 @@ worktree /v\0HEAD 0123\0branch refs/heads/rider/2-y\0\0";
         ];
         let limit = Duration::from_secs(5);
         let started = Instant::now();
-        let result = spawn_and_collect(command(&fixture.repo, &args), &shown(&args), limit);
+        let result = spawn_and_collect(command(&fixture.repo, &args), &shown(&args), limit, None);
         let elapsed = started.elapsed();
         let error = result.err();
         assert!(
@@ -1047,7 +1188,7 @@ worktree /v\0HEAD 0123\0branch refs/heads/rider/2-y\0\0";
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let started = Instant::now();
-        let result = spawn_and_collect(process, "overflow", Duration::from_secs(60));
+        let result = spawn_and_collect(process, "overflow", Duration::from_secs(60), None);
         let elapsed = started.elapsed();
         let error = result.err();
         assert!(

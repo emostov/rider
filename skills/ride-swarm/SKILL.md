@@ -38,6 +38,9 @@ answer from memory.
 3. What finished or failed recently. For a finished `review` or `security` task, say
    whether its summary reports anything blocking, and whether a fix task exists for it.
 
+End the answer with the `Your move:` line that `lead.md` defines under "Telling the owner
+where it stands".
+
 Old blocked tasks the user did not mention are theirs to keep or cancel: list them, and ask.
 
 ## Ride a swarm
@@ -64,7 +67,8 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
    `lead-fable-5-2`. Answer the user before anything else.
 
-To push a finished branch, open its PR, and get CI green, follow the `ship-swarm` skill.
+To send a finished branch for the owner's review, open its PR, and get CI green, follow the
+`ship-swarm` skill. Its loops follow the owner's settings in `<rider home>/ship.toml`.
 
 ## Stop the swarm
 
@@ -74,5 +78,5 @@ settle; nothing new is claimed. The board keeps running.
 ## Common mistakes
 
 - Doing a worker's job as the lead: editing the repository, building, or running tests.
-  Make it a task.
+  Make it a task, except the small mechanical edit `lead.md` allows.
 - Starting a second pool for a project. Check `pgrep` first.
