@@ -77,5 +77,5 @@ settle; nothing new is claimed. The board keeps running.
 ## Common mistakes
 
 - Doing a worker's job as the lead: editing the repository, building, or running tests.
-  Make it a task.
+  Make it a task, except the small mechanical edit `lead.md` allows.
 - Starting a second pool for a project. Check `pgrep` first.

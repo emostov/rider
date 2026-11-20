@@ -2,7 +2,7 @@
 
 Rider is written in TigerStyle and tested thoroughly enough that it can be rewritten with confidence. When a rule here conflicts with a habit from another codebase, this file wins.
 
-- Before every commit: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
+- Before every commit: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`; the lead's small mechanical edit runs only fast checks, with the full checks in CI before the PR is marked ready.
 - Commit `Cargo.lock`. Commit messages are one sentence and name no tool or assistant.
 - Rider is developed with Rider. Changes to this repository are planned by the lead as tasks on the board channel `work/rider` and carried out by `rider pool rider`, so every change exercises the tool. Work done any other way is the exception and says why.
 - When something goes wrong while building or using Rider, file a GitHub issue (`gh issue create`, label `from-review` or `from-use`) written as a brief a stranger could act on: what happens, the fix wanted, the paths owned, and the command that proves it. The lead plans fixes from the open issues.
