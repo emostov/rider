@@ -81,7 +81,7 @@ Text that begins with `-` is read by `vb` as an option. So:
    first, one line each with file and line, then a count of the rest. With no blocking
    findings, begin it with `No blocking findings.` Then stop.
 
-Findings and problems stay on the board; never file an issue in the project's tracker.
+Findings and problems go on the board. Only work that must outlive the board belongs in the project's tracker, as future work, and the lead files it when the run ends.
 
 ## Asking a question
 

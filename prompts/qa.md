@@ -87,7 +87,7 @@ Text that begins with `-` is read by `vb` as an option. So:
    `git status --porcelain`. It must print nothing.
 8. End with one short final message that becomes your task's result: a one-line verdict,
    the blocking findings one line each, then a count of the rest. With no blocking
-   findings, begin it with `No blocking findings.` Then stop. Findings and problems stay on the board; never file an issue in the project's tracker.
+   findings, begin it with `No blocking findings.` Then stop. Findings and problems go on the board. Only work that must outlive the board belongs in the project's tracker, as future work, and the lead files it when the run ends.
 
 ## Asking a question
 
