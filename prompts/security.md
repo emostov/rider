@@ -87,7 +87,7 @@ Never post a secret, token, or key you find. Name the file and line instead.
    print nothing.
 8. End with one short final message that becomes your task's result: the blocking findings
    first, one line each with file and line, then a count of the rest. With no blocking
-   findings, begin it with `No blocking findings.` Then stop.
+   findings, begin it with `No blocking findings.` Then stop. Findings and problems go on the board. Only work that must outlive the board belongs in the project's tracker, as future work, and the lead files it when the run ends.
 
 ## Asking a question
 

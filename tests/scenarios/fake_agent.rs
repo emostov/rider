@@ -35,6 +35,9 @@ pub enum Behaviour {
     Hold,
     /// Like `Hold`, but ignores SIGTERM.
     HoldIgnoringTerm,
+    /// As `claude --resume` of a session Claude no longer has: reports the refusal and exits 1
+    /// when started with `--resume`; otherwise commits like `Commit`.
+    RefuseResume,
 }
 
 impl Behaviour {
@@ -47,6 +50,7 @@ impl Behaviour {
             Behaviour::ExitNonZero => "exit-non-zero",
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
+            Behaviour::RefuseResume => "refuse-resume",
         }
     }
 }
@@ -67,6 +71,19 @@ pub fn work_text(task: &str, attempt: u32) -> String {
 /// The subject of the commit a committing agent makes.
 pub fn work_subject(task: &str, attempt: u32) -> String {
     format!("Work for task {task} attempt {attempt}")
+}
+
+/// The session id a fake `claude` reports in attempt `attempt` of `task`, unless it continues a
+/// session in place: started with `--resume <id>` and no `--fork-session`, it reports `<id>`.
+pub fn session(task: &str, attempt: u32) -> String {
+    format!("fake-{task}-{attempt}")
+}
+
+/// The options attempt `attempt` of `task` was started with: its arguments before `--`.
+pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}"));
+    let text = fs::read_to_string(&path).expect("read an agent's recorded arguments");
+    text.lines().map(str::to_string).collect()
 }
 
 /// The final message a fake agent reports; it becomes the task's result.
@@ -91,6 +108,20 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
+session="fake-$task-$attempt"
+resumed=""
+fork=""
+previous=""
+options="$world/{ARGS_DIR}/$task-$attempt"
+: > "$options"
+for arg in "$@"; do
+  [ "$arg" = -- ] && break
+  [ "$previous" = --resume ] && resumed="$arg"
+  [ "$arg" = --fork-session ] && fork=1
+  previous="$arg"
+  printf '%s\n' "$arg" >> "$options"
+done
+[ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
 report() {{
   if [ "$harness" = codex ]; then
@@ -101,7 +132,7 @@ report() {{
     usage='"usage":{{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
     echo '{{"type":"turn.completed",'"$usage"'}}'
   else
-    init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"fake","model":"fake"'
+    init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"'"$session"'","model":"fake"'
     echo '{{"type":"system",'"$init"'}}'
     echo '{{"type":"result","subtype":"success","is_error":false,"result":"'"$summary"'"}}'
   fi
@@ -116,6 +147,14 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  refuse-resume)
+    if [ -n "$resumed" ]; then
+      echo "No conversation found with session ID: $resumed" >&2
+      refused='"subtype":"error_during_execution","is_error":true,"num_turns":0'
+      echo '{{"type":"result",'"$refused"',"session_id":"'"$session"'"}}'
+      exit 1
+    fi
+    commit || exit 1 ;;
   hold|hold-ignoring-term)
     [ "$behaviour" = hold ] || trap '' TERM
     step=0
