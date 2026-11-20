@@ -1,6 +1,6 @@
 # Observed headless harness behavior
 
-Observed on 2026-11-19 with Claude Code 2.1.328, codex-cli 0.170.0, tact 0.8.3.
+Observed on 2026-11-19 with Claude Code 2.1.328, codex-cli 0.170.0.
 Prompt used for every run: `Create a file named ok.txt containing OK, commit it, then reply with the single word DONE.`
 Each run used its own fresh git repo (one empty initial commit) as working directory.
 All runs: exit 0, `ok.txt` committed, final message `DONE`.
@@ -53,18 +53,7 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
 
 ## tact
 
-```
-tact --model sol --workspace <DIR> run "<prompt>"
-```
-
-- Model `sol` worked and reports `model: "gpt-6.1-sol"` in `run.completed`. The full id `--model gpt-6.1-sol` also worked (exit 0, ok.txt committed).
-- `tact --help` lists no model names. `--model <MODEL>` is a free string (env `TACT_MODEL`). Other relevant flags: `--workspace`, `--thinking <low|medium|high|xhigh|max>`, `--reasoning-mode <standard|pro>`, `--auth <auto|chatgpt|api-key>`.
-- tact has no permission-skip flag and none was needed.
-- Exit code on success: 0. Exit code on SIGTERM: 0 (see below).
-- Stream: JSON objects, one per line, envelope `{protocol_version, request_id, seq, type, payload}`. Types seen: `run.started`, `input.accepted`, `model.call.started`, `model.attempt.started`, `api.event`, `assistant.delta`, `assistant.message`, `tool.call`, `tool.result`, `model.call.completed`, `run.completed`.
-- Final message: the `assistant.message` event with `payload.phase == "final_answer"`, field `payload.text` (here `"DONE"`). Other `assistant.message` events have `payload.phase == "commentary"`. `run.completed` has `payload.status == "completed"`.
-- On SIGTERM tact catches the signal, emits `run.failed` with `payload.status == "cancelled"`, and exits 0. A supervisor must read the stream, not only the exit code, to learn a tact run was cancelled.
-- Fixture: `tact.jsonl` has its `api.event` lines removed (300 of 350 lines in the raw stream, 1.1 MB), see Fixture redaction.
+Rider no longer supports tact; its observations and fixture were removed.
 
 ## SIGTERM test
 
@@ -74,16 +63,12 @@ Prompt: `Count slowly to 500, one number per message, running `sleep 2` between 
 | --- | --- | --- |
 | claude | 143 | no `result` event written |
 | codex | 143 | stream stops mid-turn |
-| tact | 0 | last event `run.failed`, `status: cancelled` |
 
 ## Fixture redaction
 
 The raw streams held private material, so the committed fixtures were scrubbed. No credentials were found (bearer tokens, `sk-`, `ghp_`, JWT prefixes, authorization headers). What was removed:
 
-- tact: every `api.event` line (they resend the full system and developer instructions, internal repo names and the skill list). All other lines are unchanged except for the redactions below. The tact fixture is now about 24 KB.
-- tact: `input.accepted` `payload.input` (it embeds agent context) and `run.started` `payload.websocket_url` (internal host) are set to `REDACTED`.
 - claude: in the `init` event, `tools`, `mcp_servers`, `slash_commands`, `agents`, `skills`, `plugins`, `memory_paths` and `additional_directories` are set to `REDACTED`. The `hook_response` `output` and `stdout` fields that held text are set to `REDACTED` because the session hook injected instruction text. `stderr` was already empty and is unchanged.
 - All fixtures: the home directory was replaced with `/Users/user/` (also in the `-Users-...-` path segment of scratch paths), and the organisation name is replaced with `REDACTED`.
-- tact: a GPG signing key id (from a `gpg: skipped` error in two `tool.result` events) is replaced with `REDACTED`.
 
 Every line is still valid JSON, and the final-message locations above are intact.
