@@ -29,7 +29,7 @@ const POOL_SLOTS_NEW_ROLE: u8 = 2;
 const MISSING: &str = "is missing for a role that is not built in";
 const _: () = assert!(AGENTS_MAX < 100);
 
-/// The limits the daemon and pool run under.
+/// The limits the daemon runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Agents running at once, across every role.
@@ -401,8 +401,6 @@ fn role_spec(
     })
 }
 
-// The role's slots in the daemon and in `rider pool`, which starts a thread per slot and so
-// keeps the built-in counts unless the file sets them.
 fn slot_counts(label: &str, set: Option<u8>, agents: u8) -> Result<(u8, u8), String> {
     assert!(agents > 0 && agents <= AGENTS_MAX);
     let slots = set.unwrap_or(agents);

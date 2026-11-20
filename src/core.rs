@@ -49,8 +49,18 @@ pub const FEED_RESTARTS_MAX: u8 = 10;
 /// How long a feed must stay up, without delivering an event, for its loss not to count as
 /// a restart in a row, in milliseconds.
 pub const FEED_UPTIME_MILLIS_MIN: u64 = 60 * 1000;
+/// Once feed restarts are exhausted, how long between tries of one more feed, and how long
+/// that feed must stay up, without delivering an event, to count as working, in milliseconds.
+pub const FEED_RETRY_MILLIS: u64 = 10 * 1000;
+/// How many restarts in a row of a board the daemon started are allowed before it is left down.
+pub const BOARD_RESTARTS_MAX: u8 = 5;
+/// How long a restarted board must stay up for its exit not to count as a restart in a row,
+/// in milliseconds.
+pub const BOARD_UPTIME_MILLIS_MIN: u64 = 60 * 1000;
 
 /// The failure reason of a task whose agent the owner killed.
+/// Upper bound on the agent records and pid files a crashed daemon's recovery reads.
+pub const LEFTOVERS_MAX: usize = 4 * AGENTS_MAX as usize * 2;
 pub const KILLED_REASON: &str = "killed by the owner";
 
 /// One role as the core sees it: its label, its profile's model part, its slots, and whether
@@ -154,6 +164,8 @@ pub struct Task {
     /// Index into the config's roles; `None` when the task has no known role.
     pub role: Option<usize>,
     pub branch: Option<String>,
+    /// The task whose branch this one continues, from its `onto` label.
+    pub onto: Option<TaskId>,
     /// The project the task's channel names under `work/`, if it names one.
     pub project: Option<String>,
     /// The task's board version: the cursor of the newest event this was learned from.
@@ -405,6 +417,10 @@ pub enum Event {
     Settled(RunId),
     /// A board call timed out or could not connect.
     BoardFailed(Call),
+    /// The board process the daemon started exited, or a `RestartBoard` could not start it.
+    BoardExited,
+    /// A `RestartBoard` started the board process again.
+    BoardRestarted,
     /// SIGTERM or SIGINT: the first drains, the next stops now.
     Signal,
     /// A socket client's request.
@@ -419,6 +435,13 @@ pub enum Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Claim {
+        run: RunId,
+        task: TaskId,
+        profile: String,
+    },
+    /// Renews, as `profile`, a claim the board shows held by it from before a restart; it is
+    /// answered as a claim is.
+    Resume {
         run: RunId,
         task: TaskId,
         profile: String,
@@ -458,6 +481,9 @@ pub enum Action {
     },
     ListTasks,
     RestartFeed(Cursor),
+    /// Starts again the board process the daemon started; answered by `BoardRestarted` or
+    /// `BoardExited`.
+    RestartBoard,
     Reply {
         client: ClientId,
         reply: Reply,
@@ -492,10 +518,25 @@ pub struct State {
     feed_restarts: u8,
     feed_since: Timestamp,
     feed_delivered: bool,
+    /// Since when feed restarts are exhausted: claims pause and only `FEED_RETRY_MILLIS` apart
+    /// is one more feed tried.
+    feed_failed: Option<Timestamp>,
+    /// When the last feed tried after exhaustion ended, or `None` while it runs.
+    feed_retry_after: Option<Timestamp>,
+    /// Restarts in a row of the board process the daemon started.
+    board_restarts: u8,
+    /// Since when the board process the daemon started has run; `None` from its exit until a
+    /// restart starts it, so a restart that fails counts as one more in a row.
+    board_since: Option<Timestamp>,
     /// Clients waiting on `down`, told of each run as it ends; at most `CLIENTS_MAX`.
     down_clients: Vec<ClientId>,
     /// Clients following a task's log, told when its agent is gone; at most `CLIENTS_MAX`.
     log_clients: Vec<(ClientId, TaskId)>,
+    /// The first snapshot was taken, and the claims it showed held by the core's profiles were
+    /// resumed.
+    recovered: bool,
+    /// Tasks whose claims are left to lapse, not resumed: an agent from before may still run.
+    unaccounted: Unaccounted,
     exited: bool,
 }
 
@@ -523,12 +564,30 @@ impl State {
             feed_restarts: 0,
             feed_since: now,
             feed_delivered: false,
+            feed_failed: None,
+            feed_retry_after: None,
+            board_restarts: 0,
+            board_since: Some(now),
             down_clients: Vec::new(),
             log_clients: Vec::new(),
+            recovered: false,
+            unaccounted: Unaccounted::Tasks(Vec::new()),
             exited: false,
         };
         assert!(state.runs.is_empty());
         state
+    }
+
+    /// Leaves the claims of `unaccounted` tasks to their leases instead of resuming them.
+    pub fn leave_to_lease(&mut self, unaccounted: Unaccounted) {
+        assert!(
+            !self.recovered,
+            "recovery decides before the first snapshot"
+        );
+        if let Unaccounted::Tasks(tasks) = &unaccounted {
+            assert!(tasks.len() <= LEFTOVERS_MAX);
+        }
+        self.unaccounted = unaccounted;
     }
 
     pub fn config(&self) -> &Config {
@@ -574,8 +633,15 @@ impl State {
         assert!(self.pending_claims.iter().all(given_up));
         &self.pending_claims
     }
+    /// The board's health for claiming: down while it fails or its feed restarts are exhausted.
     pub fn board(&self) -> BoardHealth {
-        self.board
+        let health = match (self.board, self.feed_failed) {
+            (BoardHealth::Up, Some(since)) => BoardHealth::Down { since },
+            (board, _) => board,
+        };
+        assert!(self.feed_failed.is_none() || health != BoardHealth::Up);
+        assert!(self.board == BoardHealth::Up || health == self.board);
+        health
     }
     pub fn stopping(&self) -> Stopping {
         assert!(self.stopping != Stopping::No || !self.exited);
@@ -585,6 +651,10 @@ impl State {
     }
     pub fn now(&self) -> Timestamp {
         self.now
+    }
+    /// The newest feed cursor the core has handled.
+    pub fn cursor(&self) -> Cursor {
+        self.cursor
     }
     pub fn exited(&self) -> bool {
         assert!(!self.exited || self.runs.is_empty());
@@ -644,6 +714,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
                 state.listing = true;
                 actions.push(Action::ListTasks);
             }
+            retry_feed(state, actions);
         }
         Event::Feed(feed) => track_feed(state, &feed),
         Event::FeedLost => feed_lost(state, actions),
@@ -661,8 +732,14 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             state.board = BoardHealth::Up;
             state.cursor = state.cursor.max(cursor);
             reconcile(state, &tasks, cursor, left_out);
+            if !state.recovered && state.board() == BoardHealth::Up {
+                state.recovered = true;
+                resume_held(state, &tasks, actions);
+            }
         }
         Event::BoardFailed(call) => board_failed(state, call),
+        Event::BoardExited => board_exited(state, actions),
+        Event::BoardRestarted => state.board_since = Some(state.now),
         Event::Signal => signal(state, actions),
         Event::Client { client, request } => on_request(state, client, request, actions),
         Event::ClientGone(client) => {
@@ -714,23 +791,76 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
     }
 }
 
-/// A loss counts as one more in a row unless the feed delivered an event or stayed up long.
+/// A loss counts as one more in a row unless the feed delivered an event or stayed up long;
+/// past `FEED_RESTARTS_MAX` in a row the feed is not restarted but retried by the tick.
 fn feed_lost(state: &mut State, actions: &mut Vec<Action>) {
     let uptime = state.now.0.saturating_sub(state.feed_since.0);
-    if state.feed_delivered || uptime >= FEED_UPTIME_MILLIS_MIN {
-        state.feed_restarts = 0;
+    if state.feed_failed.is_some() {
+        state.feed_retry_after = Some(state.now);
+    } else {
+        if state.feed_delivered || uptime >= FEED_UPTIME_MILLIS_MIN {
+            state.feed_restarts = 0;
+        }
+        state.feed_restarts = state.feed_restarts.saturating_add(1);
+        if state.feed_restarts > FEED_RESTARTS_MAX {
+            state.feed_failed = Some(state.now);
+            state.feed_retry_after = Some(state.now);
+        } else {
+            actions.push(Action::RestartFeed(state.cursor));
+        }
     }
-    state.feed_restarts = state.feed_restarts.saturating_add(1);
-    if state.feed_restarts > FEED_RESTARTS_MAX {
-        mark_down(state);
-    }
-    assert!(state.feed_restarts <= FEED_RESTARTS_MAX || state.board != BoardHealth::Up);
-    actions.push(Action::RestartFeed(state.cursor));
+    assert!(state.feed_restarts <= FEED_RESTARTS_MAX || state.feed_failed.is_some());
+    assert!(state.feed_failed.is_none() || state.feed_retry_after.is_some());
     if !state.listing {
         state.listing = true;
         actions.push(Action::ListTasks);
     }
     assert!(state.listing);
+}
+
+/// After feed restarts are exhausted, tries one more feed `FEED_RETRY_MILLIS` after the last
+/// ended, and resumes claiming once one delivers an event or stays up that long.
+fn retry_feed(state: &mut State, actions: &mut Vec<Action>) {
+    let Some(since) = state.feed_failed else {
+        return;
+    };
+    let now = state.now;
+    match state.feed_retry_after {
+        None => {
+            let uptime = now.0.saturating_sub(state.feed_since.0);
+            if state.feed_delivered || uptime >= FEED_RETRY_MILLIS {
+                state.feed_failed = None;
+                state.feed_restarts = 0;
+            }
+        }
+        Some(ended) if now.0.saturating_sub(ended.0) >= FEED_RETRY_MILLIS => {
+            state.feed_retry_after = None;
+            state.feed_since = now;
+            state.feed_delivered = false;
+            actions.push(Action::RestartFeed(state.cursor));
+        }
+        Some(_) => {}
+    }
+    assert!(state.feed_failed.is_none_or(|failed| failed == since));
+    assert!(state.feed_failed.is_some() || state.feed_restarts == 0);
+}
+
+/// The owned board is restarted unless it has already been restarted `BOARD_RESTARTS_MAX`
+/// times in a row; an exit after it stayed up long starts the count again, and a restart that
+/// could not start it counts as one more.
+fn board_exited(state: &mut State, actions: &mut Vec<Action>) {
+    let since = state.board_since.take();
+    let uptime = since.map_or(0, |since| state.now.0.saturating_sub(since.0));
+    if uptime >= BOARD_UPTIME_MILLIS_MIN {
+        state.board_restarts = 0;
+    }
+    mark_down(state);
+    if state.board_restarts < BOARD_RESTARTS_MAX {
+        state.board_restarts += 1;
+        actions.push(Action::RestartBoard);
+    }
+    assert!(state.board_restarts <= BOARD_RESTARTS_MAX);
+    assert!(state.board != BoardHealth::Up && state.board_since.is_none());
 }
 
 fn on_request(state: &mut State, client: ClientId, request: Request, actions: &mut Vec<Action>) {
@@ -831,7 +961,7 @@ fn status_view(state: &State) -> StatusView {
         }
     });
     let view = StatusView {
-        board: state.board,
+        board: state.board(),
         stopping: state.stopping,
         running: state.runs.len(),
         limit: state.config.agents_max,
@@ -950,6 +1080,7 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         state: task_state,
         role: role_of(&state.config, &feed.labels),
         branch: label(&feed.labels, "branch"),
+        onto: onto_of(&feed.labels),
         project: project_of(&feed.channel),
         seen: feed.cursor,
         claim_refused: false,
@@ -1111,6 +1242,7 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
                 state: view.state,
                 role: role_of(&state.config, &view.labels),
                 branch: label(&view.labels, "branch"),
+                onto: onto_of(&view.labels),
                 project: project_of(channel),
                 seen: view.version,
                 claim_refused: false,
@@ -1145,6 +1277,14 @@ fn label(labels: &[(String, String)], key: &str) -> Option<String> {
     assert!(labels.len() <= LABELS_MAX);
     let found = labels.iter().find(|(name, _)| name == key);
     found.map(|(_, value)| value.clone())
+}
+
+// A malformed `onto` is left to preparation, which blocks the task as an invalid brief.
+fn onto_of(labels: &[(String, String)]) -> Option<TaskId> {
+    assert!(labels.len() <= LABELS_MAX);
+    let value = label(labels, "onto")?;
+    let digits = value.strip_prefix('#').unwrap_or(&value);
+    digits.parse::<u64>().ok().map(TaskId)
 }
 
 fn role_of(config: &Config, labels: &[(String, String)]) -> Option<usize> {
@@ -1401,7 +1541,7 @@ fn begin_settle(
 }
 
 fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
-    let up = state.board == BoardHealth::Up;
+    let up = state.board() == BoardHealth::Up;
     let now = state.now;
     let tries_max = state.config.settle_tries_max;
     let entry = &mut state.runs[index];
@@ -1554,7 +1694,7 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
 /// Releases late grants of given-up claims, and forgets those whose grant has lapsed.
 fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
     let now = state.now;
-    let up = state.board == BoardHealth::Up;
+    let up = state.board() == BoardHealth::Up;
     state.pending_claims.retain(|pending| now < pending.until);
     for pending in state.pending_claims.iter_mut() {
         let Some(epoch) = pending.epoch else {
@@ -1577,7 +1717,7 @@ fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
 }
 
 fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
-    if state.board != BoardHealth::Up || state.stopping != Stopping::No {
+    if state.board() != BoardHealth::Up || state.stopping != Stopping::No {
         return;
     }
     let agents_max = usize::from(state.config.agents_max);
@@ -1591,40 +1731,106 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         let Some((task, role, slot)) = next_claimable(state) else {
             break;
         };
-        let id = RunId(state.next_run);
-        state.next_run = state.next_run.saturating_add(1);
-        let profile = state.profile(role, slot);
-        let now = state.now;
         let branch = state.tasks[task].branch.clone();
         let task = state.tasks[task].id;
-        state.runs.push(Run {
-            id,
-            task,
-            role,
-            slot,
-            phase: Phase::Claiming,
-            epoch: 0,
-            lease_until: now,
-            attempt_start: now,
-            phase_start: now,
-            renewing: false,
-            settlement: None,
-            settle_tries: 0,
-            settling: false,
-            retry_at: now,
-            agent_alive: false,
-            branch,
-            stop_tries: 0,
-            agent_lost: false,
-        });
-        actions.push(Action::Claim {
-            run: id,
-            task,
-            profile,
-        });
-        assert!(state.next_run > id.0);
+        let (run, profile) = new_run(state, task, role, slot, branch);
+        actions.push(Action::Claim { run, task, profile });
     }
     assert!(state.runs.len() <= agents_max);
+}
+
+/// A new run claiming `task` as `role`'s `slot`, and the profile it claims as.
+fn new_run(
+    state: &mut State,
+    task: TaskId,
+    role: usize,
+    slot: u8,
+    branch: Option<String>,
+) -> (RunId, String) {
+    assert!(state.runs.len() < usize::from(state.config.agents_max));
+    let id = RunId(state.next_run);
+    state.next_run = state.next_run.saturating_add(1);
+    let now = state.now;
+    state.runs.push(Run {
+        id,
+        task,
+        role,
+        slot,
+        phase: Phase::Claiming,
+        epoch: 0,
+        lease_until: now,
+        attempt_start: now,
+        phase_start: now,
+        renewing: false,
+        settlement: None,
+        settle_tries: 0,
+        settling: false,
+        retry_at: now,
+        agent_alive: false,
+        branch,
+        stop_tries: 0,
+        agent_lost: false,
+    });
+    assert!(state.next_run > id.0);
+    (id, state.profile(role, slot))
+}
+
+/// Starts a run for each claimed task a listing shows held by one of the core's profiles,
+/// renewing the claim as that profile, while the limits allow.
+fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action>) {
+    assert!(state.board() == BoardHealth::Up);
+    if state.stopping != Stopping::No {
+        return;
+    }
+    let Unaccounted::Tasks(unaccounted) = state.unaccounted.clone() else {
+        return;
+    };
+    let roles = state.config.roles.len();
+    for ListedTask { view, .. } in tasks {
+        if state.runs.len() >= usize::from(state.config.agents_max) {
+            break;
+        }
+        if unaccounted.contains(&view.id) {
+            continue;
+        }
+        let holder = view
+            .claim
+            .as_ref()
+            .filter(|_| view.state == TaskState::Claimed);
+        let Some(holder) = holder.map(|claim| claim.holder.as_str()) else {
+            continue;
+        };
+        // The board names a holder `<owner>+<profile>`.
+        let profile = holder
+            .rsplit_once('+')
+            .map_or(holder, |(_, profile)| profile);
+        let held = (0..roles).find_map(|role| {
+            let slots = state.config.roles[role].slots;
+            let slot = (1..=slots).find(|slot| state.profile(role, *slot) == profile)?;
+            Some((role, slot))
+        });
+        let Some((role, slot)) = held else {
+            continue;
+        };
+        let branch = label(&view.labels, "branch");
+        let config = &state.config;
+        let builders = (state.runs.iter()).filter(|run| config.roles[run.role].builds);
+        let full =
+            config.roles[role].builds && builders.count() >= usize::from(config.builders_max);
+        let taken = state.runs.iter().any(|run| {
+            run.task == view.id
+                || (run.role == role && run.slot == slot)
+                || (branch.is_some() && run.branch == branch)
+        });
+        if full || taken {
+            continue;
+        }
+        let task = view.id;
+        let (run, profile) = new_run(state, task, role, slot, branch);
+        actions.push(Action::Resume { run, task, profile });
+    }
+    assert!(state.runs.len() <= usize::from(state.config.agents_max));
+    assert!(branches_unique(&state.runs));
 }
 
 /// The oldest claimable task, its role, and the lowest free slot of that role; a task of a
@@ -1641,10 +1847,14 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
         let Some(role) = role else {
             continue;
         };
-        let taken = state
-            .runs
-            .iter()
-            .any(|run| run.task == task.id || (task.branch.is_some() && run.branch == task.branch));
+        // A task `onto` another waits while any run that holds a branch is settling: that
+        // run's worktree keeps the branch, which may be the onto task's, until it is removed.
+        let taken = state.runs.iter().any(|run| {
+            run.task == task.id
+                || (task.branch.is_some() && run.branch == task.branch)
+                || task.onto == Some(run.task)
+                || (task.onto.is_some() && run.phase == Phase::Settling && run.branch.is_some())
+        });
         if task.state != TaskState::Ready || taken {
             continue;
         }
@@ -1746,4 +1956,82 @@ fn finish_stopping(state: &mut State, actions: &mut Vec<Action>) {
     actions.push(Action::Exit(0));
     assert!(state.runs.is_empty());
     assert!(state.pending_claims.is_empty());
+}
+
+/// An agent a crashed daemon recorded: its task, process group, and the leader's start time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub task: TaskId,
+    pub group: i32,
+    /// When the group's leader started, in seconds since the epoch.
+    pub start: u64,
+}
+
+/// A pid file a crashed daemon left for `task`: the group it names, if readable, and the
+/// record acknowledging that group, if one was written and is readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidFile {
+    pub task: TaskId,
+    pub group: Option<i32>,
+    pub ack: Option<AgentRecord>,
+}
+
+/// Tasks a crashed daemon may still have an agent for that recovery could not identify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unaccounted {
+    Tasks(Vec<TaskId>),
+    /// Neither the agents file nor the pid files could be read.
+    Every,
+}
+
+/// What recovery after a crash does: the groups to stop, and the tasks to leave to their leases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovery {
+    pub stop: Vec<AgentRecord>,
+    pub unaccounted: Unaccounted,
+}
+
+/// Decides recovery from the agents file and the pid files, `None` where unreadable; `started`
+/// gives the start time of a live group's leader. A group is stopped only when its leader
+/// started when a record says; a live group a pid file names that no record identifies leaves
+/// its task unaccounted.
+pub fn recover(
+    records: Option<&[AgentRecord]>,
+    pid_files: Option<&[PidFile]>,
+    started: &dyn Fn(i32) -> Option<u64>,
+) -> Recovery {
+    assert!(records.is_none_or(|records| records.len() <= LEFTOVERS_MAX));
+    assert!(pid_files.is_none_or(|files| files.len() <= LEFTOVERS_MAX));
+    let acks = pid_files
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|file| file.ack);
+    let mut stop: Vec<AgentRecord> = Vec::new();
+    for record in records.unwrap_or_default().iter().copied().chain(acks) {
+        let known = stop.iter().any(|stopped| stopped.group == record.group);
+        if record.group > 1 && !known && started(record.group) == Some(record.start) {
+            stop.push(record);
+        }
+    }
+    let unaccounted = match pid_files {
+        None if records.is_none() => Unaccounted::Every,
+        None => Unaccounted::Tasks(Vec::new()),
+        Some(files) => {
+            let mut tasks: Vec<TaskId> = Vec::new();
+            for file in files {
+                let identified = file.group.is_some_and(|group| {
+                    group <= 1
+                        || started(group).is_none()
+                        || stop.iter().any(|record| record.group == group)
+                });
+                if !identified && !tasks.contains(&file.task) {
+                    tasks.push(file.task);
+                }
+            }
+            Unaccounted::Tasks(tasks)
+        }
+    };
+    assert!(stop.len() <= 2 * LEFTOVERS_MAX);
+    assert!(stop.iter().all(|record| record.group > 1));
+    Recovery { stop, unaccounted }
 }

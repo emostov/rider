@@ -90,7 +90,7 @@ worker take it again.
 Never write `branch`, `attempt`, or `start` yourself, except `attempt=0` to retry an
 exhausted task.
 
-`role` makes a task claimable: the pool claims only tasks with `role=<role>`. So `role` is
+`role` makes a task claimable: the daemon claims only tasks with `role=<role>`. So `role` is
 always the last label a task gets (see "Creating a plan").
 
 Rider checks these before starting a worker, and blocks the task as `invalid_brief` when one
@@ -160,7 +160,7 @@ These rules are yours to keep. Rider does not check them:
 
 The rule: **a task becomes claimable only when it has `role`, and `role` is always set
 last.** Never create a task with `role` and add `base`, `onto`, `of`, or `from` afterwards:
-the pool may claim it in between and run it on the wrong branch.
+the daemon may claim it in between and run it on the wrong branch.
 
 1. Write the plan to a file outside this directory (`mktemp`): a JSON array of
    `{"key", "text", "labels", "needs"}`. A need is `{"key": "<key in this plan>"}` or the
@@ -253,7 +253,7 @@ task of its own.
 | blocked `rider_error` | Rider could not run the task (git, prompt file, harness) | Tell the owner. Do not retry blindly |
 | failed | the reason and the log tail are in the thread | Read them. Reply with what the next attempt must do, then `vb tasks reopen <id> --as lead-fable-5-2` retries in the same worktree. The next worker follows your latest reply over the brief, so make it a complete, specific instruction. If the correction changes what the task is, rewrite the brief instead: `vb edit <id> - --as lead-fable-5-2` with the new text on standard input, then reopen. Dependents keep waiting |
 | blocked `awaiting_approval`, in `decisions` | waiting for the owner | Nothing until they answer |
-| completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@1` record: branch, head, commits, summary |
+| completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@2` record: branch, head, commits, summary, and `behind`, the stacked tasks whose branches lack the new head |
 
 `vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
 "<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.
@@ -268,9 +268,10 @@ never delete the branch. A completed task whose thread says "Kept the worktree" 
 same case once its changes are understood. `rider clean` (issue #60) will replace this rule.
 
 A branch moves after children were cut from it only when an `onto` task completes on it.
-Then restack each child branch, bottom up, one task at a time: `role=light` (or
+The `behind` field of that task's `rider-result@2` record names the children whose branches
+lack its new head. Then restack each child branch, bottom up, one task at a time: `role=light` (or
 `implement`), `onto=<the child's task>`, needing the task that moved its parent. Its brief
-names the commit to rebase onto (the parent's new head, from the `rider-result@1` record of
+names the commit to rebase onto (the parent's new head, from the `rider-result@2` record of
 the task that moved it) and the proof command. That head does not exist until the restack
 below completes, so create each restack only after the one below it has completed, never as
 one batch.

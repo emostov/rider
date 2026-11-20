@@ -1,12 +1,13 @@
 //! The simulated world: a fake board, git, process table and clock around one core.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use rider::board::{ListedTask, TaskId, TaskState, TaskView, Timestamp};
+use rider::board::{Claim, ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
-    ACTIONS_MAX, Action, BoardHealth, Call, ClientId, Config, Event, FEED_RESTARTS_MAX,
-    FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase, Reply, Request, RunId, Settlement, State,
-    StopReason, Stopping, Untracked, step,
+    ACTIONS_MAX, Action, AgentRecord, BOARD_RESTARTS_MAX, BOARD_UPTIME_MILLIS_MIN, BoardHealth,
+    Call, ClientId, Config, Event, FEED_RESTARTS_MAX, FEED_RETRY_MILLIS, FEED_UPTIME_MILLIS_MIN,
+    KILLED_REASON, Phase, PidFile, Reply, Request, RunId, Settlement, State, StopReason, Stopping,
+    Unaccounted, Untracked, recover, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -40,6 +41,14 @@ const LISTING_TASKS_MAX: usize = 24;
 const LISTING_LAG_MAX: u64 = 4;
 /// One flapping fault in this many is a burst of feeds that exit at once.
 const FLAP_EVERY: u32 = 4;
+/// One seed in this many runs a board the core's daemon started, which may die.
+const OWNED_BOARD_EVERY: u64 = 2;
+/// One restart of a dead board in this many fails at once.
+const BOARD_RESTART_FAILS_EVERY: u32 = 2;
+/// Upper bound, in minutes, on how long a board left dead stays so until the owner starts it.
+const BOARD_DEAD_MINUTES_MAX: u64 = 12;
+/// Upper bound on how far past one lease a clock jump lands.
+const JUMP_PAST_LEASE_MAX: u64 = 30 * MINUTE;
 
 /// The newest version of one task the core was told, by cursor.
 #[derive(Debug)]
@@ -55,6 +64,11 @@ struct FakeTask {
     labels: Vec<(String, String)>,
     epoch: u64,
     holder: Option<RunId>,
+    /// The restarts of the core before the holder's claim was granted or renewed, which tells
+    /// apart runs of different cores that share an id.
+    generation: u64,
+    /// The profile the claim is held as.
+    profile: String,
     lease_until: Timestamp,
     /// The cursor of the newest event published about the task.
     version: u64,
@@ -62,6 +76,10 @@ struct FakeTask {
 
 struct Agent {
     run: RunId,
+    task: TaskId,
+    /// The agent's process group, and when its leader started, in seconds.
+    group: i32,
+    start: u64,
     /// The id of the `Spawn` the agent's exit answers.
     spawn: u64,
     exit_at: Timestamp,
@@ -98,6 +116,8 @@ struct RunLog {
 
 pub struct World {
     rng: fastrand::Rng,
+    /// Draws which tasks work `onto` another, apart from `rng` so the other draws stay put.
+    onto_rng: fastrand::Rng,
     config: Config,
     core: State,
     now: Timestamp,
@@ -113,12 +133,36 @@ pub struct World {
     feed_restarts: u8,
     feed_since: Timestamp,
     feed_delivered: bool,
+    /// Since when feed restarts are exhausted, by the rule the core must follow.
+    feed_failed: Option<Timestamp>,
+    /// When the last feed tried after exhaustion ended, or `None` while it runs.
+    feed_retry_after: Option<Timestamp>,
+    /// The core stopped restarting the feed after `FEED_RESTARTS_MAX` losses in a row.
+    pub feed_given_up: bool,
+    /// A feed tried after exhaustion worked and the core claimed again.
+    pub feed_recovered: bool,
     cursor: u64,
     /// Results not yet delivered, each with the id of the outstanding action it answers.
     /// A result is not delivered before its time.
     results: Vec<(Event, u64, Timestamp)>,
     agents: Vec<Agent>,
+    /// Agents of the core before the last restart that its recovery left running.
+    leftovers: Vec<Agent>,
+    next_group: i32,
     down_until: Timestamp,
+    /// The daemon started the board: it may die, and the core restarts it.
+    owns_board: bool,
+    /// The board process is dead until then, unless a restart starts it sooner.
+    dead_until: Timestamp,
+    /// Board restarts in a row, by the rule the core must follow.
+    board_restarts: u8,
+    board_since: Option<Timestamp>,
+    /// The core left the board dead after `BOARD_RESTARTS_MAX` restarts in a row.
+    pub board_given_up: bool,
+    /// Every restart of the dead board fails until then.
+    spawn_fails_until: Timestamp,
+    /// The core gave up on a board whose restarts all failed after it had stayed up long.
+    pub spawn_given_up: bool,
     /// Actions not yet answered, by run (`None` for a listing or a feed restart).
     outstanding: Vec<(u64, Option<RunId>, &'static str)>,
     next_action: u64,
@@ -141,6 +185,14 @@ pub struct World {
     signals: u8,
     exited: bool,
     pub trace: Vec<String>,
+    /// The phases runs were in when the core was restarted, by name.
+    pub restarted_in: BTreeSet<String>,
+    /// The phases runs were in when a board outage began, by name.
+    pub down_in: BTreeSet<String>,
+    /// The phases runs were in when the clock jumped past every lease, by name.
+    pub jumped_in: BTreeSet<String>,
+    /// How many times the core was restarted.
+    generation: u64,
     /// The replies the core sent `OWNER` during its current request.
     replies: Vec<(ClientId, Reply)>,
 }
@@ -156,6 +208,7 @@ impl World {
         let now = Timestamp(1_800_000_000_000);
         World {
             rng: fastrand::Rng::with_seed(seed),
+            onto_rng: fastrand::Rng::with_seed(!seed),
             core: State::new(config.clone(), now),
             config,
             now,
@@ -167,10 +220,23 @@ impl World {
             feed_restarts: 0,
             feed_since: now,
             feed_delivered: false,
+            feed_failed: None,
+            feed_retry_after: None,
+            feed_given_up: false,
+            feed_recovered: false,
             cursor: 0,
             results: Vec::new(),
             agents: Vec::new(),
+            leftovers: Vec::new(),
+            next_group: 2,
             down_until: now,
+            owns_board: seed.is_multiple_of(OWNED_BOARD_EVERY),
+            dead_until: now,
+            board_restarts: 0,
+            board_since: Some(now),
+            board_given_up: false,
+            spawn_fails_until: now,
+            spawn_given_up: false,
             outstanding: Vec::new(),
             next_action: 0,
             log: HashMap::new(),
@@ -185,6 +251,10 @@ impl World {
             signals: 0,
             exited: false,
             trace: Vec::new(),
+            restarted_in: BTreeSet::new(),
+            down_in: BTreeSet::new(),
+            jumped_in: BTreeSet::new(),
+            generation: 0,
             replies: Vec::new(),
         }
     }
@@ -240,10 +310,9 @@ impl World {
             ));
         }
         let now = self.now;
-        let held = self
-            .tasks
-            .iter()
-            .find(|task| task.holder.is_some() && task.lease_until > now);
+        let held = self.tasks.iter().find(|task| {
+            task.holder.is_some() && task.generation == self.generation && task.lease_until > now
+        });
         match held {
             Some(task) => Err(format!(
                 "task {} is still claimed by {:?} until {:?} after the core exited at {now:?}",
@@ -287,9 +356,11 @@ impl World {
         }
         match choice {
             80..=87 => self.create_task(),
-            88..=89 => self.lose_claim(),
+            88 => self.lose_claim(),
+            89 => return self.jump_clock(),
             90..=91 => self.crash_agent(),
-            92 => self.down_until = Timestamp(self.now.0 + self.rng.u64(1..10) * MINUTE),
+            92 if self.owns_board && self.rng.bool() => self.board_dies(),
+            92 => self.board_outage(),
             93 => self.lose_feed(),
             94..=95 => self.unblock(),
             96 => self.cancel_task(),
@@ -300,9 +371,37 @@ impl World {
                 self.flaps_left = self.rng.u32(restarts..3 * restarts);
                 self.lose_feed();
             }
+            98 => return self.restart(),
             _ => return self.advance(),
         }
         Ok(())
+    }
+
+    /// Every board call fails for one to nine minutes from now.
+    fn board_outage(&mut self) {
+        for run in self.core.runs() {
+            self.down_in.insert(phase_name(run.phase));
+        }
+        self.down_until = Timestamp(self.now.0 + self.rng.u64(1..10) * MINUTE);
+        self.trace
+            .push(format!("board down until {:?}", self.down_until));
+    }
+
+    /// The board process the daemon started dies; it stays dead until a restart or the owner
+    /// starts it.
+    fn board_dies(&mut self) {
+        for run in self.core.runs() {
+            self.down_in.insert(phase_name(run.phase));
+        }
+        let minutes = self.rng.u64(1..=BOARD_DEAD_MINUTES_MAX);
+        self.dead_until = Timestamp(self.now.0 + minutes * MINUTE);
+        if self.rng.bool() {
+            self.spawn_fails_until = self.dead_until;
+        }
+        self.trace
+            .push(format!("board dead until {:?}", self.dead_until));
+        let id = self.expect(None, "board");
+        self.reply(id, Event::BoardExited);
     }
 
     /// Asks the core, as the owner, to kill a task's agent or to follow its log, sometimes for
@@ -354,6 +453,21 @@ impl World {
         } else {
             self.rng.u64(SECOND..3 * MINUTE)
         };
+        self.pass(pause)
+    }
+
+    /// The clock jumps past every lease between two ticks, whatever is in flight.
+    fn jump_clock(&mut self) -> Result<(), String> {
+        for run in self.core.runs() {
+            self.jumped_in.insert(phase_name(run.phase));
+        }
+        let pause = self.config.lease_millis + self.rng.u64(SECOND..JUMP_PAST_LEASE_MAX);
+        self.trace.push(format!("clock jumps {pause} ms"));
+        self.pass(pause)
+    }
+
+    /// Time passes: leases lapse, agents due exit, and the core is told the time.
+    fn pass(&mut self, pause: u64) -> Result<(), String> {
         self.now = Timestamp(self.now.0 + pause);
         let now = self.now;
         for index in 0..self.tasks.len() {
@@ -366,10 +480,114 @@ impl World {
             .drain(..)
             .partition(|agent| agent.exit_at <= now);
         self.agents = running;
+        self.leftovers.retain(|agent| agent.exit_at > now);
         for agent in done {
             self.reply(agent.spawn, Event::AgentExited(agent.run));
         }
         self.deliver(Event::Tick(now))
+    }
+
+    /// The daemon crashes and starts again: the core's state, its actions in flight and its
+    /// agents are gone, and a new core rebuilds from the board, following the feed from the
+    /// cursor the old one handled.
+    fn restart(&mut self) -> Result<(), String> {
+        for run in self.core.runs() {
+            self.restarted_in.insert(phase_name(run.phase));
+        }
+        let saved = self.core.cursor();
+        let crashed = std::mem::take(&mut self.agents);
+        let unaccounted = self.recover(crashed)?;
+        self.core = State::new(self.config.clone(), self.now);
+        self.core.leave_to_lease(unaccounted);
+        self.generation += 1;
+        self.results.clear();
+        self.outstanding.clear();
+        self.log.clear();
+        self.spawned.clear();
+        self.refused.clear();
+        self.listings.clear();
+        self.replies.clear();
+        self.told.clear();
+        self.left_out.clear();
+        self.listed_through = 0;
+        self.flaps_left = 0;
+        self.feed_restarts = 0;
+        self.feed_since = self.now;
+        self.feed_delivered = false;
+        self.feed_failed = None;
+        self.feed_retry_after = None;
+        // The restarted daemon starts the board again if it is dead.
+        self.dead_until = self.now;
+        self.spawn_fails_until = self.now;
+        self.board_restarts = 0;
+        self.board_since = Some(self.now);
+        self.stopped_now = false;
+        self.feed = (self.history.iter())
+            .filter(|event| event.cursor > saved)
+            .cloned()
+            .collect();
+        self.feed_up = true;
+        self.trace.push(format!("restart from {saved:?}"));
+        self.deliver(Event::Tick(self.now))
+    }
+
+    /// The restarted daemon's recovery, from files that may be unreadable or lost and pids
+    /// that may have been reused: every live agent of the crashed core must be stopped or have
+    /// its task left to its lease, and no reused pid may be stopped.
+    fn recover(&mut self, crashed: Vec<Agent>) -> Result<Unaccounted, String> {
+        let (reused, live): (Vec<Agent>, Vec<Agent>) =
+            crashed.into_iter().partition(|_| self.rng.u32(0..10) == 0);
+        let record = |agent: &Agent| AgentRecord {
+            task: agent.task,
+            group: agent.group,
+            start: agent.start,
+        };
+        let all: Vec<&Agent> = live.iter().chain(&reused).collect();
+        let records: Vec<AgentRecord> = all.iter().map(|agent| record(agent)).collect();
+        let mut pid_files = Vec::new();
+        for agent in &all {
+            pid_files.push(PidFile {
+                task: agent.task,
+                group: (self.rng.u32(0..8) != 0).then_some(agent.group),
+                ack: (self.rng.u32(0..4) != 0).then_some(record(agent)),
+            });
+        }
+        let records_read = (self.rng.u32(0..4) != 0).then_some(&records[..]);
+        let pid_files_read = (self.rng.u32(0..6) != 0).then_some(&pid_files[..]);
+        let started = |group: i32| {
+            let alive = live.iter().find(|agent| agent.group == group);
+            let stranger = reused.iter().find(|agent| agent.group == group);
+            alive
+                .map(|agent| agent.start)
+                .or(stranger.map(|agent| agent.start + 1))
+        };
+        let recovery = recover(records_read, pid_files_read, &started);
+        self.trace.push(format!("recovered {recovery:?}"));
+        if let Some(record) =
+            (recovery.stop.iter()).find(|r| reused.iter().any(|a| a.group == r.group))
+        {
+            return Err(format!("recovery stopped {record:?}, a reused pid"));
+        }
+        self.leftovers.clear();
+        for agent in live {
+            let stopped = recovery
+                .stop
+                .iter()
+                .any(|record| record.group == agent.group);
+            let left = match &recovery.unaccounted {
+                Unaccounted::Every => true,
+                Unaccounted::Tasks(tasks) => tasks.contains(&agent.task),
+            };
+            if left && !stopped {
+                self.leftovers.push(agent);
+            } else if !stopped {
+                return Err(format!(
+                    "recovery neither stopped nor accounted for {:?}'s agent, group {}",
+                    agent.task, agent.group
+                ));
+            }
+        }
+        Ok(recovery.unaccounted)
     }
 
     fn create_task(&mut self) {
@@ -382,7 +600,11 @@ impl World {
             _ => "unknown",
         };
         let mut labels = vec![("role".to_string(), role.to_string())];
-        if self.rng.bool() {
+        if id.0 > 1 && self.onto_rng.u32(0..3) == 0 {
+            let onto = self.onto_rng.u64(1..id.0);
+            labels.push(("onto".to_string(), format!("#{onto}")));
+        }
+        if self.rng.bool() && labels.len() == 1 {
             let branch = BRANCHES[self.rng.usize(0..BRANCHES.len())];
             labels.push(("branch".to_string(), branch.to_string()));
         }
@@ -392,6 +614,8 @@ impl World {
             labels,
             epoch: 0,
             holder: None,
+            generation: 0,
+            profile: String::new(),
             lease_until: self.now,
             version: 0,
         });
@@ -528,9 +752,103 @@ impl World {
                 self.feed_restarts
             ));
         }
+        self.check_board(&event, &actions)?;
+        self.check_feed(&event, &actions)?;
         self.check(&actions)?;
         for action in actions {
             self.perform(action)?;
+        }
+        Ok(())
+    }
+
+    /// Counts board restarts in a row as the core must, and checks it restarts the board it
+    /// started no more than `BOARD_RESTARTS_MAX` times in a row and counts it down meanwhile.
+    fn check_board(&mut self, event: &Event, actions: &[Action]) -> Result<(), String> {
+        let restarts = (actions.iter())
+            .filter(|action| matches!(action, Action::RestartBoard))
+            .count();
+        match event {
+            Event::BoardRestarted => self.board_since = Some(self.now),
+            Event::BoardExited if !self.core.exited() => {
+                let since = self.board_since.take();
+                let uptime = since.map_or(0, |since| self.now.0.saturating_sub(since.0));
+                if uptime >= BOARD_UPTIME_MILLIS_MIN {
+                    self.board_restarts = 0;
+                }
+                let expected = usize::from(self.board_restarts < BOARD_RESTARTS_MAX);
+                if restarts != expected {
+                    return Err(format!(
+                        "the board exited after {} restarts in a row, and the core asked for \
+                         {restarts} restarts",
+                        self.board_restarts
+                    ));
+                }
+                if self.core.board() == BoardHealth::Up {
+                    return Err("the board exited, but it still counts as up".to_string());
+                }
+                self.board_given_up |= expected == 0;
+                self.spawn_given_up |= expected == 0 && self.now < self.spawn_fails_until;
+                self.board_restarts += u8::try_from(expected).expect("zero or one");
+            }
+            _ if restarts > 0 => {
+                return Err(format!("{event:?} asked for a board restart"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Follows the feed rule the core must: past `FEED_RESTARTS_MAX` losses in a row it stops
+    /// restarting the feed and claims nothing until a feed tried `FEED_RETRY_MILLIS` apart
+    /// delivers an event or stays up that long.
+    fn check_feed(&mut self, event: &Event, actions: &[Action]) -> Result<(), String> {
+        if self.core.exited() {
+            return Ok(());
+        }
+        let now = self.now;
+        let mut expected = 0;
+        match (event, self.feed_retry_after) {
+            (Event::FeedLost, _) if self.feed_failed.is_some() => {
+                self.feed_retry_after = Some(now);
+            }
+            (Event::FeedLost, _) if self.feed_restarts > FEED_RESTARTS_MAX => {
+                self.feed_failed = Some(now);
+                self.feed_retry_after = Some(now);
+                self.feed_given_up = true;
+            }
+            (Event::FeedLost, _) => expected = 1,
+            (Event::Tick(_), None) if self.feed_failed.is_some() => {
+                let uptime = now.0.saturating_sub(self.feed_since.0);
+                if self.feed_delivered || uptime >= FEED_RETRY_MILLIS {
+                    self.feed_failed = None;
+                    self.feed_restarts = 0;
+                    self.feed_recovered = true;
+                }
+            }
+            (Event::Tick(_), Some(ended))
+                if self.feed_failed.is_some()
+                    && now.0.saturating_sub(ended.0) >= FEED_RETRY_MILLIS =>
+            {
+                self.feed_retry_after = None;
+                self.feed_since = now;
+                self.feed_delivered = false;
+                expected = 1;
+            }
+            _ => {}
+        }
+        let restarts = (actions.iter())
+            .filter(|action| matches!(action, Action::RestartFeed(_)))
+            .count();
+        if restarts != expected {
+            return Err(format!(
+                "{event:?} with feed restarts exhausted since {:?} asked for {restarts} feed \
+                 restarts, not {expected}",
+                self.feed_failed
+            ));
+        }
+        let claims = (actions.iter()).any(|action| matches!(action, Action::Claim { .. }));
+        if self.feed_failed.is_some() && (claims || self.core.board() == BoardHealth::Up) {
+            return Err("the feed's restarts are exhausted, but the core claims".to_string());
         }
         Ok(())
     }
@@ -595,7 +913,9 @@ impl World {
         match event {
             Event::Tick(_) => self.refused.clear(),
             Event::Feed(feed) => {
-                if let Some(state) = feed.state.filter(|_| feed.cursor.0 > self.listed_through) {
+                // The core drops an event at or before its cursor, as one it already reflects.
+                let through = self.listed_through.max(self.core.cursor().0);
+                if let Some(state) = feed.state.filter(|_| feed.cursor.0 > through) {
                     let newer = (self.told.get(&feed.task.0))
                         .is_none_or(|told| told.cursor < feed.cursor.0);
                     if newer {
@@ -650,7 +970,7 @@ impl World {
                 self.feed_since = self.now;
                 self.feed_delivered = false;
             }
-            Event::FeedLost => {
+            Event::FeedLost if self.feed_failed.is_none() => {
                 let uptime = self.now.0.saturating_sub(self.feed_since.0);
                 if self.feed_delivered || uptime >= FEED_UPTIME_MILLIS_MIN {
                     self.feed_restarts = 0;
@@ -662,12 +982,16 @@ impl World {
     }
 
     fn board_fails(&mut self) -> bool {
-        self.now < self.down_until || self.rng.u32(0..20) == 0
+        self.now < self.down_until || self.now < self.dead_until || self.rng.u32(0..20) == 0
     }
 
     fn perform(&mut self, action: Action) -> Result<(), String> {
         match action {
-            Action::Claim { run, task, .. } => self.claim(run, task),
+            Action::Claim { run, task, profile } => {
+                self.check_onto_free(task)?;
+                self.claim(run, task, profile);
+            }
+            Action::Resume { run, task, profile } => self.resume(run, task, &profile),
             Action::Prepare { run, task } => {
                 let id = self.expect(Some(run), "prepare");
                 let branch = self.learn_branch(task);
@@ -685,13 +1009,18 @@ impl World {
                 };
                 self.reply(id, event);
             }
-            Action::Spawn { run, .. } => {
+            Action::Spawn { run, task, .. } => {
                 let spawn = self.expect(Some(run), "spawn");
                 self.spawned.insert(run);
                 let exit_at = Timestamp(self.now.0 + self.rng.u64(MINUTE..70 * MINUTE));
                 let stubborn = self.rng.u32(0..6) == 0;
+                let group = self.next_group;
+                self.next_group += 1;
                 self.agents.push(Agent {
                     run,
+                    task,
+                    group,
+                    start: self.now.0 / SECOND,
                     spawn,
                     exit_at,
                     stubborn,
@@ -731,6 +1060,16 @@ impl World {
                 run, task, epoch, ..
             } => self.close(run, task, epoch, None)?,
             Action::ListTasks => self.list(),
+            Action::RestartBoard => {
+                let id = self.expect(None, "board");
+                let fails = self.now < self.spawn_fails_until;
+                if fails || self.rng.u32(0..BOARD_RESTART_FAILS_EVERY) == 0 {
+                    self.reply(id, Event::BoardExited);
+                } else {
+                    self.dead_until = self.now;
+                    self.reply(id, Event::BoardRestarted);
+                }
+            }
             Action::RestartFeed(cursor) => {
                 let id = self.expect(None, "feed");
                 self.reply(id, Event::FeedResumed(cursor));
@@ -770,10 +1109,40 @@ impl World {
     fn holds(&self, run: RunId, task: TaskId) -> Option<usize> {
         let index = self.tasks.iter().position(|fake| fake.id == task)?;
         let fake = &self.tasks[index];
-        (fake.holder == Some(run) && fake.lease_until > self.now).then_some(index)
+        let current = fake.generation == self.generation;
+        (fake.holder == Some(run) && current && fake.lease_until > self.now).then_some(index)
     }
 
-    fn claim(&mut self, run: RunId, task: TaskId) {
+    /// Renews, as `profile`, a claim granted to a core before a restart.
+    fn resume(&mut self, run: RunId, task: TaskId, profile: &str) {
+        self.log.entry(run).or_default().task = Some(task);
+        let id = self.expect(Some(run), "claim");
+        if self.board_fails() {
+            self.reply(id, Event::BoardFailed(Call::Claim(run)));
+            return;
+        }
+        let now = self.now;
+        let held = (self.tasks.iter()).position(|fake| {
+            fake.id == task
+                && fake.state == TaskState::Claimed
+                && fake.holder.is_some()
+                && fake.profile == profile
+                && fake.lease_until > now
+        });
+        let Some(index) = held else {
+            self.reply(id, Event::ClaimRefused(run));
+            return;
+        };
+        let until = Timestamp(now.0 + self.config.lease_millis);
+        let fake = &mut self.tasks[index];
+        fake.holder = Some(run);
+        fake.generation = self.generation;
+        fake.lease_until = until;
+        let epoch = fake.epoch;
+        self.reply(id, Event::Claimed { run, epoch, until });
+    }
+
+    fn claim(&mut self, run: RunId, task: TaskId, profile: String) {
         self.log.entry(run).or_default().task = Some(task);
         let id = self.expect(Some(run), "claim");
         if self.board_fails() {
@@ -790,6 +1159,8 @@ impl World {
                 let fake = &mut self.tasks[index];
                 fake.epoch += 1;
                 fake.holder = Some(run);
+                fake.generation = self.generation;
+                fake.profile = profile;
                 fake.state = TaskState::Claimed;
                 fake.lease_until = until;
                 let epoch = fake.epoch;
@@ -892,7 +1263,10 @@ impl World {
                     labels: fake.labels.clone(),
                     needs: Vec::new(),
                     epoch: fake.epoch,
-                    claim: None,
+                    claim: fake.holder.map(|_| Claim {
+                        holder: format!("local:user:sim+{}", fake.profile),
+                        until: fake.lease_until,
+                    }),
                     version: Cursor(fake.version),
                 },
                 channel: "work/sim".to_string(),
@@ -950,9 +1324,12 @@ impl World {
                     matches!(action, Action::Renew { run: id, .. }
                         | Action::StopAgent { run: id, .. } if *id == run.id)
                 });
-            if run.phase == Phase::Running && run.lease_until <= now && !covered {
+            // Every phase but Claiming and Abandoning holds the claim and may write with it.
+            let holds = !matches!(run.phase, Phase::Claiming | Phase::Abandoning);
+            if holds && run.lease_until <= now && !covered {
                 return Err(format!(
-                    "invariant 3: {run:?} runs on a lapsed lease at {now:?}"
+                    "invariant 3: {run:?} holds a lapsed lease at {now:?}, neither renewed \
+                     nor abandoned"
                 ));
             }
             // A lost agent has ended its phase: the run waits only for the agent's exit.
@@ -993,7 +1370,8 @@ impl World {
     }
 
     fn check_actions(&mut self, actions: &[Action]) -> Result<(), String> {
-        let blocked = self.core.board() != BoardHealth::Up || self.core.stopping() != Stopping::No;
+        let down = self.core.board() != BoardHealth::Up;
+        let blocked = down || self.core.stopping() != Stopping::No;
         for action in actions {
             let (run, write) = match action {
                 Action::Claim { run, task, profile } => {
@@ -1008,8 +1386,24 @@ impl World {
                     }
                     (*run, true)
                 }
+                Action::Resume { run, task, profile } => {
+                    self.log.entry(*run).or_default().profile = Some(profile.clone());
+                    if blocked {
+                        return Err(format!("invariant 9: {action:?} while down or stopping"));
+                    }
+                    if let Some(agent) = self.leftovers.iter().find(|a| a.task == *task) {
+                        return Err(format!(
+                            "{action:?} resumes beside group {}, an agent from before",
+                            agent.group
+                        ));
+                    }
+                    (*run, true)
+                }
                 Action::Renew { run, .. } => (*run, true),
                 Action::Release { run, profile, .. } => {
+                    if down {
+                        return Err(format!("{action:?} while the board is down"));
+                    }
                     let claimed = self.log.entry(*run).or_default().profile.as_ref();
                     if claimed != Some(profile) {
                         return Err(format!("{action:?} is not as the claim's {claimed:?}"));
@@ -1021,6 +1415,9 @@ impl World {
                 } => {
                     if self.stopped_now {
                         return Err(format!("stop-now: {action:?} counts an attempt"));
+                    }
+                    if down {
+                        return Err(format!("{action:?} while the board is down"));
                     }
                     let log = self.log.entry(*run).or_default();
                     log.settles += 1;
@@ -1128,6 +1525,29 @@ impl World {
         Ok(())
     }
 
+    /// Invariant 2 on onto: a task is not claimed while a settling run's worktree holds the
+    /// branch of the task it works onto, so its preparation would find that branch busy.
+    fn check_onto_free(&self, task: TaskId) -> Result<(), String> {
+        let label_of = |task: TaskId, name: &str| {
+            let fake = self.tasks.iter().find(|fake| fake.id == task)?;
+            let found = fake.labels.iter().find(|(label, _)| label == name)?;
+            Some(found.1.clone())
+        };
+        let onto = label_of(task, "onto").and_then(|onto| onto[1..].parse::<u64>().ok());
+        let Some(branch) = onto.and_then(|onto| label_of(TaskId(onto), "branch")) else {
+            return Ok(());
+        };
+        let busy = (self.core.runs().iter()).find(|run| {
+            run.phase == Phase::Settling && run.branch.as_deref() == Some(branch.as_str())
+        });
+        match busy {
+            Some(run) => Err(format!(
+                "invariant 2: claimed {task:?} onto {branch} while {run:?} settles there"
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Invariant 2 on branches: no two runs reserve one, and no two spawned runs work on one.
     fn check_branches(&self) -> Result<(), String> {
         let runs = self.core.runs();
@@ -1153,6 +1573,11 @@ impl World {
         }
         Ok(())
     }
+}
+
+fn phase_name(phase: Phase) -> String {
+    let phase = format!("{phase:?}");
+    phase.split('(').next().unwrap_or_default().to_string()
 }
 
 fn is_closed(state: TaskState) -> bool {
