@@ -118,6 +118,7 @@ Running a swarm:
 - [Labels](./docs/manual.md#labels): how a task says what it is and which branch it builds on
 - [Watching](./docs/manual.md#watching): the inspector and the commands that show progress
 - [Stopping](./docs/manual.md#stopping): how to stop the swarm and what happens to running agents
+- [Shipping](./skills/ship-swarm/SKILL.md): the lead pushes a finished stack, opens its PR, and gets CI green
 
 When something is off:
 

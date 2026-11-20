@@ -66,6 +66,8 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    command so the user can keep talking to you, and take the next turn when it returns.
    Answer the user before anything else.
 
+To push a finished branch, open its PR, and get CI green, follow the `ship-swarm` skill.
+
 ## Stop the swarm
 
 Ask the user to type `stop` in the pool's terminal. Running agents finish and their tasks
