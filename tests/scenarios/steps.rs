@@ -1125,6 +1125,19 @@ pub fn then_the_client_reads_to_the_end(mut client: &UnixStream) -> Vec<Value> {
                     error.kind(),
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                 ) => {}
+            // Linux resets the connection when the daemon closes it with the client's
+            // requests still unread, which it may do once its bound on reading them is reached.
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {
+                let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+                assert!(
+                    text.ends_with('\n'),
+                    "reset after a cut line: {bytes} bytes, {error}"
+                );
+                let lines: Vec<Value> = text.lines().map(parse::<Value>).collect();
+                let code = lines.last().and_then(|line| line["error"]["code"].as_str());
+                assert_eq!(code, Some("lagged"), "reset before lagged: {error}");
+                return lines;
+            }
             Err(error) => panic!("reading to the end failed after {bytes} bytes: {error}"),
         }
     }
