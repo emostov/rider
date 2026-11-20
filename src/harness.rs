@@ -197,7 +197,6 @@ pub fn command_for(
                 &dir,
             ],
         ),
-        Harness::Tact => ("tact", vec!["--model", model, "--workspace", &dir, "run"]),
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
     if let Some(session) = resume {
@@ -618,23 +617,6 @@ struct CodexItem {
     text: Option<Field<String>>,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum TactEvent {
-    #[serde(rename = "assistant.message")]
-    AssistantMessage { payload: Option<Field<TactPayload>> },
-    #[serde(rename = "run.failed")]
-    RunFailed,
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Deserialize)]
-struct TactPayload {
-    phase: Option<Field<String>>,
-    text: Option<Field<String>>,
-}
-
 // Visits each line of `log` that is an `E`; skips other lines and those over `LINE_BYTES_MAX`.
 // Returns whether the whole log was read.
 fn scan<E: DeserializeOwned>(log: &Path, mut visit: impl FnMut(E)) -> bool {
@@ -691,17 +673,6 @@ pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
                 set(valid(item.text));
             }
         }),
-        Harness::Tact => scan(log, |event| {
-            let TactEvent::AssistantMessage { payload } = event else {
-                return;
-            };
-            let Some(payload) = valid(payload) else {
-                return;
-            };
-            if valid(payload.phase).as_deref() == Some("final_answer") {
-                set(valid(payload.text));
-            }
-        }),
     };
     if !complete {
         return None;
@@ -753,13 +724,10 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
 
 /// Whether the stream at `log` records a failed run; false when the log is unreadable.
 pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
-    let mut failed = false;
     let mut last_result_failed = false;
     let mut last_turn_failed = false;
     // A log cut short still counts for what it showed.
     let _ = match harness {
-        // tact exits 0 when cancelled; only the stream says so.
-        Harness::Tact => scan(log, |event| failed |= matches!(event, TactEvent::RunFailed)),
         // `item.type == "error"` inside `item.completed` is a harmless warning, and a
         // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
         Harness::Codex => scan(log, |event| match event {
@@ -778,10 +746,9 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
             }
         }),
     };
-    assert!(!failed || *harness != Harness::Claude);
     assert!(!last_result_failed || *harness == Harness::Claude);
     assert!(!last_turn_failed || *harness == Harness::Codex);
-    failed || last_result_failed || last_turn_failed
+    last_result_failed || last_turn_failed
 }
 
 #[cfg(test)]
@@ -789,22 +756,6 @@ mod tests {
     use super::*;
     use crate::roles::role_from_label;
     use std::path::PathBuf;
-
-    const TACT_ROLE: RoleSpec = RoleSpec {
-        label: "tact-test",
-        harness: Harness::Tact,
-        model: "sol",
-        commits_expected: false,
-        needs_of: true,
-        builds: false,
-        title: "Tact-test",
-        model_name: "Sol",
-        model_slug: "sol",
-        slots: 1,
-        pool_slots: 1,
-        prompt_file: "none.md",
-        skills: &[],
-    };
 
     const PROMPT: &str = "Do the task.";
 
@@ -863,22 +814,11 @@ mod tests {
     }
 
     #[test]
-    fn tact_command_matches_the_recorded_form() {
-        let c = command_for(&TACT_ROLE, PROMPT, Path::new("/w"), None).unwrap();
-        assert_eq!(c.program, "tact");
-        let expected = ["--model", "sol", "--workspace", "/w", "run", "--", PROMPT];
-        assert_eq!(c.args, expected);
-        assert_eq!(c.env, []);
-    }
-
-    #[test]
     fn a_prompt_is_one_argument_after_the_options() {
         let prompt = "--help me\nplease";
         let security = role_from_label("security").unwrap();
-        for spec in [security, &TACT_ROLE] {
-            let c = command_for(spec, prompt, Path::new("/w"), None).unwrap();
-            assert_eq!(c.args[c.args.len() - 2..], ["--", prompt]);
-        }
+        let c = command_for(security, prompt, Path::new("/w"), None).unwrap();
+        assert_eq!(c.args[c.args.len() - 2..], ["--", prompt]);
         let mythos = command_for(security, PROMPT, Path::new("/w"), None).unwrap();
         assert_eq!(mythos.args[1..3], ["--model", "claude-mythos-5-2"]);
     }
@@ -888,7 +828,7 @@ mod tests {
         let claude = role_from_label("implement").unwrap();
         let codex = role_from_label("review").unwrap();
         for prompt in ["", " \n\t ", "-", "mcp", "doctor", "--help"] {
-            for spec in [claude, codex, &TACT_ROLE] {
+            for spec in [claude, codex] {
                 let result = command_for(spec, prompt, Path::new("/w"), None);
                 assert!(
                     matches!(result, Err(HarnessError::PromptUnsafe)),
@@ -987,11 +927,7 @@ mod tests {
 
     #[test]
     fn last_message_is_found_in_each_recorded_stream() {
-        let cases = [
-            (Harness::Claude, "claude"),
-            (Harness::Codex, "codex"),
-            (Harness::Tact, "tact"),
-        ];
+        let cases = [(Harness::Claude, "claude"), (Harness::Codex, "codex")];
         for (h, f) in cases {
             let path = format!("fixtures/harness/{f}.jsonl");
             let m = last_message(&h, Path::new(&path));
@@ -1024,25 +960,17 @@ mod tests {
 
     #[test]
     fn recorded_streams_report_no_failure() {
-        let cases = [
-            (Harness::Claude, "claude"),
-            (Harness::Codex, "codex"),
-            (Harness::Tact, "tact"),
-        ];
+        let cases = [(Harness::Claude, "claude"), (Harness::Codex, "codex")];
         for (h, f) in cases {
             let path = format!("fixtures/harness/{f}.jsonl");
             assert!(!stream_reports_failure(&h, Path::new(&path)), "{f}");
         }
         let missing = Path::new("/nonexistent/rider/agent.log");
-        assert!(!stream_reports_failure(&Harness::Tact, missing));
+        assert!(!stream_reports_failure(&Harness::Codex, missing));
     }
 
     #[test]
     fn failures_in_the_stream_are_reported() {
-        let tact = r#"{"type":"run.started"}
-{"type":"run.failed","payload":{"status":"cancelled"}}
-"#;
-        assert!(reports_failure("tact-failed", Harness::Tact, tact));
         let claude = r#"{"type":"result","subtype":"success","is_error":true}"#;
         assert!(reports_failure("claude-error", Harness::Claude, claude));
         let claude = r#"{"type":"result","subtype":"error_max_turns","is_error":false}"#;

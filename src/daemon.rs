@@ -35,8 +35,8 @@ use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
-    Attempt, Env, Judgement, Prepared, RunError, judge_attempt, launch_agent, prepare_attempt,
-    settle_attempt,
+    Attempt, Env, IdentityUnknown, Judgement, Prepared, RunError, board_identity_at_start,
+    judge_attempt, launch_agent, prepare_attempt, settle_attempt,
 };
 use crate::settle::Verdict;
 use crate::socket::{self, SOCKET_FILE, Socket};
@@ -57,6 +57,8 @@ pub const SUBTREE: &str = "work/";
 pub const DAEMON_PROFILE: &str = "rider-daemon";
 /// What the daemon prints once it follows the board.
 pub const FOLLOWING: &str = "rider daemon: following";
+const DRAIN_LINE: &str = "a stop signal: draining, claiming nothing new";
+const STOP_NOW_LINE: &str = "a second stop signal: stopping now";
 /// The test-only setting that shortens limits: `lease=<ms>,attempt=<ms>,tick=<ms>,grace=<ms>`,
 /// any subset.
 pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
@@ -163,6 +165,8 @@ pub enum DaemonError {
     Setting(String),
     /// The daemon's log exists and is not a regular file.
     NotAFile(PathBuf),
+    /// The board's identity could not be read at start-up.
+    Identity(IdentityUnknown),
 }
 
 impl fmt::Display for DaemonError {
@@ -181,6 +185,7 @@ impl fmt::Display for DaemonError {
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
             DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
+            DaemonError::Identity(error) => write!(f, "{error}"),
         }
     }
 }
@@ -492,6 +497,15 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         saved_cursor,
     });
     let board = BoardGuard(Arc::clone(&shared));
+    serve_if_down(&shared);
+    // Read before any claim, so no attempt spends its lease on it.
+    let identity = board_identity_at_start(&shared.paths.board_url, &shared.board(DAEMON_PROFILE));
+    if let Err(error) = identity {
+        shared.log.write(&error.to_string());
+        shared.socket.close();
+        drop(board);
+        return Err(DaemonError::Identity(error));
+    }
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
     start_signals(shared.events.clone())?;
@@ -503,7 +517,6 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
     state.leave_to_lease(unaccounted);
-    serve_if_down(&shared);
     let code = drive(&mut state, &inputs, &jobs, &shared);
     save_cursor(&shared, state.cursor());
     shared.socket.close();
@@ -795,7 +808,17 @@ fn drive(
         }
         let event = absorb(input, &mut contexts, &shared.log);
         let ticked = matches!(event, Event::Tick(_));
+        let signalled = matches!(event, Event::Signal);
         pending = step(state, event);
+        if signalled {
+            let stopping = state.stopping();
+            assert!(stopping != Stopping::No);
+            shared.log.write(if stopping == Stopping::Now {
+                STOP_NOW_LINE
+            } else {
+                DRAIN_LINE
+            });
+        }
         if ticked && state.cursor() != saved {
             saved = state.cursor();
             save_cursor(shared, saved);
@@ -1334,6 +1357,9 @@ impl Board for Guarded<'_> {
     }
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
         self.board.list_open(subtree)
+    }
+    fn identity(&self) -> Result<String, BoardError> {
+        self.board.identity()
     }
     fn list_labelled(
         &self,

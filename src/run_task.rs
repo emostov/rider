@@ -1,17 +1,21 @@
 //! One attempt at one claimed task: check it, run its agent, and settle it on the board.
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
-use crate::brief::{Brief, echo, label, parse_brief};
+use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
+use crate::core::TASKS_MAX;
 use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
@@ -20,7 +24,7 @@ use crate::harness::{
 };
 use crate::roles::{Harness, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
-use crate::worktree::{self, BRANCH_LABEL, Checkout, WorktreeError};
+use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
@@ -41,7 +45,12 @@ pub const PROMPT_FILE_BYTES_MAX: u64 = 64 * 1024;
 pub const LOG_RUNS_MAX: u16 = 16;
 /// The most characters of a failed attempt's log reply, kept well under the board's limit.
 pub const TAIL_REPLY_CHARS_MAX: usize = MESSAGE_CHARS_MAX - 1_000;
+/// Upper bound on the closed `onto` tasks read to find the unfinished tasks on a branch.
+pub const ONTO_READS_MAX: usize = 32;
 // JSON writes a character as at most six, so a record with this summary fits one message.
+/// How many times start-up reads the board's identity before giving up.
+pub const IDENTITY_READS_MAX: u32 = 5;
+const IDENTITY_PAUSE_MILLIS: u64 = 1_000;
 const SUMMARY_CHARS_MAX: usize = TAIL_REPLY_CHARS_MAX / 6;
 const ATTEMPT_LABEL: &str = "attempt";
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
@@ -57,6 +66,8 @@ const SESSION_FILE_BYTES_MAX: usize = 4096;
 const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as the \
                           last attempt left them, uncommitted changes included.";
+
+static BOARD_IDENTITY: Mutex<Option<(String, BoardIdentity)>> = Mutex::new(None);
 
 /// Where rider keeps its files, and how its agents reach the board.
 pub struct Env {
@@ -277,9 +288,15 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
     let start_label = label(&view, START_LABEL);
     // A label that is malformed, or names no commit here, is ignored: never fatal.
     let start = start_label.filter(|value| git::is_commit_id(value));
-    let prepared = validate(&view, env.attempts)
-        .and_then(|(brief, failed)| prepare(brief, failed, start, env, board));
-    let attempt = match prepared {
+    let (brief, failed) = match validate(&view, env.attempts) {
+        Ok(validated) => validated,
+        Err(block) => return Ok(block.prepared()),
+    };
+    if let Some(error) = unneeded_on_branch(&brief, &view, board)? {
+        return Ok(Block::new("invalid_brief", error.to_string()).prepared());
+    }
+    let identity = board_identity(&env.board_url, board)?;
+    let attempt = match prepare(brief, failed, start, env, board, &identity) {
         Ok(attempt) => attempt,
         Err(block) => return Ok(block.prepared()),
     };
@@ -296,6 +313,61 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
         let _ = board.reply(id, note);
     }
     Ok(Prepared::Ready(Box::new(attempt)))
+}
+
+/// The identity of the board at `url`, read from it once per process and then remembered.
+pub fn board_identity(url: &str, board: &dyn Board) -> Result<BoardIdentity, BoardError> {
+    assert!(!url.is_empty());
+    // Held across the read, so the attempts of one daemon post at most one marker between them.
+    let mut known = BOARD_IDENTITY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some((known_url, identity)) = known.as_ref()
+        && known_url == url
+    {
+        return Ok(identity.clone());
+    }
+    let identity = BoardIdentity::new(&board.identity()?);
+    *known = Some((url.to_string(), identity.clone()));
+    Ok(identity)
+}
+
+/// Why start-up could not learn the identity of the board at `url`.
+#[derive(Debug)]
+pub struct IdentityUnknown {
+    pub url: String,
+    pub error: BoardError,
+}
+
+impl fmt::Display for IdentityUnknown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "could not read the identity of the board at {} in {IDENTITY_READS_MAX} tries: {}",
+            self.url, self.error
+        )
+    }
+}
+
+/// The board's identity, read up to `IDENTITY_READS_MAX` times with a pause between reads.
+pub fn board_identity_at_start(
+    url: &str,
+    board: &dyn Board,
+) -> Result<BoardIdentity, IdentityUnknown> {
+    assert!(!url.is_empty());
+    let mut reads: u32 = 0;
+    loop {
+        reads += 1;
+        assert!(reads <= IDENTITY_READS_MAX);
+        match board_identity(url, board) {
+            Ok(identity) => return Ok(identity),
+            Err(error) if reads == IDENTITY_READS_MAX => {
+                let url = url.to_string();
+                return Err(IdentityUnknown { url, error });
+            }
+            Err(_) => thread::sleep(Duration::from_millis(IDENTITY_PAUSE_MILLIS)),
+        }
+    }
 }
 
 /// Judges an attempt once its agent has ended, from the task's state and the worktree.
@@ -399,6 +471,103 @@ fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
     Ok((brief, failed))
 }
 
+// An open task on the branch an `onto` task works must be one it needs, or one that waits for
+// it; any other would race it on the branch. A task works the branch named by its own `branch`
+// label or, until it has one, by its `onto` task's, in the repository of its own `repo` label.
+fn unneeded_on_branch(
+    brief: &Brief,
+    view: &TaskView,
+    board: &dyn Board,
+) -> Result<Option<BriefError>, RunError> {
+    assert!(brief.id == view.id);
+    let Some(onto) = brief.onto else {
+        return Ok(None);
+    };
+    let listing = board.list_open(SUBTREE)?;
+    if listing.left_out > 0 {
+        let unchecked = listing.left_out;
+        return Ok(Some(BriefError::OntoUnchecked { onto, unchecked }));
+    }
+    let open: Vec<&TaskView> = listing
+        .tasks
+        .iter()
+        .map(|listed| &listed.view)
+        .filter(|task| task.id != view.id && in_repo(task, &brief.repo))
+        .collect();
+    let mut targets: Vec<TaskId> = vec![onto];
+    for task in &open {
+        let target = label(task, BRANCH_LABEL)
+            .is_none()
+            .then(|| parse_id_label(task, "onto").ok().flatten())
+            .flatten();
+        if let Some(target) = target.filter(|target| {
+            !targets.contains(target)
+                && listing.tasks.iter().all(|listed| listed.view.id != *target)
+        }) {
+            targets.push(target);
+        }
+    }
+    if targets.len() > ONTO_READS_MAX {
+        let unchecked = targets.len() - ONTO_READS_MAX;
+        return Ok(Some(BriefError::OntoUnchecked { onto, unchecked }));
+    }
+    let mut branches: Vec<(TaskId, Option<String>)> = Vec::with_capacity(targets.len());
+    for id in targets {
+        let target = board.read_task(id)?;
+        branches.push((id, label(&target, BRANCH_LABEL).map(str::to_string)));
+    }
+    let branch_of = |id: TaskId| branches.iter().find(|(read, _)| *read == id);
+    let Some((_, Some(branch))) = branch_of(onto) else {
+        return Ok(None);
+    };
+    let on_branch = closure(&open, onto, |task, members| {
+        let works_onto = parse_id_label(task, "onto").ok().flatten();
+        let own = label(task, BRANCH_LABEL);
+        let inherited = works_onto
+            .and_then(branch_of)
+            .and_then(|(_, b)| b.as_deref());
+        own.or(inherited) == Some(branch.as_str())
+            || own.is_none() && works_onto.is_some_and(|id| members.contains(&id))
+    });
+    let after = closure(&open, view.id, |task, members| {
+        task.needs.iter().any(|need| members.contains(need))
+    });
+    let unneeded = open
+        .iter()
+        .map(|task| task.id)
+        .find(|id| on_branch.contains(id) && !after.contains(id) && !view.needs.contains(id));
+    assert!(unneeded != Some(view.id));
+    Ok(unneeded.map(|unfinished| BriefError::OntoNotNeeded { unfinished, onto }))
+}
+
+fn in_repo(task: &TaskView, repo: &Path) -> bool {
+    assert!(repo.is_absolute());
+    label(task, "repo").is_some_and(|value| Path::new(value) == repo)
+}
+
+// `seed` and every task in `open` that `joins` the members found so far, until none joins.
+fn closure(
+    open: &[&TaskView],
+    seed: TaskId,
+    joins: impl Fn(&TaskView, &[TaskId]) -> bool,
+) -> Vec<TaskId> {
+    assert!(open.len() <= TASKS_MAX);
+    let mut members = vec![seed];
+    for _ in 0..=open.len() {
+        let joining: Vec<TaskId> = open
+            .iter()
+            .filter(|task| !members.contains(&task.id) && joins(task, &members))
+            .map(|task| task.id)
+            .collect();
+        if joining.is_empty() {
+            break;
+        }
+        members.extend(joining);
+    }
+    assert!(members.len() <= open.len() + 1);
+    members
+}
+
 fn parse_attempts(value: &str) -> Option<u16> {
     assert!(!value.is_empty(), "empty labels are absent");
     let digits = value.len() <= ATTEMPT_DIGITS_MAX && value.bytes().all(|b| b.is_ascii_digit());
@@ -413,6 +582,7 @@ fn prepare(
     start: Option<&str>,
     env: &Env,
     board: &dyn Board,
+    identity: &BoardIdentity,
 ) -> Result<Attempt, Block> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
     let dir = worktree::dir_for(&brief, &env.home);
@@ -451,7 +621,7 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = worktree::prepare(&brief, board, &env.home);
+    let checkout = worktree::prepare(&brief, board, &env.home, identity);
     let checkout = checkout.map_err(|error| worktree_block(&error))?;
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
@@ -542,7 +712,7 @@ fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     let path = session_path(home, attempt.brief.id);
     let session = match attempt.brief.role.harness {
         Harness::Claude => harness::session_id(attempt.log()),
-        Harness::Codex | Harness::Tact => None,
+        Harness::Codex => None,
     };
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
     let fits = |repo: &&str| repo.len() < SESSION_FILE_BYTES_MAX - SESSION_BYTES_MAX - 2;
@@ -693,7 +863,14 @@ fn worktree_block(error: &WorktreeError) -> Block {
              this task."
             ),
         ),
+        WorktreeError::ForeignBoard { .. } => Block::new(
+            "rider_error",
+            format!(
+                "Rider will not reuse the worktree: {error}. Move it aside or remove it, then unblock this task."
+            ),
+        ),
         WorktreeError::NotACheckout(_)
+        | WorktreeError::BoardRecord { .. }
         | WorktreeError::NotOnBranch { .. }
         | WorktreeError::NotReleasable { .. }
         | WorktreeError::Git(_)
@@ -774,9 +951,8 @@ fn evidence(attempt: &Attempt) -> Result<Evidence, String> {
                 ));
             }
             let head = git::commit_of(dir, &full).map_err(text)?;
-            // A restack rebases its branch, so only it may leave its starting commit behind.
-            let restacks = attempt.brief.onto.is_some();
-            let keeps_start = restacks || git::is_ancestor(dir, start, &head).map_err(text)?;
+            let keeps_start =
+                attempt.brief.restack || git::is_ancestor(dir, start, &head).map_err(text)?;
             let commits = git::own_commit_count(dir, branch, &head, start).map_err(text)?;
             (
                 current.as_deref() == Some(branch),
@@ -1113,6 +1289,11 @@ mod tests {
         view(ID.0, &labels, TaskState::Claimed)
     }
 
+    fn needing(mut view: TaskView, need: u64) -> TaskView {
+        view.needs.push(TaskId(need));
+        view
+    }
+
     fn start_call(fixture: &Fixture, rev: &str) -> String {
         format!(
             "set_label 7 start={}",
@@ -1224,7 +1405,7 @@ mod tests {
     fn a_base_task_without_a_branch_blocks_as_an_invalid_brief() {
         let (fixture, env) = setup("run-base");
         let base = view(3, &[], TaskState::Completed);
-        let board = FakeBoard::new(vec![task(&fixture, &[("base", "#3")]), base]);
+        let board = FakeBoard::new(vec![needing(task(&fixture, &[("base", "#3")]), 3), base]);
         assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
         let reason = "Set the `branch` label on task #3 to its branch, or remove the `base` \
                       label from this task.";
@@ -1717,37 +1898,22 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_rewritten_below_its_start_fails_unless_the_task_restacks() {
+    fn a_branch_rewritten_below_its_start_fails() {
         let (fixture, env) = setup("run-rewrite-base");
         let base = base_task(&fixture);
-        let board = FakeBoard::new(vec![task(&fixture, &[("base", "#3")]), base]);
+        let board = FakeBoard::new(vec![needing(task(&fixture, &[("base", "#3")]), 3), base]);
         let reason = "no committed work: the branch no longer contains its starting commit";
         let expected = Verdict::Fail {
             reason: reason.to_string(),
         };
         assert_eq!(run(&env, &board, &rewriting_agent(&fixture)), expected);
-
-        let (fixture, env) = setup("run-rewrite-onto");
-        let base = base_task(&fixture);
-        let board = FakeBoard::new(vec![task(&fixture, &[("onto", "#3")]), base]);
-        let start = start_call(&fixture, "rider/3-store");
-        let verdict = run(&env, &board, &rewriting_agent(&fixture));
-        assert_eq!(verdict, completed("Extracted the store."));
-        let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
-        let expected = vec![
-            "set_label 7 branch=rider/3-store".to_string(),
-            start,
-            "complete 7 Extracted the store.".to_string(),
-            record(Some("rider/3-store"), &head, 1, "Extracted the store."),
-        ];
-        assert_eq!(calls(&board), expected);
     }
 
     #[test]
     fn a_review_that_commits_fails() {
         let (fixture, env) = setup("run-review");
         let base = base_task(&fixture);
-        let mut review = task(&fixture, &[("of", "#3")]);
+        let mut review = needing(task(&fixture, &[("of", "#3")]), 3);
         review.labels[0].1 = "review".to_string();
         let board = FakeBoard::new(vec![review, base]);
         let expected = Verdict::Fail {
@@ -1757,7 +1923,7 @@ mod tests {
 
         let (fixture, env) = setup("run-review-ok");
         let base = base_task(&fixture);
-        let mut review = task(&fixture, &[("of", "#3")]);
+        let mut review = needing(task(&fixture, &[("of", "#3")]), 3);
         review.labels[0].1 = "review".to_string();
         let board = FakeBoard::new(vec![review, base]);
         let reading = |_: &CommandLine, _: &Path, log: &Path| {
@@ -1926,31 +2092,11 @@ mod tests {
     }
 
     #[test]
-    fn a_restack_completes_when_it_rebases_and_fails_when_it_only_drops() {
-        let (fixture, env) = setup("run-restack");
-        let base = base_task(&fixture);
-        fixture.commit(&fixture.repo, "main.txt", "main moved on");
-        let board = FakeBoard::new(vec![task(&fixture, &[("onto", "#3")]), base]);
-        let rebase = |_: &CommandLine, dir: &Path, log: &Path| {
-            git(dir, &["rebase", "-q", "main"]);
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(
-            run(&env, &board, &rebase),
-            completed("Extracted the store.")
-        );
-        let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
-        let settled = calls(&board)[2..].to_vec();
-        let expected = vec![
-            "complete 7 Extracted the store.".to_string(),
-            record(Some("rider/3-store"), &head, 1, "Extracted the store."),
-        ];
-        assert_eq!(settled, expected);
-
+    fn a_restack_that_only_drops_commits_fails() {
         let (fixture, env) = setup("run-restack-drop");
         let base = base_task(&fixture);
-        let board = FakeBoard::new(vec![task(&fixture, &[("onto", "#3")]), base]);
+        let restack = task(&fixture, &[("onto", "#3"), ("restack", "1")]);
+        let board = FakeBoard::new(vec![restack, base]);
         let drop = |_: &CommandLine, dir: &Path, log: &Path| {
             git(dir, &["reset", "-q", "--hard", "HEAD~1"]);
             write_log(log, &format!("{DONE_STREAM}\n"));

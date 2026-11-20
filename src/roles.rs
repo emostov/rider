@@ -8,14 +8,13 @@ use std::sync::OnceLock;
 pub enum Harness {
     Claude,
     Codex,
-    Tact,
 }
 
 impl Harness {
     pub fn runs_skills(self) -> bool {
         match self {
             Harness::Claude => true,
-            Harness::Codex | Harness::Tact => false,
+            Harness::Codex => false,
         }
     }
 }
