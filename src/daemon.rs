@@ -17,7 +17,8 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::board::{
-    Board, BoardError, Listing, TaskId, TaskView, Timestamp, VbCli, one_line, parse_failure_reason,
+    Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
+    parse_failure_reason,
 };
 use crate::cli::with_vb_on_path;
 use crate::config::Limits;
@@ -58,6 +59,8 @@ pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
 const TEST_SETTINGS_MAX: usize = 4;
 const GRACE_MILLIS: u64 = KILL_GRACE_SECONDS * 1000;
 const STOP_POLL_MILLIS: u64 = 50;
+/// Upper bound on the agents one attempt starts: a resumed session and its fresh start.
+const AGENT_GROUPS_MAX: usize = 2;
 /// How long the daemon waits on exit for the feed thread once its group is killed: past the
 /// feed's own grace for its stdout to close after a kill.
 const FEED_JOIN_MILLIS_MAX: u64 = 15_000;
@@ -581,7 +584,11 @@ fn job(
             shared.log.write(&format!("spawned #{} {profile}", task.0));
             Box::new(move || spawn(&shared, run, task, &attempt))
         }
-        Action::StopAgent { run, task } => Box::new(move || stop_agent(&shared, run, task)),
+        Action::StopAgent { run, task } => {
+            let context = contexts.iter().find(|context| context.run == run);
+            let attempt = context.and_then(|context| context.attempt.clone());
+            Box::new(move || stop_agent(&shared, run, task, attempt.as_deref()))
+        }
         Action::Judge { run, task } => {
             let reason = "rider lost the attempt's state before judging it".to_string();
             let unjudged = Event::Judged {
@@ -737,22 +744,33 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     }
 }
 
-fn stop_agent(shared: &Shared, run: RunId, task: TaskId) -> Input {
+fn stop_agent(shared: &Shared, run: RunId, task: TaskId, attempt: Option<&Attempt>) -> Input {
     assert!(shared.grace_millis > 0 && shared.grace_millis <= GRACE_MILLIS);
+    if let Some(attempt) = attempt {
+        attempt.stop();
+    }
     let path = shared.pid_file(task);
-    if let Some(group) = agent_group(&path) {
+    let mut stopped = None;
+    // A refused resume's fresh start may have begun before the attempt was told to stop.
+    for _ in 0..AGENT_GROUPS_MAX {
+        let Some(group) = agent_group(&path).filter(|group| Some(*group) != stopped) else {
+            break;
+        };
         // A group that is already gone has nothing left to stop.
         let _ = kill_process_group(group, Signal::TERM);
         let polls = shared.grace_millis.div_ceil(STOP_POLL_MILLIS);
-        for _ in 0..polls {
+        let ended = (0..polls).any(|_| {
             thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
-            // The pid file goes only once the agent is reaped.
-            if agent_group(&path) != Some(group) {
-                return Input::plain(Event::StopDone(run));
-            }
+            // The pid file names another group once a fresh start began, and goes once the
+            // attempt's last agent is reaped.
+            agent_group(&path) != Some(group)
+        });
+        if !ended {
+            let _ = kill_process_group(group, Signal::KILL);
         }
-        let _ = kill_process_group(group, Signal::KILL);
+        stopped = Some(group);
     }
+    assert!(stopped.is_none_or(|group| group.as_raw_nonzero().get() > 1));
     Input::plain(Event::StopDone(run))
 }
 
@@ -836,8 +854,16 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
         }
         // A failure decided without judging, such as the time limit, still counts the attempt.
         (Settlement::Verdict(verdict @ Verdict::Fail { .. }), Some(attempt), None) => {
-            let judgement = Judgement::uninspected(verdict.clone());
-            settle_attempt(task, &shared.env(profile), &board, attempt, &judgement)
+            match board.read_task(task).map(|view| view.state) {
+                Ok(TaskState::Claimed) => {
+                    let judgement = Judgement::uninspected(verdict.clone());
+                    settle_attempt(task, &shared.env(profile), &board, attempt, &judgement)
+                }
+                // A worker that blocked its task owns it now, however its process ended.
+                Ok(TaskState::Blocked) => Ok(()),
+                Ok(state) => Err(RunError::LostClaim(state)),
+                Err(error) => Err(RunError::Board(error)),
+            }
         }
         (Settlement::Verdict(Verdict::Fail { reason }), _, _) => {
             board.fail(task, reason).map_err(RunError::Board)

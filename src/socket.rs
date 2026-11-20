@@ -43,7 +43,13 @@ const ACCEPTS_MAX: u64 = u64::MAX;
 const REQUESTS_MAX: u64 = u64::MAX;
 const STREAM_LINES_MAX: u64 = u64::MAX;
 /// Upper bound on one log line streamed to a client; a longer one is split.
-const LOG_LINE_BYTES_MAX: usize = 1024 * 1024;
+const LOG_LINE_BYTES_MAX: usize = REPLY_BYTES_MAX / 8;
+/// The most bytes JSON writes for one log byte: a control byte becomes `\u00XX`.
+const JSON_BYTES_PER_BYTE_MAX: usize = 6;
+const STREAM_FRAME_BYTES_MAX: usize = 64;
+const _: () = assert!(
+    LOG_LINE_BYTES_MAX * JSON_BYTES_PER_BYTE_MAX + STREAM_FRAME_BYTES_MAX <= REPLY_BYTES_MAX
+);
 /// Upper bound on the log bytes read in one go.
 const LOG_READ_BYTES_MAX: u64 = 4 * 1024 * 1024;
 /// How often a followed log is read again.
@@ -452,24 +458,39 @@ fn stream_log(
     queued: &Receiver<Outgoing>,
     logs: &Path,
 ) -> bool {
-    let mut file: Option<File> = None;
+    let mut file: Option<(PathBuf, File)> = None;
     let mut pending: Vec<u8> = Vec::new();
     let mut ended = !follow;
     for _ in 0..LOG_POLLS_MAX {
         if file.is_none() {
-            file = newest_log(logs, task).and_then(|path| File::open(path).ok());
+            let newest = newest_log(logs, task);
+            file = newest.and_then(|path| File::open(&path).ok().map(|file| (path, file)));
             let ok = format!("{}\n", json!({"id": id, "ok": true}));
             if file.is_some() && stream.write_all(ok.as_bytes()).is_err() {
                 return false;
             }
         }
         let mut full = false;
-        if let Some(file) = file.as_mut() {
+        if let Some((_, file)) = file.as_mut() {
             let read = file.take(LOG_READ_BYTES_MAX).read_to_end(&mut pending);
             full = read.is_ok_and(|read| read as u64 == LOG_READ_BYTES_MAX);
             if !write_log_lines(stream, id, &mut pending, false) {
                 return false;
             }
+        }
+        // A newer log means the attempt started another agent, as a refused resume's fresh
+        // start does; the old one is read to its end first.
+        let newer = file
+            .as_ref()
+            .filter(|_| !full)
+            .and_then(|(path, _)| newest_log(logs, task).filter(|newest| newest != path))
+            .and_then(|path| File::open(&path).ok().map(|file| (path, file)));
+        if newer.is_some() {
+            if !write_log_lines(stream, id, &mut pending, true) {
+                return false;
+            }
+            file = newer;
+            continue;
         }
         if ended && !full {
             let last = match file {
