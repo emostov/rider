@@ -280,3 +280,49 @@ fn a_descendant_of_a_waiting_vb_is_killed_with_no_kill_command_on_path() {
     assert!(!Path::new(&vb_dir).join("kill").exists());
     then_the_hung_identity_read_left_nothing(world, "wait", &vb_dir);
 }
+
+const BURST_EVENTS: u64 = 25;
+const BURST_FIRST_CURSOR: u64 = 1_000_001;
+
+#[test]
+fn every_event_a_feed_vb_prints_before_it_exits_reaches_the_daemon() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let recorded = include_str!("../../fixtures/board/tail-task-canceled.json");
+    let (before, after) = recorded
+        .split_once(r#""cursor":"22""#)
+        .expect("the recorded event's cursor");
+    let last = BURST_FIRST_CURSOR + BURST_EVENTS - 1;
+    let burst: String = (BURST_FIRST_CURSOR..=last)
+        .map(|cursor| format!("{before}\"cursor\":\"{cursor}\"{after}"))
+        .collect();
+    let burst_file = world.root.join("burst");
+    fs::write(&burst_file, burst).expect("write the burst of events");
+    let (tails, runs) = (world.root.join("tails"), world.root.join("tail-runs"));
+    given_vb_tail_starts_with(
+        &world,
+        &tails,
+        &format!(
+            r#"echo "$*" >> '{}'; [ "$runs" -le 1 ] && {{ cat '{}'; exit 3; }}"#,
+            runs.display(),
+            burst_file.display()
+        ),
+    );
+
+    given_a_running_daemon(&mut world);
+    let deadline = Instant::now() + Duration::from_secs(FEED_RUNS_SECONDS_MAX);
+    while feed_runs(&tails) < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let runs = fs::read_to_string(&runs).unwrap_or_default();
+    let second = runs.lines().nth(1).unwrap_or_default();
+    assert!(
+        second.starts_with(&format!("tail --after {last} ")),
+        "the restarted feed: {runs}\n{}",
+        world.daemon_log()
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
