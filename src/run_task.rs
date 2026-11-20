@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use serde_json::json;
+use serde::Serialize;
 
 use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
@@ -91,6 +91,14 @@ impl Block {
 struct Work {
     head: String,
     commits: u64,
+}
+
+#[derive(Serialize)]
+struct ResultRecord<'a> {
+    branch: Option<&'a str>,
+    commits: u64,
+    head: &'a str,
+    summary: &'a str,
 }
 
 struct Evidence {
@@ -583,15 +591,16 @@ fn complete(
     let end = result.char_indices().nth(SUMMARY_CHARS_MAX);
     let summary = &result[..end.map_or(result.len(), |(index, _)| index)];
     assert!(!summary.trim().is_empty() && summary.chars().count() <= SUMMARY_CHARS_MAX);
-    let record = json!({
-        "branch": attempt.checkout.branch,
-        "head": work.head,
-        "commits": work.commits,
-        "summary": summary,
-    });
-    let record = record.to_string();
+    let record = ResultRecord {
+        branch: attempt.checkout.branch.as_deref(),
+        commits: work.commits,
+        head: &work.head,
+        summary,
+    };
     // The record and the note below only inform; losing them must not undo finished work.
-    if board.post_structured(id, RESULT_SCHEMA, &record).is_err() {
+    if let Ok(record) = serde_json::to_string(&record)
+        && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
+    {
         let _ = board.reply(id, &record);
     }
     if let Err(error) = worktree::release(&attempt.checkout, &attempt.brief.repo, &env.home) {
