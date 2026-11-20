@@ -541,7 +541,7 @@ fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     let path = session_path(home, attempt.brief.id);
     let session = match attempt.brief.role.harness {
         Harness::Claude => harness::session_id(attempt.log()),
-        Harness::Codex | Harness::Tact => None,
+        Harness::Codex => None,
     };
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
     let fits = |repo: &&str| repo.len() < SESSION_FILE_BYTES_MAX - SESSION_BYTES_MAX - 2;

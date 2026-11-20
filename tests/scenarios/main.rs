@@ -557,7 +557,7 @@ fn a_prompt_file_named_directly_under_the_rider_home_is_accepted() {
 }
 
 #[test]
-fn a_role_can_select_the_tact_harness() {
+fn the_tact_harness_is_refused_naming_the_harness() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -565,8 +565,10 @@ fn a_role_can_select_the_tact_harness() {
 
     let output = when_rider_runs(&world, &["config"]);
 
-    assert_eq!(output.code, Some(0), "{output:?}");
-    assert!(output.stdout.contains("harness = \"tact\""), "{output:?}");
+    assert_ne!(output.code, Some(0), "{output:?}");
+    assert!(output.stderr.contains("tact"), "{output:?}");
+    assert!(output.stderr.contains("claude"), "{output:?}");
+    assert!(output.stderr.contains("codex"), "{output:?}");
 }
 
 #[test]

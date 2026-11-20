@@ -21,8 +21,8 @@ channel while the rest of the work goes on.
 **The swarm** is the `rider up` daemon. It runs agents in roles you configure in
 `~/.rider/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
 at once. `rider config` prints the settings in effect: the built-in roles and limits with the
-file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI) or
-`tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
+file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI),
+chosen per role with `harness` in `rider.toml`; each must be installed and signed in
 for the roles that use it.
 
 ## Getting started
@@ -41,7 +41,7 @@ review threads) and saves the answers in `~/.rider/ship.toml`.
 
 ## Quickstart
 
-Rider needs Rust, Node 22, and `claude`, `codex` or `tact` on `PATH`, signed in for the roles
+Rider needs Rust, Node 22, and `claude` or `codex` on `PATH`, signed in for the roles
 that use them. Install the Board CLI where Rider looks for it:
 
 ```sh
