@@ -16,7 +16,7 @@ use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
     SESSION_BYTES_MAX, SessionId, command_for,
 };
-use crate::roles::Harness;
+use crate::roles::{Harness, RoleSpec};
 use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, Checkout, WorktreeError};
 
@@ -70,6 +70,17 @@ pub enum RunError {
     LostClaim(TaskState),
 }
 
+/// What running a claimed task came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ran {
+    Settled(Verdict),
+    /// The task was relabeled after its claim: no agent launched and it is still claimed.
+    RoleChanged {
+        claimed: &'static str,
+        found: &'static str,
+    },
+}
+
 impl From<BoardError> for RunError {
     fn from(error: BoardError) -> RunError {
         RunError::Board(error)
@@ -113,24 +124,33 @@ struct Evidence {
     work: Work,
 }
 
-/// Runs one attempt at one already-claimed task and settles it on the board.
+/// Runs one attempt at one already-claimed task and settles it on the board; a task claimed
+/// as `claimed` launches only as that role.
 pub fn run_task(
     id: TaskId,
     env: &Env,
     board: &dyn Board,
+    claimed: Option<&'static RoleSpec>,
     launch: &dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError>,
-) -> Result<Verdict, RunError> {
+) -> Result<Ran, RunError> {
     let attempt = match prepare_attempt(id, env, board)? {
         Prepared::Ready(attempt) => attempt,
         Prepared::Blocked { kind, reason } => {
             board.block(id, &reason, kind)?;
-            return Ok(Verdict::LeaveBlocked);
+            return Ok(Ran::Settled(Verdict::LeaveBlocked));
         }
     };
+    let found = attempt.role().label;
+    if let Some(claimed) = claimed.filter(|claimed| claimed.label != found) {
+        return Ok(Ran::RoleChanged {
+            claimed: claimed.label,
+            found,
+        });
+    }
     let launched = attempt.launch(launch);
     let judgement = judge_attempt(id, board, &attempt, launched)?;
     settle_attempt(id, env, board, &attempt, &judgement)?;
-    Ok(judgement.verdict)
+    Ok(Ran::Settled(judgement.verdict))
 }
 
 /// An attempt whose brief was checked and whose worktree is ready for its agent.
@@ -158,6 +178,11 @@ struct Fallback {
 }
 
 impl Attempt {
+    /// The role the attempt's agent launches as.
+    pub fn role(&self) -> &'static RoleSpec {
+        self.brief.role
+    }
+
     /// The branch the attempt works on, when the task has one.
     pub fn branch(&self) -> Option<&str> {
         let branch = self.checkout.branch.as_deref();
@@ -963,7 +988,10 @@ mod tests {
     }
 
     fn run(env: &Env, board: &FakeBoard, launch: &Launch) -> Verdict {
-        run_task(ID, env, board, launch).unwrap()
+        match run_task(ID, env, board, None, launch).unwrap() {
+            Ran::Settled(verdict) => verdict,
+            ran => panic!("expected a settled run, got {ran:?}"),
+        }
     }
 
     fn completed(result: &str) -> Verdict {
@@ -1198,8 +1226,8 @@ mod tests {
             write_log(log, &format!("{DONE_STREAM}\n"));
             Ok(Exit::Code(0))
         };
-        let verdict = run_task(TaskId(8), &env, &board, &polish).unwrap();
-        assert_eq!(verdict, completed("Extracted the store."));
+        let ran = run_task(TaskId(8), &env, &board, None, &polish).unwrap();
+        assert_eq!(ran, Ran::Settled(completed("Extracted the store.")));
     }
 
     #[test]
@@ -1338,7 +1366,7 @@ mod tests {
         let mut ready = task(&fixture, &[]);
         ready.state = TaskState::Ready;
         let board = FakeBoard::new(vec![ready]);
-        let result = run_task(ID, &env, &board, &never);
+        let result = run_task(ID, &env, &board, None, &never);
         assert!(
             matches!(result, Err(RunError::LostClaim(TaskState::Ready))),
             "{result:?}"
@@ -1354,7 +1382,7 @@ mod tests {
             board.set_state(ID, TaskState::Ready);
             Ok(Exit::Code(1))
         };
-        let result = run_task(ID, &env, &board, &lost);
+        let result = run_task(ID, &env, &board, None, &lost);
         assert!(
             matches!(result, Err(RunError::LostClaim(TaskState::Ready))),
             "{result:?}"
@@ -1373,14 +1401,14 @@ mod tests {
         let (fixture, env) = setup("run-board");
         let board = FakeBoard::new(vec![task(&fixture, &[])]);
         board.failing.borrow_mut().push("read_task");
-        let result = run_task(ID, &env, &board, &never);
+        let result = run_task(ID, &env, &board, None, &never);
         assert!(matches!(result, Err(RunError::Board(_))), "{result:?}");
         assert_eq!(calls(&board), Vec::<String>::new());
 
         let board = FakeBoard::new(vec![task(&fixture, &[("attempt", "1")])]);
         board.failing.borrow_mut().push("fail");
         let crashed = |_: &CommandLine, _: &Path, _: &Path| Ok(Exit::Signal);
-        let result = run_task(ID, &env, &board, &crashed);
+        let result = run_task(ID, &env, &board, None, &crashed);
         assert!(matches!(result, Err(RunError::Board(_))), "{result:?}");
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),

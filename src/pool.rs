@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::board::{Board, TaskId, one_line};
 use crate::core::ROLES_MAX;
 use crate::roles::{AGENTS_MAX, RoleSpec, display_name, profile_name};
-use crate::run_task::RunError;
+use crate::run_task::{Ran, RunError};
 use crate::settle::Verdict;
 
 /// The wait of every claim: none, because a claiming slot holds a gate place, and a place
@@ -149,6 +149,8 @@ pub enum Event<'a> {
     Completed(&'a str),
     Failed(&'a str),
     Blocked,
+    /// The task was handed back unrun, for the reason given.
+    Released(&'a str),
     Error(&'a str),
 }
 
@@ -169,6 +171,7 @@ pub fn event_line(event: Event, id: Option<TaskId>, name: &str, now: SystemTime)
         Event::Completed(result) => ("completed", Some(result)),
         Event::Failed(reason) => ("failed", Some(reason)),
         Event::Blocked => ("blocked", None),
+        Event::Released(reason) => ("released", Some(reason)),
         Event::Error(message) => ("error", Some(message)),
     };
     let mut line = match id {
@@ -195,7 +198,7 @@ pub enum SlotEnd {
 /// What a slot does besides reaching the board: run a claimed task, pause for one step of
 /// `PAUSE_STEP_MILLIS`, and report one line.
 pub struct Effects<'a> {
-    pub run: &'a dyn Fn(TaskId) -> Result<Verdict, RunError>,
+    pub run: &'a dyn Fn(TaskId) -> Result<Ran, RunError>,
     pub pause: &'a dyn Fn(),
     pub say: &'a dyn Fn(&str),
     pub now: &'a dyn Fn() -> SystemTime,
@@ -258,14 +261,24 @@ pub fn slot_loop(
         let ran = (effects.run)(id);
         drop(pass);
         match ran {
-            Ok(Verdict::Complete { result }) => say(Event::Completed(&result), Some(id)),
-            Ok(Verdict::Fail { reason }) => say(Event::Failed(&reason), Some(id)),
-            Ok(Verdict::LeaveBlocked) => say(Event::Blocked, Some(id)),
+            Ok(Ran::Settled(Verdict::Complete { result })) => {
+                say(Event::Completed(&result), Some(id))
+            }
+            Ok(Ran::Settled(Verdict::Fail { reason })) => say(Event::Failed(&reason), Some(id)),
+            Ok(Ran::Settled(Verdict::LeaveBlocked)) => say(Event::Blocked, Some(id)),
             Err(RunError::Board(error)) => say(Event::Error(&error.to_string()), Some(id)),
             Err(RunError::LostClaim(state)) => {
                 let message = format!("the task is no longer claimed; it is {state:?}");
                 say(Event::Error(&message), Some(id));
             }
+            // It goes back to be claimed by a slot of its new role, under that role's gate.
+            Ok(Ran::RoleChanged { claimed, found }) => match board.release(id) {
+                Ok(()) => {
+                    let reason = format!("claimed as {claimed}, it is now {found}");
+                    say(Event::Released(&reason), Some(id));
+                }
+                Err(error) => say(Event::Error(&error.to_string()), Some(id)),
+            },
         }
     }
     let message = format!("{SLOT_ROUNDS_MAX} claims made; this slot stops");
@@ -439,7 +452,7 @@ mod tests {
         let running = &board.running;
         let running_max = AtomicUsize::new(0);
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             let now = running.fetch_add(1, Ordering::SeqCst) + 1;
             running_max.fetch_max(now, Ordering::SeqCst);
             // Wait, within a bound, for a second task to start, so the test shows real overlap.
@@ -456,7 +469,7 @@ mod tests {
             if ran.len() == usize::try_from(TASKS).unwrap() {
                 stop.store(true, Ordering::SeqCst);
             }
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
         let all = slots(&ROLES);
         let ends: Vec<SlotEnd> = thread::scope(|scope| {
@@ -499,12 +512,12 @@ mod tests {
         board.claims.borrow_mut().push_back(TaskId(7));
         let stop = AtomicBool::new(false);
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             ran.lock().unwrap().push(id.0);
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::Complete {
+            Ok(Ran::Settled(Verdict::Complete {
                 result: "done".to_string(),
-            })
+            }))
         };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
@@ -541,7 +554,7 @@ mod tests {
     #[test]
     fn stop_ends_every_loop() {
         let stop = AtomicBool::new(true);
-        let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+        let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
         let effects = Effects {
             run: &run,
             pause: &no_pause,
@@ -564,12 +577,12 @@ mod tests {
         board.claims.borrow_mut().extend([TaskId(3), TaskId(4)]);
         let stop = AtomicBool::new(false);
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             stop.store(true, Ordering::SeqCst);
             ran.lock().unwrap().push(id.0);
-            Ok(Verdict::Fail {
+            Ok(Ran::Settled(Verdict::Fail {
                 reason: "tests failed".to_string(),
-            })
+            }))
         };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
@@ -613,10 +626,10 @@ mod tests {
                 board.failing.borrow_mut().clear();
             }
         };
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             assert_eq!(id, TaskId(9));
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
@@ -658,7 +671,7 @@ mod tests {
         let pause = || {
             pauses.fetch_add(1, Ordering::SeqCst);
         };
-        let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+        let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
         let lines = Mutex::new(Vec::new());
         let say = |line: &str| lines.lock().unwrap().push(line.to_string());
         let effects = Effects {
@@ -700,7 +713,7 @@ mod tests {
         let board = FakeBoard::new(Vec::new());
         board.claims.borrow_mut().extend([TaskId(5), TaskId(6)]);
         let stop = AtomicBool::new(false);
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             if id == TaskId(5) {
                 return Err(RunError::LostClaim(TaskState::Ready));
             }
@@ -740,6 +753,49 @@ mod tests {
     }
 
     #[test]
+    fn a_task_relabeled_after_its_claim_is_released_unrun() {
+        let board = FakeBoard::new(Vec::new());
+        board.claims.borrow_mut().push_back(TaskId(5));
+        let stop = AtomicBool::new(false);
+        let run = |_: TaskId| -> Result<Ran, RunError> {
+            stop.store(true, Ordering::SeqCst);
+            Ok(Ran::RoleChanged {
+                claimed: "review",
+                found: "implement",
+            })
+        };
+        let lines = Mutex::new(Vec::new());
+        let say = |line: &str| lines.lock().unwrap().push(line.to_string());
+        let effects = Effects {
+            run: &run,
+            pause: &no_pause,
+            say: &say,
+            now: &epoch,
+        };
+        let end = slot_loop(
+            &slot("review", 2),
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX, AGENTS_MAX),
+            &stop,
+            &effects,
+        );
+        assert_eq!(end, SlotEnd::Stopped);
+        let calls = ["claim_ready work/demo review 0", "release 5"];
+        assert_eq!(*board.calls.borrow(), calls.map(str::to_string));
+        assert_eq!(
+            lines.into_inner().unwrap(),
+            vec![
+                "00:00:00Z claimed #5 Review 2 (Sol 6.1)",
+                concat!(
+                    "00:00:00Z released #5 Review 2 (Sol 6.1): ",
+                    "claimed as review, it is now implement"
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn nothing_ready_resets_the_failure_count() {
         let mut steps = vec![Step::Fail; 4];
         steps.push(Step::Empty);
@@ -752,10 +808,10 @@ mod tests {
             pauses.fetch_add(1, Ordering::SeqCst);
         };
         let ran = Mutex::new(Vec::new());
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             ran.lock().unwrap().push(id.0);
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
         let effects = Effects {
             run: &run,
@@ -850,11 +906,11 @@ mod tests {
         let gate = Gate::new(4, 4);
         let stop = AtomicBool::new(false);
         let ran = AtomicBool::new(false);
-        let run = |id: TaskId| -> Result<Verdict, RunError> {
+        let run = |id: TaskId| -> Result<Ran, RunError> {
             assert_eq!(id, TaskId(1));
             ran.store(true, Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
-            Ok(Verdict::LeaveBlocked)
+            Ok(Ran::Settled(Verdict::LeaveBlocked))
         };
         let pause = || thread::sleep(Duration::from_millis(5));
         let idle = ["implement", "light"].map(|label| [slot(label, 1), slot(label, 2)]);
@@ -903,7 +959,7 @@ mod tests {
             pauses.fetch_add(1, Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
         };
-        let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+        let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
         let effects = Effects {
             run: &run,
             pause: &pause,
@@ -949,7 +1005,7 @@ mod tests {
             let waiting = scope.spawn(|| {
                 let board = FakeBoard::new(Vec::new());
                 board.claims.borrow_mut().push_back(TaskId(1));
-                let run = |id: TaskId| -> Result<Verdict, RunError> { panic!("ran task {}", id.0) };
+                let run = |id: TaskId| -> Result<Ran, RunError> { panic!("ran task {}", id.0) };
                 let effects = Effects {
                     run: &run,
                     pause: &no_pause,

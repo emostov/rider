@@ -22,7 +22,7 @@ use crate::pool::{
     Effects, Event, Gate, PAUSE_STEP_MILLIS, Slot, SlotEnd, event_line, slot_loop, slots,
 };
 use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
-use crate::run_task::{Env, RunError, run_task};
+use crate::run_task::{Env, Ran, RunError, run_task};
 use crate::settle::Verdict;
 
 const ENVIRONMENT: &str = r#"environment:
@@ -495,7 +495,7 @@ fn run_slot(
         attempts: limits.attempts,
     };
     let launch = launcher(config, limits);
-    let run = |id: TaskId| run_task(id, &env, &board, &launch);
+    let run = |id: TaskId| run_task(id, &env, &board, Some(slot.role), &launch);
     let pause = || thread::sleep(Duration::from_millis(PAUSE_STEP_MILLIS));
     let effects = Effects {
         run: &run,
@@ -523,7 +523,11 @@ fn run_one(id: TaskId, config: &Config) -> Result<u8, CliError> {
         board_url: config.board_url.clone(),
         attempts: limits.attempts,
     };
-    let verdict = run_task(id, &env, &board, &launcher(config, limits)).map_err(CliError::Run)?;
+    let launch = launcher(config, limits);
+    let ran = run_task(id, &env, &board, None, &launch).map_err(CliError::Run)?;
+    let Ran::Settled(verdict) = ran else {
+        panic!("a run with no claimed role never reports a role change");
+    };
     let now = SystemTime::now();
     let line = match &verdict {
         Verdict::Complete { result } => {

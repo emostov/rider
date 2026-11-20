@@ -275,10 +275,12 @@ pub enum Event {
         until: Timestamp,
     },
     ClaimRefused(RunId),
-    /// The worktree is ready; `branch` is the branch preparation found, if any.
+    /// The worktree is ready; `branch` is the branch preparation found, if any, and `role` the
+    /// label of the role the agent would launch as.
     Prepared {
         run: RunId,
         branch: Option<String>,
+        role: String,
     },
     PrepareBlocked {
         run: RunId,
@@ -539,7 +541,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         Event::Signal => signal(state, actions),
         Event::Claimed { run, epoch, until } => on_claimed(state, run, epoch, until, actions),
         Event::ClaimRefused(run) => claim_refused(state, run),
-        Event::Prepared { run, branch } => on_prepared(state, run, branch, actions),
+        Event::Prepared { run, branch, role } => on_prepared(state, run, branch, &role, actions),
         Event::PrepareBlocked { run, kind, reason } => {
             if let Some(index) = run_in(state, run, Phase::Preparing) {
                 begin_settle(state, index, Settlement::Block { kind, reason }, actions);
@@ -1007,7 +1009,13 @@ fn on_claimed(
     actions.push(Action::Prepare { run, task });
 }
 
-fn on_prepared(state: &mut State, run: RunId, branch: Option<String>, actions: &mut Vec<Action>) {
+fn on_prepared(
+    state: &mut State,
+    run: RunId,
+    branch: Option<String>,
+    role: &str,
+    actions: &mut Vec<Action>,
+) {
     let Some(index) = run_in(state, run, Phase::Preparing) else {
         return;
     };
@@ -1024,7 +1032,10 @@ fn on_prepared(state: &mut State, run: RunId, branch: Option<String>, actions: &
         begin_settle(state, index, Settlement::Release, actions);
         return;
     }
-    if state.stopping == Stopping::Now {
+    // A task relabeled after its claim goes back, to be claimed under its new role, slot and
+    // profile, so the builders limit counts each agent by the role it launches as.
+    let relabeled = state.config.roles[state.runs[index].role].label != role;
+    if relabeled || state.stopping == Stopping::Now {
         begin_settle(state, index, Settlement::Release, actions);
         return;
     }

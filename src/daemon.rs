@@ -632,9 +632,10 @@ fn prepare(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     match prepared {
         Ok(Prepared::Ready(attempt)) => {
             let branch = attempt.branch().map(str::to_string);
+            let role = attempt.role().label.to_string();
             let attempt = *attempt;
             Input {
-                event: Event::Prepared { run, branch },
+                event: Event::Prepared { run, branch, role },
                 extra: Extra::Attempt(Arc::new(attempt)),
             }
         }

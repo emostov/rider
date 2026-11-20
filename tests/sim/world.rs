@@ -73,6 +73,8 @@ struct RunLog {
     prepared: bool,
     /// The branch `Prepared` reported: the one the run's agent works on.
     branch: Option<String>,
+    /// The role `Prepared` reported: the one the run's agent launches with.
+    launch_role: Option<String>,
     /// The task the run claimed.
     task: Option<TaskId>,
     lost: bool,
@@ -346,7 +348,7 @@ impl World {
         self.feed_up = true;
     }
 
-    /// The owner adds a role to an open task, or removes the one it has.
+    /// The owner adds a role to an open task, or changes or removes the one it has.
     fn relabel_role(&mut self) {
         let open: Vec<usize> = (0..self.tasks.len())
             .filter(|index| !is_closed(self.tasks[*index].state))
@@ -358,7 +360,8 @@ impl World {
         let role = ROLES[self.rng.usize(0..ROLES.len())].label;
         let labels = &mut self.tasks[index].labels;
         match labels.iter().position(|(name, _)| name == "role") {
-            Some(found) => drop(labels.remove(found)),
+            Some(found) if self.rng.bool() => drop(labels.remove(found)),
+            Some(found) => labels[found].1 = role.to_string(),
             None => labels.push(("role".to_string(), role.to_string())),
         }
         self.publish(index, EventKind::LabelsChanged);
@@ -499,9 +502,10 @@ impl World {
         let log = self.log.entry(run).or_default();
         match (entry, event) {
             ("claimed", _) => log.claimed = true,
-            (_, Event::Prepared { branch, .. }) => {
+            (_, Event::Prepared { branch, role, .. }) => {
                 log.prepared = true;
                 log.branch = branch.clone();
+                log.launch_role = Some(role.clone());
             }
             ("blocked", _) => log.blocked = true,
             ("lost", _) => log.lost = true,
@@ -598,13 +602,17 @@ impl World {
             Action::Prepare { run, task } => {
                 let id = self.expect(Some(run), "prepare");
                 let branch = self.learn_branch(task);
-                let event = match self.rng.u32(0..10) {
-                    0 => Event::PrepareBlocked {
+                // Preparation reads the role the task has now, whatever it was claimed as.
+                let role = (self.tasks.iter().find(|fake| fake.id == task))
+                    .and_then(|fake| fake.labels.iter().find(|(name, _)| name == "role"))
+                    .map(|(_, role)| role.clone());
+                let event = match (self.rng.u32(0..10), role) {
+                    (0, _) | (_, None) => Event::PrepareBlocked {
                         run,
                         kind: "invalid_brief".to_string(),
                         reason: "base is not a need".to_string(),
                     },
-                    _ => Event::Prepared { run, branch },
+                    (_, Some(role)) => Event::Prepared { run, branch, role },
                 };
                 self.reply(id, event);
             }
@@ -619,6 +627,7 @@ impl World {
                     exit_at,
                     stubborn,
                 });
+                self.check_launched_builders()?;
             }
             Action::StopAgent { run, .. } => {
                 let id = self.expect(Some(run), "stop");
@@ -951,9 +960,17 @@ impl World {
                     (*run, true)
                 }
                 Action::Spawn { run, .. } => {
+                    let claimed = (self.core.runs().iter().find(|entry| entry.id == *run))
+                        .map(|entry| self.config.roles[entry.role].label.clone());
                     let log = self.log.entry(*run).or_default();
                     if !log.claimed || !log.prepared {
                         return Err(format!("invariant 5: {action:?} before claim and prepare"));
+                    }
+                    if log.launch_role.is_none() || log.launch_role != claimed {
+                        return Err(format!(
+                            "invariant 11: {action:?} launches as {:?}, claimed as {claimed:?}",
+                            log.launch_role
+                        ));
                     }
                     (*run, false)
                 }
@@ -962,6 +979,26 @@ impl World {
             if write && self.log.get(&run).is_some_and(|log| log.lost) {
                 return Err(format!("invariant 4: {action:?} after its claim was lost"));
             }
+        }
+        Ok(())
+    }
+
+    /// Live agents of building roles, by the role each launched with, are within the limit.
+    fn check_launched_builders(&self) -> Result<(), String> {
+        let builds = |run: &RunId| {
+            let role = self.log.get(run).and_then(|log| log.launch_role.as_ref());
+            (self.config.roles.iter()).any(|spec| Some(&spec.label) == role && spec.builds)
+        };
+        let builders = self
+            .agents
+            .iter()
+            .filter(|agent| builds(&agent.run))
+            .count();
+        if builders > usize::from(self.config.builders_max) {
+            let max = self.config.builders_max;
+            return Err(format!(
+                "invariant 1: {builders} agents launched as building roles, over {max}"
+            ));
         }
         Ok(())
     }
