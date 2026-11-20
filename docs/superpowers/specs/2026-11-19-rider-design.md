@@ -124,12 +124,12 @@ no new code, so it is milestone 0 below rather than a rejected option.
 
 ```
            Zeke
-            |  rider chat / status / logs        inspector (browser)
+            |  rider status / logs               inspector (browser)
             v                                          |
-   +---------------+   wake-ups (resume + message)   +------+
-   |    riderd     | ------------------------------> | lead |
-   | (Rust daemon) | <------------------------------ |      |
    +---------------+   rider CLI (process control)   +------+
+   |    riderd     | <------------------------------ | lead |
+   | (Rust daemon) |                                 | (terminal)
+   +---------------+                                 +------+
      |    |    |                                        |
      |    |    +-- spawns workers per role              |  plans, answers,
      |    +------- git worktrees and branches           |  checks
@@ -223,10 +223,10 @@ All mechanical:
 6. Capture each agent's output to a bounded log file.
 7. Enforce limits: agents at once in total and per role, wall clock per
    attempt, failed attempts per task.
-8. Queue wake-ups for the lead and run its turns one at a time.
-9. Raise a desktop notification when a `decisions` task is blocked for
-   Zeke.
-10. Serve the control socket.
+8. Serve the control socket.
+
+The daemon never starts, resumes, or wakes a lead. A desktop notification
+when a `decisions` task is blocked for Zeke is a later addition (issue #45).
 
 The daemon talks to the board through the `vb` CLI, behind one Rust trait.
 (Decided in the daemon design: the CLI keeps claim tokens where workers and a
@@ -234,13 +234,17 @@ restarted daemon can use them.)
 
 ### The lead
 
-A Claude Code session on Fable that the daemon runs headless and resumes
-by session id. Its working directory holds its instructions: the planning
-practices above, the label scheme, the role table, and the turn order.
+An open terminal session on Fable running the ride-swarm skill
+(`skills/ride-swarm/`), which holds the planning practices above, the label
+scheme, the role table, and the turn order. Zeke talks to it in that terminal.
+The daemon runs workers only: it does not start, resume, or wake the lead, and
+it keeps no state about one. There is no `rider chat`, no lead queue, and no
+lead status.
 
-It does not loop or wait. The daemon wakes it with one message containing
-the events since its last turn and the cursor they end at. Each turn, in
-Board's recommended order:
+The lead waits on the board with `vb wait`, which returns on the events it cares
+about (a message from Zeke; a task completed, failed, or blocked; an answer in
+`decisions`; a branch that moved under branches stacked on it; a channel with
+nothing left open). Each time it wakes, in Board's recommended order:
 
 1. Answer blocked workers first: reply in the thread, then unblock.
 2. Read each finished task's result before relying on it.
@@ -248,25 +252,20 @@ Board's recommended order:
 4. Handle failures: reopen, reopen under a different role or model, split,
    or put a decision to Zeke.
 5. Keep the queue full: create the next tasks with their needs.
-6. End the turn.
+6. Wait again.
 
-Wake-ups: a message from Zeke; a task completed, failed, or blocked; an
-answer from Zeke in `decisions`; a branch that moved under branches
-stacked on it; a channel with nothing left open. Wake-ups arriving during
-a turn are delivered together in the next one. The queue is bounded; when
-full, older wake-ups for the same task are dropped, since the board still
-holds the truth and the lead re-reads it.
+A `rider wait` command wrapping `vb wait` is a possible later enhancement
+(issue #133).
 
 The lead writes to the board with the Board CLI as profile `lead`, and
 uses the `rider` CLI for process control.
 
-**Questions for Zeke.** If he is attached, the lead asks in the chat. If
-not, it creates a task in `decisions` written for someone who has not
-followed the work (the question, a recommendation, what waits on it, the
-options and their costs) and blocks it as `awaiting_approval`. Work that
-does not depend on it carries on. When Zeke answers in the thread or in
-chat, the lead completes the task with the answer, so `decisions` is the
-record of what was decided.
+**Questions for Zeke.** The lead asks in its terminal. If Zeke is away, it
+creates a task in `decisions` written for someone who has not followed the work
+(the question, a recommendation, what waits on it, the options and their costs)
+and blocks it as `awaiting_approval`. Work that does not depend on it carries
+on. When Zeke answers in the thread or in the terminal, the lead completes the
+task with the answer, so `decisions` is the record of what was decided.
 
 ### Workers
 
@@ -306,7 +305,6 @@ One binary; the daemon is `rider daemon`. (Call)
 
 ```
 rider up | down               start or stop the daemon (and the board)
-rider chat <project> ["message"]   talk to that project's lead; streams its reply
 rider status                  tasks by state, running agents, open decisions
 rider agents                  running agents: task, role, model, age, last output
 rider logs <task> [-f]        an agent's output
@@ -318,7 +316,7 @@ rider open                    open the board inspector in the browser
 What `rider status` shows:
 
 ```
-board  http://127.0.0.1:4100   2 running / 4 max   lead: idle   decisions: 1 open
+board  http://127.0.0.1:4100   2 running / 4 max   decisions: 1 open
 
 work/auth-refactor   /Users/zeke/code/app   base main
   completed  #12  implement  opus-1    extract token store          rider/12-token-store
@@ -375,7 +373,7 @@ lead creates tasks from a plan file (role, repo, base/onto, needs)
   and recreated if needed.
 - A branch moves after children were cut from it only when an `onto` task
   completes on it. The daemon notices that the parent head is no longer an
-  ancestor of each child and wakes the lead.
+  ancestor of each child, which the lead sees when it waits.
 - Restacking is the lead's decision and a worker's job: one `onto` task
   per child branch, each needing the fix-up and the restack of the branch
   below it.
@@ -389,8 +387,6 @@ lead creates tasks from a plan file (role, repo, base/onto, needs)
   the existing worktree, or, if the lease already lapsed, lets the task
   return to ready and claims it normally. A restart does not count as a
   failed attempt.
-- **Lead turn fails.** Its wake-ups go back on the queue. After repeated
-  failures the daemon stops waking it and says so in `rider status`.
 - **Board server dies.** The daemon restarts it and pauses spawning until
   it answers.
 - **Agent hangs.** The wall clock limit kills it.
@@ -415,7 +411,7 @@ lead creates tasks from a plan file (role, repo, base/onto, needs)
 
 Default limits (Call): 4 agents at once; per role 2 implement, 2 light, 2 review,
 1 polish, 1 security; 55 minutes per attempt; 3 failed attempts per task; 256
-tracked tasks; 64 queued wake-ups.
+tracked tasks.
 
 ## Milestones
 
@@ -439,8 +435,8 @@ behaviour change adds or changes a scenario first. Tracked as issue #14 and
 built through Rider.
 
 **1. The daemon.** One milestone, designed in `2026-11-19-rider-daemon-design.md`: workers
-under the daemon, the control socket and CLI, restart recovery, the desktop
-notification, and the simulator. The lead is a terminal session, not run by the
+under the daemon, the control socket and CLI, restart recovery, and the
+simulator. The desktop notification comes later (issue #45). The lead is a terminal session, not run by the
 daemon. It replaces what this document
 first split into milestones 1 to 3.
 

@@ -183,7 +183,7 @@ any phase --> Abandoning -> (removed)   the claim was lost: stop, write nothing
 `Claim(task, profile)`, `Prepare(task)`, `Spawn(task, profile)`,
 `Renew(task)`, `StopAgent(task)`, `Judge(task)`, `Settle(task, verdict)`,
 `Release(task)`, `CheckStack(task)`, `ListTasks`, `RestartFeed(cursor)`,
-`RestartBoard`, `Notify(text)`, `Reply(client, message)`, `SaveCursor(cursor)`, `Exit(code)`.
+`RestartBoard`, `Reply(client, message)`, `SaveCursor(cursor)`, `Exit(code)`.
 
 ### Rules the core follows
 
@@ -294,11 +294,11 @@ lead run by hand and a daemon work together without a link between them.
 A `rider wait` command, wrapping `vb wait` for the lead, is a possible later
 enhancement (GitHub issue #133). It is not in this milestone.
 
-### Notification
+### Notification (later, issue #45)
 
 When a task in `decisions` is blocked as `awaiting_approval`, the daemon
 raises one desktop notification with the task id and its first line. A failure
-to notify is logged and ignored. (GitHub issue #45, outside milestone 1.)
+to notify is logged and ignored. Not in milestone 1: it is built later, as issue #45.
 
 ## The socket and CLI
 
@@ -444,11 +444,10 @@ with "the pool" read as "the daemon"; the ones below are new.
     board reuses its task id, then the task is blocked as `rider_error`
     naming the worktree, and the worktree is untouched.
 
-**Notification**
-
-25. *Decision blocked.* Given a task in `decisions` that is blocked as
-    `awaiting_approval`, then one desktop notification is raised naming the task
-    id and its first line, and a failing notifier does not stop the daemon.
+**Deferred (later, issue #45).** A scenario for the desktop notification is written
+with it: given a task in `decisions` blocked as `awaiting_approval`, one
+notification names the task id and its first line, and a failing notifier does
+not stop the daemon.
 
 ### Covered only by the simulator, and why
 
@@ -511,8 +510,7 @@ Each step is one to three issues, and each leaves something usable.
    board down, board restart, the board identity on worktrees. Scenarios 7 to
    9, 22 to 24.
 5. **Label rules and stack-moved detection.** Scenarios 11 to 15.
-6. **The notification.** Scenario 25.
-7. **Close out.** Widen the simulator's faults, delete `rider pool`, update
+6. **Close out.** Widen the simulator's faults, delete `rider pool`, update
    the README.
 
 ## Room left
@@ -532,7 +530,6 @@ Each step is one to three issues, and each leaves something usable.
   `serde` derive for the socket and board shapes and a seeded random number
   crate for the simulator are the expected ones. (Call)
 - The exact fields of `status` and `agents` data, and their terminal layout.
-- How the notification is raised, with text never passed as a bare argument.
 - How scenarios shorten the lease and time limits (a test-only setting read
   from the environment is expected).
 - The exact content of the board identity file.
