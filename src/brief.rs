@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
 
 use crate::board::{LABELS_MAX, TaskId, TaskView};
+use crate::git;
 use crate::roles::{RoleSpec, role_from_label};
 
 /// Upper bound, in characters, on a label value echoed back in an error message.
@@ -268,7 +269,11 @@ fn check_git_repo(repo: &Path) -> Result<(), BriefError> {
         let reason = format!("{shown:?} is not a directory");
         return Err(BriefError::RepoNotAGitRepo(reason));
     }
-    let status = Process::new("git")
+    let mut git = Process::new("git");
+    for name in git::ENV_REMOVED {
+        git.env_remove(name);
+    }
+    let status = git
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--git-dir"])
