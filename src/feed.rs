@@ -57,6 +57,8 @@ pub enum EventKind {
     TaskExpired,
     TaskBlocked,
     TaskUnblocked,
+    /// The board made a waiting task ready because its needs were met.
+    TaskReady,
     TaskReopened,
     TaskCompleted,
     TaskFailed,
@@ -410,6 +412,7 @@ pub fn parse_event(line: &str) -> Result<FeedEvent, FeedError> {
         "task.expired" => EventKind::TaskExpired,
         "task.blocked" => EventKind::TaskBlocked,
         "task.unblocked" => EventKind::TaskUnblocked,
+        "task.ready" => EventKind::TaskReady,
         "task.reopened" => EventKind::TaskReopened,
         "task.completed" => EventKind::TaskCompleted,
         "task.failed" => EventKind::TaskFailed,
@@ -604,6 +607,7 @@ mod tests {
             ("task-failed", 17, TaskFailed, 2, &at("failed"), Failed, w),
             ("task-reopened", 18, TaskReopened, 2, &ready, Ready, p),
             ("task-completed", 20, TaskCompleted, 2, &at("completed"), Completed, w),
+            ("task-ready", 21, TaskReady, 4, &[("board.task", "ready"), role], Ready, None),
             ("task-canceled", 22, TaskCanceled, 4, &canceled, Canceled, p),
         ];
         for (name, cursor, kind, task, labels, state, actor) in cases {
@@ -612,8 +616,6 @@ mod tests {
         }
         let reply = known(14, MessagePosted, 2, &[], None, p);
         assert_eq!(fixture("tail-message-posted-reply.json"), reply);
-        let other = FeedEvent::Other { cursor: Cursor(21) };
-        assert_eq!(fixture("tail-task-ready.json"), other);
     }
 
     #[test]
@@ -679,8 +681,8 @@ mod tests {
         let (mut feed, dir) = reader("exit", &body);
         let expired = fixture("tail-task-expired.json");
         assert_eq!(feed.next_item().unwrap(), FeedItem::Event(expired));
-        let other = FeedEvent::Other { cursor: Cursor(21) };
-        assert_eq!(feed.next_item().unwrap(), FeedItem::Event(other));
+        let ready = fixture("tail-task-ready.json");
+        assert_eq!(feed.next_item().unwrap(), FeedItem::Event(ready));
         assert_eq!(
             feed.next_item().unwrap(),
             FeedItem::Exited { code: Some(3) }
@@ -868,8 +870,8 @@ exit 4
                 .display()
         );
         let (mut feed, dir) = reader("group", &body);
-        let other = FeedEvent::Other { cursor: Cursor(21) };
-        assert_eq!(feed.next_item().unwrap(), FeedItem::Event(other));
+        let ready = fixture("tail-task-ready.json");
+        assert_eq!(feed.next_item().unwrap(), FeedItem::Event(ready));
         drop(feed);
         let pid = fs::read_to_string(&pid_file).unwrap();
         fs::remove_file(&pid_file).unwrap();
