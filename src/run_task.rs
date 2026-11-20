@@ -799,6 +799,8 @@ fn complete(
         head: &work.head,
         summary,
     };
+    // The fenced write goes first: a retry writes nothing twice, and a lost claim nothing.
+    board.complete(id, summary)?;
     if let Err(error) = record_session(attempt, &env.home) {
         let note = format!("Rider could not record the agent's session: {error}.");
         let _ = board.reply(id, &one_line(&note));
@@ -827,7 +829,6 @@ fn complete(
         };
         let _ = board.reply(id, &one_line(&note));
     }
-    board.complete(id, summary)?;
     Ok(())
 }
 
@@ -845,14 +846,20 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     } else {
         message_tail(&tail, budget)
     };
-    // The tail only informs; losing it must not leave the attempt uncounted.
+    // The fenced write goes first, so nothing is written for a task whose claim was lost.
+    board.fail(id, reason)?;
+    let failed = attempt.failed + 1;
+    // The task is failed already: a lost label or log reply must not retry the `fail`.
+    if board
+        .set_label(id, ATTEMPT_LABEL, &failed.to_string())
+        .is_err()
+    {
+        let note = format!("Rider could not set the `attempt` label to {failed}.");
+        let _ = board.reply(id, &note);
+    }
     if board.reply(id, &format!("{header}\n{tail}")).is_err() {
         let _ = board.reply(id, &header);
     }
-    let failed = attempt.failed + 1;
-    // Counting before failing means a lost `fail` over-counts, never under-counts.
-    board.set_label(id, ATTEMPT_LABEL, &failed.to_string())?;
-    board.fail(id, reason)?;
     Ok(())
 }
 
@@ -1142,8 +1149,8 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
             "complete 7 Extracted the store.".to_string(),
+            record(Some(BRANCH), &head, 1, "Extracted the store."),
         ];
         assert_eq!(calls(&board), expected);
         assert!(
@@ -1183,9 +1190,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
+            "complete 7 Extracted the store.".to_string(),
             record(Some(BRANCH), &head, 1, "Extracted the store."),
             format!("reply 7 {json}"),
-            "complete 7 Extracted the store.".to_string(),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1209,6 +1216,7 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
+            "complete 7 Extracted the store.".to_string(),
             record(Some(BRANCH), &head, 1, "Extracted the store."),
             format!(
                 "reply 7 Kept the worktree at {dir}, so branch {BRANCH} stays checked out \
@@ -1217,7 +1225,6 @@ mod tests {
                  in progress.",
                 dir = dir.display()
             ),
-            "complete 7 Extracted the store.".to_string(),
         ];
         assert_eq!(calls(&board), expected);
         assert!(dir.join("store.rs").exists());
@@ -1269,9 +1276,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 2, &tail.join("\n")),
-            "set_label 7 attempt=2".to_string(),
             "fail 7 agent exited 2".to_string(),
+            "set_label 7 attempt=2".to_string(),
+            tail_reply(&env, 2, &tail.join("\n")),
         ];
         assert_eq!(calls(&board), expected);
         assert_eq!(
@@ -1313,9 +1320,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 1, DONE_STREAM),
-            "set_label 7 attempt=1".to_string(),
             format!("fail 7 {reason}"),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, DONE_STREAM),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1355,9 +1362,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 1, NO_OUTPUT),
-            "set_label 7 attempt=1".to_string(),
             format!("fail 7 {reason}"),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, NO_OUTPUT),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1433,14 +1440,12 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 2, NO_OUTPUT),
-            "set_label 7 attempt=2".to_string(),
             "fail 7 agent exited on a signal".to_string(),
         ];
         assert_eq!(
             calls(&board),
             expected,
-            "the attempt is counted before the failure"
+            "nothing is written before the failure is"
         );
     }
 
@@ -1457,10 +1462,10 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
+            "fail 7 agent exited on a signal".to_string(),
+            "set_label 7 attempt=1".to_string(),
             tail_reply(&env, 1, NO_OUTPUT),
             format!("reply 7 {}", log_line(&env, 1)),
-            "set_label 7 attempt=1".to_string(),
-            "fail 7 agent exited on a signal".to_string(),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1578,9 +1583,9 @@ mod tests {
         let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
         let expected = vec![
             "set_label 7 branch=rider/3-store".to_string(),
+            "complete 7 Extracted the store.".to_string(),
             start,
             record(Some("rider/3-store"), &head, 1, "Extracted the store."),
-            "complete 7 Extracted the store.".to_string(),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1609,8 +1614,8 @@ mod tests {
         assert_eq!(run(&env, &board, &reading), completed("completed"));
         let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
         let expected = vec![
-            record(None, &head, 0, "completed"),
             "complete 7 completed".to_string(),
+            record(None, &head, 0, "completed"),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1631,9 +1636,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             format!("set_label 7 start={start}"),
-            tail_reply(&env, 1, NO_OUTPUT),
-            "set_label 7 attempt=1".to_string(),
             "fail 7 agent exited 1".to_string(),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, NO_OUTPUT),
         ];
         assert_eq!(calls(&board), expected);
 
@@ -1647,8 +1652,8 @@ mod tests {
         let head = git(&fixture.repo, &["rev-parse", BRANCH]);
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
             "complete 7 Extracted the store.".to_string(),
+            record(Some(BRANCH), &head, 1, "Extracted the store."),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1668,9 +1673,9 @@ mod tests {
         assert_eq!(run(&env, &board, &idle), expected);
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
-            tail_reply(&env, 1, DONE_STREAM),
-            "set_label 7 attempt=1".to_string(),
             format!("fail 7 {reason}"),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, DONE_STREAM),
         ];
         assert_eq!(
             calls(&board),
@@ -1761,8 +1766,8 @@ mod tests {
         let head = git(&fixture.repo, &["rev-parse", BRANCH]);
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
             "complete 7 Extracted the store.".to_string(),
+            record(Some(BRANCH), &head, 1, "Extracted the store."),
         ];
         assert_eq!(calls(&board), expected);
     }

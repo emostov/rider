@@ -673,6 +673,27 @@ exec '{}' "$@"
     crate::world::write_executable(&world.vb, &script);
 }
 
+/// Given the first `times` `vb tasks complete` calls each fail, logged as lines in `completes`.
+pub fn given_vb_fails_complete(world: &World, times: u32, completes: &Path) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = tasks ] && [ "$2" = complete ]; then
+  echo complete >> '{completes}'
+  if [ "$(wc -l < '{completes}')" -le {times} ]; then
+    echo 'injected complete failure' >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"#,
+        completes = completes.display(),
+        real = real.display(),
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
 /// A second `vb serve` on a port of its own, killed with its group when it drops.
 pub struct OtherBoard {
     pub url: String,

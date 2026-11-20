@@ -613,10 +613,10 @@ fn a_shortened_attempt_limit_stops_a_never_exiting_agent_and_fails_its_task() {
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(15), "failed after {waited:?}");
     assert!(!is_alive(run.pid), "the agent {} still runs", run.pid);
-    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
     assert_eq!(agent_runs_for(&world, &task).len(), 1);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
 }
 
 #[test]
@@ -675,6 +675,29 @@ fn a_second_sigterm_while_a_failure_is_being_written_releases_the_task_uncounted
     assert_eq!(task_label(&world, &task, "attempt"), None);
     let log = fs::read_to_string(world.home.join("daemon.log")).expect("read daemon.log");
     assert!(log.contains("instead of settling: stop-now"), "{log}");
+}
+
+#[test]
+fn a_complete_that_fails_twice_is_retried_and_the_task_completes_with_one_agent_run() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Commit]);
+    let completes = world.root.join("completes");
+    given_vb_fails_complete(&world, 2, &completes);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["completed"]);
+    let tries = fs::read_to_string(&completes).expect("read the complete log");
+    assert_eq!(tries.lines().count(), 3, "{tries}");
+    assert_eq!(agent_runs_for(&world, &task).len(), 1);
+    assert_eq!(task_records(&world, &task, "rider-result").len(), 1);
+    then_the_worktree_is_removed(&world, &task);
 }
 
 #[test]
@@ -1385,7 +1408,6 @@ fn rider_kill_stops_the_agent_and_fails_its_task_killed_by_the_owner() {
         run.pid
     );
     assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
-    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
     let read = world.vb_lead(&["read", &task, "--json"], None);
     assert!(read.contains("killed by the owner"), "{read}");
     assert_eq!(not_running.code, Some(1), "{not_running:?}");
@@ -1398,6 +1420,7 @@ fn rider_kill_stops_the_agent_and_fails_its_task_killed_by_the_owner() {
     world.release_agent(&waiting);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
 }
 
 #[test]
@@ -1428,9 +1451,9 @@ fn rider_kill_of_a_resumed_agent_that_refused_its_session_starts_no_fresh_agent(
         1,
         "a fresh agent started after the kill: {runs:?}"
     );
-    assert_eq!(task_label(&world, &fix, "attempt"), Some("1".to_string()));
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(task_label(&world, &fix, "attempt"), Some("1".to_string()));
 }
 
 #[test]
