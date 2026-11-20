@@ -561,3 +561,18 @@ pub fn when_the_process_ends_within(pid: u32, seconds: u64) -> bool {
 pub fn agents_running(world: &World) -> usize {
     fake_agent::running_pids(&world.root).len()
 }
+
+/// Given every `vb reply` touches `marker` and then waits `seconds` before it runs.
+pub fn given_vb_replies_slowly(world: &World, marker: &Path, seconds: u32) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" reply "*) : > '{}'; sleep {seconds};; esac
+exec '{}' "$@"
+"#,
+        marker.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}

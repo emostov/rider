@@ -1,9 +1,11 @@
 //! `rider daemon`: the core driven by the board's feed, a timer, signals and worker threads.
 
+use std::cell::Cell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -13,11 +15,13 @@ use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{Board, BoardError, TaskId, Timestamp, VbCli, one_line, parse_failure_reason};
+use crate::board::{
+    Board, BoardError, Listing, TaskId, TaskView, Timestamp, VbCli, one_line, parse_failure_reason,
+};
 use crate::cli::with_vb_on_path;
 use crate::core::{
     self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, Call, Config, Event, LEASE_MILLIS, RunId,
-    Settlement, State,
+    Settlement, State, Stopping,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
 use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
@@ -66,6 +70,11 @@ const TICKS_MAX: u64 = u64::MAX;
 const SIGNALS_MAX: usize = 1 << 20;
 const FEED_ITEMS_MAX: u64 = 1 << 40;
 const JOBS_MAX: u64 = u64::MAX;
+/// Upper bound on the log lines waiting for the log thread; past it lines are dropped.
+const LOG_QUEUE_MAX: usize = 256;
+const LOG_LINES_MAX: u64 = u64::MAX;
+/// Why a settlement's board write was refused: the daemon is stopping now.
+const STOPPED: &str = "the daemon is stopping now";
 // Writes its own pid, which is its process group, then becomes the agent.
 const PID_WRAPPER: &str = r#"echo $$ > "$RIDER_AGENT_PID_FILE" && exec "$@""#;
 
@@ -98,6 +107,8 @@ pub enum DaemonError {
     QueueClosed,
     /// `TEST_MILLIS_VAR` is malformed.
     Setting(String),
+    /// The daemon's log exists and is not a regular file.
+    NotAFile(PathBuf),
 }
 
 impl fmt::Display for DaemonError {
@@ -115,6 +126,7 @@ impl fmt::Display for DaemonError {
             DaemonError::JobsFull => write!(f, "more than {JOBS_QUEUED_MAX} actions waited"),
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
+            DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
         }
     }
 }
@@ -303,6 +315,9 @@ struct Shared {
     lease_millis: u64,
     grace_millis: u64,
     feed: Mutex<FeedSlot>,
+    /// The core has decided to stop now; a settlement checks it before each board write.
+    stop_now: AtomicBool,
+    log: Log,
 }
 
 /// The current feed thread and how to end it.
@@ -380,12 +395,15 @@ pub fn run(paths: Paths) -> Result<u8, DaemonError> {
     let (events, inputs) = sync_channel::<Input>(EVENT_QUEUE_MAX);
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
     let lease_millis = timing.lease_millis;
+    let log = Log::start(&paths.home.join(LOG_FILE))?;
     let shared = Arc::new(Shared {
         paths,
         events,
         lease_millis,
         grace_millis: timing.grace_millis,
         feed: Mutex::new(FeedSlot::default()),
+        stop_now: AtomicBool::new(false),
+        log,
     });
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
@@ -438,7 +456,6 @@ fn drive(
 ) -> Result<u8, DaemonError> {
     let mut contexts: Vec<RunContext> = Vec::with_capacity(usize::from(AGENTS_MAX));
     let mut following = false;
-    let log = shared.paths.home.join(LOG_FILE);
     let tick = step(state, Event::Tick(now()));
     let mut pending: Vec<Action> = tick;
     for _ in 0..STEPS_MAX {
@@ -446,8 +463,7 @@ fn drive(
             if let Action::Exit(code) = action {
                 return Ok(u8::try_from(code).unwrap_or(1));
             }
-            let job = dispatch(action, &mut contexts, shared, &log);
-            if let Some(job) = job {
+            if let Some(job) = dispatch(action, &mut contexts, shared) {
                 jobs.try_send(job).map_err(|error| match error {
                     TrySendError::Full(_) => DaemonError::JobsFull,
                     TrySendError::Disconnected(_) => DaemonError::QueueClosed,
@@ -460,8 +476,10 @@ fn drive(
             following = true;
             println!("{FOLLOWING} {SUBTREE} on {}", shared.paths.board_url);
         }
-        let event = absorb(input, &mut contexts, &log);
+        let event = absorb(input, &mut contexts, &shared.log);
         pending = step(state, event);
+        let now_stopping = state.stopping() == Stopping::Now;
+        shared.stop_now.store(now_stopping, Ordering::SeqCst);
         contexts.retain(|context| state.runs().iter().any(|run| run.id == context.run));
         assert!(contexts.len() <= usize::from(AGENTS_MAX));
     }
@@ -475,7 +493,7 @@ fn step(state: &mut State, event: Event) -> Vec<Action> {
 }
 
 // Keeps what a worker handed back, logs it, and returns the event for the core.
-fn absorb(input: Input, contexts: &mut [RunContext], log: &Path) -> Event {
+fn absorb(input: Input, contexts: &mut [RunContext], log: &Log) -> Event {
     let run = match &input.event {
         Event::Claimed { run, .. }
         | Event::Prepared { run, .. }
@@ -492,13 +510,10 @@ fn absorb(input: Input, contexts: &mut [RunContext], log: &Path) -> Event {
                     "claimed #{} {} epoch {epoch}",
                     context.task.0, context.profile
                 );
-                write_log(log, &line);
+                log.write(&line);
             }
             (Event::Settled(_), _) => {
-                write_log(
-                    log,
-                    &format!("settled #{} {}", context.task.0, context.profile),
-                );
+                log.write(&format!("settled #{} {}", context.task.0, context.profile));
             }
             (_, Extra::Attempt(attempt)) => context.attempt = Some(attempt),
             (_, Extra::Launched(launched)) => context.launched = Some(launched),
@@ -509,44 +524,66 @@ fn absorb(input: Input, contexts: &mut [RunContext], log: &Path) -> Event {
     input.event
 }
 
-fn dispatch(
-    action: Action,
-    contexts: &mut Vec<RunContext>,
-    shared: &Arc<Shared>,
-    log: &Path,
-) -> Option<Job> {
+// The job carrying out `action`; every action but `Exit` gets one, which answers it once.
+fn dispatch(action: Action, contexts: &mut Vec<RunContext>, shared: &Arc<Shared>) -> Option<Job> {
     assert!(contexts.len() <= usize::from(AGENTS_MAX));
+    if let Action::Claim { run, task, profile } = &action {
+        contexts.push(RunContext::new(*run, *task, profile.clone()));
+    }
+    match job(action, contexts, shared) {
+        Ok(job) => job,
+        Err(event) => {
+            shared
+                .log
+                .write(&format!("lost a run's state; answered {event:?}"));
+            Some(Box::new(move || Input::plain(event)))
+        }
+    }
+}
+
+// The job for `action`, or the failure that answers it when its run's context is missing.
+fn job(
+    action: Action,
+    contexts: &mut [RunContext],
+    shared: &Arc<Shared>,
+) -> Result<Option<Job>, Event> {
     let shared = Arc::clone(shared);
-    let find = |contexts: &[RunContext], run: RunId| {
-        contexts.iter().position(|context| context.run == run)
+    let lost = |run: RunId, during: &str| Event::PrepareBlocked {
+        run,
+        kind: "rider_error".to_string(),
+        reason: format!("Rider lost the run's state before it could {during} the attempt."),
     };
     let job: Job = match action {
         Action::Claim { run, task, profile } => {
-            contexts.push(RunContext::new(run, task, profile.clone()));
             Box::new(move || claim(&shared, run, task, &profile))
         }
         Action::Prepare { run, task } => {
-            let index = find(contexts.as_slice(), run)?;
-            let profile = contexts[index].profile.clone();
+            let profile = find(contexts, run, lost(run, "prepare"))?.profile.clone();
             Box::new(move || prepare(&shared, run, task, &profile))
         }
         Action::Spawn { run, task, profile } => {
-            let index = find(contexts.as_slice(), run)?;
-            let attempt = contexts[index].attempt.clone()?;
-            write_log(log, &format!("spawned #{} {profile}", task.0));
+            let context = find(contexts, run, Event::AgentExited(run))?;
+            let attempt = context.attempt.clone().ok_or(Event::AgentExited(run))?;
+            shared.log.write(&format!("spawned #{} {profile}", task.0));
             Box::new(move || spawn(&shared, run, task, &attempt))
         }
         Action::StopAgent { run, task } => Box::new(move || stop_agent(&shared, run, task)),
         Action::Judge { run, task } => {
-            let index = find(contexts.as_slice(), run)?;
-            let context = &mut contexts[index];
-            let (profile, attempt) = (context.profile.clone(), context.attempt.clone()?);
-            let launched = context.launched.take()?;
+            let reason = "rider lost the attempt's state before judging it".to_string();
+            let unjudged = Event::Judged {
+                run,
+                verdict: Verdict::Fail { reason },
+            };
+            let context = find(contexts, run, unjudged.clone())?;
+            let attempt = context.attempt.clone().ok_or(unjudged.clone())?;
+            let launched = context.launched.take().ok_or(unjudged)?;
+            let profile = context.profile.clone();
             Box::new(move || judge(&shared, run, task, &profile, &attempt, launched))
         }
         Action::Renew { run, task } => {
-            let index = find(contexts.as_slice(), run)?;
-            let profile = contexts[index].profile.clone();
+            let profile = find(contexts, run, Event::BoardFailed(Call::Renew(run)))?
+                .profile
+                .clone();
             Box::new(move || renew(&shared, run, task, &profile))
         }
         Action::Settle {
@@ -555,27 +592,29 @@ fn dispatch(
             settlement,
             ..
         } => {
-            let index = find(contexts.as_slice(), run)?;
-            let context = &contexts[index];
-            let profile = context.profile.clone();
-            let (attempt, judgement) = (context.attempt.clone(), context.judgement.clone());
+            let context = find(contexts, run, Event::BoardFailed(Call::Settle(run)))?;
             let close = Close {
                 settlement,
-                attempt,
-                judgement,
+                attempt: context.attempt.clone(),
+                judgement: context.judgement.clone(),
             };
+            let profile = context.profile.clone();
             Box::new(move || settle(&shared, run, task, &profile, close))
         }
-        Action::Release { run, task, .. } => {
-            let index = find(contexts.as_slice(), run)?;
-            let profile = contexts[index].profile.clone();
-            Box::new(move || release(&shared, run, task, &profile))
-        }
+        Action::Release {
+            run, task, profile, ..
+        } => Box::new(move || release(&shared, run, task, &profile)),
         Action::ListTasks => Box::new(move || list(&shared)),
         Action::RestartFeed(cursor) => Box::new(move || restart_feed(&shared, cursor)),
-        Action::Exit(_) => return None,
+        Action::Exit(_) => return Ok(None),
     };
-    Some(job)
+    Ok(Some(job))
+}
+
+fn find(contexts: &mut [RunContext], run: RunId, missing: Event) -> Result<&mut RunContext, Event> {
+    let found = contexts.iter_mut().find(|context| context.run == run);
+    assert!(found.as_ref().is_none_or(|context| context.run == run));
+    found.ok_or(missing)
 }
 
 fn call_failed(error: &BoardError) -> bool {
@@ -761,8 +800,19 @@ struct Close {
 }
 
 fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close) -> Input {
-    let board = shared.board(profile);
+    let board = Guarded {
+        board: shared.board(profile),
+        shared,
+        task,
+        counted: Cell::new(false),
+        refused: Cell::new(false),
+        noted: Cell::new(false),
+    };
     let written = match (&close.settlement, &close.attempt, &close.judgement) {
+        _ if board.stopped() => {
+            board.refused.set(true);
+            Err(RunError::Board(BoardError::Io(STOPPED.to_string())))
+        }
         (Settlement::Block { kind, reason }, _, _) => {
             board.block(task, reason, kind).map_err(RunError::Board)
         }
@@ -780,6 +830,13 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
         (Settlement::Verdict(_), _, _) => Ok(()),
         (Settlement::Release, _, _) => board.release(task).map_err(RunError::Board),
     };
+    if board.refused.get() {
+        shared.log.write(&format!(
+            "released #{} {profile} instead of settling: stop-now",
+            task.0
+        ));
+        return release(shared, run, task, profile);
+    }
     let event = match written {
         Ok(()) => Event::Settled(run),
         Err(RunError::Board(error)) if call_failed(&error) => Event::BoardFailed(Call::Settle(run)),
@@ -789,6 +846,96 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
         Err(RunError::Board(_)) => Event::BoardFailed(Call::Settle(run)),
     };
     Input::plain(event)
+}
+
+/// The board a settlement writes through: on stop-now it refuses every write until one that
+/// settles or counts the attempt has been made, and after that it lets the rest finish.
+struct Guarded<'a> {
+    board: VbCli,
+    shared: &'a Shared,
+    task: TaskId,
+    /// A write that settles the task or counts its attempt was sent; it cannot be undone.
+    counted: Cell<bool>,
+    /// A write was refused for stop-now.
+    refused: Cell<bool>,
+    /// The log says this settlement finishes despite stop-now.
+    noted: Cell<bool>,
+}
+
+impl Guarded<'_> {
+    fn stopped(&self) -> bool {
+        self.shared.stop_now.load(Ordering::SeqCst)
+    }
+
+    fn gate(&self, counts: bool) -> Result<(), BoardError> {
+        assert!(!self.refused.get() || !self.counted.get());
+        if self.stopped() {
+            if !self.counted.get() {
+                self.refused.set(true);
+                return Err(BoardError::Io(STOPPED.to_string()));
+            }
+            if !self.noted.replace(true) {
+                let line = format!(
+                    "finishing the settlement of #{} after stop-now: it was written before",
+                    self.task.0
+                );
+                self.shared.log.write(&line);
+            }
+        }
+        self.counted.set(self.counted.get() || counts);
+        assert!(!counts || self.counted.get());
+        Ok(())
+    }
+}
+
+impl Board for Guarded<'_> {
+    fn read_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
+        self.board.read_task(id)
+    }
+    fn claim_ready(
+        &self,
+        channel: &str,
+        role: &str,
+        wait: u32,
+    ) -> Result<Option<TaskId>, BoardError> {
+        self.board.claim_ready(channel, role, wait)
+    }
+    fn set_label(&self, id: TaskId, key: &str, value: &str) -> Result<(), BoardError> {
+        self.gate(true)?;
+        self.board.set_label(id, key, value)
+    }
+    fn reply(&self, id: TaskId, text: &str) -> Result<(), BoardError> {
+        self.gate(false)?;
+        self.board.reply(id, text)
+    }
+    fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError> {
+        self.gate(false)?;
+        self.board.post_structured(id, schema, json)
+    }
+    fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError> {
+        self.gate(true)?;
+        self.board.complete(id, result)
+    }
+    fn fail(&self, id: TaskId, reason: &str) -> Result<(), BoardError> {
+        self.gate(true)?;
+        self.board.fail(id, reason)
+    }
+    fn block(&self, id: TaskId, reason: &str, kind: &str) -> Result<(), BoardError> {
+        self.gate(true)?;
+        self.board.block(id, reason, kind)
+    }
+    fn claim_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
+        self.board.claim_task(id)
+    }
+    fn renew(&self, id: TaskId) -> Result<TaskView, BoardError> {
+        self.board.renew(id)
+    }
+    fn release(&self, id: TaskId) -> Result<(), BoardError> {
+        self.board.release(id)
+    }
+    fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
+        self.board.list_open(subtree)
+    }
 }
 
 fn release(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
@@ -949,11 +1096,63 @@ fn now() -> Timestamp {
     Timestamp(millis)
 }
 
-// A timestamped line appended to the daemon's log; losing one must not stop the daemon.
-fn write_log(path: &Path, line: &str) {
-    assert!(!line.contains('\n'));
-    let text = format!("{} {line}\n", clock_line(SystemTime::now()));
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+/// The daemon's log, written by its own thread so a slow file never holds up the core.
+struct Log {
+    lines: SyncSender<String>,
+    /// Lines dropped because the queue was full, reported with the next line written.
+    dropped: Arc<AtomicU64>,
+}
+
+impl Log {
+    // Anything there but a regular file is refused before opening, which would block on a FIFO.
+    fn start(path: &Path) -> Result<Log, DaemonError> {
+        match fs::metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(DaemonError::NotAFile(path.to_path_buf()));
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(io_error("inspect", path)(error));
+            }
+            Ok(_) | Err(_) => {}
+        }
+        let opened = OpenOptions::new().create(true).append(true).open(path);
+        let file = opened.map_err(io_error("open", path))?;
+        let metadata = file.metadata().map_err(io_error("inspect", path))?;
+        if !metadata.is_file() {
+            return Err(DaemonError::NotAFile(path.to_path_buf()));
+        }
+        let (lines, queued) = sync_channel::<String>(LOG_QUEUE_MAX);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&dropped);
+        let builder = thread::Builder::new().name("log".into());
+        let spawned = builder.spawn(move || write_lines(file, &queued, &counted));
+        spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
+        Ok(Log { lines, dropped })
+    }
+
+    // Queues a timestamped line; a full queue drops and counts it rather than wait.
+    fn write(&self, line: &str) {
+        assert!(!line.contains('\n'));
+        let text = format!("{} {line}\n", clock_line(SystemTime::now()));
+        assert!(text.ends_with('\n'));
+        if let Err(TrySendError::Full(_)) = self.lines.try_send(text) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// Appends queued lines to `file` until the daemon drops its log; losing one must not stop it.
+fn write_lines(mut file: File, queued: &Receiver<String>, dropped: &AtomicU64) {
+    for _ in 0..LOG_LINES_MAX {
+        let Ok(text) = queued.recv() else { return };
+        let lost = dropped.swap(0, Ordering::SeqCst);
+        if lost > 0 {
+            let note = format!(
+                "{} dropped {lost} log lines\n",
+                clock_line(SystemTime::now())
+            );
+            let _ = file.write_all(note.as_bytes());
+        }
         let _ = file.write_all(text.as_bytes());
     }
 }

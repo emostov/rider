@@ -377,3 +377,56 @@ fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_wr
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
+
+#[test]
+fn a_second_sigterm_while_a_failure_is_being_written_releases_the_task_uncounted() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::ExitNonZero]);
+    let marker = world.root.join("reply-started");
+    given_vb_replies_slowly(&world, &marker, 3);
+    given_a_running_daemon(&mut world);
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "no reply began:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    when_the_daemon_is_sent_sigterm(&world);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(task_state(&world, &task), "ready");
+    assert_eq!(task_label(&world, &task, "attempt"), None);
+    let log = fs::read_to_string(world.home.join("daemon.log")).expect("read daemon.log");
+    assert!(log.contains("instead of settling: stop-now"), "{log}");
+}
+
+#[test]
+fn a_daemon_log_that_is_a_fifo_is_refused_and_the_daemon_exits() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let log = world.home.join("daemon.log");
+    fs::create_dir_all(&world.home).expect("create the rider home");
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&log)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success());
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("daemon.log is not a regular file"),
+        "{output:?}"
+    );
+}

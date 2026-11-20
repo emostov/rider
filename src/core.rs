@@ -208,6 +208,8 @@ pub struct Run {
 pub struct PendingClaim {
     pub run: RunId,
     pub task: TaskId,
+    /// The profile the claim was sent as, which a release of a late grant writes as.
+    pub profile: String,
     /// When the claim was sent; past one lease any grant has lapsed.
     pub since: Timestamp,
     /// The granted epoch, once a late `Claimed` arrived.
@@ -334,6 +336,7 @@ pub enum Action {
         run: RunId,
         task: TaskId,
         epoch: u64,
+        profile: String,
     },
     ListTasks,
     RestartFeed(Cursor),
@@ -1047,6 +1050,7 @@ fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         return;
     }
     let (run, task, epoch) = (entry.id, entry.task, entry.epoch);
+    let (role, slot) = (entry.role, entry.slot);
     // After stop-now no attempt counts: whatever was decided, the claim is released.
     if state.stopping == Stopping::Now {
         entry.settlement = Some(Settlement::Release);
@@ -1056,7 +1060,12 @@ fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
     };
     entry.settling = true;
     actions.push(match settlement {
-        Settlement::Release => Action::Release { run, task, epoch },
+        Settlement::Release => Action::Release {
+            run,
+            task,
+            epoch,
+            profile: state.profile(role, slot),
+        },
         settlement => Action::Settle {
             run,
             task,
@@ -1195,8 +1204,13 @@ fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
         };
         if up && !pending.releasing && now >= pending.retry_at {
             pending.releasing = true;
-            let (run, task) = (pending.run, pending.task);
-            actions.push(Action::Release { run, task, epoch });
+            let (run, task, profile) = (pending.run, pending.task, pending.profile.clone());
+            actions.push(Action::Release {
+                run,
+                task,
+                epoch,
+                profile,
+            });
         }
     }
     assert!(state.pending_claims.len() <= PENDING_CLAIMS_MAX);
@@ -1330,9 +1344,12 @@ fn phase_expired(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         Phase::Claiming => {
             assert!(state.pending_claims.len() < PENDING_CLAIMS_MAX);
             let since = entry.phase_start;
+            let (role, slot) = (entry.role, entry.slot);
+            let profile = state.profile(role, slot);
             state.pending_claims.push(PendingClaim {
                 run,
                 task,
+                profile,
                 since,
                 epoch: None,
                 releasing: false,
