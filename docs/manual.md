@@ -4,7 +4,7 @@ The full reference for running Rider today. For the short introduction, see the 
 
 Rider runs a swarm of coding agents on your own machine through a local Vercel Board. You talk
 to one lead agent, which plans a goal into board tasks with dependencies and a role for each.
-`rider pool` claims each ready task, starts the agent its role calls for in a git worktree of
+`rider up` starts a daemon that claims each ready task, starts the agent its role calls for in a git worktree of
 its own, and settles the task on the board when the agent exits.
 
 ## Status
@@ -75,10 +75,12 @@ vb schemas create rider-finding@1 --file skills/ride-swarm/schemas/rider-finding
 
 The `vb` commands under "Watching" need the same two `export` settings.
 
-**Terminal 2: the workers.** `demo` is the project name; tasks go in the channel `work/demo`.
+**Terminal 2: the workers.** One daemon serves every project; tasks for `demo` go in the
+channel `work/demo`.
 
 ```sh
-rider pool demo
+rider up
+rider status
 ```
 
 **Terminal 3: the lead.**
@@ -219,11 +221,11 @@ finished, the `ship-swarm` skill opens its pull requests and keeps CI green when
 
 ## Stopping
 
-- In the pool terminal, type `stop` and press Enter, or press Ctrl-D. Each slot finishes the
-  task it is running and claims no more; the pool exits when they have all finished.
-- The pool stops when its standard input closes, so run it in a terminal. Started with its
-  standard input closed (from a script, or with `< /dev/null`), it stops at once.
-- Ctrl-C kills `rider` at once. Agents already running are left to finish on their own and
+- `rider down` drains: each agent finishes its task and nothing new is claimed. `rider down
+  --now` stops every agent at once and releases its task, the attempt uncounted.
+- Fallback until `rider pool` is removed: in its terminal, type `stop` and press Enter, or
+  press Ctrl-D. It stops when its standard input closes, so run it in a terminal.
+- Ctrl-C on `rider pool` kills `rider` at once. Agents already running are left to finish on their own and
   their tasks are not settled. Each claim is a one-hour lease, so those tasks return to ready
   within the hour.
 
