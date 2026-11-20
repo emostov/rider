@@ -694,8 +694,12 @@ fn a_task_onto_one_that_is_still_settling_waits_for_its_worktree_and_completes()
     given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
     // The result record is posted after the fenced complete and before the worktree is
     // released, so the fix is ready while the branch is still checked out.
-    given_vb_runs_slowly(&world, "post", &world.root.join("posted"), 3);
+    let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
+    given_vb_waits_for(&world, "post", &posted, &release);
     given_a_running_daemon(&mut world);
+    when_the_file_exists(&world, &posted);
+    when_the_task_is(&world, &fix, "ready");
+    fs::write(&release, "").expect("release the held post");
 
     let states = when_the_tasks_settle(&world, &[&built, &fix]);
 
@@ -783,6 +787,29 @@ fn a_board_the_daemon_started_is_restarted_when_killed_and_its_running_task_comp
         !is_alive(boards[1]),
         "the board the daemon started outlived it"
     );
+}
+
+#[test]
+fn a_board_left_by_a_killed_daemon_is_kept_by_the_next_and_stopped_by_rider_down() {
+    let Some(mut world) = World::new() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    let board = when_the_daemon_has_started_boards(&world, 1, 5)[0];
+    when_the_daemon_crashes(&mut world);
+    assert!(is_alive(board), "the board ended with the daemon");
+
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows(&world, &format!("{BOARD_KEPT} {board}"));
+    let down = when_rider_runs(&world, &["down"]);
+
+    assert_eq!(down.code, Some(0), "{down:?}");
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(
+        when_the_process_ends_within(board, 15),
+        "the board {board} outlived the daemon that kept it"
+    );
+    assert_eq!(boards_the_daemon_started(&world), vec![board]);
 }
 
 #[test]
@@ -1697,6 +1724,34 @@ fn when_the_board_lease_lapses(world: &World, task: &str) {
             Instant::now() < deadline,
             "#{task}'s claim never lapsed: {}",
             task_state(world, task)
+        );
+        thread::sleep(Duration::from_millis(LEASE_POLL_MILLIS));
+    }
+}
+
+/// Waits until the daemon's log contains `text`.
+fn when_the_daemon_log_shows(world: &World, text: &str) {
+    let log = world.home.join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !fs::read_to_string(&log).unwrap_or_default().contains(text) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon log never showed {text}:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(LOG_POLL_MILLIS));
+    }
+}
+
+/// Waits until the board shows `task` in `state`.
+fn when_the_task_is(world: &World, task: &str, state: &str) {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while task_state(world, task) != state {
+        assert!(
+            Instant::now() < deadline,
+            "#{task} was {}, never {state}:\n{}",
+            task_state(world, task),
+            world.pool_log()
         );
         thread::sleep(Duration::from_millis(LEASE_POLL_MILLIS));
     }

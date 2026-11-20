@@ -49,6 +49,9 @@ pub const FEED_RESTARTS_MAX: u8 = 10;
 /// How long a feed must stay up, without delivering an event, for its loss not to count as
 /// a restart in a row, in milliseconds.
 pub const FEED_UPTIME_MILLIS_MIN: u64 = 60 * 1000;
+/// Once feed restarts are exhausted, how long between tries of one more feed, and how long
+/// that feed must stay up, without delivering an event, to count as working, in milliseconds.
+pub const FEED_RETRY_MILLIS: u64 = 10 * 1000;
 /// How many restarts in a row of a board the daemon started are allowed before it is left down.
 pub const BOARD_RESTARTS_MAX: u8 = 5;
 /// How long a restarted board must stay up for its exit not to count as a restart in a row,
@@ -515,9 +518,16 @@ pub struct State {
     feed_restarts: u8,
     feed_since: Timestamp,
     feed_delivered: bool,
+    /// Since when feed restarts are exhausted: claims pause and only `FEED_RETRY_MILLIS` apart
+    /// is one more feed tried.
+    feed_failed: Option<Timestamp>,
+    /// When the last feed tried after exhaustion ended, or `None` while it runs.
+    feed_retry_after: Option<Timestamp>,
     /// Restarts in a row of the board process the daemon started.
     board_restarts: u8,
-    board_since: Timestamp,
+    /// Since when the board process the daemon started has run; `None` from its exit until a
+    /// restart starts it, so a restart that fails counts as one more in a row.
+    board_since: Option<Timestamp>,
     /// Clients waiting on `down`, told of each run as it ends; at most `CLIENTS_MAX`.
     down_clients: Vec<ClientId>,
     /// Clients following a task's log, told when its agent is gone; at most `CLIENTS_MAX`.
@@ -554,8 +564,10 @@ impl State {
             feed_restarts: 0,
             feed_since: now,
             feed_delivered: false,
+            feed_failed: None,
+            feed_retry_after: None,
             board_restarts: 0,
-            board_since: now,
+            board_since: Some(now),
             down_clients: Vec::new(),
             log_clients: Vec::new(),
             recovered: false,
@@ -621,8 +633,15 @@ impl State {
         assert!(self.pending_claims.iter().all(given_up));
         &self.pending_claims
     }
+    /// The board's health for claiming: down while it fails or its feed restarts are exhausted.
     pub fn board(&self) -> BoardHealth {
-        self.board
+        let health = match (self.board, self.feed_failed) {
+            (BoardHealth::Up, Some(since)) => BoardHealth::Down { since },
+            (board, _) => board,
+        };
+        assert!(self.feed_failed.is_none() || health != BoardHealth::Up);
+        assert!(self.board == BoardHealth::Up || health == self.board);
+        health
     }
     pub fn stopping(&self) -> Stopping {
         assert!(self.stopping != Stopping::No || !self.exited);
@@ -695,6 +714,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
                 state.listing = true;
                 actions.push(Action::ListTasks);
             }
+            retry_feed(state, actions);
         }
         Event::Feed(feed) => track_feed(state, &feed),
         Event::FeedLost => feed_lost(state, actions),
@@ -719,7 +739,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         }
         Event::BoardFailed(call) => board_failed(state, call),
         Event::BoardExited => board_exited(state, actions),
-        Event::BoardRestarted => state.board_since = state.now,
+        Event::BoardRestarted => state.board_since = Some(state.now),
         Event::Signal => signal(state, actions),
         Event::Client { client, request } => on_request(state, client, request, actions),
         Event::ClientGone(client) => {
@@ -771,18 +791,26 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
     }
 }
 
-/// A loss counts as one more in a row unless the feed delivered an event or stayed up long.
+/// A loss counts as one more in a row unless the feed delivered an event or stayed up long;
+/// past `FEED_RESTARTS_MAX` in a row the feed is not restarted but retried by the tick.
 fn feed_lost(state: &mut State, actions: &mut Vec<Action>) {
     let uptime = state.now.0.saturating_sub(state.feed_since.0);
-    if state.feed_delivered || uptime >= FEED_UPTIME_MILLIS_MIN {
-        state.feed_restarts = 0;
+    if state.feed_failed.is_some() {
+        state.feed_retry_after = Some(state.now);
+    } else {
+        if state.feed_delivered || uptime >= FEED_UPTIME_MILLIS_MIN {
+            state.feed_restarts = 0;
+        }
+        state.feed_restarts = state.feed_restarts.saturating_add(1);
+        if state.feed_restarts > FEED_RESTARTS_MAX {
+            state.feed_failed = Some(state.now);
+            state.feed_retry_after = Some(state.now);
+        } else {
+            actions.push(Action::RestartFeed(state.cursor));
+        }
     }
-    state.feed_restarts = state.feed_restarts.saturating_add(1);
-    if state.feed_restarts > FEED_RESTARTS_MAX {
-        mark_down(state);
-    }
-    assert!(state.feed_restarts <= FEED_RESTARTS_MAX || state.board != BoardHealth::Up);
-    actions.push(Action::RestartFeed(state.cursor));
+    assert!(state.feed_restarts <= FEED_RESTARTS_MAX || state.feed_failed.is_some());
+    assert!(state.feed_failed.is_none() || state.feed_retry_after.is_some());
     if !state.listing {
         state.listing = true;
         actions.push(Action::ListTasks);
@@ -790,10 +818,39 @@ fn feed_lost(state: &mut State, actions: &mut Vec<Action>) {
     assert!(state.listing);
 }
 
+/// After feed restarts are exhausted, tries one more feed `FEED_RETRY_MILLIS` after the last
+/// ended, and resumes claiming once one delivers an event or stays up that long.
+fn retry_feed(state: &mut State, actions: &mut Vec<Action>) {
+    let Some(since) = state.feed_failed else {
+        return;
+    };
+    let now = state.now;
+    match state.feed_retry_after {
+        None => {
+            let uptime = now.0.saturating_sub(state.feed_since.0);
+            if state.feed_delivered || uptime >= FEED_RETRY_MILLIS {
+                state.feed_failed = None;
+                state.feed_restarts = 0;
+            }
+        }
+        Some(ended) if now.0.saturating_sub(ended.0) >= FEED_RETRY_MILLIS => {
+            state.feed_retry_after = None;
+            state.feed_since = now;
+            state.feed_delivered = false;
+            actions.push(Action::RestartFeed(state.cursor));
+        }
+        Some(_) => {}
+    }
+    assert!(state.feed_failed.is_none_or(|failed| failed == since));
+    assert!(state.feed_failed.is_some() || state.feed_restarts == 0);
+}
+
 /// The owned board is restarted unless it has already been restarted `BOARD_RESTARTS_MAX`
-/// times in a row; an exit after it stayed up long starts the count again.
+/// times in a row; an exit after it stayed up long starts the count again, and a restart that
+/// could not start it counts as one more.
 fn board_exited(state: &mut State, actions: &mut Vec<Action>) {
-    let uptime = state.now.0.saturating_sub(state.board_since.0);
+    let since = state.board_since.take();
+    let uptime = since.map_or(0, |since| state.now.0.saturating_sub(since.0));
     if uptime >= BOARD_UPTIME_MILLIS_MIN {
         state.board_restarts = 0;
     }
@@ -803,7 +860,7 @@ fn board_exited(state: &mut State, actions: &mut Vec<Action>) {
         actions.push(Action::RestartBoard);
     }
     assert!(state.board_restarts <= BOARD_RESTARTS_MAX);
-    assert!(state.board != BoardHealth::Up);
+    assert!(state.board != BoardHealth::Up && state.board_since.is_none());
 }
 
 fn on_request(state: &mut State, client: ClientId, request: Request, actions: &mut Vec<Action>) {
@@ -904,7 +961,7 @@ fn status_view(state: &State) -> StatusView {
         }
     });
     let view = StatusView {
-        board: state.board,
+        board: state.board(),
         stopping: state.stopping,
         running: state.runs.len(),
         limit: state.config.agents_max,
@@ -1660,7 +1717,7 @@ fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
 }
 
 fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
-    if state.board != BoardHealth::Up || state.stopping != Stopping::No {
+    if state.board() != BoardHealth::Up || state.stopping != Stopping::No {
         return;
     }
     let agents_max = usize::from(state.config.agents_max);

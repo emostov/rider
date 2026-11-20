@@ -457,6 +457,10 @@ pub const DAEMON_STARTED: &str = "rider daemon: following";
 pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
 /// The daemon log's line naming a board process the daemon started, before its pid.
 pub const BOARD_STARTED: &str = "started the board, pid";
+/// The daemon log's line naming a board process a killed daemon started, kept as its own.
+pub const BOARD_KEPT: &str = "kept the board started before, pid";
+/// How long a held `vb` call waits for its release, in tenths of a second.
+const HELD_TENTHS_MAX: u32 = 1200;
 
 /// Given a running `rider daemon` that follows the board.
 pub fn given_a_running_daemon(world: &mut World) {
@@ -680,6 +684,42 @@ exec '{}' "$@"
         real.display()
     );
     crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb` run whose arguments contain the word `word` touches `marker` and then
+/// waits, up to `HELD_TENTHS_MAX` tenths of a second, until `release` exists.
+pub fn given_vb_waits_for(world: &World, word: &str, marker: &Path, release: &Path) {
+    assert!(!word.is_empty() && !word.contains(['\'', ' ']));
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" {word} "*)
+  : > '{}'
+  n=0
+  while [ ! -e '{}' ] && [ $n -lt {HELD_TENTHS_MAX} ]; do sleep 0.1; n=$((n + 1)); done;;
+esac
+exec '{}' "$@"
+"#,
+        marker.display(),
+        release.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Waits until `path` exists.
+pub fn when_the_file_exists(world: &World, path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared:\n{}",
+            path.display(),
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
 }
 
 /// Given the first `times` `vb tasks complete` calls each fail, logged as lines in `completes`.

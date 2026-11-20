@@ -45,14 +45,32 @@ fn more_seeds_hold_every_invariant() {
     let mut restarted_in = BTreeSet::new();
     let mut down_in = BTreeSet::new();
     let mut given_up = 0_u64;
+    let mut spawns_given_up = 0_u64;
+    let mut feeds_given_up = 0_u64;
+    let mut feeds_recovered = 0_u64;
     for seed in SEEDS..SEEDS + MORE_SEEDS {
         let world = run_seed(seed);
         assert!(!world.trace.is_empty());
         restarted_in.extend(world.restarted_in);
         down_in.extend(world.down_in);
         given_up += u64::from(world.board_given_up);
+        spawns_given_up += u64::from(world.spawn_given_up);
+        feeds_given_up += u64::from(world.feed_given_up);
+        feeds_recovered += u64::from(world.feed_recovered);
     }
     assert!(given_up > 0, "no seed's owned board died past its restarts");
+    assert!(
+        spawns_given_up > 0,
+        "no seed failed every restart of a board that had stayed up long"
+    );
+    assert!(
+        feeds_given_up > 0,
+        "no seed lost the feed past its restarts"
+    );
+    assert!(
+        feeds_recovered > 0,
+        "no seed's feed worked again after its restarts ran out"
+    );
     let expected: BTreeSet<String> = PHASES.iter().map(|phase| phase.to_string()).collect();
     assert_eq!(restarted_in, expected, "the phases a restart came in");
     assert_eq!(down_in, expected, "the phases a board outage came in");

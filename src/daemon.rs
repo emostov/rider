@@ -78,6 +78,14 @@ pub const LOG_FILE: &str = "daemon.log";
 pub const BOARD_LOG_FILE: &str = "board.log";
 /// The daemon log's line naming the board process the daemon started.
 pub const BOARD_STARTED: &str = "started the board, pid";
+/// The daemon log's line naming the board process a crashed daemon started, kept as its own.
+pub const BOARD_KEPT: &str = "kept the board started before, pid";
+/// The file under the Rider home naming the board process the daemon started and its start.
+pub const BOARD_FILE: &str = "board.json";
+const BOARD_FILE_BYTES_MAX: u64 = 256;
+/// How often the daemon checks that a board it kept from before still runs.
+const BOARD_POLL_MILLIS: u64 = 200;
+const BOARD_POLLS_MAX: u64 = u64::MAX;
 /// How long a board the daemon started is given to end after SIGTERM before SIGKILL.
 const BOARD_STOP_MILLIS_MAX: u64 = 10_000;
 const AGENTS_DIR: &str = "agents";
@@ -483,6 +491,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         recorder,
         saved_cursor,
     });
+    let board = BoardGuard(Arc::clone(&shared));
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
     start_signals(shared.events.clone())?;
@@ -499,7 +508,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     save_cursor(&shared, state.cursor());
     shared.socket.close();
     stop_feed(&shared);
-    stop_board(&shared);
+    drop(board);
     let code = code?;
     assert!(state.exited());
     Ok(code)
@@ -510,6 +519,9 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
 fn serve_if_down(shared: &Arc<Shared>) {
     let url = &shared.paths.board_url;
     let Some(port) = local_port(url) else { return };
+    if keep_board(shared) {
+        return;
+    }
     match shared.board(DAEMON_PROFILE).list_open(SUBTREE) {
         Err(error) if call_failed(&error) => {}
         _ => return,
@@ -568,21 +580,115 @@ fn start_board(shared: &Arc<Shared>) -> Result<(), DaemonError> {
     let builder = thread::Builder::new().name("board".into());
     let spawned = builder.spawn(move || {
         let _ = child.wait();
-        let mut slot = watcher.served();
-        slot.group = None;
-        if !slot.stopping {
-            drop(slot);
-            send(&watcher.events, Event::BoardExited);
-        }
+        board_ended(&watcher);
     });
     let spawned = spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
     shared
         .log
         .write(&format!("{BOARD_STARTED} {}", group.as_raw_nonzero()));
+    record_board(shared, group);
     slot.group = Some(group);
     slot.thread = Some(spawned);
     assert!(!slot.stopping && slot.group.is_some());
     Ok(())
+}
+
+// Reports the end of the board the daemon owns unless the daemon is exiting.
+fn board_ended(shared: &Shared) {
+    let mut slot = shared.served();
+    slot.group = None;
+    if !slot.stopping {
+        drop(slot);
+        send(&shared.events, Event::BoardExited);
+    }
+}
+
+// Names the board group `group` in the board file, so a daemon started after this one is
+// killed keeps owning it and stops it.
+fn record_board(shared: &Shared, group: Pid) {
+    let path = shared.paths.home.join(BOARD_FILE);
+    let Some(start) = start_time(group) else {
+        shared
+            .log
+            .write("could not record the board: it already ended");
+        return;
+    };
+    let record = WireBoard {
+        group: group.as_raw_nonzero().get(),
+        start,
+    };
+    assert!(record.group > 0);
+    let written = serde_json::to_string(&record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .and_then(|text| write_atomically(&path, text.as_bytes()));
+    if let Err(error) = written {
+        let line = format!("could not record the board in {}: {error}", path.display());
+        shared.log.write(&line);
+    }
+}
+
+// Takes on as the daemon's own the board the board file names while that process, started
+// when the file says, still runs; a thread reports its end as an exit.
+fn keep_board(shared: &Arc<Shared>) -> bool {
+    let path = shared.paths.home.join(BOARD_FILE);
+    let text = match read_bounded(&path, BOARD_FILE_BYTES_MAX) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            shared
+                .log
+                .write(&format!("could not read {}: {error}", path.display()));
+            return false;
+        }
+    };
+    let Ok(record) = serde_json::from_str::<WireBoard>(&text) else {
+        shared
+            .log
+            .write(&format!("ignored {}: not a board record", path.display()));
+        return false;
+    };
+    let Some(group) = Pid::from_raw(record.group) else {
+        return false;
+    };
+    let start = record.start;
+    let runs = move |group: Pid| {
+        test_kill_process_group(group).is_ok() && start_time(group) == Some(start)
+    };
+    if !runs(group) {
+        return false;
+    }
+    let mut slot = shared.served();
+    assert!(slot.group.is_none() && !slot.stopping);
+    let watcher = Arc::clone(shared);
+    let builder = thread::Builder::new().name("board".into());
+    let spawned = builder.spawn(move || {
+        for _ in 0..BOARD_POLLS_MAX {
+            if !runs(group) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(BOARD_POLL_MILLIS));
+        }
+        board_ended(&watcher);
+    });
+    let Ok(spawned) = spawned else {
+        shared.log.write("could not watch the board started before");
+        return false;
+    };
+    slot.group = Some(group);
+    slot.thread = Some(spawned);
+    shared
+        .log
+        .write(&format!("{BOARD_KEPT} {}", group.as_raw_nonzero()));
+    true
+}
+
+/// Stops the board the daemon owns when dropped, so it ends on every exit, a panic included.
+struct BoardGuard(Arc<Shared>);
+
+impl Drop for BoardGuard {
+    fn drop(&mut self) {
+        stop_board(&self.0);
+    }
 }
 
 // Stops the board the daemon started, SIGKILL after `BOARD_STOP_MILLIS_MAX`, and waits for
@@ -598,17 +704,29 @@ fn stop_board(shared: &Shared) {
     };
     let _ = kill_process_group(group, Signal::TERM);
     let polls = BOARD_STOP_MILLIS_MAX / STOP_POLL_MILLIS;
-    for _ in 0..polls {
-        if waiter.is_finished() {
-            let _ = waiter.join();
-            return;
+    let ended = (0..polls).any(|_| {
+        let finished = waiter.is_finished();
+        if !finished {
+            thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
         }
-        thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
+        finished
+    });
+    if ended {
+        let _ = waiter.join();
+    } else {
+        let _ = kill_process_group(group, Signal::KILL);
+        shared
+            .log
+            .write("the board did not end after SIGTERM; sent SIGKILL");
     }
-    let _ = kill_process_group(group, Signal::KILL);
-    shared
-        .log
-        .write("the board did not end after SIGTERM; sent SIGKILL");
+    let path = shared.paths.home.join(BOARD_FILE);
+    if let Err(error) = fs::remove_file(&path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        shared
+            .log
+            .write(&format!("could not remove {}: {error}", path.display()));
+    }
 }
 
 // Kills the feed's group and waits up to `FEED_JOIN_MILLIS_MAX` for its thread to end, so
@@ -1468,6 +1586,15 @@ struct WireAgent {
     task: u64,
     group: i32,
     /// When the group's leader started, in seconds since the epoch.
+    start: u64,
+}
+
+/// The board process the daemon started as the board file names it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireBoard {
+    group: i32,
+    /// When the board process started, in seconds since the epoch.
     start: u64,
 }
 

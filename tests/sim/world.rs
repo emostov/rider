@@ -5,9 +5,9 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use rider::board::{Claim, ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
     ACTIONS_MAX, Action, AgentRecord, BOARD_RESTARTS_MAX, BOARD_UPTIME_MILLIS_MIN, BoardHealth,
-    Call, ClientId, Config, Event, FEED_RESTARTS_MAX, FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase,
-    PidFile, Reply, Request, RunId, Settlement, State, StopReason, Stopping, Unaccounted,
-    Untracked, recover, step,
+    Call, ClientId, Config, Event, FEED_RESTARTS_MAX, FEED_RETRY_MILLIS, FEED_UPTIME_MILLIS_MIN,
+    KILLED_REASON, Phase, PidFile, Reply, Request, RunId, Settlement, State, StopReason, Stopping,
+    Unaccounted, Untracked, recover, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -129,6 +129,14 @@ pub struct World {
     feed_restarts: u8,
     feed_since: Timestamp,
     feed_delivered: bool,
+    /// Since when feed restarts are exhausted, by the rule the core must follow.
+    feed_failed: Option<Timestamp>,
+    /// When the last feed tried after exhaustion ended, or `None` while it runs.
+    feed_retry_after: Option<Timestamp>,
+    /// The core stopped restarting the feed after `FEED_RESTARTS_MAX` losses in a row.
+    pub feed_given_up: bool,
+    /// A feed tried after exhaustion worked and the core claimed again.
+    pub feed_recovered: bool,
     cursor: u64,
     /// Results not yet delivered, each with the id of the outstanding action it answers.
     /// A result is not delivered before its time.
@@ -144,9 +152,13 @@ pub struct World {
     dead_until: Timestamp,
     /// Board restarts in a row, by the rule the core must follow.
     board_restarts: u8,
-    board_since: Timestamp,
+    board_since: Option<Timestamp>,
     /// The core left the board dead after `BOARD_RESTARTS_MAX` restarts in a row.
     pub board_given_up: bool,
+    /// Every restart of the dead board fails until then.
+    spawn_fails_until: Timestamp,
+    /// The core gave up on a board whose restarts all failed after it had stayed up long.
+    pub spawn_given_up: bool,
     /// Actions not yet answered, by run (`None` for a listing or a feed restart).
     outstanding: Vec<(u64, Option<RunId>, &'static str)>,
     next_action: u64,
@@ -201,6 +213,10 @@ impl World {
             feed_restarts: 0,
             feed_since: now,
             feed_delivered: false,
+            feed_failed: None,
+            feed_retry_after: None,
+            feed_given_up: false,
+            feed_recovered: false,
             cursor: 0,
             results: Vec::new(),
             agents: Vec::new(),
@@ -210,8 +226,10 @@ impl World {
             owns_board: seed.is_multiple_of(OWNED_BOARD_EVERY),
             dead_until: now,
             board_restarts: 0,
-            board_since: now,
+            board_since: Some(now),
             board_given_up: false,
+            spawn_fails_until: now,
+            spawn_given_up: false,
             outstanding: Vec::new(),
             next_action: 0,
             log: HashMap::new(),
@@ -368,6 +386,9 @@ impl World {
         }
         let minutes = self.rng.u64(1..=BOARD_DEAD_MINUTES_MAX);
         self.dead_until = Timestamp(self.now.0 + minutes * MINUTE);
+        if self.rng.bool() {
+            self.spawn_fails_until = self.dead_until;
+        }
         self.trace
             .push(format!("board dead until {:?}", self.dead_until));
         let id = self.expect(None, "board");
@@ -469,10 +490,13 @@ impl World {
         self.feed_restarts = 0;
         self.feed_since = self.now;
         self.feed_delivered = false;
+        self.feed_failed = None;
+        self.feed_retry_after = None;
         // The restarted daemon starts the board again if it is dead.
         self.dead_until = self.now;
+        self.spawn_fails_until = self.now;
         self.board_restarts = 0;
-        self.board_since = self.now;
+        self.board_since = Some(self.now);
         self.stopped_now = false;
         self.feed = (self.history.iter())
             .filter(|event| event.cursor > saved)
@@ -701,6 +725,7 @@ impl World {
             ));
         }
         self.check_board(&event, &actions)?;
+        self.check_feed(&event, &actions)?;
         self.check(&actions)?;
         for action in actions {
             self.perform(action)?;
@@ -715,9 +740,10 @@ impl World {
             .filter(|action| matches!(action, Action::RestartBoard))
             .count();
         match event {
-            Event::BoardRestarted => self.board_since = self.now,
+            Event::BoardRestarted => self.board_since = Some(self.now),
             Event::BoardExited if !self.core.exited() => {
-                let uptime = self.now.0.saturating_sub(self.board_since.0);
+                let since = self.board_since.take();
+                let uptime = since.map_or(0, |since| self.now.0.saturating_sub(since.0));
                 if uptime >= BOARD_UPTIME_MILLIS_MIN {
                     self.board_restarts = 0;
                 }
@@ -733,12 +759,68 @@ impl World {
                     return Err("the board exited, but it still counts as up".to_string());
                 }
                 self.board_given_up |= expected == 0;
+                self.spawn_given_up |= expected == 0 && self.now < self.spawn_fails_until;
                 self.board_restarts += u8::try_from(expected).expect("zero or one");
             }
             _ if restarts > 0 => {
                 return Err(format!("{event:?} asked for a board restart"));
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Follows the feed rule the core must: past `FEED_RESTARTS_MAX` losses in a row it stops
+    /// restarting the feed and claims nothing until a feed tried `FEED_RETRY_MILLIS` apart
+    /// delivers an event or stays up that long.
+    fn check_feed(&mut self, event: &Event, actions: &[Action]) -> Result<(), String> {
+        if self.core.exited() {
+            return Ok(());
+        }
+        let now = self.now;
+        let mut expected = 0;
+        match (event, self.feed_retry_after) {
+            (Event::FeedLost, _) if self.feed_failed.is_some() => {
+                self.feed_retry_after = Some(now);
+            }
+            (Event::FeedLost, _) if self.feed_restarts > FEED_RESTARTS_MAX => {
+                self.feed_failed = Some(now);
+                self.feed_retry_after = Some(now);
+                self.feed_given_up = true;
+            }
+            (Event::FeedLost, _) => expected = 1,
+            (Event::Tick(_), None) if self.feed_failed.is_some() => {
+                let uptime = now.0.saturating_sub(self.feed_since.0);
+                if self.feed_delivered || uptime >= FEED_RETRY_MILLIS {
+                    self.feed_failed = None;
+                    self.feed_restarts = 0;
+                    self.feed_recovered = true;
+                }
+            }
+            (Event::Tick(_), Some(ended))
+                if self.feed_failed.is_some()
+                    && now.0.saturating_sub(ended.0) >= FEED_RETRY_MILLIS =>
+            {
+                self.feed_retry_after = None;
+                self.feed_since = now;
+                self.feed_delivered = false;
+                expected = 1;
+            }
+            _ => {}
+        }
+        let restarts = (actions.iter())
+            .filter(|action| matches!(action, Action::RestartFeed(_)))
+            .count();
+        if restarts != expected {
+            return Err(format!(
+                "{event:?} with feed restarts exhausted since {:?} asked for {restarts} feed \
+                 restarts, not {expected}",
+                self.feed_failed
+            ));
+        }
+        let claims = (actions.iter()).any(|action| matches!(action, Action::Claim { .. }));
+        if self.feed_failed.is_some() && (claims || self.core.board() == BoardHealth::Up) {
+            return Err("the feed's restarts are exhausted, but the core claims".to_string());
         }
         Ok(())
     }
@@ -858,7 +940,7 @@ impl World {
                 self.feed_since = self.now;
                 self.feed_delivered = false;
             }
-            Event::FeedLost => {
+            Event::FeedLost if self.feed_failed.is_none() => {
                 let uptime = self.now.0.saturating_sub(self.feed_since.0);
                 if self.feed_delivered || uptime >= FEED_UPTIME_MILLIS_MIN {
                     self.feed_restarts = 0;
@@ -947,7 +1029,8 @@ impl World {
             Action::ListTasks => self.list(),
             Action::RestartBoard => {
                 let id = self.expect(None, "board");
-                if self.rng.u32(0..BOARD_RESTART_FAILS_EVERY) == 0 {
+                let fails = self.now < self.spawn_fails_until;
+                if fails || self.rng.u32(0..BOARD_RESTART_FAILS_EVERY) == 0 {
                     self.reply(id, Event::BoardExited);
                 } else {
                     self.dead_until = self.now;

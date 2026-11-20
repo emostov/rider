@@ -1789,11 +1789,12 @@ mod tests {
             completed("Extracted the store.")
         );
         let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
-        let last = calls(&board)[2].clone();
-        assert_eq!(
-            last,
-            record(Some("rider/3-store"), &head, 1, "Extracted the store.")
-        );
+        let settled = calls(&board)[2..].to_vec();
+        let expected = vec![
+            "complete 7 Extracted the store.".to_string(),
+            record(Some("rider/3-store"), &head, 1, "Extracted the store."),
+        ];
+        assert_eq!(settled, expected);
 
         let (fixture, env) = setup("run-restack-drop");
         let base = base_task(&fixture);
