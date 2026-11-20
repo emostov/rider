@@ -59,8 +59,9 @@ Text that begins with `-` is read by `vb` as an option. So:
    If `git merge-base --is-ancestor "$start" HEAD` fails, the branch was rewritten: ask for
    the range (see below).
 4. Reply with your plan: the points you will attack and how you will test each.
-5. Attack each point in the brief. Read the code, run the tests, and write failing cases
-   outside the worktree. A finding needs evidence: a command, an input, or a line of code
+5. Attack each point in the brief within a budget of about 40 commands. Read the diff and
+   the code it touches; run a test only to prove a finding, never the whole suite. Write
+   failing cases outside the worktree. A finding needs evidence: a command, an input, or a line of code
    that shows it. Do not report style preferences.
 6. Post each finding as its own structured reply. `severity` is `blocking` only when the
    failure is reachable in normal operation, leaks processes, files or claims, or is a security
