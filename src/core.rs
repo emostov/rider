@@ -753,7 +753,8 @@ fn on_prepared(state: &mut State, run: RunId, branch: Option<String>, actions: &
     let Some(index) = run_in(state, run, Phase::Preparing) else {
         return;
     };
-    if state.runs[index].branch.is_none() {
+    // The branch preparation found is the one the agent would work on, whatever was reserved.
+    if branch.is_some() {
         state.runs[index].branch = branch;
     }
     let mine = state.runs[index].branch.as_deref();

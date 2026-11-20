@@ -50,6 +50,8 @@ struct Agent {
 struct RunLog {
     claimed: bool,
     prepared: bool,
+    /// The branch `Prepared` reported: the one the run's agent works on.
+    branch: Option<String>,
     lost: bool,
     /// `Judged` results, and the verdict of the last.
     judged: u32,
@@ -366,7 +368,10 @@ impl World {
         let log = self.log.entry(run).or_default();
         match (entry, event) {
             ("claimed", _) => log.claimed = true,
-            ("prepared", _) => log.prepared = true,
+            (_, Event::Prepared { branch, .. }) => {
+                log.prepared = true;
+                log.branch = branch.clone();
+            }
             ("blocked", _) => log.blocked = true,
             ("lost", _) => log.lost = true,
             ("failure", _) => log.settle_failures += 1,
@@ -477,12 +482,18 @@ impl World {
         Ok(())
     }
 
-    /// The task's branch as preparation finds it; for a task with none it sometimes picks one.
+    /// The task's branch as preparation finds it; for a task with none it sometimes picks one,
+    /// and an existing one it sometimes moves to another branch.
     fn learn_branch(&mut self, task: TaskId) -> Option<String> {
         let index = self.tasks.iter().position(|fake| fake.id == task)?;
-        let labels = &self.tasks[index].labels;
-        if let Some((_, branch)) = labels.iter().find(|(name, _)| name == "branch") {
-            return Some(branch.clone());
+        let labels = &mut self.tasks[index].labels;
+        if let Some(found) = labels.iter().position(|(name, _)| name == "branch") {
+            if self.rng.u32(0..4) == 0 {
+                let branch = BRANCHES[self.rng.usize(0..BRANCHES.len())];
+                labels[found].1 = branch.to_string();
+                self.publish(index, EventKind::LabelsChanged);
+            }
+            return Some(self.tasks[index].labels[found].1.clone());
         }
         if self.rng.u32(0..3) != 0 {
             return None;
@@ -757,17 +768,9 @@ impl World {
                 ));
             }
         }
-        let branch_of = |task: TaskId| {
-            let fake = self.tasks.iter().find(|fake| fake.id == task)?;
-            let found = fake.labels.iter().find(|(name, _)| name == "branch");
-            found.map(|(_, value)| value.as_str())
-        };
-        let spawned: Vec<_> = self
-            .core
-            .runs()
-            .iter()
+        let spawned: Vec<_> = (self.core.runs().iter())
             .filter(|run| self.spawned.contains(&run.id))
-            .filter_map(|run| Some((run, branch_of(run.task)?)))
+            .filter_map(|run| Some((run, self.log.get(&run.id)?.branch.as_deref()?)))
             .collect();
         for (index, (run, branch)) in spawned.iter().enumerate() {
             if let Some((other, _)) = spawned[index + 1..].iter().find(|(_, b)| b == branch) {
