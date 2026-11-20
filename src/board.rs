@@ -1441,6 +1441,7 @@ pub mod testing {
 mod tests {
     use super::*;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn parses_a_recorded_task() {
@@ -1862,11 +1863,10 @@ mod tests {
     }
 
     /// A stand-in vb in a fresh directory, running `body`.
-    fn stand_in(name: &str, body: &str) -> (VbCli, PathBuf) {
+    fn stand_in(body: &str) -> (VbCli, TempDir) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("rider-board-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let vb = dir.join("vb");
+        let dir = TempDir::new().unwrap();
+        let vb = dir.path().join("vb");
         fs::write(&vb, format!("#!/bin/sh\n{body}")).unwrap();
         fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
         let board = VbCli {
@@ -1880,7 +1880,7 @@ mod tests {
     /// A stand-in vb that reads the recorded cursor `6` and lists open tasks `1..=count` in
     /// pages, as the board does: a full page's cursor is its last id, a short page's is the
     /// event cursor `9999`.
-    fn listing_of(name: &str, count: usize) -> (VbCli, PathBuf) {
+    fn listing_of(count: usize) -> (VbCli, TempDir) {
         let task = concat!(
             r#"{"message":{"id":"%d","text":"t","labels":{},"#,
             r#""task":{"state":"ready","epoch":0,"needs":[],"claim":null},"version":%d}}"#
@@ -1903,14 +1903,13 @@ cursor=9999
 printf '],"cursor":"%s"}}\n' $cursor
 "#
         );
-        stand_in(name, &body)
+        stand_in(&body)
     }
 
     #[test]
     fn a_listing_returns_the_board_cursor() {
-        let (board, dir) = listing_of("list-cursor", 3);
+        let (board, _dir) = listing_of(3);
         let listing = board.list_open("work/");
-        fs::remove_dir_all(dir).unwrap();
         let listing = listing.unwrap();
         let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
         assert_eq!(ids, vec![1, 2, 3]);
@@ -1920,9 +1919,8 @@ printf '],"cursor":"%s"}}\n' $cursor
     #[test]
     fn a_listing_pages_up_to_the_tracked_tasks_and_counts_the_rest() {
         let count = TASKS_MAX + 201;
-        let (board, dir) = listing_of("list-pages", count);
+        let (board, _dir) = listing_of(count);
         let listing = board.list_open("work/");
-        fs::remove_dir_all(dir).unwrap();
         let listing = listing.unwrap();
         let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
         let tracked: Vec<u64> = (1..=TASKS_MAX as u64).collect();
@@ -1932,9 +1930,8 @@ printf '],"cursor":"%s"}}\n' $cursor
 
     #[test]
     fn a_listing_past_the_page_bound_is_too_many_tasks() {
-        let (board, dir) = listing_of("list-bound", TASKS_PAGE_MAX * LISTING_PAGES_MAX + 1);
+        let (board, _dir) = listing_of(TASKS_PAGE_MAX * LISTING_PAGES_MAX + 1);
         let listing = board.list_open("work/");
-        fs::remove_dir_all(dir).unwrap();
         assert!(
             matches!(listing, Err(BoardError::TooManyTasks)),
             "{listing:?}"
@@ -2029,18 +2026,8 @@ printf '],"cursor":"%s"}}\n' $cursor
 
     /// Runs `read_task` against a stand-in vb made of `body`, which writes the pid to kill to
     /// `$0.pid`, and checks the call times out at the limit and that pid is gone afterwards.
-    fn times_out_and_kills(name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("rider-board-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let vb = dir.join("vb");
-        fs::write(&vb, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
-        let board = VbCli {
-            vb: vb.clone(),
-            url: "http://127.0.0.1:1".into(),
-            profile: "tester".into(),
-        };
+    fn times_out_and_kills(body: &str) {
+        let (board, dir) = stand_in(body);
         let started = Instant::now();
         let result = board.read_task(TaskId(7));
         let took = started.elapsed();
@@ -2059,7 +2046,7 @@ printf '],"cursor":"%s"}}\n' $cursor
             took >= limit && took < limit + Duration::from_secs(1),
             "{took:?}"
         );
-        let pid = fs::read_to_string(dir.join("vb.pid")).unwrap();
+        let pid = fs::read_to_string(dir.path().join("vb.pid")).unwrap();
         let pid = Pid::from_raw(pid.trim().parse().unwrap()).unwrap();
         // A killed descendant stays a zombie until its new parent reaps it.
         let gone = (0..100).any(|_| {
@@ -2067,22 +2054,21 @@ printf '],"cursor":"%s"}}\n' $cursor
             rustix::process::test_kill_process(pid) == Err(Errno::SRCH)
         });
         assert!(gone, "{} is still running", pid.as_raw_pid());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_vb_that_never_exits_is_killed_at_the_limit() {
-        times_out_and_kills("hang", "echo $$ > \"$0.pid\"\nexec sleep 3600\n");
+        times_out_and_kills("echo $$ > \"$0.pid\"\nexec sleep 3600\n");
     }
 
     #[test]
     fn a_descendant_holding_the_output_of_an_exited_vb_is_killed_at_the_limit() {
-        times_out_and_kills("exit", "sleep 120 &\necho $! > \"$0.pid\"\nexit 0\n");
+        times_out_and_kills("sleep 120 &\necho $! > \"$0.pid\"\nexit 0\n");
     }
 
     #[test]
     fn a_descendant_of_a_waiting_vb_is_killed_at_the_limit() {
-        times_out_and_kills("wait", "sleep 120 &\necho $! > \"$0.pid\"\nwait\n");
+        times_out_and_kills("sleep 120 &\necho $! > \"$0.pid\"\nwait\n");
     }
 
     #[test]
@@ -2092,19 +2078,17 @@ printf '],"cursor":"%s"}}\n' $cursor
         if std::env::var_os(CHILD).is_some() {
             assert!(std::env::var_os("PATH").is_some_and(|path| !path.is_empty()));
             let body = "/bin/sleep 120 &\necho $! > \"$0.pid\"\nwait\n";
-            times_out_and_kills("nopath", body);
+            times_out_and_kills(body);
             return;
         }
-        let empty = std::env::temp_dir().join(format!("rider-board-path-{}", std::process::id()));
-        fs::create_dir_all(&empty).unwrap();
+        let empty = TempDir::new().unwrap();
         let ran = Process::new(std::env::current_exe().unwrap())
             .args(["--exact", "--test-threads", "1", "--", name])
-            .env("PATH", &empty)
+            .env("PATH", empty.path())
             .env(CHILD, "1")
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        fs::remove_dir_all(&empty).unwrap();
         let stdout = String::from_utf8_lossy(&ran.stdout);
         assert!(
             ran.status.success(),
