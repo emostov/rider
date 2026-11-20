@@ -30,7 +30,8 @@ asks for it in this conversation.
   every option: `vb reply 12 --as lead-fable-5-2 -- "<text>"`. Read longer text from
   standard input with `-`:
   `vb reply 12 - --as lead-fable-5-2 <<'EOF'` ... `EOF`.
-- `rider pool <project>` runs the workers. It claims each ready task and starts its worker.
+- The `rider up` daemon runs the workers for every project. It claims each ready task and
+  starts its worker.
   You do not start workers, and you never claim, complete, or fail a `work/` task.
 
 ## Agree the shape first

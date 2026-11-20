@@ -2,10 +2,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use rider::board::{TaskId, TaskState, TaskView, Timestamp};
+use rider::board::{ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
-    ACTIONS_MAX, Action, BoardHealth, Call, Config, Event, FEED_RESTARTS_MAX,
-    FEED_UPTIME_MILLIS_MIN, Phase, RunId, Settlement, State, StopReason, Stopping, Untracked, step,
+    ACTIONS_MAX, Action, BoardHealth, Call, ClientId, Config, Event, FEED_RESTARTS_MAX,
+    FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase, Reply, Request, RunId, Settlement, State,
+    StopReason, Stopping, Untracked, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -15,6 +16,8 @@ use rider::settle::Verdict;
 const STEPS_MAX: usize = 1500;
 /// Steps allowed for the core to stop once it has been signalled.
 const STOP_STEPS_MAX: usize = 3000;
+/// The socket client that kills agents and follows logs.
+const OWNER: ClientId = ClientId(3);
 /// Upper bound on tasks the fake board holds.
 const BOARD_TASKS_MAX: usize = 40;
 const SECOND: u64 = 1000;
@@ -85,6 +88,8 @@ struct RunLog {
     blocked: bool,
     /// The core stopped the agent at its time limit: it may be failed without a judgment.
     time_limited: bool,
+    /// The owner killed the agent: it may be failed as killed without a judgment.
+    killed: bool,
     settles: u32,
     settle_failures: u32,
     /// The profile the run's claim was sent as.
@@ -136,6 +141,8 @@ pub struct World {
     signals: u8,
     exited: bool,
     pub trace: Vec<String>,
+    /// The replies the core sent `OWNER` during its current request.
+    replies: Vec<(ClientId, Reply)>,
 }
 
 impl World {
@@ -178,6 +185,7 @@ impl World {
             signals: 0,
             exited: false,
             trace: Vec::new(),
+            replies: Vec::new(),
         }
     }
 
@@ -193,7 +201,27 @@ impl World {
             }
             if self.signals < 2 && self.rng.u32(0..40) == 0 {
                 self.signals += 1;
-                self.deliver(Event::Signal)?;
+                // A stop comes as a signal or as `down` on the socket, the second stopping now.
+                let event = match self.rng.bool() {
+                    true => Event::Signal,
+                    false => Event::Client {
+                        client: ClientId(1),
+                        request: Request::Down {
+                            now: self.signals == 2,
+                        },
+                    },
+                };
+                self.deliver(event)?;
+                continue;
+            }
+            if self.rng.u32(0..20) == 0 {
+                let request = match self.rng.bool() {
+                    true => Request::Status,
+                    false => Request::Agents,
+                };
+                let client = ClientId(2);
+                self.deliver(Event::Client { client, request })?;
+                self.deliver(Event::ClientGone(client))?;
                 continue;
             }
             self.turn(false)
@@ -266,6 +294,7 @@ impl World {
             94..=95 => self.unblock(),
             96 => self.cancel_task(),
             97 => self.relabel_role(),
+            99 => return self.kill_or_follow(),
             98 if self.rng.u32(0..FLAP_EVERY) == 0 => {
                 let restarts = u32::from(FEED_RESTARTS_MAX);
                 self.flaps_left = self.rng.u32(restarts..3 * restarts);
@@ -273,6 +302,46 @@ impl World {
             }
             _ => return self.advance(),
         }
+        Ok(())
+    }
+
+    /// Asks the core, as the owner, to kill a task's agent or to follow its log, sometimes for
+    /// a task no agent runs, and checks the answer.
+    fn kill_or_follow(&mut self) -> Result<(), String> {
+        let running: Vec<TaskId> = (self.core.runs().iter())
+            .filter(|run| run.phase == Phase::Running)
+            .map(|run| run.task)
+            .collect();
+        let alive: Vec<TaskId> = (self.core.runs().iter())
+            .filter(|run| run.agent_alive)
+            .map(|run| run.task)
+            .collect();
+        let task = match running.is_empty() || self.rng.u32(0..4) == 0 {
+            true => TaskId(self.rng.u64(1..2 * BOARD_TASKS_MAX as u64)),
+            false => running[self.rng.usize(0..running.len())],
+        };
+        let kill = self.rng.bool();
+        let request = match kill {
+            true => Request::Kill(task),
+            false => Request::Logs { task, follow: true },
+        };
+        let client = OWNER;
+        self.replies.clear();
+        self.deliver(Event::Client { client, request })?;
+        let answer = (self.replies.iter())
+            .find(|(id, _)| *id == client)
+            .map(|(_, reply)| reply.clone());
+        let expected = match (kill, answer.as_ref()) {
+            (true, Some(Reply::Done)) => running.contains(&task),
+            (true, Some(Reply::Refused { .. })) => !running.contains(&task),
+            (false, Some(Reply::Log { follow, .. })) => *follow == alive.contains(&task),
+            _ => false,
+        };
+        if !expected {
+            return Err(format!("{request:?} for {task:?} was answered {answer:?}"));
+        }
+        self.deliver(Event::ClientGone(client))?;
+        self.replies.clear();
         Ok(())
     }
 
@@ -537,7 +606,7 @@ impl World {
             Event::Snapshot { tasks, cursor, .. } => {
                 self.listed_through = self.listed_through.max(cursor.0);
                 // A listing shows every open task it does not leave out, as of its cursor.
-                let listed = |id: &u64| tasks.iter().any(|view| view.id.0 == *id);
+                let listed = |id: &u64| tasks.iter().any(|task| task.view.id.0 == *id);
                 let left_out = &self.left_out;
                 for (id, told) in self.told.iter_mut() {
                     if !listed(id) && !left_out.contains(id) && told.cursor <= cursor.0 {
@@ -545,7 +614,7 @@ impl World {
                         told.state = TaskState::Completed;
                     }
                 }
-                for view in tasks {
+                for ListedTask { view, .. } in tasks {
                     let version = view.version.0;
                     let newer =
                         (self.told.get(&view.id.0)).is_none_or(|told| told.cursor <= version);
@@ -666,6 +735,10 @@ impl World {
                 let id = self.expect(None, "feed");
                 self.reply(id, Event::FeedResumed(cursor));
             }
+            Action::Reply { client, reply } if client == OWNER => {
+                self.replies.push((client, reply));
+            }
+            Action::Reply { .. } => {}
             Action::Exit(_) => self.exited = true,
         }
         Ok(())
@@ -811,15 +884,18 @@ impl World {
         self.listings
             .insert(id, rest.iter().map(|fake| fake.id.0).collect());
         let tasks = (listed.iter())
-            .map(|fake| TaskView {
-                id: fake.id,
-                text: String::new(),
-                state: fake.state,
-                labels: fake.labels.clone(),
-                needs: Vec::new(),
-                epoch: fake.epoch,
-                claim: None,
-                version: Cursor(fake.version),
+            .map(|fake| ListedTask {
+                view: TaskView {
+                    id: fake.id,
+                    text: String::new(),
+                    state: fake.state,
+                    labels: fake.labels.clone(),
+                    needs: Vec::new(),
+                    epoch: fake.epoch,
+                    claim: None,
+                    version: Cursor(fake.version),
+                },
+                channel: "work/sim".to_string(),
             })
             .collect();
         // The cursor is read before the pages, so events may land between the two.
@@ -863,6 +939,9 @@ impl World {
             }
             if run.phase == Phase::Stopping(StopReason::TimeLimit) {
                 self.log.entry(run.id).or_default().time_limited = true;
+            }
+            if run.phase == Phase::Stopping(StopReason::Killed) {
+                self.log.entry(run.id).or_default().killed = true;
             }
             let now = self.core.now();
             let covered = (self.outstanding.iter())
@@ -951,7 +1030,9 @@ impl World {
                             log.judged == 1 && judged.as_ref() == Some(settlement)
                         }
                         Settlement::Block { .. } => log.blocked,
-                        Settlement::Verdict(Verdict::Fail { .. }) => log.time_limited,
+                        Settlement::Verdict(Verdict::Fail { reason }) => {
+                            log.time_limited || (log.killed && reason == KILLED_REASON)
+                        }
                         _ => false,
                     };
                     if !based || log.settles > 1 + log.settle_failures {
