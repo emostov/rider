@@ -45,7 +45,7 @@ fn a_stacked_task_is_cut_from_its_base_tasks_branch() {
         return;
     };
     let base = when_the_lead_creates(&world, &an_implement_task(&world, "Add the base work."));
-    let stacked = steps::NewTask::new("Add the stacked work.")
+    let stacked = NewTask::new("Add the stacked work.")
         .label("repo", world.repo_label())
         .label("base", &base)
         .needs(&base)

@@ -1,7 +1,7 @@
 //! The world a scenario runs in: a board, a rider home, a repository, and fake agents.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Error as IoError, Read, Write, stderr};
 use std::net::TcpListener;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -75,18 +75,14 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     found
 }
 
-fn find_vb() -> Option<PathBuf> {
-    if let Some(found) = find_on_path("vb") {
-        return Some(found);
-    }
-    let home = std::env::var_os("HOME")?;
-    let installed = PathBuf::from(home).join(".rider/node/node_modules/.bin/vb");
-    installed.is_file().then_some(installed)
-}
-
 /// The installed `vb` and `node`, or `None` after saying on standard error which is missing.
 pub fn find_tools() -> Option<(PathBuf, PathBuf)> {
-    let (vb, node) = (find_vb(), find_on_path("node"));
+    let vb = find_on_path("vb").or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let installed = PathBuf::from(home).join(".rider/node/node_modules/.bin/vb");
+        installed.is_file().then_some(installed)
+    });
+    let node = find_on_path("node");
     match (vb, node) {
         (Some(vb), Some(node)) => Some((vb, node)),
         (vb, _) => {
@@ -97,29 +93,10 @@ pub fn find_tools() -> Option<(PathBuf, PathBuf)> {
             };
             // `eprintln!` is captured by the test runner; a skip must be seen.
             let line = format!("skipping scenario: {missing} not found; {INSTALL_HINT}\n");
-            let _ = std::io::stderr().write_all(line.as_bytes());
+            let _ = stderr().write_all(line.as_bytes());
             None
         }
     }
-}
-
-fn scratch_path() -> PathBuf {
-    let n = WORLDS.fetch_add(1, Ordering::SeqCst);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let name = format!("rider-scenario-{}-{n}-{nanos}", std::process::id());
-    let temp = std::env::temp_dir().canonicalize();
-    let root = temp.expect("resolve the temporary directory").join(name);
-    assert!(root.is_absolute());
-    root
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-    let port = listener.local_addr().expect("read the bound port").port();
-    assert!(port != 0 && port != 4100, "never the live board's port");
-    port
 }
 
 /// Writes an executable file.
@@ -133,8 +110,18 @@ impl World {
     /// Lays out the directories and starts nothing; `None` when `vb` or `node` is missing.
     pub fn new() -> Option<World> {
         let (installed_vb, node) = find_tools()?;
-        let url = format!("http://127.0.0.1:{}/api/board", free_port());
-        let root = scratch_path();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().expect("read the bound port").port();
+        assert!(port != 0 && port != 4100, "never the live board's port");
+        let url = format!("http://127.0.0.1:{port}/api/board");
+        let n = WORLDS.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!("rider-scenario-{}-{n}-{nanos}", std::process::id());
+        let temp = std::env::temp_dir().canonicalize();
+        let root = temp.expect("resolve the temporary directory").join(name);
+        assert!(root.is_absolute());
         // Built before the root exists so a failure from its creation on unwinds through Drop.
         let mut world = World {
             repo: root.join("repo"),
@@ -273,12 +260,12 @@ impl World {
 /// Why a bounded command produced no `Output`.
 #[derive(Debug)]
 pub enum RunError {
-    Spawn(std::io::Error),
-    Wait(std::io::Error),
+    Spawn(IoError),
+    Wait(IoError),
     /// Writing the command's standard input failed.
-    Input(std::io::Error),
+    Input(IoError),
     /// Reading the command's standard output or error failed.
-    Read(std::io::Error),
+    Read(IoError),
     /// The command printed more than `OUTPUT_BYTES_MAX` bytes on one stream.
     OutputTooLong,
     /// The command, or a descendant holding its input or output, outlived `COMMAND_SECONDS_MAX`.
@@ -526,7 +513,7 @@ impl Drop for World {
         }
         let why = format!("the scenario world was not cleaned up: {failures:?}\n");
         if thread::panicking() {
-            let _ = std::io::stderr().write_all(why.as_bytes());
+            let _ = stderr().write_all(why.as_bytes());
         } else {
             panic!("{why}");
         }
