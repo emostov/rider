@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::board::{TaskId, VbCli};
+use crate::daemon::{self, DaemonError, Paths, take_lock};
 use crate::harness::{CommandLine, Exit, HarnessError};
 use crate::pool::{
     Effects, Event, Gate, PAUSE_STEP_MILLIS, Slot, SlotEnd, event_line, slot_loop, slots,
@@ -24,6 +25,8 @@ use crate::settle::Verdict;
 /// What `rider --help` prints.
 pub const USAGE: &str = r#"usage:
   rider serve              run the local board in the foreground
+  rider daemon             claim and run tasks on every work/ channel in the foreground;
+                           SIGTERM or Ctrl-C drains, a second one stops every agent now
   rider pool <project>     run worker slots on the channel work/<project>;
                            type stop or press Ctrl-D to stop after running tasks finish
   rider run-task <id>      one attempt at a task already claimed by $BOARD_PROFILE
@@ -85,6 +88,7 @@ impl Project {
 pub enum Command {
     Help,
     Serve,
+    Daemon,
     Pool(Project),
     RunTask(TaskId),
 }
@@ -134,6 +138,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     let (command, used) = match word.as_str() {
         "--help" | "-h" | "help" => (Command::Help, 0),
         "serve" => (Command::Serve, 0),
+        "daemon" => (Command::Daemon, 0),
         "pool" => {
             let project = rest.first().ok_or(UsageError::MissingArgument("project"))?;
             (Command::Pool(Project::parse(project)?), 1)
@@ -317,6 +322,7 @@ pub enum CliError {
     },
     Run(RunError),
     SlotsFailed(usize),
+    Daemon(DaemonError),
 }
 
 impl fmt::Display for CliError {
@@ -338,6 +344,7 @@ impl fmt::Display for CliError {
             CliError::Run(RunError::LostClaim(state)) => {
                 write!(f, "the task is no longer claimed; it is {state:?}")
             }
+            CliError::Daemon(error) => write!(f, "{error}"),
             CliError::SlotsFailed(count) => {
                 write!(f, "{count} slots stopped before they were asked to")
             }
@@ -380,6 +387,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             Ok(0)
         }
         Command::Serve => serve(config),
+        Command::Daemon => daemon(config),
         Command::Pool(project) => pool(project, config),
         Command::RunTask(id) => run_one(*id, config),
     }
@@ -411,7 +419,21 @@ fn serve(config: &Config) -> Result<u8, CliError> {
         .unwrap_or(1))
 }
 
+fn daemon(config: &Config) -> Result<u8, CliError> {
+    write_prompts(config)?;
+    let paths = Paths {
+        home: config.home.clone(),
+        prompts: config.prompts(),
+        vb: config.vb_dir().join("vb"),
+        board_url: config.board_url.clone(),
+        inherited_path: config.inherited_path.clone(),
+    };
+    assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
+    daemon::run(paths).map_err(CliError::Daemon)
+}
+
 fn pool(project: &Project, config: &Config) -> Result<u8, CliError> {
+    let _lock = take_lock(&config.home).map_err(CliError::Daemon)?;
     write_prompts(config)?;
     let channel = project.channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -545,8 +567,8 @@ fn say(line: &str) {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::write_executable;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use super::*;
@@ -889,8 +911,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 3\n",
             record.display()
         );
-        fs::write(bin.join("vb"), script).unwrap();
-        fs::set_permissions(bin.join("vb"), fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&bin.join("vb"), &script);
         let code = execute(&Command::Serve, &config_at(&home)).unwrap();
         assert_eq!(code, 3);
         let board = home.join("board");

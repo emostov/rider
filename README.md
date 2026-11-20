@@ -15,7 +15,7 @@ the workers' questions, checks their results, and keeps you updated. It never
 writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
-**The swarm** runs up to four agents at once:
+**The swarm** runs as many agents at once as the task graph allows, up to 32:
 
 | Role        | Model           | Job                                         |
 | ----------- | --------------- | ------------------------------------------- |
@@ -42,7 +42,9 @@ Install Rider: run `cargo install swarm-rider`, which installs the `rider` binar
 Then run `npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
 ```
 
-Then say "ride a swarm to <goal>" in a new session.
+Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
+pull request, it asks how you like its loops to run (a review packet first, comments, CI,
+review threads) and saves the answers in `~/.rider/ship.toml`.
 
 ## Safety
 
@@ -55,8 +57,24 @@ Then say "ride a swarm to <goal>" in a new session.
 
 ## Status
 
-Rider is early. It runs a swarm from the board and the skills; a daemon (`rider up`,
-`rider chat`, `rider status`) is next.
+Rider is early. `rider daemon` runs the swarm from the board's event feed; `rider up`,
+`rider status` and `rider chat` are next. Today the skills start `rider pool` for you.
+
+## How it's built
+
+- **A deterministic simulator.** The daemon's decisions are one pure function,
+  `step(state, event) -> actions`, with no I/O. A seeded simulator (`tests/sim/`) drives it
+  through thousands of runs with a fake board, agents and clock, injecting crashes, lost
+  claims, board outages and clock jumps, and checks the design's invariants after every
+  step. A failing seed replays exactly: `SIM_SEED=<n> cargo test --test sim`.
+- **Elements of TigerStyle.** At least two assertions per function, every loop and
+  collection bounded by a named constant, no recursion, no `unsafe`, no async runtime:
+  threads, bounded channels and back pressure. See [AGENTS.md](./AGENTS.md).
+- **Black-box scenario tests.** `tests/scenarios/` runs the real `rider` binary against a
+  real board in a scratch directory, with fake agents, so behaviour is pinned from the
+  outside and the code can be rewritten with confidence.
+- **Built by its own swarm.** Rider's changes are planned on the board and carried out by
+  Rider's own agents, each reviewed by a different model than the one that wrote it.
 
 ## Docs
 

@@ -33,8 +33,9 @@ pub const JUDGE_MILLIS_MAX: u64 = 10 * 60 * 1000;
 pub const STOP_MILLIS_MAX: u64 = 2 * 60 * 1000;
 /// How many times a stop is sent before the agent counts as lost.
 pub const STOP_TRIES_MAX: u8 = 3;
-/// Upper bound on claims whose answer came after their run was given up.
-pub const PENDING_CLAIMS_MAX: usize = AGENTS_MAX as usize;
+/// Upper bound on claims given up while the board may still hold them: claims in flight are
+/// kept below `AGENTS_MAX` together with these, and each run may join them.
+pub const PENDING_CLAIMS_MAX: usize = 2 * AGENTS_MAX as usize;
 /// Upper bound on the distinct untracked tasks the core counts.
 pub const UNTRACKED_MAX: usize = 4 * TASKS_MAX;
 /// Upper bound on the closed tasks the core remembers until a snapshot covers their closing.
@@ -203,14 +204,16 @@ pub struct Run {
     pub agent_lost: bool,
 }
 
-/// A claim given up while unanswered: if the board granted it, the grant is released.
+/// A claim given up while the board may hold it: once its epoch is known, it is released.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingClaim {
     pub run: RunId,
     pub task: TaskId,
-    /// When the claim was sent; past one lease any grant has lapsed.
-    pub since: Timestamp,
-    /// The granted epoch, once a late `Claimed` arrived.
+    /// The profile the claim was sent as, which a release of a late grant writes as.
+    pub profile: String,
+    /// When any grant of the claim has lapsed.
+    pub until: Timestamp,
+    /// The granted epoch, once known.
     pub epoch: Option<u64>,
     pub releasing: bool,
     pub retry_at: Timestamp,
@@ -334,6 +337,7 @@ pub enum Action {
         run: RunId,
         task: TaskId,
         epoch: u64,
+        profile: String,
     },
     ListTasks,
     RestartFeed(Cursor),
@@ -858,7 +862,8 @@ fn board_failed(state: &mut State, call: Call) {
     let now = state.now;
     let pause = state.config.settle_pause_millis;
     for pending in state.pending_claims.iter_mut() {
-        if call == Call::Release(pending.run) && pending.releasing {
+        let closing = call == Call::Release(pending.run) || call == Call::Settle(pending.run);
+        if closing && pending.releasing {
             pending.releasing = false;
             pending.retry_at = Timestamp(now.0.saturating_add(pause));
         }
@@ -889,13 +894,51 @@ fn board_failed(state: &mut State, call: Call) {
             entry.settle_tries = entry.settle_tries.saturating_add(1);
             entry.retry_at = Timestamp(now.0.saturating_add(pause));
             if entry.settle_tries >= tries_max {
-                remove_run(state, index);
+                give_up_claim(state, index);
             }
         }
         _ => {}
     }
     let index = state.run_index(run);
     assert!(index.is_none_or(|index| state.runs[index].settle_tries < tries_max));
+}
+
+fn give_up_claim(state: &mut State, index: usize) {
+    let lease = state.config.lease_millis;
+    let entry = &state.runs[index];
+    assert!(holds_claim(entry.phase));
+    let mut until = entry.lease_until;
+    if entry.renewing {
+        // A renewal in flight may extend the lease by up to one lease from when it was sent.
+        until = until.max(Timestamp(state.now.0.saturating_add(lease)));
+    }
+    let epoch = entry.epoch;
+    give_up(state, index, until, Some(epoch));
+}
+
+// The board may hold the run's claim until `until`; the core does not exit before it lapses.
+fn give_up(state: &mut State, index: usize, until: Timestamp, epoch: Option<u64>) {
+    // Claims are sent only while pending and claiming runs number below `agents_max`, so
+    // runs and pending claims together stay below `PENDING_CLAIMS_MAX`.
+    assert!(state.pending_claims.len() + state.runs.len() <= PENDING_CLAIMS_MAX);
+    let now = state.now;
+    let entry = &state.runs[index];
+    // A closing write in flight is answered like the pending claim's own release.
+    let (run, task, releasing) = (entry.id, entry.task, entry.settling);
+    let profile = state.profile(entry.role, entry.slot);
+    remove_run(state, index);
+    if now < until {
+        state.pending_claims.push(PendingClaim {
+            run,
+            task,
+            profile,
+            until,
+            epoch,
+            releasing,
+            retry_at: now,
+        });
+    }
+    assert!(state.run_index(run).is_none());
 }
 
 fn remove_run(state: &mut State, index: usize) {
@@ -1047,6 +1090,7 @@ fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         return;
     }
     let (run, task, epoch) = (entry.id, entry.task, entry.epoch);
+    let (role, slot) = (entry.role, entry.slot);
     // After stop-now no attempt counts: whatever was decided, the claim is released.
     if state.stopping == Stopping::Now {
         entry.settlement = Some(Settlement::Release);
@@ -1056,7 +1100,12 @@ fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
     };
     entry.settling = true;
     actions.push(match settlement {
-        Settlement::Release => Action::Release { run, task, epoch },
+        Settlement::Release => Action::Release {
+            run,
+            task,
+            epoch,
+            profile: state.profile(role, slot),
+        },
         settlement => Action::Settle {
             run,
             task,
@@ -1184,23 +1233,25 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
 /// Releases late grants of given-up claims, and forgets those whose grant has lapsed.
 fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
     let now = state.now;
-    let lease = state.config.lease_millis;
     let up = state.board == BoardHealth::Up;
-    state
-        .pending_claims
-        .retain(|pending| now.0 < pending.since.0.saturating_add(lease));
+    state.pending_claims.retain(|pending| now < pending.until);
     for pending in state.pending_claims.iter_mut() {
         let Some(epoch) = pending.epoch else {
             continue;
         };
         if up && !pending.releasing && now >= pending.retry_at {
             pending.releasing = true;
-            let (run, task) = (pending.run, pending.task);
-            actions.push(Action::Release { run, task, epoch });
+            let (run, task, profile) = (pending.run, pending.task, pending.profile.clone());
+            actions.push(Action::Release {
+                run,
+                task,
+                epoch,
+                profile,
+            });
         }
     }
     assert!(state.pending_claims.len() <= PENDING_CLAIMS_MAX);
-    let held = |pending: &PendingClaim| now.0 < pending.since.0.saturating_add(lease);
+    let held = |pending: &PendingClaim| now < pending.until;
     assert!(state.pending_claims.iter().all(held));
 }
 
@@ -1213,7 +1264,7 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         let claiming = state.runs.iter().filter(|run| run.phase == Phase::Claiming);
         // Every claim in flight must fit among the pending claims if it is given up.
         let unanswered = state.pending_claims.len() + claiming.count();
-        if state.runs.len() >= agents_max || unanswered >= PENDING_CLAIMS_MAX {
+        if state.runs.len() >= agents_max || unanswered >= agents_max {
             break;
         }
         let Some((task, role, slot)) = next_claimable(state) else {
@@ -1328,17 +1379,9 @@ fn phase_expired(state: &mut State, index: usize, actions: &mut Vec<Action>) {
     match entry.phase {
         // Whether the board granted it is unknown; a late grant is released.
         Phase::Claiming => {
-            assert!(state.pending_claims.len() < PENDING_CLAIMS_MAX);
-            let since = entry.phase_start;
-            state.pending_claims.push(PendingClaim {
-                run,
-                task,
-                since,
-                epoch: None,
-                releasing: false,
-                retry_at: now,
-            });
-            remove_run(state, index);
+            let lease = state.config.lease_millis;
+            let until = Timestamp(entry.phase_start.0.saturating_add(lease));
+            give_up(state, index, until, None);
         }
         Phase::Preparing | Phase::Judging => {
             begin_settle(state, index, Settlement::Release, actions);
@@ -1347,8 +1390,8 @@ fn phase_expired(state: &mut State, index: usize, actions: &mut Vec<Action>) {
             set_phase(entry, Phase::Stopping(StopReason::TimeLimit), now);
             send_stop(entry, actions);
         }
-        // The closing write is abandoned and the lease lapses, as when its tries run out.
-        Phase::Settling => remove_run(state, index),
+        // The closing write is abandoned, as when its tries run out.
+        Phase::Settling => give_up_claim(state, index),
         // Only an observed exit ends the agent; past the tries it is lost, not gone.
         Phase::Stopping(_) | Phase::Abandoning if entry.stop_tries < STOP_TRIES_MAX => {
             entry.stop_tries = entry.stop_tries.saturating_add(1);

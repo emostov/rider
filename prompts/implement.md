@@ -74,6 +74,8 @@ If `git commit` fails for a reason you cannot fix inside the brief (a signing er
 that needs something you do not have), reply with the exact command and its full error, then
 stop. Do not work around it.
 
+Findings and problems go on the board. Only work that must outlive the board belongs in the project's tracker, as future work, and the lead files it when the run ends.
+
 ## Asking a question
 
 When you need a decision, cannot continue, or will not finish in time:

@@ -22,12 +22,13 @@ const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
 pub const BRANCH_LABEL: &str = "branch";
 // What git keeps in a worktree's git directory while an operation is unfinished.
-const IN_PROGRESS: [&str; 7] = [
+const IN_PROGRESS: [&str; 8] = [
     "rebase-merge",
     "rebase-apply",
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
+    "sequencer",
     "BISECT_LOG",
     "BISECT_START",
 ];
@@ -218,11 +219,10 @@ fn planned_branch(brief: &Brief) -> String {
     branch
 }
 
-// A task's branch is fixed when it is first prepared: its own label names it from then on.
-fn expected_branch(brief: &Brief, board: &dyn Board) -> Result<Option<String>, WorktreeError> {
-    if !brief.role.commits_expected {
-        return Ok(None);
-    }
+// A task's branch is fixed when it is first prepared: its own label names it from then on,
+// even after its worktree is released and its text, and so its planned name, changes.
+fn expected_branch(brief: &Brief, board: &dyn Board) -> Result<String, WorktreeError> {
+    assert!(brief.role.commits_expected);
     let view = board.read_task(brief.id)?;
     if view.id != brief.id {
         let reason = format!("asked for task {}, read task {}", brief.id.0, view.id.0);
@@ -236,7 +236,7 @@ fn expected_branch(brief: &Brief, board: &dyn Board) -> Result<Option<String>, W
         (None, None) => planned_branch(brief),
     };
     assert!(git::is_safe_ref(&branch));
-    Ok(Some(branch))
+    Ok(branch)
 }
 
 fn full_ref(branch: &str) -> String {
@@ -270,7 +270,7 @@ fn plan(brief: &Brief, board: &dyn Board) -> Result<Plan, WorktreeError> {
         (None, Some(from)) => from.clone(),
         (None, None) => git::default_branch(repo)?.ok_or(WorktreeError::NoFromBranch)?,
     };
-    let branch = planned_branch(brief);
+    let branch = expected_branch(brief, board)?;
     assert!(git::is_safe_ref(&from));
     Ok(Plan::NewBranch { branch, from })
 }
@@ -345,7 +345,10 @@ fn reuse(brief: &Brief, board: &dyn Board, dir: PathBuf) -> Result<Checkout, Wor
     if !is_checkout_of(&dir, &brief.repo)? {
         return Err(WorktreeError::NotACheckout(dir));
     }
-    let expected = expected_branch(brief, board)?;
+    let expected = match brief.role.commits_expected {
+        true => Some(expected_branch(brief, board)?),
+        false => None,
+    };
     let branch = git::current_branch(&dir)?;
     if branch != expected {
         return Err(WorktreeError::NotOnBranch {
@@ -434,6 +437,10 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
     if checkout.branch.is_none() && git::head(&dir)? != checkout.start_head {
         return Err(refuse("moved from its start"));
     }
+    // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
+    if git::head_reflog_only_commit_count(&dir)? != 0 {
+        return Err(refuse("commits only its HEAD reflog reaches"));
+    }
     git::remove_worktree(repo, &dir)?;
     assert!(dir.starts_with(&root) && dir != root);
     Ok(())
@@ -474,6 +481,7 @@ mod tests {
             onto: None,
             of: None,
             from: Some("main".to_string()),
+            resume: false,
             text: text.to_string(),
         }
     }
@@ -506,7 +514,7 @@ mod tests {
         fixture.set_origin_head("main");
         git(&fixture.repo, &["checkout", "-q", "-b", "elsewhere"]);
         fixture.commit(&fixture.repo, "elsewhere.txt", "elsewhere");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let mut brief = brief(&fixture, "implement", "Extract token store\nDetails.");
         brief.from = None;
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
@@ -525,7 +533,7 @@ mod tests {
     fn new_task_is_cut_from_the_from_branch() {
         let fixture = Fixture::new("wt-from");
         let other = fixture.branch_ahead("feature/other");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let mut brief = brief(&fixture, "implement", "Use other");
         brief.from = Some("feature/other".to_string());
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
@@ -537,7 +545,7 @@ mod tests {
     fn stacked_task_is_cut_from_its_base_tasks_branch() {
         let fixture = Fixture::new("wt-base");
         let base_head = fixture.branch_ahead(BASE_BRANCH);
-        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
         let mut brief = brief(&fixture, "implement", "Use the store");
         brief.base = Some(TaskId(3));
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
@@ -552,7 +560,7 @@ mod tests {
     fn onto_task_checks_out_the_existing_branch() {
         let fixture = Fixture::new("wt-onto");
         let base_head = fixture.branch_ahead(BASE_BRANCH);
-        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
         let mut brief = brief(&fixture, "polish", "Polish the store");
         brief.onto = Some(TaskId(3));
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
@@ -570,7 +578,7 @@ mod tests {
     fn review_task_is_detached_at_the_reviewed_branch_head() {
         let fixture = Fixture::new("wt-review");
         let base_head = fixture.branch_ahead(BASE_BRANCH);
-        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
         let mut brief = brief(&fixture, "review", "Review the store");
         brief.of = Some(TaskId(3));
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
@@ -668,7 +676,7 @@ mod tests {
     fn a_reused_review_checkout_must_still_be_detached() {
         let fixture = Fixture::new("wt-review-attached");
         fixture.branch_ahead(BASE_BRANCH);
-        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
         let error = reused_on(&fixture, &board, "review", &["switch", "-q", "-c", "notes"]);
         assert_eq!(not_on_branch(error), (Some("notes".to_string()), None));
     }
@@ -676,7 +684,7 @@ mod tests {
     #[test]
     fn release_is_not_confused_by_a_tag_named_like_the_branch() {
         let fixture = Fixture::new("wt-tag");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(
             &brief(&fixture, "implement", "Tagged"),
             &board,
@@ -692,7 +700,7 @@ mod tests {
     fn existing_review_checkout_is_reused_untouched() {
         let fixture = Fixture::new("wt-review-again");
         fixture.branch_ahead(BASE_BRANCH);
-        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
         let mut brief = brief(&fixture, "review", "Review");
         brief.of = Some(TaskId(3));
         let first = prepare(&brief, &board, &fixture.home).unwrap();
@@ -709,13 +717,33 @@ mod tests {
         let fixture = Fixture::new("wt-reattach");
         let branch = "rider/7-extract-token-store";
         let ahead = fixture.branch_ahead(branch);
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let brief = brief(&fixture, "implement", "Extract token store");
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
         assert_eq!(checkout.branch.as_deref(), Some(branch));
         assert_eq!(checkout.start_head, ahead);
         assert_eq!(current_branch(&checkout.dir).as_deref(), Some(branch));
         assert_eq!(git(&fixture.repo, &["rev-parse", branch]), ahead);
+    }
+
+    #[test]
+    fn a_reopened_task_with_new_text_returns_to_its_labelled_branch() {
+        let fixture = Fixture::new("wt-reopened");
+        let branch = "rider/7-extract-token-store";
+        let board = FakeBoard::new(vec![task(7, Some(branch))]);
+        let first = brief(&fixture, "implement", "Extract token store");
+        let checkout = prepare(&first, &board, &fixture.home).unwrap();
+        let committed = fixture.commit(&checkout.dir, "work.txt", "finished work");
+        release(&checkout, &fixture.repo, &fixture.home).unwrap();
+        assert!(!checkout.dir.exists());
+        let reopened = brief(&fixture, "implement", "Extract the token store again");
+        let again = prepare(&reopened, &board, &fixture.home).unwrap();
+        assert_eq!(again.dir, checkout.dir);
+        assert_eq!(again.branch.as_deref(), Some(branch));
+        assert_eq!(again.start_head, committed);
+        assert_eq!(current_branch(&again.dir).as_deref(), Some(branch));
+        let list = ["branch", "--list", "--format=%(refname:short)", "rider/7-*"];
+        assert_eq!(git(&fixture.repo, &list), branch);
     }
 
     #[test]
@@ -748,7 +776,7 @@ mod tests {
     #[test]
     fn a_missing_task_is_a_board_error() {
         let fixture = Fixture::new("wt-missing");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let mut stacked = brief(&fixture, "implement", "Stacked");
         stacked.base = Some(TaskId(3));
         let result = prepare(&stacked, &board, &fixture.home);
@@ -760,7 +788,7 @@ mod tests {
         let fixture = Fixture::new("wt-subdir");
         let sub = fixture.repo.join("crates").join("store");
         fs::create_dir_all(&sub).unwrap();
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let mut brief = brief(&fixture, "implement", "Sub");
         brief.repo = sub;
         let checkout = prepare(&brief, &board, &fixture.home).unwrap();
@@ -778,7 +806,7 @@ mod tests {
         let dir = expected_dir(&fixture);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("keep.txt"), "mine\n").unwrap();
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let result = prepare(&brief(&fixture, "implement", "X"), &board, &fixture.home);
         assert!(matches!(result, Err(WorktreeError::NotACheckout(_))));
         assert_eq!(fs::read_to_string(dir.join("keep.txt")).unwrap(), "mine\n");
@@ -794,7 +822,11 @@ mod tests {
     fn a_label_that_names_a_tag_or_head_is_not_a_branch() {
         let fixture = Fixture::new("wt-tag");
         git(&fixture.repo, &["tag", "v1"]);
-        let board = FakeBoard::new(vec![task(3, Some("v1")), task(4, Some("HEAD"))]);
+        let board = FakeBoard::new(vec![
+            task(7, None),
+            task(3, Some("v1")),
+            task(4, Some("HEAD")),
+        ]);
         for n in [3, 4] {
             let mut onto = brief(&fixture, "polish", "Onto");
             onto.onto = Some(TaskId(n));
@@ -817,7 +849,7 @@ mod tests {
         let fixture = Fixture::new("wt-tag-branch");
         git(&fixture.repo, &["tag", BASE_BRANCH]);
         let base_head = fixture.branch_ahead(BASE_BRANCH);
-        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
         let mut stacked = brief(&fixture, "implement", "Stacked");
         stacked.base = Some(TaskId(3));
         let checkout = prepare(&stacked, &board, &fixture.home).unwrap();
@@ -827,7 +859,7 @@ mod tests {
     #[test]
     fn release_removes_a_clean_worktree_and_keeps_its_branch() {
         let fixture = Fixture::new("wt-release");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         let committed = fixture.commit(&checkout.dir, "work.txt", "work");
@@ -842,7 +874,7 @@ mod tests {
     #[test]
     fn release_refuses_a_dirty_worktree_and_leaves_it() {
         let fixture = Fixture::new("wt-release-dirty");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         fs::write(checkout.dir.join("scratch.txt"), "untracked\n").unwrap();
@@ -891,7 +923,7 @@ mod tests {
     #[test]
     fn release_refuses_a_worktree_of_another_repository() {
         let fixture = Fixture::new("wt-release-other");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         let other = fixture.root.join("other");
@@ -905,7 +937,7 @@ mod tests {
     #[test]
     fn onto_branch_checked_out_elsewhere_is_busy_until_released() {
         let fixture = Fixture::new("wt-busy");
-        let board = FakeBoard::new(vec![task(3, Some("rider/3-store"))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some("rider/3-store"))]);
         let base = prepare(
             &brief_for(&fixture, 3, "implement", "Store"),
             &board,
@@ -934,7 +966,7 @@ mod tests {
     #[test]
     fn onto_branch_checked_out_in_the_main_checkout_is_busy() {
         let fixture = Fixture::new("wt-busy-main");
-        let board = FakeBoard::new(vec![task(3, Some("main"))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some("main"))]);
         let mut polish = brief(&fixture, "polish", "Polish");
         polish.onto = Some(TaskId(3));
         let result = prepare(&polish, &board, &fixture.home);
@@ -950,7 +982,7 @@ mod tests {
         let dir = expected_dir(&fixture);
         fs::create_dir_all(&dir).unwrap();
         crate::git::testing::init_repo(&dir);
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let result = prepare(&brief(&fixture, "implement", "X"), &board, &fixture.home);
         assert!(matches!(result, Err(WorktreeError::NotACheckout(_))));
         assert!(dir.join("README").exists());
@@ -973,7 +1005,7 @@ mod tests {
         let long = format!("b/{}", "x".repeat(248));
         assert_eq!(long.len(), 250);
         fixture.branch_ahead(&long);
-        let board = FakeBoard::new(vec![task(3, Some(&long))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(&long))]);
         let mut stacked = brief(&fixture, "implement", "Stacked");
         stacked.base = Some(TaskId(3));
         let result = prepare(&stacked, &board, &fixture.home);
@@ -1007,7 +1039,7 @@ mod tests {
             &fixture.repo,
             &["worktree", "add", "-q", "--", path, "rider/7-work"],
         );
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let result = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         match result {
             Err(WorktreeError::BranchBusy(branch)) => assert_eq!(branch, "rider/7-work"),
@@ -1019,7 +1051,7 @@ mod tests {
     #[test]
     fn release_refuses_a_worktree_moved_off_its_branch() {
         let fixture = Fixture::new("wt-release-moved");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         git(&checkout.dir, &["checkout", "-q", "--detach"]);
@@ -1034,11 +1066,12 @@ mod tests {
     fn release_refuses_a_detached_checkout_that_moved() {
         let fixture = Fixture::new("wt-release-detached");
         fixture.branch_ahead(BASE_BRANCH);
-        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let board = FakeBoard::new(vec![task(7, None), task(3, Some(BASE_BRANCH))]);
         let mut review = brief(&fixture, "review", "Review");
         review.of = Some(TaskId(3));
         let checkout = prepare(&review, &board, &fixture.home).unwrap();
-        let moved = fixture.commit(&checkout.dir, "notes.txt", "notes");
+        git(&checkout.dir, &["checkout", "-q", "--detach", "HEAD~1"]);
+        let moved = git(&checkout.dir, &["rev-parse", "HEAD"]);
         refused_because(released(&fixture, &checkout), "moved from its start");
         assert_eq!(git(&checkout.dir, &["rev-parse", "HEAD"]), moved);
         git(
@@ -1052,7 +1085,7 @@ mod tests {
     #[test]
     fn release_refuses_a_rebase_or_bisect_in_progress() {
         let fixture = Fixture::new("wt-release-busy");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         fixture.commit(&checkout.dir, "work.txt", "work");
@@ -1069,9 +1102,92 @@ mod tests {
     }
 
     #[test]
+    fn release_refuses_a_stopped_multi_commit_cherry_pick() {
+        let fixture = Fixture::new("wt-release-sequencer");
+        let board = FakeBoard::new(vec![task(7, None)]);
+        let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
+        let checkout = checkout.unwrap();
+        git(&fixture.repo, &["checkout", "-q", "-b", "picks"]);
+        let first = fixture.commit(&fixture.repo, "work.txt", "theirs");
+        let second = fixture.commit(&fixture.repo, "more.txt", "more");
+        fixture.commit(&checkout.dir, "work.txt", "ours");
+        assert!(!git_succeeds(
+            &checkout.dir,
+            &["cherry-pick", &first, &second]
+        ));
+        fs::write(checkout.dir.join("work.txt"), "resolved").unwrap();
+        git(&checkout.dir, &["commit", "-q", "-a", "--no-edit"]);
+        refused_because(released(&fixture, &checkout), "an operation is in progress");
+        git(&checkout.dir, &["cherry-pick", "--quit"]);
+        released(&fixture, &checkout).unwrap();
+    }
+
+    #[test]
+    fn release_refuses_commits_only_the_worktrees_head_reflog_reaches() {
+        let fixture = Fixture::new("wt-release-reflog");
+        let board = FakeBoard::new(vec![task(7, None)]);
+        let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
+        let checkout = checkout.unwrap();
+        fixture.commit(&checkout.dir, "work.txt", "work");
+        fixture.commit(&checkout.dir, "work.txt", "amended");
+        git(&checkout.dir, &["commit", "-q", "--amend", "-m", "amended"]);
+        git(&checkout.dir, &["checkout", "-q", "--detach"]);
+        let orphan = fixture.commit(&checkout.dir, "orphan.txt", "orphan");
+        git(&checkout.dir, &["checkout", "-q", "rider/7-work"]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &orphan]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
+    }
+
+    fn detached_review(fixture: &Fixture) -> Checkout {
+        fixture.branch_ahead(BASE_BRANCH);
+        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let mut review = brief(fixture, "review", "Review");
+        review.of = Some(TaskId(3));
+        prepare(&review, &board, &fixture.home).unwrap()
+    }
+
+    #[test]
+    fn release_refuses_a_head_only_it_reaches_when_head_is_not_logged() {
+        let fixture = Fixture::new("wt-release-unlogged");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "false"]);
+        let checkout = detached_review(&fixture);
+        git(&fixture.repo, &["branch", "-q", "-D", BASE_BRANCH]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &checkout.start_head]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
+    }
+
+    #[test]
+    fn release_refuses_a_commit_only_an_old_id_in_its_head_reflog_reaches() {
+        let fixture = Fixture::new("wt-release-old-id");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "false"]);
+        let checkout = detached_review(&fixture);
+        let orphan = fixture.commit(&checkout.dir, "orphan.txt", "orphan");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "true"]);
+        let start = checkout.start_head.as_str();
+        git(&checkout.dir, &["checkout", "-q", "--detach", start]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &orphan]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
+    }
+
+    #[test]
     fn release_removes_a_worktree_holding_ignored_build_output_and_keeps_its_branch() {
         let fixture = Fixture::new("wt-release-ignored");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         let committed = fixture.commit(&checkout.dir, ".gitignore", "target/\n");
@@ -1088,7 +1204,7 @@ mod tests {
     #[test]
     fn release_resolves_a_symlinked_path_before_it_acts() {
         let fixture = Fixture::new("wt-release-link");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         let link = fixture.home.join("worktrees").join("link");

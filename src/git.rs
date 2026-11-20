@@ -2,7 +2,8 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::Read;
+use std::fs::File;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::thread::{self, JoinHandle};
@@ -188,11 +189,48 @@ fn command(dir: &Path, args: &[&OsStr]) -> Process {
 }
 
 fn run(dir: &Path, args: &[&OsStr]) -> Result<Output, GitError> {
+    run_fed(dir, args, None)
+}
+
+fn run_fed(dir: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Output, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
     let line = shown(args);
-    let spawned = command(dir, args).spawn();
+    let mut process = command(dir, args);
+    if input.is_some() {
+        process.stdin(Stdio::piped());
+    }
+    let spawned = process.spawn();
     let mut child = spawned.map_err(|error| GitError::Spawn(format!("git {line}: {error}")))?;
-    let output = collect(&mut child, &line);
+    let writer = match (input, child.stdin.take()) {
+        (Some(bytes), Some(mut stdin)) => {
+            // Written from its own thread so git can't block on a full stdout meanwhile.
+            let builder = thread::Builder::new().name("git-stdin".to_string());
+            let started = builder.spawn(move || stdin.write_all(&bytes));
+            let started = started.map_err(|error| GitError::Spawn(format!("git {line}: {error}")));
+            match started {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        }
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitError::Spawn(format!("git {line}: stdin is not set up")));
+        }
+    };
+    let mut output = collect(&mut child, &line);
+    let written = writer.map(|handle| handle.join());
+    if let (Ok(done), Some(Ok(Err(_)) | Err(_))) = (&output, written) {
+        // A git that exits without reading all its input reports its own failure.
+        if done.code == Some(0) {
+            output = Err(GitError::Io(format!("writing to git {line}")));
+        }
+    }
     if output.is_err() {
         let _ = child.kill();
         let _ = child.wait();
@@ -340,6 +378,104 @@ pub fn own_commit_count(
     let digits = line.bytes().all(|b| b.is_ascii_digit());
     let count = line.parse::<u64>().ok().filter(|_| digits);
     count.ok_or_else(|| parse_error(&args, &stdout))
+}
+
+fn reflog_commits(dir: &Path, log_args: &[&str]) -> Result<Vec<String>, GitError> {
+    let args: Vec<&OsStr> = log_args.iter().map(OsStr::new).collect();
+    let stdout = run_ok(dir, &args)?;
+    let text = std::str::from_utf8(&stdout).map_err(|_| parse_error(&args, &stdout))?;
+    let mut commits: Vec<String> = text.lines().map(str::to_string).collect();
+    if !commits.iter().all(|commit| is_commit_id(commit)) {
+        return Err(parse_error(&args, &stdout));
+    }
+    commits.sort_unstable();
+    commits.dedup();
+    assert!(commits.len() <= stdout.len());
+    Ok(commits)
+}
+
+// A reflog record is `<old id> <new id> <identity>\t<message>`; a ref's first record has an
+// all-zero old id. Neither id is guaranteed to be reachable from anything else.
+fn head_reflog_ids(dir: &Path) -> Result<Vec<String>, GitError> {
+    let words = [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "logs/HEAD",
+    ];
+    let args = words.map(OsStr::new);
+    let stdout = run_ok(dir, &args)?;
+    let path = absolute_path(&args, &stdout)?;
+    let shown_path = path.display().to_string();
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(GitError::Io(format!("opening {shown_path}: {error}"))),
+    };
+    let bytes = read_bounded(&mut file, &shown_path)?;
+    let malformed = |line: &[u8]| GitError::Parse {
+        args: shown_path.clone(),
+        stdout: String::from_utf8_lossy(line).into_owned(),
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for line in bytes.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+        let mut fields = line.splitn(3, |&b| b == b' ');
+        for _ in 0..2 {
+            let field = fields.next().ok_or_else(|| malformed(line))?;
+            let id = std::str::from_utf8(field).map_err(|_| malformed(line))?;
+            if !is_commit_id(id) {
+                return Err(malformed(line));
+            }
+            if id.bytes().any(|b| b != b'0') {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    assert!(ids.len() <= bytes.len());
+    assert!(ids.iter().all(|id| is_commit_id(id)));
+    Ok(ids)
+}
+
+/// The commits `dir`'s own HEAD, or either id of any record of its HEAD reflog, reaches that
+/// no local branch nor any branch's reflog does: the commits lost when the worktree, and with
+/// it that reflog, is removed.
+pub fn head_reflog_only_commit_count(dir: &Path) -> Result<u64, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let mut reached = head_reflog_ids(dir)?;
+    reached.push(head(dir)?);
+    reached.sort_unstable();
+    reached.dedup();
+    assert!(!reached.is_empty());
+    let kept = reflog_commits(dir, &["log", "-g", "--format=%H", "--branches", "--"])?;
+    let mut input = String::new();
+    for commit in &reached {
+        input.push_str(commit);
+        input.push('\n');
+    }
+    for commit in &kept {
+        input.push('^');
+        input.push_str(commit);
+        input.push('\n');
+    }
+    assert!(input.lines().count() == reached.len() + kept.len());
+    // A record's id may name a commit already pruned, which removal can no longer lose.
+    let words = [
+        "rev-list",
+        "--count",
+        "--ignore-missing",
+        "--stdin",
+        "--not",
+        "--branches",
+    ];
+    let args = words.map(OsStr::new);
+    let output = run_fed(dir, &args, Some(input.into_bytes()))?;
+    if output.code != Some(0) {
+        return Err(exit_error(&args, &output));
+    }
+    let line = one_line(&args, &output.stdout)?;
+    let digits = line.bytes().all(|b| b.is_ascii_digit());
+    let count = line.parse::<u64>().ok().filter(|_| digits);
+    count.ok_or_else(|| parse_error(&args, &output.stdout))
 }
 
 /// Whether `commit` names a commit in `dir`'s repository.
