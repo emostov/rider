@@ -22,12 +22,13 @@ const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
 pub const BRANCH_LABEL: &str = "branch";
 // What git keeps in a worktree's git directory while an operation is unfinished.
-const IN_PROGRESS: [&str; 7] = [
+const IN_PROGRESS: [&str; 8] = [
     "rebase-merge",
     "rebase-apply",
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
+    "sequencer",
     "BISECT_LOG",
     "BISECT_START",
 ];
@@ -435,6 +436,10 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
     }
     if checkout.branch.is_none() && git::head(&dir)? != checkout.start_head {
         return Err(refuse("moved from its start"));
+    }
+    // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
+    if git::head_reflog_only_commit_count(&dir)? != 0 {
+        return Err(refuse("commits only its HEAD reflog reaches"));
     }
     git::remove_worktree(repo, &dir)?;
     assert!(dir.starts_with(&root) && dir != root);
@@ -1065,7 +1070,8 @@ mod tests {
         let mut review = brief(&fixture, "review", "Review");
         review.of = Some(TaskId(3));
         let checkout = prepare(&review, &board, &fixture.home).unwrap();
-        let moved = fixture.commit(&checkout.dir, "notes.txt", "notes");
+        git(&checkout.dir, &["checkout", "-q", "--detach", "HEAD~1"]);
+        let moved = git(&checkout.dir, &["rev-parse", "HEAD"]);
         refused_because(released(&fixture, &checkout), "moved from its start");
         assert_eq!(git(&checkout.dir, &["rev-parse", "HEAD"]), moved);
         git(
@@ -1093,6 +1099,89 @@ mod tests {
         refused_because(released(&fixture, &checkout), "an operation is in progress");
         git(&checkout.dir, &["bisect", "reset"]);
         released(&fixture, &checkout).unwrap();
+    }
+
+    #[test]
+    fn release_refuses_a_stopped_multi_commit_cherry_pick() {
+        let fixture = Fixture::new("wt-release-sequencer");
+        let board = FakeBoard::new(vec![task(7, None)]);
+        let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
+        let checkout = checkout.unwrap();
+        git(&fixture.repo, &["checkout", "-q", "-b", "picks"]);
+        let first = fixture.commit(&fixture.repo, "work.txt", "theirs");
+        let second = fixture.commit(&fixture.repo, "more.txt", "more");
+        fixture.commit(&checkout.dir, "work.txt", "ours");
+        assert!(!git_succeeds(
+            &checkout.dir,
+            &["cherry-pick", &first, &second]
+        ));
+        fs::write(checkout.dir.join("work.txt"), "resolved").unwrap();
+        git(&checkout.dir, &["commit", "-q", "-a", "--no-edit"]);
+        refused_because(released(&fixture, &checkout), "an operation is in progress");
+        git(&checkout.dir, &["cherry-pick", "--quit"]);
+        released(&fixture, &checkout).unwrap();
+    }
+
+    #[test]
+    fn release_refuses_commits_only_the_worktrees_head_reflog_reaches() {
+        let fixture = Fixture::new("wt-release-reflog");
+        let board = FakeBoard::new(vec![task(7, None)]);
+        let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
+        let checkout = checkout.unwrap();
+        fixture.commit(&checkout.dir, "work.txt", "work");
+        fixture.commit(&checkout.dir, "work.txt", "amended");
+        git(&checkout.dir, &["commit", "-q", "--amend", "-m", "amended"]);
+        git(&checkout.dir, &["checkout", "-q", "--detach"]);
+        let orphan = fixture.commit(&checkout.dir, "orphan.txt", "orphan");
+        git(&checkout.dir, &["checkout", "-q", "rider/7-work"]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &orphan]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
+    }
+
+    fn detached_review(fixture: &Fixture) -> Checkout {
+        fixture.branch_ahead(BASE_BRANCH);
+        let board = FakeBoard::new(vec![task(3, Some(BASE_BRANCH))]);
+        let mut review = brief(fixture, "review", "Review");
+        review.of = Some(TaskId(3));
+        prepare(&review, &board, &fixture.home).unwrap()
+    }
+
+    #[test]
+    fn release_refuses_a_head_only_it_reaches_when_head_is_not_logged() {
+        let fixture = Fixture::new("wt-release-unlogged");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "false"]);
+        let checkout = detached_review(&fixture);
+        git(&fixture.repo, &["branch", "-q", "-D", BASE_BRANCH]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &checkout.start_head]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
+    }
+
+    #[test]
+    fn release_refuses_a_commit_only_an_old_id_in_its_head_reflog_reaches() {
+        let fixture = Fixture::new("wt-release-old-id");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "false"]);
+        let checkout = detached_review(&fixture);
+        let orphan = fixture.commit(&checkout.dir, "orphan.txt", "orphan");
+        git(&fixture.repo, &["config", "core.logAllRefUpdates", "true"]);
+        let start = checkout.start_head.as_str();
+        git(&checkout.dir, &["checkout", "-q", "--detach", start]);
+        refused_because(
+            released(&fixture, &checkout),
+            "commits only its HEAD reflog reaches",
+        );
+        git(&fixture.repo, &["branch", "kept", &orphan]);
+        released(&fixture, &checkout).unwrap();
+        assert!(!checkout.dir.exists());
     }
 
     #[test]
