@@ -6,15 +6,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs4::{FileExt, TryLockError};
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use serde::{Deserialize, Serialize};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
     Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
@@ -85,6 +87,21 @@ const LOG_QUEUE_MAX: usize = 256;
 const LOG_LINES_MAX: u64 = u64::MAX;
 /// Why a settlement's board write was refused: the daemon is stopping now.
 const STOPPED: &str = "the daemon is stopping now";
+/// The file under the Rider home naming each running agent's process group and start time.
+pub const AGENTS_FILE: &str = "agents.json";
+/// The file under the Rider home holding the last feed cursor the core handled.
+pub const CURSOR_FILE: &str = "cursor";
+const AGENTS_BYTES_MAX: u64 = 64 * 1024;
+const CURSOR_BYTES_MAX: u64 = 32;
+/// Upper bound on the agents `agents.json` names: every group of every attempt.
+const AGENT_RECORDS_MAX: usize = AGENTS_MAX as usize * AGENT_GROUPS_MAX;
+/// Upper bound on the entries read from the agents directory when clearing it.
+const AGENT_FILES_MAX: usize = 4 * AGENT_RECORDS_MAX;
+/// Upper bound on the agent starts and ends waiting for the recorder.
+const RECORDER_QUEUE_MAX: usize = 4 * AGENTS_MAX as usize;
+/// How often the recorder looks for a pid file that has appeared or changed.
+const RECORD_POLL_MILLIS: u64 = 100;
+const RECORDER_ROUNDS_MAX: u64 = u64::MAX;
 // Writes its own pid, which is its process group, then becomes the agent.
 const PID_WRAPPER: &str = r#"echo $$ > "$RIDER_AGENT_PID_FILE" && exec "$@""#;
 
@@ -304,6 +321,10 @@ struct Shared {
     /// The core has decided to stop now; a settlement checks it before each board write.
     stop_now: AtomicBool,
     log: Log,
+    /// Tells the recorder of each agent's start and end.
+    recorder: SyncSender<Recorded>,
+    /// The cursor saved before the daemon last stopped, if any.
+    saved_cursor: Option<Cursor>,
 }
 
 /// The current feed thread and how to end it.
@@ -354,14 +375,14 @@ impl Shared {
     }
 
     fn pid_file(&self, task: TaskId) -> PathBuf {
-        let path = self
-            .paths
-            .home
-            .join(AGENTS_DIR)
-            .join(format!("{}.pid", task.0));
-        assert!(path.starts_with(&self.paths.home));
-        path
+        pid_file(&self.paths.home, task)
     }
+}
+
+fn pid_file(home: &Path, task: TaskId) -> PathBuf {
+    let path = home.join(AGENTS_DIR).join(format!("{}.pid", task.0));
+    assert!(path.starts_with(home));
+    path
 }
 
 /// Runs the daemon in the foreground until it is stopped; returns its exit code.
@@ -385,6 +406,9 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
     let lease_millis = timing.lease_millis;
     let log = Log::start(&paths.home.join(LOG_FILE))?;
+    stop_leftovers(&paths.home, timing.grace_millis, &log);
+    let saved_cursor = read_cursor(&paths.home, &log);
+    let recorder = start_recorder(paths.home.clone())?;
     match reap::find_leaks(&paths.board_url) {
         Ok(leaks) if leaks.is_empty() => {}
         Ok(leaks) => {
@@ -413,6 +437,8 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         feed: Mutex::new(FeedSlot::default()),
         stop_now: AtomicBool::new(false),
         log,
+        recorder,
+        saved_cursor,
     });
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
@@ -425,6 +451,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
     let code = drive(&mut state, &inputs, &jobs, &shared);
+    save_cursor(&shared, state.cursor());
     shared.socket.close();
     stop_feed(&shared);
     let code = code?;
@@ -468,6 +495,7 @@ fn drive(
 ) -> Result<u8, DaemonError> {
     let mut contexts: Vec<RunContext> = Vec::with_capacity(usize::from(AGENTS_MAX));
     let mut following = false;
+    let mut saved = shared.saved_cursor.unwrap_or(Cursor(0));
     let tick = step(state, Event::Tick(now()));
     let mut pending: Vec<Action> = tick;
     for _ in 0..STEPS_MAX {
@@ -489,12 +517,19 @@ fn drive(
         }
         let input = inputs.recv().map_err(|_| DaemonError::QueueClosed)?;
         if !following && let Event::Snapshot { cursor, .. } = &input.event {
-            start_feed(shared, *cursor)?;
+            // A saved cursor past the snapshot's is from another board, or one started anew.
+            let from = shared.saved_cursor.filter(|saved| saved <= cursor);
+            start_feed(shared, from.unwrap_or(*cursor))?;
             following = true;
             println!("{FOLLOWING} {SUBTREE} on {}", shared.paths.board_url);
         }
         let event = absorb(input, &mut contexts, &shared.log);
+        let ticked = matches!(event, Event::Tick(_));
         pending = step(state, event);
+        if ticked && state.cursor() != saved {
+            saved = state.cursor();
+            save_cursor(shared, saved);
+        }
         let now_stopping = state.stopping() == Stopping::Now;
         shared.stop_now.store(now_stopping, Ordering::SeqCst);
         contexts.retain(|context| state.runs().iter().any(|run| run.id == context.run));
@@ -544,7 +579,7 @@ fn absorb(input: Input, contexts: &mut [RunContext], log: &Log) -> Event {
 // The job carrying out `action`; every action but `Exit` gets one, which answers it once.
 fn dispatch(action: Action, contexts: &mut Vec<RunContext>, shared: &Arc<Shared>) -> Option<Job> {
     assert!(contexts.len() <= usize::from(AGENTS_MAX));
-    if let Action::Claim { run, task, profile } = &action {
+    if let Action::Claim { run, task, profile } | Action::Resume { run, task, profile } = &action {
         contexts.push(RunContext::new(*run, *task, profile.clone()));
     }
     match job(action, contexts, shared) {
@@ -573,6 +608,9 @@ fn job(
     let job: Job = match action {
         Action::Claim { run, task, profile } => {
             Box::new(move || claim(&shared, run, task, &profile))
+        }
+        Action::Resume { run, task, profile } => {
+            Box::new(move || resume(&shared, run, task, &profile))
         }
         Action::Prepare { run, task } => {
             let profile = find(contexts, run, lost(run, "prepare"))?.profile.clone();
@@ -664,6 +702,35 @@ fn claim(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     Input::plain(event)
 }
 
+// Renews a claim held from before a restart; it is answered as a claim, keeping its epoch.
+fn resume(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
+    assert!(!profile.is_empty());
+    let sent = now();
+    let renewed = shared.board(profile).renew(task);
+    let event = match renewed {
+        Ok(view) => match view.claim {
+            Some(claim) if view.id == task => Event::Claimed {
+                run,
+                epoch: view.epoch,
+                until: shared.lease_until(sent, claim.until),
+            },
+            _ => Event::ClaimRefused(run),
+        },
+        Err(error) if call_failed(&error) => Event::BoardFailed(Call::Claim(run)),
+        // `claim_lost` or `claim_not_held`: the task becomes ready when its lease lapses.
+        Err(_) => Event::ClaimRefused(run),
+    };
+    let outcome = match &event {
+        Event::Claimed { .. } => "renewed",
+        Event::BoardFailed(_) => "the board did not answer",
+        _ => "no longer held",
+    };
+    shared
+        .log
+        .write(&format!("resumed #{} {profile}: {outcome}", task.0));
+    Input::plain(event)
+}
+
 fn prepare(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     let board = shared.board(profile);
     let prepared = prepare_attempt(task, &shared.env(profile), &board);
@@ -735,9 +802,12 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
         };
         launch_agent(&wrapped, dir, log)
     };
+    // A full queue makes the worker wait: the recorder is never far behind.
+    let _ = shared.recorder.send(Recorded::Started(task));
     let launched = attempt.launch(&launch);
     // The agent is gone, so its pid may be reused: nothing may signal it any more.
     let _ = fs::remove_file(&pid_file);
+    let _ = shared.recorder.send(Recorded::Ended(task));
     Input {
         event: Event::AgentExited(run),
         extra: Extra::Launched(launched),
@@ -1219,4 +1289,215 @@ fn clock_line(now: SystemTime) -> String {
     assert!(line.len() >= "YYYY-MM-DDTHH:MM:SSZ".len());
     assert!((1..=12).contains(&month));
     line
+}
+
+/// One running agent as `agents.json` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRecord {
+    task: u64,
+    group: i32,
+    /// When the group's leader started, in seconds since the epoch.
+    start: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentsFile {
+    agents: Vec<AgentRecord>,
+}
+
+/// What the recorder is told by the workers that run agents.
+enum Recorded {
+    Started(TaskId),
+    Ended(TaskId),
+}
+
+/// Writes `bytes` to `path` by renaming a finished file beside it over it.
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    let staged = path.with_file_name(name);
+    assert!(staged != path);
+    fs::write(&staged, bytes)?;
+    fs::rename(&staged, path)
+}
+
+fn read_bounded(path: &Path, bytes_max: u64) -> io::Result<String> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(bytes_max.saturating_add(1))
+        .read_to_string(&mut text)?;
+    let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    if length > bytes_max {
+        let message = format!("longer than {bytes_max} bytes");
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+    }
+    Ok(text)
+}
+
+// The cursor saved under `home`; one that is missing is `None`, and so is a malformed one,
+// which is logged.
+fn read_cursor(home: &Path, log: &Log) -> Option<Cursor> {
+    let path = home.join(CURSOR_FILE);
+    let text = match read_bounded(&path, CURSOR_BYTES_MAX) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            log.write(&format!("could not read {}: {error}", path.display()));
+            return None;
+        }
+    };
+    let cursor = text.trim().parse::<u64>().ok().map(Cursor);
+    if cursor.is_none() {
+        log.write(&format!("ignored {}: not a cursor", path.display()));
+    }
+    cursor
+}
+
+fn save_cursor(shared: &Shared, cursor: Cursor) {
+    let path = shared.paths.home.join(CURSOR_FILE);
+    if let Err(error) = write_atomically(&path, format!("{}\n", cursor.0).as_bytes()) {
+        let line = format!("could not save the cursor to {}: {error}", path.display());
+        shared.log.write(&line);
+    }
+}
+
+// When process `pid` started, in seconds since the epoch, while it exists.
+fn start_time(pid: Pid) -> Option<u64> {
+    let raw = u32::try_from(pid.as_raw_nonzero().get()).ok()?;
+    let pid = sysinfo::Pid::from_u32(raw);
+    let mut system = System::new().ok()?;
+    let only = [pid];
+    let kind = ProcessRefreshKind::nothing();
+    system.refresh_processes_specifics(ProcessesToUpdate::Some(&only), true, kind);
+    let start = system.process(pid).map(sysinfo::Process::start_time);
+    start.filter(|start| *start > 0)
+}
+
+// The agents `agents.json` under `home` names; a missing file names none.
+fn read_agents(home: &Path) -> Result<Vec<AgentRecord>, String> {
+    let path = home.join(AGENTS_FILE);
+    let text = match read_bounded(&path, AGENTS_BYTES_MAX) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let file: AgentsFile = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    if file.agents.len() > AGENT_RECORDS_MAX {
+        return Err(format!("names more than {AGENT_RECORDS_MAX} agents"));
+    }
+    Ok(file.agents)
+}
+
+/// Stops each agent a crashed daemon left running: only a group that still exists and whose
+/// leader started when `agents.json` says, so a reused pid is never signalled.
+fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) {
+    assert!(grace_millis > 0);
+    let records = read_agents(home).unwrap_or_else(|error| {
+        log.write(&format!("ignored {AGENTS_FILE}: {error}"));
+        Vec::new()
+    });
+    let mut groups: Vec<Pid> = Vec::with_capacity(records.len());
+    for record in &records {
+        let group = Pid::from_raw(record.group).filter(|_| record.group > 1);
+        let Some(group) = group.filter(|group| test_kill_process_group(*group).is_ok()) else {
+            continue;
+        };
+        if start_time(group) == Some(record.start) {
+            log.write(&format!(
+                "stopping #{} left from before: group {}",
+                record.task, record.group
+            ));
+            let _ = kill_process_group(group, Signal::TERM);
+            groups.push(group);
+        }
+    }
+    let polls = grace_millis.div_ceil(STOP_POLL_MILLIS);
+    for _ in 0..polls {
+        groups.retain(|group| test_kill_process_group(*group).is_ok());
+        if groups.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
+    }
+    for group in &groups {
+        let _ = kill_process_group(*group, Signal::KILL);
+    }
+    clear_agents(home, log);
+    assert!(groups.len() <= AGENT_RECORDS_MAX);
+}
+
+// Removes the agents file and every pid file, which name no agent of this daemon.
+fn clear_agents(home: &Path, log: &Log) {
+    let agents = home.join(AGENTS_FILE);
+    if let Err(error) = fs::remove_file(&agents)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        log.write(&format!("could not remove {}: {error}", agents.display()));
+    }
+    let Ok(entries) = fs::read_dir(home.join(AGENTS_DIR)) else {
+        return;
+    };
+    for entry in entries.take(AGENT_FILES_MAX).flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "pid") {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn start_recorder(home: PathBuf) -> Result<SyncSender<Recorded>, DaemonError> {
+    assert!(home.is_absolute());
+    let (recorder, told) = sync_channel::<Recorded>(RECORDER_QUEUE_MAX);
+    let builder = thread::Builder::new().name("recorder".into());
+    let spawned = builder.spawn(move || record_agents(&home, &told));
+    spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
+    Ok(recorder)
+}
+
+// Keeps `agents.json` naming the group of each running agent, as its pid file names it, until
+// the daemon drops its recorder.
+fn record_agents(home: &Path, told: &Receiver<Recorded>) {
+    let mut running: Vec<(TaskId, Option<AgentRecord>)> = Vec::new();
+    let mut written: Vec<AgentRecord> = Vec::new();
+    let poll = Duration::from_millis(RECORD_POLL_MILLIS);
+    for _ in 0..RECORDER_ROUNDS_MAX {
+        match told.recv_timeout(poll) {
+            Ok(Recorded::Started(task)) => {
+                running.retain(|(id, _)| *id != task);
+                if running.len() < AGENT_RECORDS_MAX {
+                    running.push((task, None));
+                }
+            }
+            Ok(Recorded::Ended(task)) => running.retain(|(id, _)| *id != task),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        for (task, record) in running.iter_mut() {
+            let group = agent_group(&pid_file(home, *task));
+            let raw = group.map(|group| group.as_raw_nonzero().get());
+            if raw != record.map(|record| record.group) {
+                *record = group.zip(raw).and_then(|(group, raw)| {
+                    let start = start_time(group)?;
+                    Some(AgentRecord {
+                        task: task.0,
+                        group: raw,
+                        start,
+                    })
+                });
+            }
+        }
+        let now: Vec<AgentRecord> = running.iter().filter_map(|(_, record)| *record).collect();
+        if now != written {
+            let file = AgentsFile {
+                agents: now.clone(),
+            };
+            let text = serde_json::to_string(&file).unwrap_or_default();
+            if write_atomically(&home.join(AGENTS_FILE), text.as_bytes()).is_ok() {
+                written = now;
+            }
+        }
+        assert!(running.len() <= AGENT_RECORDS_MAX);
+    }
 }

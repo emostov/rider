@@ -1,8 +1,8 @@
 //! The simulated world: a fake board, git, process table and clock around one core.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use rider::board::{ListedTask, TaskId, TaskState, TaskView, Timestamp};
+use rider::board::{Claim, ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
     ACTIONS_MAX, Action, BoardHealth, Call, ClientId, Config, Event, FEED_RESTARTS_MAX,
     FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase, Reply, Request, RunId, Settlement, State,
@@ -55,6 +55,11 @@ struct FakeTask {
     labels: Vec<(String, String)>,
     epoch: u64,
     holder: Option<RunId>,
+    /// The restarts of the core before the holder's claim was granted or renewed, which tells
+    /// apart runs of different cores that share an id.
+    generation: u64,
+    /// The profile the claim is held as.
+    profile: String,
     lease_until: Timestamp,
     /// The cursor of the newest event published about the task.
     version: u64,
@@ -141,6 +146,10 @@ pub struct World {
     signals: u8,
     exited: bool,
     pub trace: Vec<String>,
+    /// The phases runs were in when the core was restarted, by name.
+    pub restarted_in: BTreeSet<String>,
+    /// How many times the core was restarted.
+    generation: u64,
     /// The replies the core sent `OWNER` during its current request.
     replies: Vec<(ClientId, Reply)>,
 }
@@ -185,6 +194,8 @@ impl World {
             signals: 0,
             exited: false,
             trace: Vec::new(),
+            restarted_in: BTreeSet::new(),
+            generation: 0,
             replies: Vec::new(),
         }
     }
@@ -240,10 +251,9 @@ impl World {
             ));
         }
         let now = self.now;
-        let held = self
-            .tasks
-            .iter()
-            .find(|task| task.holder.is_some() && task.lease_until > now);
+        let held = self.tasks.iter().find(|task| {
+            task.holder.is_some() && task.generation == self.generation && task.lease_until > now
+        });
         match held {
             Some(task) => Err(format!(
                 "task {} is still claimed by {:?} until {:?} after the core exited at {now:?}",
@@ -300,6 +310,7 @@ impl World {
                 self.flaps_left = self.rng.u32(restarts..3 * restarts);
                 self.lose_feed();
             }
+            98 => return self.restart(),
             _ => return self.advance(),
         }
         Ok(())
@@ -372,6 +383,43 @@ impl World {
         self.deliver(Event::Tick(now))
     }
 
+    /// The daemon crashes and starts again: the core's state, its actions in flight and its
+    /// agents are gone, and a new core rebuilds from the board, following the feed from the
+    /// cursor the old one handled.
+    fn restart(&mut self) -> Result<(), String> {
+        for run in self.core.runs() {
+            let phase = format!("{:?}", run.phase);
+            let name = phase.split('(').next().unwrap_or_default().to_string();
+            self.restarted_in.insert(name);
+        }
+        let saved = self.core.cursor();
+        self.core = State::new(self.config.clone(), self.now);
+        self.generation += 1;
+        self.results.clear();
+        self.outstanding.clear();
+        self.agents.clear();
+        self.log.clear();
+        self.spawned.clear();
+        self.refused.clear();
+        self.listings.clear();
+        self.replies.clear();
+        self.told.clear();
+        self.left_out.clear();
+        self.listed_through = 0;
+        self.flaps_left = 0;
+        self.feed_restarts = 0;
+        self.feed_since = self.now;
+        self.feed_delivered = false;
+        self.stopped_now = false;
+        self.feed = (self.history.iter())
+            .filter(|event| event.cursor > saved)
+            .cloned()
+            .collect();
+        self.feed_up = true;
+        self.trace.push(format!("restart from {saved:?}"));
+        self.deliver(Event::Tick(self.now))
+    }
+
     fn create_task(&mut self) {
         if self.tasks.len() >= BOARD_TASKS_MAX {
             return;
@@ -392,6 +440,8 @@ impl World {
             labels,
             epoch: 0,
             holder: None,
+            generation: 0,
+            profile: String::new(),
             lease_until: self.now,
             version: 0,
         });
@@ -667,7 +717,8 @@ impl World {
 
     fn perform(&mut self, action: Action) -> Result<(), String> {
         match action {
-            Action::Claim { run, task, .. } => self.claim(run, task),
+            Action::Claim { run, task, profile } => self.claim(run, task, profile),
+            Action::Resume { run, task, profile } => self.resume(run, task, &profile),
             Action::Prepare { run, task } => {
                 let id = self.expect(Some(run), "prepare");
                 let branch = self.learn_branch(task);
@@ -770,10 +821,40 @@ impl World {
     fn holds(&self, run: RunId, task: TaskId) -> Option<usize> {
         let index = self.tasks.iter().position(|fake| fake.id == task)?;
         let fake = &self.tasks[index];
-        (fake.holder == Some(run) && fake.lease_until > self.now).then_some(index)
+        let current = fake.generation == self.generation;
+        (fake.holder == Some(run) && current && fake.lease_until > self.now).then_some(index)
     }
 
-    fn claim(&mut self, run: RunId, task: TaskId) {
+    /// Renews, as `profile`, a claim granted to a core before a restart.
+    fn resume(&mut self, run: RunId, task: TaskId, profile: &str) {
+        self.log.entry(run).or_default().task = Some(task);
+        let id = self.expect(Some(run), "claim");
+        if self.board_fails() {
+            self.reply(id, Event::BoardFailed(Call::Claim(run)));
+            return;
+        }
+        let now = self.now;
+        let held = (self.tasks.iter()).position(|fake| {
+            fake.id == task
+                && fake.state == TaskState::Claimed
+                && fake.holder.is_some()
+                && fake.profile == profile
+                && fake.lease_until > now
+        });
+        let Some(index) = held else {
+            self.reply(id, Event::ClaimRefused(run));
+            return;
+        };
+        let until = Timestamp(now.0 + self.config.lease_millis);
+        let fake = &mut self.tasks[index];
+        fake.holder = Some(run);
+        fake.generation = self.generation;
+        fake.lease_until = until;
+        let epoch = fake.epoch;
+        self.reply(id, Event::Claimed { run, epoch, until });
+    }
+
+    fn claim(&mut self, run: RunId, task: TaskId, profile: String) {
         self.log.entry(run).or_default().task = Some(task);
         let id = self.expect(Some(run), "claim");
         if self.board_fails() {
@@ -790,6 +871,8 @@ impl World {
                 let fake = &mut self.tasks[index];
                 fake.epoch += 1;
                 fake.holder = Some(run);
+                fake.generation = self.generation;
+                fake.profile = profile;
                 fake.state = TaskState::Claimed;
                 fake.lease_until = until;
                 let epoch = fake.epoch;
@@ -892,7 +975,10 @@ impl World {
                     labels: fake.labels.clone(),
                     needs: Vec::new(),
                     epoch: fake.epoch,
-                    claim: None,
+                    claim: fake.holder.map(|_| Claim {
+                        holder: format!("local:user:sim+{}", fake.profile),
+                        until: fake.lease_until,
+                    }),
                     version: Cursor(fake.version),
                 },
                 channel: "work/sim".to_string(),
@@ -1005,6 +1091,13 @@ impl World {
                         return Err(format!(
                             "{action:?} retries a refused claim before a tick or news of its task"
                         ));
+                    }
+                    (*run, true)
+                }
+                Action::Resume { run, profile, .. } => {
+                    self.log.entry(*run).or_default().profile = Some(profile.clone());
+                    if blocked {
+                        return Err(format!("invariant 9: {action:?} while down or stopping"));
                     }
                     (*run, true)
                 }

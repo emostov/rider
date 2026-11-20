@@ -423,6 +423,13 @@ pub enum Action {
         task: TaskId,
         profile: String,
     },
+    /// Renews, as `profile`, a claim the board shows held by it from before a restart; it is
+    /// answered as a claim is.
+    Resume {
+        run: RunId,
+        task: TaskId,
+        profile: String,
+    },
     Prepare {
         run: RunId,
         task: TaskId,
@@ -496,6 +503,9 @@ pub struct State {
     down_clients: Vec<ClientId>,
     /// Clients following a task's log, told when its agent is gone; at most `CLIENTS_MAX`.
     log_clients: Vec<(ClientId, TaskId)>,
+    /// The first snapshot was taken, and the claims it showed held by the core's profiles were
+    /// resumed.
+    recovered: bool,
     exited: bool,
 }
 
@@ -525,6 +535,7 @@ impl State {
             feed_delivered: false,
             down_clients: Vec::new(),
             log_clients: Vec::new(),
+            recovered: false,
             exited: false,
         };
         assert!(state.runs.is_empty());
@@ -585,6 +596,10 @@ impl State {
     }
     pub fn now(&self) -> Timestamp {
         self.now
+    }
+    /// The newest feed cursor the core has handled.
+    pub fn cursor(&self) -> Cursor {
+        self.cursor
     }
     pub fn exited(&self) -> bool {
         assert!(!self.exited || self.runs.is_empty());
@@ -661,6 +676,10 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             state.board = BoardHealth::Up;
             state.cursor = state.cursor.max(cursor);
             reconcile(state, &tasks, cursor, left_out);
+            if !state.recovered {
+                state.recovered = true;
+                resume_held(state, &tasks, actions);
+            }
         }
         Event::BoardFailed(call) => board_failed(state, call),
         Event::Signal => signal(state, actions),
@@ -1591,40 +1610,99 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         let Some((task, role, slot)) = next_claimable(state) else {
             break;
         };
-        let id = RunId(state.next_run);
-        state.next_run = state.next_run.saturating_add(1);
-        let profile = state.profile(role, slot);
-        let now = state.now;
         let branch = state.tasks[task].branch.clone();
         let task = state.tasks[task].id;
-        state.runs.push(Run {
-            id,
-            task,
-            role,
-            slot,
-            phase: Phase::Claiming,
-            epoch: 0,
-            lease_until: now,
-            attempt_start: now,
-            phase_start: now,
-            renewing: false,
-            settlement: None,
-            settle_tries: 0,
-            settling: false,
-            retry_at: now,
-            agent_alive: false,
-            branch,
-            stop_tries: 0,
-            agent_lost: false,
-        });
-        actions.push(Action::Claim {
-            run: id,
-            task,
-            profile,
-        });
-        assert!(state.next_run > id.0);
+        let (run, profile) = new_run(state, task, role, slot, branch);
+        actions.push(Action::Claim { run, task, profile });
     }
     assert!(state.runs.len() <= agents_max);
+}
+
+/// A new run claiming `task` as `role`'s `slot`, and the profile it claims as.
+fn new_run(
+    state: &mut State,
+    task: TaskId,
+    role: usize,
+    slot: u8,
+    branch: Option<String>,
+) -> (RunId, String) {
+    assert!(state.runs.len() < usize::from(state.config.agents_max));
+    let id = RunId(state.next_run);
+    state.next_run = state.next_run.saturating_add(1);
+    let now = state.now;
+    state.runs.push(Run {
+        id,
+        task,
+        role,
+        slot,
+        phase: Phase::Claiming,
+        epoch: 0,
+        lease_until: now,
+        attempt_start: now,
+        phase_start: now,
+        renewing: false,
+        settlement: None,
+        settle_tries: 0,
+        settling: false,
+        retry_at: now,
+        agent_alive: false,
+        branch,
+        stop_tries: 0,
+        agent_lost: false,
+    });
+    assert!(state.next_run > id.0);
+    (id, state.profile(role, slot))
+}
+
+/// Starts a run for each claimed task a listing shows held by one of the core's profiles,
+/// renewing the claim as that profile, while the limits allow.
+fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action>) {
+    if state.stopping != Stopping::No || state.board != BoardHealth::Up {
+        return;
+    }
+    let roles = state.config.roles.len();
+    for ListedTask { view, .. } in tasks {
+        if state.runs.len() >= usize::from(state.config.agents_max) {
+            break;
+        }
+        let holder = view
+            .claim
+            .as_ref()
+            .filter(|_| view.state == TaskState::Claimed);
+        let Some(holder) = holder.map(|claim| claim.holder.as_str()) else {
+            continue;
+        };
+        // The board names a holder `<owner>+<profile>`.
+        let profile = holder
+            .rsplit_once('+')
+            .map_or(holder, |(_, profile)| profile);
+        let held = (0..roles).find_map(|role| {
+            let slots = state.config.roles[role].slots;
+            let slot = (1..=slots).find(|slot| state.profile(role, *slot) == profile)?;
+            Some((role, slot))
+        });
+        let Some((role, slot)) = held else {
+            continue;
+        };
+        let branch = label(&view.labels, "branch");
+        let config = &state.config;
+        let builders = (state.runs.iter()).filter(|run| config.roles[run.role].builds);
+        let full =
+            config.roles[role].builds && builders.count() >= usize::from(config.builders_max);
+        let taken = state.runs.iter().any(|run| {
+            run.task == view.id
+                || (run.role == role && run.slot == slot)
+                || (branch.is_some() && run.branch == branch)
+        });
+        if full || taken {
+            continue;
+        }
+        let task = view.id;
+        let (run, profile) = new_run(state, task, role, slot, branch);
+        actions.push(Action::Resume { run, task, profile });
+    }
+    assert!(state.runs.len() <= usize::from(state.config.agents_max));
+    assert!(branches_unique(&state.runs));
 }
 
 /// The oldest claimable task, its role, and the lowest free slot of that role; a task of a
