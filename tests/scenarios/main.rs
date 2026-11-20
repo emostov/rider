@@ -1203,7 +1203,10 @@ fn rider_down_drains_the_running_agent_claims_nothing_new_and_the_daemon_exits()
 
     let down = thread::scope(|scope| {
         let down = scope.spawn(|| when_rider_runs(&world, &["down"]));
-        thread::sleep(Duration::from_secs(1));
+        assert!(
+            when_rider_status_shows_within(&world, "draining", 30),
+            "rider status never said draining"
+        );
         let later = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
         assert_eq!(
             when_the_task_leaves_ready_within(&world, &later, 3),
@@ -1288,6 +1291,29 @@ fn rider_status_shows_a_running_and_a_waiting_task_and_rider_agents_the_running_
     world.release_agent(&running);
     world.release_agent(&waiting);
     when_the_daemon_is_sent_sigterm(&world);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn rider_status_groups_a_task_open_before_the_daemon_started_under_its_project() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let roleless = NewTask::new("Wait for a role.")
+        .label("repo", world.repo_label())
+        .label("from", MAIN);
+    let task = when_the_lead_creates(&world, &roleless);
+    given_a_running_daemon(&mut world);
+
+    let listed = when_rider_status_shows_within(&world, &format!("#{task} "), 30);
+
+    assert!(listed, "rider status never listed #{task}");
+    let status = when_rider_runs(&world, &["status"]);
+    let lines: Vec<&str> = status.stdout.lines().collect();
+    let at = (lines.iter()).position(|line| line.starts_with(&format!("  #{task} ")));
+    let heading = at.and_then(|at| lines[..at].iter().rev().find(|line| !line.starts_with(' ')));
+    assert_eq!(heading, Some(&PROJECT), "{status:?}");
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }

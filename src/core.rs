@@ -1,6 +1,6 @@
 //! The daemon's decisions for workers: one pure `step` from a state and an event to actions.
 
-use crate::board::{BOARD_CALL_SECONDS_MAX, LABELS_MAX, TaskId, TaskState, TaskView, Timestamp};
+use crate::board::{BOARD_CALL_SECONDS_MAX, LABELS_MAX, ListedTask, TaskId, TaskState, Timestamp};
 use crate::feed::{BoardEvent, Cursor, EventKind};
 use crate::roles::{AGENTS_MAX, BUILDERS_DEFAULT, RoleSpec};
 use crate::settle::Verdict;
@@ -154,7 +154,7 @@ pub struct Task {
     /// Index into the config's roles; `None` when the task has no known role.
     pub role: Option<usize>,
     pub branch: Option<String>,
-    /// The project from the task's channel, once the feed has named it.
+    /// The project the task's channel names under `work/`, if it names one.
     pub project: Option<String>,
     /// The task's board version: the cursor of the newest event this was learned from.
     pub seen: Cursor,
@@ -284,7 +284,7 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRow {
     pub id: TaskId,
-    /// The project from the task's channel, once the feed has named it.
+    /// The project the task's channel names under `work/`, if it names one.
     pub project: Option<String>,
     pub state: TaskState,
     pub role: Option<String>,
@@ -366,7 +366,7 @@ pub enum Event {
     FeedResumed(Cursor),
     /// A listing: its tasks, the cursor read before its first page, and how many it left out.
     Snapshot {
-        tasks: Vec<TaskView>,
+        tasks: Vec<ListedTask>,
         cursor: Cursor,
         left_out: usize,
     },
@@ -950,9 +950,7 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         state: task_state,
         role: role_of(&state.config, &feed.labels),
         branch: label(&feed.labels, "branch"),
-        project: (feed.channel.strip_prefix("work/"))
-            .filter(|project| !project.is_empty())
-            .map(str::to_string),
+        project: project_of(&feed.channel),
         seen: feed.cursor,
         claim_refused: false,
     };
@@ -981,6 +979,15 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
     );
     reserve_branches(state);
     assert!(state.untracked.len() <= UNTRACKED_MAX);
+}
+
+/// The project a task's channel names under `work/`, if it names one.
+fn project_of(channel: &str) -> Option<String> {
+    let project = channel
+        .strip_prefix("work/")
+        .filter(|project| !project.is_empty());
+    assert!(project.is_none_or(|project| channel.ends_with(project)));
+    project.map(str::to_string)
 }
 
 /// A task the last listing may have left out became tracked or closed, so the bound drops.
@@ -1053,7 +1060,7 @@ fn note_closed(state: &mut State, task: TaskId, at: Cursor) {
 }
 
 /// Replaces what the core knows with a snapshot, except what is newer by the task's version.
-fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor, left_out: usize) {
+fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: usize) {
     if cursor < state.closed_unrecorded {
         return;
     }
@@ -1062,11 +1069,11 @@ fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor, left_out: us
     if state.untracked_overflow.is_some_and(|at| at <= cursor) {
         state.untracked_overflow = None;
     }
-    let listed = |id: TaskId| views.iter().find(|view| view.id == id);
-    // A listing names no channel, so a task it replaces keeps the project the feed named.
-    let projects: Vec<(TaskId, String)> = (state.tasks.iter())
-        .filter_map(|task| Some((task.id, task.project.clone()?)))
-        .collect();
+    let listed = |id: TaskId| {
+        (tasks.iter())
+            .find(|task| task.view.id == id)
+            .map(|task| &task.view)
+    };
     // A task the listing omits is gone unless the feed told of it after the listing began.
     state.tasks.retain(|task| match listed(task.id) {
         Some(view) => view.version <= task.seen,
@@ -1079,7 +1086,7 @@ fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor, left_out: us
     let mut listed_untracked: usize = 0;
     // Tasks with a run go first, so a run's task stays known whatever the overflow.
     for with_run in [true, false] {
-        for view in views {
+        for ListedTask { view, channel } in tasks {
             let has_run = state.runs.iter().any(|run| run.task == view.id);
             let newer = state.tasks.iter().any(|task| task.id == view.id)
                 || (state.closed.iter()).any(|(id, at)| *id == view.id && *at >= view.version);
@@ -1104,9 +1111,7 @@ fn reconcile(state: &mut State, views: &[TaskView], cursor: Cursor, left_out: us
                 state: view.state,
                 role: role_of(&state.config, &view.labels),
                 branch: label(&view.labels, "branch"),
-                project: (projects.iter())
-                    .find(|(id, _)| *id == view.id)
-                    .map(|(_, project)| project.clone()),
+                project: project_of(channel),
                 seen: view.version,
                 claim_refused: false,
             });

@@ -545,6 +545,18 @@ pub fn when_rider_runs(world: &World, args: &[&str]) -> crate::world::Output {
     crate::world::run_bounded(command, None)
 }
 
+/// When `rider status` is run until its output contains `text`, for at most `seconds`.
+pub fn when_rider_status_shows_within(world: &World, text: &str, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if when_rider_runs(world, &["status"]).stdout.contains(text) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+    false
+}
+
 /// The command lines of the `vb tail` processes following the world's board as the daemon.
 pub fn daemon_feeds(world: &World) -> Vec<String> {
     let mut command = std::process::Command::new("/bin/ps");

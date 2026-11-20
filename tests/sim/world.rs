@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use rider::board::{TaskId, TaskState, TaskView, Timestamp};
+use rider::board::{ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
     ACTIONS_MAX, Action, BoardHealth, Call, ClientId, Config, Event, FEED_RESTARTS_MAX,
     FEED_UPTIME_MILLIS_MIN, KILLED_REASON, Phase, Reply, Request, RunId, Settlement, State,
@@ -606,7 +606,7 @@ impl World {
             Event::Snapshot { tasks, cursor, .. } => {
                 self.listed_through = self.listed_through.max(cursor.0);
                 // A listing shows every open task it does not leave out, as of its cursor.
-                let listed = |id: &u64| tasks.iter().any(|view| view.id.0 == *id);
+                let listed = |id: &u64| tasks.iter().any(|task| task.view.id.0 == *id);
                 let left_out = &self.left_out;
                 for (id, told) in self.told.iter_mut() {
                     if !listed(id) && !left_out.contains(id) && told.cursor <= cursor.0 {
@@ -614,7 +614,7 @@ impl World {
                         told.state = TaskState::Completed;
                     }
                 }
-                for view in tasks {
+                for ListedTask { view, .. } in tasks {
                     let version = view.version.0;
                     let newer =
                         (self.told.get(&view.id.0)).is_none_or(|told| told.cursor <= version);
@@ -884,15 +884,18 @@ impl World {
         self.listings
             .insert(id, rest.iter().map(|fake| fake.id.0).collect());
         let tasks = (listed.iter())
-            .map(|fake| TaskView {
-                id: fake.id,
-                text: String::new(),
-                state: fake.state,
-                labels: fake.labels.clone(),
-                needs: Vec::new(),
-                epoch: fake.epoch,
-                claim: None,
-                version: Cursor(fake.version),
+            .map(|fake| ListedTask {
+                view: TaskView {
+                    id: fake.id,
+                    text: String::new(),
+                    state: fake.state,
+                    labels: fake.labels.clone(),
+                    needs: Vec::new(),
+                    epoch: fake.epoch,
+                    claim: None,
+                    version: Cursor(fake.version),
+                },
+                channel: "work/sim".to_string(),
             })
             .collect();
         // The cursor is read before the pages, so events may land between the two.

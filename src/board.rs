@@ -110,10 +110,17 @@ pub struct TaskView {
     pub version: Cursor,
 }
 
+/// An open task as a listing shows it, with the channel it is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedTask {
+    pub view: TaskView,
+    pub channel: String,
+}
+
 /// One page of a listing and the cursor the board printed with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPage {
-    pub tasks: Vec<TaskView>,
+    pub tasks: Vec<ListedTask>,
     pub cursor: Cursor,
 }
 
@@ -121,7 +128,7 @@ pub struct TaskPage {
 /// before the first page, so a feed started there replays any change made while paging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
-    pub tasks: Vec<TaskView>,
+    pub tasks: Vec<ListedTask>,
     pub cursor: Cursor,
     /// The open tasks past `TASKS_MAX`, which the listing does not return.
     pub left_out: usize,
@@ -623,6 +630,14 @@ struct WireLease {
 
 #[derive(Deserialize)]
 struct WireListed {
+    message: WireListedMessage,
+}
+
+/// A listed task's message: a task's message and the channel it is in.
+#[derive(Deserialize)]
+struct WireListedMessage {
+    channel: String,
+    #[serde(flatten)]
     message: WireMessage,
 }
 
@@ -813,10 +828,17 @@ pub fn parse_task_list(json: &str) -> Result<TaskPage, BoardError> {
         )));
     }
     let cursor = Cursor(parse_id_text(&listing.cursor)?.0);
-    let tasks: Result<Vec<TaskView>, BoardError> = listing
-        .tasks
-        .into_iter()
-        .map(|listed| view_from_wire(listed.message))
+    let tasks: Result<Vec<ListedTask>, BoardError> = (listing.tasks.into_iter())
+        .map(|listed| {
+            let WireListedMessage { channel, message } = listed.message;
+            if channel.is_empty() {
+                return Err(BoardError::Parse(
+                    "a listed task in an empty channel".into(),
+                ));
+            }
+            let view = view_from_wire(message)?;
+            Ok(ListedTask { view, channel })
+        })
         .collect();
     let tasks = tasks?;
     assert_eq!(tasks.len(), count, "no task was dropped");
@@ -1256,13 +1278,13 @@ impl Board for VbCli {
         );
         let read: WireCursor = parse(&self.read(&Command::Cursor { subtree })?)?;
         let cursor = Cursor(parse_id_text(&read.cursor)?.0);
-        let mut tasks: Vec<TaskView> = Vec::new();
+        let mut tasks: Vec<ListedTask> = Vec::new();
         let mut left_out: usize = 0;
         let mut after: Option<Cursor> = None;
         for _ in 0..LISTING_PAGES_MAX {
             let page = parse_task_list(&self.read(&Command::List { subtree, after })?)?;
             let full = page.tasks.len() == TASKS_PAGE_MAX;
-            let first = page.tasks.first().map(|task| task.id.0);
+            let first = page.tasks.first().map(|task| task.view.id.0);
             if first
                 .zip(after)
                 .is_some_and(|(first, after)| first <= after.0)
@@ -1275,7 +1297,7 @@ impl Board for VbCli {
             }
             // A full page's cursor is its last task's id, where the next page starts; any
             // other page's cursor is the board's event cursor as of the listing.
-            let last = page.tasks.last().map(|task| task.id.0);
+            let last = page.tasks.last().map(|task| task.view.id.0);
             if full && last != Some(page.cursor.0) {
                 return Err(BoardError::Parse(format!(
                     "a full page's cursor {} is not its last task",
@@ -1306,7 +1328,9 @@ pub mod testing {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
-    use super::{Board, BoardError, Listing, TaskId, TaskState, TaskView, check_message};
+    use super::{
+        Board, BoardError, ListedTask, Listing, TaskId, TaskState, TaskView, check_message,
+    };
     use crate::feed::Cursor;
 
     /// Upper bound on the calls one fake board records.
@@ -1428,8 +1452,12 @@ pub mod testing {
             let closed = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
             let tasks = self.tasks.borrow();
             let open = tasks.iter().filter(|task| !closed.contains(&task.state));
+            let listed = open.map(|view| ListedTask {
+                view: view.clone(),
+                channel: "work/fake".into(),
+            });
             Ok(Listing {
-                tasks: open.cloned().collect(),
+                tasks: listed.collect(),
                 cursor: Cursor(0),
                 left_out: 0,
             })
@@ -1857,8 +1885,12 @@ mod tests {
         let mut b = versioned(recorded(4, "task b", &waiting, TaskState::Waiting), 5);
         b.needs = vec![TaskId(2)];
         b.epoch = 0;
+        let listed = |view| ListedTask {
+            view,
+            channel: "work/scratch".into(),
+        };
         let page = TaskPage {
-            tasks: vec![a, b],
+            tasks: vec![listed(a), listed(b)],
             cursor: Cursor(8),
         };
         assert_eq!(parse_task_list(list).unwrap(), page);
@@ -1882,7 +1914,7 @@ mod tests {
     /// event cursor `9999`.
     fn listing_of(count: usize) -> (VbCli, TempDir) {
         let task = concat!(
-            r#"{"message":{"id":"%d","text":"t","labels":{},"#,
+            r#"{"message":{"id":"%d","channel":"work/t","text":"t","labels":{},"#,
             r#""task":{"state":"ready","epoch":0,"needs":[],"claim":null},"version":%d}}"#
         );
         let read = concat!(
@@ -1911,7 +1943,7 @@ printf '],"cursor":"%s"}}\n' $cursor
         let (board, _dir) = listing_of(3);
         let listing = board.list_open("work/");
         let listing = listing.unwrap();
-        let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
+        let ids: Vec<u64> = listing.tasks.iter().map(|task| task.view.id.0).collect();
         assert_eq!(ids, vec![1, 2, 3]);
         assert_eq!((listing.cursor, listing.left_out), (Cursor(6), 0));
     }
@@ -1922,7 +1954,7 @@ printf '],"cursor":"%s"}}\n' $cursor
         let (board, _dir) = listing_of(count);
         let listing = board.list_open("work/");
         let listing = listing.unwrap();
-        let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
+        let ids: Vec<u64> = listing.tasks.iter().map(|task| task.view.id.0).collect();
         let tracked: Vec<u64> = (1..=TASKS_MAX as u64).collect();
         assert_eq!(ids, tracked);
         assert_eq!((listing.cursor, listing.left_out), (Cursor(6), 201));
