@@ -27,8 +27,8 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
 - Never leave a review on a PR: no `gh pr review`, no review comments. Reviewer findings
   stay on the board. Replying to a human's review thread, and resolving it once its fix is
   pushed, is fine.
-- Wait in the background, never poll in the foreground: run each watch as a background
-  command and take a turn when it returns, so the owner can talk to you meanwhile.
+- Wait in the background as `lead.md` step 9 says, never in the foreground: run each watch
+  as a background command and take a turn when it returns.
 - Posting on GitHub publishes. Say what you posted, with its link.
 
 In the commands below, `<repo>` is the repository, `<branch>` the branch being shipped (its
@@ -59,7 +59,7 @@ CI is green.
 ## 2. Watch CI
 
 Choose `<cap>`, the most minutes to wait for CI (the longest the workflows normally run,
-doubled). Run as one background command a bounded poll: every 30 seconds read
+doubled). Run as one background command (the rule in `lead.md` step 9) a bounded poll: every 30 seconds read
 `gh pr checks <n> --json name,bucket,link`, and stop when a check has bucket `fail`, or when
 there are checks and none is `pending`, or when `<cap>` minutes have passed. No checks yet
 (right after a push) counts as still waiting. The cap is tested on every pass, so a check
