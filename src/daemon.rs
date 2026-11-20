@@ -25,6 +25,7 @@ use crate::core::{
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
 use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
+use crate::reap;
 use crate::roles::{AGENTS_MAX, ROLES};
 use crate::run_task::{
     Attempt, Env, Judgement, Prepared, RunError, judge_attempt, launch_agent, prepare_attempt,
@@ -396,6 +397,19 @@ pub fn run(paths: Paths) -> Result<u8, DaemonError> {
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
     let lease_millis = timing.lease_millis;
     let log = Log::start(&paths.home.join(LOG_FILE))?;
+    match reap::find_leaks(&paths.board_url) {
+        Ok(leaks) if leaks.is_empty() => {}
+        Ok(leaks) => {
+            for leak in &leaks {
+                log.write(&format!("leaked {}", reap::leak_line(leak)));
+            }
+            let count = leaks.len();
+            log.write(&format!(
+                "{count} leaked vb processes; rider reap --yes stops them"
+            ));
+        }
+        Err(error) => log.write(&format!("could not look for leaked vb processes: {error}")),
+    }
     let shared = Arc::new(Shared {
         paths,
         events,

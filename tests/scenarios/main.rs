@@ -666,3 +666,60 @@ fn claude_options(session: Option<&str>) -> Vec<String> {
     }
     options
 }
+
+#[test]
+fn reap_lists_and_stops_only_an_orphaned_vb_whose_board_is_gone() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let live = given_another_board(&world, "live-board");
+    let mut gone = given_another_board(&world, "gone-board");
+    let mut orphans = Orphans::default();
+    let on_world = given_an_orphaned_vb_tail(&world, &mut orphans, &world.url.clone());
+    let on_live = given_an_orphaned_vb_tail(&world, &mut orphans, &live.url);
+    let on_gone = given_an_orphaned_vb_tail(&world, &mut orphans, &gone.url);
+    gone.stop();
+
+    let listed = when_rider_runs(&world, &["reap"]);
+
+    assert_eq!(listed.code, Some(0), "{listed:?}");
+    let shown = format!(
+        "pid {on_gone} age <age> vb tail --url {} --as rider-daemon",
+        gone.url
+    );
+    assert_eq!(line_for_pid(&listed.stdout, on_gone), Some(shown));
+    assert_eq!(line_for_pid(&listed.stdout, on_live), None);
+    assert_eq!(line_for_pid(&listed.stdout, on_world), None);
+    assert!(
+        listed
+            .stdout
+            .contains("leaked vb processes; rider reap --yes stops them")
+    );
+    assert!(is_alive(on_gone), "listing stops nothing");
+
+    given_a_running_daemon(&mut world);
+    let logged = format!("leaked pid {on_gone} age ");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let log = || fs::read_to_string(world.home.join("daemon.log")).unwrap_or_default();
+    while !log().contains(&logged) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon logged no leak:\n{}",
+            log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(is_alive(on_gone), "the daemon stops nothing");
+
+    let stopped = when_rider_runs(&world, &["reap", "--yes"]);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    let line = format!("stopped pid {on_gone} with SIGTERM");
+    assert!(stopped.stdout.lines().any(|l| l == line), "{stopped:?}");
+    assert!(when_the_process_ends_within(on_gone, 5));
+    assert!(is_alive(on_live) && is_alive(on_world));
+    let board = world.board.as_mut().expect("the world's board runs");
+    assert_eq!(board.try_wait().expect("poll the board"), None);
+}

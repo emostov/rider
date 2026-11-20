@@ -18,6 +18,7 @@ use crate::harness::{CommandLine, Exit, HarnessError};
 use crate::pool::{
     Effects, Event, Gate, PAUSE_STEP_MILLIS, Slot, SlotEnd, event_line, slot_loop, slots,
 };
+use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{AGENTS_MAX, PROFILE_LEN_MAX};
 use crate::run_task::{Env, RunError, launch_agent, run_task};
 use crate::settle::Verdict;
@@ -30,6 +31,8 @@ pub const USAGE: &str = r#"usage:
   rider pool <project>     run worker slots on the channel work/<project>;
                            type stop or press Ctrl-D to stop after running tasks finish
   rider run-task <id>      one attempt at a task already claimed by $BOARD_PROFILE
+  rider reap [--yes]       list orphaned vb processes whose board no longer answers;
+                           --yes stops them
 
 environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
@@ -91,6 +94,10 @@ pub enum Command {
     Daemon,
     Pool(Project),
     RunTask(TaskId),
+    /// Lists leaked Board CLI processes; `yes` stops them too.
+    Reap {
+        yes: bool,
+    },
 }
 
 /// Arguments rider does not accept.
@@ -143,6 +150,10 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             let project = rest.first().ok_or(UsageError::MissingArgument("project"))?;
             (Command::Pool(Project::parse(project)?), 1)
         }
+        "reap" => match rest.first().map(String::as_str) {
+            Some("--yes") => (Command::Reap { yes: true }, 1),
+            _ => (Command::Reap { yes: false }, 0),
+        },
         "run-task" => {
             let id = rest.first().ok_or(UsageError::MissingArgument("task id"))?;
             (Command::RunTask(parse_task_id(id)?), 1)
@@ -323,6 +334,7 @@ pub enum CliError {
     Run(RunError),
     SlotsFailed(usize),
     Daemon(DaemonError),
+    Reap(ReapError),
 }
 
 impl fmt::Display for CliError {
@@ -345,6 +357,7 @@ impl fmt::Display for CliError {
                 write!(f, "the task is no longer claimed; it is {state:?}")
             }
             CliError::Daemon(error) => write!(f, "{error}"),
+            CliError::Reap(error) => write!(f, "{error}"),
             CliError::SlotsFailed(count) => {
                 write!(f, "{count} slots stopped before they were asked to")
             }
@@ -390,7 +403,41 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Daemon => daemon(config),
         Command::Pool(project) => pool(project, config),
         Command::RunTask(id) => run_one(*id, config),
+        Command::Reap { yes } => reap_leaks(*yes, config),
     }
+}
+
+fn reap_leaks(yes: bool, config: &Config) -> Result<u8, CliError> {
+    let leaks = reap::find_leaks(&config.board_url).map_err(CliError::Reap)?;
+    for leak in &leaks {
+        say(&reap::leak_line(leak));
+    }
+    let count = leaks.len();
+    if !yes {
+        say(&format!(
+            "{count} leaked vb processes; rider reap --yes stops them"
+        ));
+        return Ok(0);
+    }
+    let ends = reap::stop(&leaks);
+    assert_eq!(ends.len(), count);
+    let mut failed = 0_usize;
+    for (leak, end) in leaks.iter().zip(&ends) {
+        match end {
+            Ok(Stopped::Gone) => say(&format!("pid {} had already ended", leak.pid)),
+            Ok(Stopped::Term) => say(&format!("stopped pid {} with SIGTERM", leak.pid)),
+            Ok(Stopped::Kill) => say(&format!("stopped pid {} with SIGKILL", leak.pid)),
+            Err(error) => {
+                failed += 1;
+                say(&format!("could not stop pid {}: {error}", leak.pid));
+            }
+        }
+    }
+    say(&format!(
+        "stopped {} of {count} leaked vb processes",
+        count - failed
+    ));
+    Ok(u8::from(failed > 0))
 }
 
 fn serve(config: &Config) -> Result<u8, CliError> {

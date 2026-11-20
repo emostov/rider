@@ -576,3 +576,143 @@ exec '{}' "$@"
     );
     crate::world::write_executable(&world.vb, &script);
 }
+
+/// A second `vb serve` on a port of its own, killed with its group when it drops.
+pub struct OtherBoard {
+    pub url: String,
+    child: Option<std::process::Child>,
+}
+
+impl OtherBoard {
+    /// Kills the board and waits until its port refuses connections.
+    pub fn stop(&mut self) {
+        let mut child = self.child.take().expect("the board is stopped once");
+        kill_group(child.id());
+        child.wait().expect("wait for the board");
+        let address = self.url.trim_start_matches("http://");
+        let address = address.split('/').next().expect("the URL has an address");
+        let deadline = Instant::now() + Duration::from_secs(OTHER_BOARD_SECONDS_MAX);
+        while std::net::TcpStream::connect(address).is_ok() {
+            assert!(Instant::now() < deadline, "{address} still answers");
+            thread::sleep(Duration::from_millis(POLL_MILLIS));
+        }
+    }
+}
+
+impl Drop for OtherBoard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            kill_group(child.id());
+            let _ = child.wait();
+        }
+    }
+}
+
+const OTHER_BOARD_SECONDS_MAX: u64 = 30;
+const ORPHAN_SECONDS_MAX: u64 = 10;
+
+fn kill_group(pid: u32) {
+    assert!(pid > 1, "never signal init or every process");
+    let _ = std::process::Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Given another board, named `name` under the world, that answers with one channel.
+pub fn given_another_board(world: &World, name: &str) -> OtherBoard {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let port = listener.local_addr().expect("read the bound port").port();
+    drop(listener);
+    assert!(port != 0 && port != 4100, "never the live board's port");
+    let url = format!("http://127.0.0.1:{port}/api/board");
+    let log = fs::File::create(world.root.join(format!("{name}.log"))).expect("create a log");
+    let err = log.try_clone().expect("share the log");
+    let child = world
+        .command(&world.vb)
+        .args([
+            "serve",
+            "--port",
+            &port.to_string(),
+            "--no-open",
+            "--no-inspect",
+        ])
+        .arg("--dir")
+        .arg(world.root.join(name))
+        .stdout(log)
+        .stderr(err)
+        .process_group(0)
+        .spawn()
+        .expect("start vb serve");
+    let board = OtherBoard {
+        url,
+        child: Some(child),
+    };
+    let deadline = Instant::now() + Duration::from_secs(OTHER_BOARD_SECONDS_MAX);
+    let create = ["channels", "create", "scratch", "--url", &board.url];
+    while world.vb_as(crate::world::LEAD, &create, None).code != Some(0) {
+        assert!(Instant::now() < deadline, "the {name} board did not answer");
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+    board
+}
+
+/// Orphaned `vb` processes, killed when this drops so a failed scenario leaks none.
+#[derive(Default)]
+pub struct Orphans(Vec<u32>);
+
+impl Drop for Orphans {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            if is_alive(*pid) {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+/// Given a `vb tail` on `url` whose parent has exited, so its parent is now process 1.
+pub fn given_an_orphaned_vb_tail(world: &World, orphans: &mut Orphans, url: &str) -> u32 {
+    let mut command = world.command(Path::new("/bin/sh"));
+    command
+        .args([
+            "-c",
+            r#""$0" tail --url "$1" --as rider-daemon </dev/null >/dev/null 2>&1 &
+echo $!"#,
+        ])
+        .arg(&world.vb)
+        .arg(url);
+    let output = crate::world::run_bounded(command, None);
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let pid: u32 = output.stdout.trim().parse().expect("sh printed the pid");
+    orphans.0.push(pid);
+    let deadline = Instant::now() + Duration::from_secs(ORPHAN_SECONDS_MAX);
+    while parent_of(pid) != Some(1) {
+        assert!(Instant::now() < deadline, "{pid} was not orphaned");
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+    pid
+}
+
+fn parent_of(pid: u32) -> Option<u32> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .stdin(Stdio::null());
+    let output = crate::world::run_bounded(command, None);
+    output.stdout.trim().parse().ok()
+}
+
+/// The line of `output` that names `pid`, with its age replaced by `<age>`.
+pub fn line_for_pid(output: &str, pid: u32) -> Option<String> {
+    let prefix = format!("pid {pid} age ");
+    let line = output.lines().find(|line| line.starts_with(&prefix))?;
+    let rest = &line[prefix.len()..];
+    let (_, command) = rest.split_once(' ')?;
+    Some(format!("{prefix}<age> {command}"))
+}
