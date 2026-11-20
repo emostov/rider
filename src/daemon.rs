@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
+use fs4::{FileExt, TryLockError};
+use rustix::process::{Pid, Signal, kill_process_group};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
@@ -90,7 +91,7 @@ pub struct Paths {
 /// Why the daemon could not start or keep going.
 #[derive(Debug)]
 pub enum DaemonError {
-    /// Another live process holds the lock.
+    /// Another process holds the lock.
     Held {
         path: PathBuf,
         holder: String,
@@ -190,73 +191,47 @@ impl Timing {
     }
 }
 
-/// The daemon lock under the Rider home, removed when dropped.
+/// The daemon lock under the Rider home, held until dropped or the process ends.
 pub struct Lock {
-    path: PathBuf,
+    _file: File,
 }
 
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // A lock that is already gone needs no removing.
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Takes `daemon.lock` under `home`, taking over a lock whose process is gone.
+/// Takes `daemon.lock` under `home` with an exclusive OS lock and writes our pid into it.
 pub fn take_lock(home: &Path) -> Result<Lock, DaemonError> {
     assert!(home.is_absolute());
     fs::create_dir_all(home).map_err(io_error("create", home))?;
     let path = home.join(LOCK_FILE);
-    let pid = std::process::id();
-    let text = format!("pid {pid} started {}\n", clock_line(SystemTime::now()));
-    for _ in 0..2 {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(text.as_bytes())
-                    .map_err(io_error("write", &path))?;
-                assert!(path.starts_with(home));
-                return Ok(Lock { path });
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if let Some(holder) = live_holder(&path)? {
-                    return Err(DaemonError::Held { path, holder });
-                }
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(io_error("remove", &path)(error)),
-                }
-            }
-            Err(error) => return Err(io_error("create", &path)(error)),
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(io_error("open", &path))?;
+    match FileExt::try_lock(&file) {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            let mut text = String::new();
+            let read = (&file).take(LOCK_BYTES_MAX).read_to_string(&mut text);
+            read.map_err(io_error("read", &path))?;
+            let holder = match one_line(text.trim()) {
+                line if line.is_empty() => "a process that has not written its pid".to_string(),
+                line => line,
+            };
+            return Err(DaemonError::Held { path, holder });
         }
+        Err(TryLockError::Error(error)) => return Err(io_error("lock", &path)(error)),
     }
-    let holder = "a process that took it while it was being taken over".to_string();
-    Err(DaemonError::Held { path, holder })
-}
-
-// The holder named in a lock file, when its process still exists; a malformed lock is held.
-fn live_holder(path: &Path) -> Result<Option<String>, DaemonError> {
-    let mut text = String::new();
-    let file = File::open(path).map_err(io_error("open", path))?;
-    let read = file.take(LOCK_BYTES_MAX).read_to_string(&mut text);
-    read.map_err(io_error("read", path))?;
-    let text = one_line(text.trim());
-    let pid = text
-        .strip_prefix("pid ")
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|pid| pid.parse::<i32>().ok())
-        .and_then(Pid::from_raw);
-    let Some(pid) = pid else {
-        return Ok(Some(format!(
-            "an unreadable lock {text:?}; remove it if no rider runs"
-        )));
-    };
-    assert!(pid.as_raw_nonzero().get() > 0);
-    let alive = match test_kill_process(pid) {
-        Ok(()) => true,
-        Err(error) => error != rustix::io::Errno::SRCH,
-    };
-    Ok(alive.then_some(text))
+    let text = format!(
+        "pid {} started {}\n",
+        std::process::id(),
+        clock_line(SystemTime::now())
+    );
+    file.set_len(0).map_err(io_error("truncate", &path))?;
+    file.write_all(text.as_bytes())
+        .map_err(io_error("write", &path))?;
+    assert!(path.starts_with(home));
+    Ok(Lock { _file: file })
 }
 
 /// What a worker hands back with its result.

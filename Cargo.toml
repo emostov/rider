@@ -29,9 +29,15 @@ name = "fake_agent"
 path = "tests/bin/fake_agent.rs"
 
 [dependencies]
+clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
+process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group"] }
 rustix = { version = "1.1.6", features = ["process"] }
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = "1"
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 
 [dev-dependencies]
 fastrand = "2"
+tempfile = { version = "3.27.0", default-features = false }

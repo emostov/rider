@@ -7,10 +7,11 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use tempfile::{Builder, TempDir};
 
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
@@ -38,8 +39,6 @@ const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const INSTALL_HINT: &str = "install Node 22 and the Board CLI: \
                             npm install --prefix ~/.rider/node @vercel/board";
 
-static WORLDS: AtomicU32 = AtomicU32::new(0);
-
 /// A board, a rider home, and a repository, all removed and stopped when it drops.
 pub struct World {
     pub root: PathBuf,
@@ -53,7 +52,8 @@ pub struct World {
     pub vb: PathBuf,
     pub(crate) board: Option<Child>,
     pub(crate) pool: Option<Pool>,
-    owns_root: bool,
+    /// Holds `root`; taken and removed last, once every process is dead.
+    dir: Option<TempDir>,
 }
 
 /// A running `rider pool` and the standard input that stops it.
@@ -132,16 +132,13 @@ impl World {
         let port = listener.local_addr().expect("read the bound port").port();
         assert!(port != 0 && port != 4100, "never the live board's port");
         let url = format!("http://127.0.0.1:{port}/api/board");
-        let n = WORLDS.fetch_add(1, Ordering::SeqCst);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let name = format!("rider-scenario-{}-{n}-{nanos}", std::process::id());
         let temp = std::env::temp_dir().canonicalize();
-        let root = temp.expect("resolve the temporary directory").join(name);
+        let temp = temp.expect("resolve the temporary directory");
+        let dir = Builder::new().prefix("rider-scenario-").tempdir_in(temp);
+        let dir = dir.expect("create the scenario's directory");
+        let root = dir.path().to_path_buf();
         assert!(root.is_absolute());
-        // Built before the root exists so a failure from its creation on unwinds through Drop.
-        let mut world = World {
+        let world = World {
             repo: root.join("repo"),
             vb: root.join("rider-home/node/node_modules/.bin/vb"),
             home: root.join("rider-home"),
@@ -151,12 +148,8 @@ impl World {
             url,
             board: None,
             pool: None,
-            owns_root: false,
+            dir: Some(dir),
         };
-        if let Err(error) = fs::create_dir(&world.root) {
-            panic!("create the scenario's directory: {error}");
-        }
-        world.owns_root = true;
         let vb_dir = world.vb.parent().expect("vb has a directory");
         for dir in [
             vb_dir,
@@ -597,13 +590,12 @@ impl Drop for World {
         {
             failures.push("the board outlived its kill".to_string());
         }
+        // A live process can still write into the directory, so all die before it is removed.
         if let Err(why) = sweep(self) {
             failures.push(why);
         }
-        let temp = std::env::temp_dir().canonicalize();
-        if self.owns_root
-            && temp.is_ok_and(|temp| self.root.starts_with(temp))
-            && let Err(error) = fs::remove_dir_all(&self.root)
+        if let Some(dir) = self.dir.take()
+            && let Err(error) = dir.close()
         {
             failures.push(format!("removing {}: {error}", self.root.display()));
         }

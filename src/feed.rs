@@ -1,20 +1,23 @@
 //! The board's event feed: a `vb tail --json` child whose lines become typed events.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::mem;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
-use serde_json::{Map, Value};
+use serde::Deserialize;
 
-use crate::board::{BoardError, LABELS_MAX, TaskId, TaskState, VbCli, kill_group_with};
+use crate::board::{
+    BoardError, LABELS_MAX, TaskId, TaskState, VbCli, WireState, kill_group, nullable,
+};
 
 /// Upper bound on one line of the feed, its newline excluded.
 pub const FEED_LINE_BYTES_MAX: usize = 1024 * 1024;
@@ -160,29 +163,17 @@ enum Received {
     End,
 }
 
-/// How a feed signals its process group and reads its child's stdout.
-#[derive(Clone, Copy)]
-struct Seams {
-    signal_group: fn(Pid) -> Result<(), Errno>,
-    read_lines: fn(BufReader<ChildStdout>, &SyncSender<Received>),
-}
-
-const SEAMS: Seams = Seams {
-    signal_group: kill_group_signal,
-    read_lines,
-};
-
-fn kill_group_signal(group: Pid) -> Result<(), Errno> {
-    kill_process_group(group, Signal::KILL)
-}
+/// How a feed reads its child's stdout.
+type ReadLines = fn(BufReader<ChildStdout>, &SyncSender<Received>);
 
 /// A running `vb tail` in its own process group. Dropping it kills the group. After an
 /// error, drop it and start again from the last cursor seen.
 pub struct FeedReader {
-    child: Child,
+    child: Box<dyn ChildWrapper>,
+    /// The child's pid, which names its group.
+    leader: Pid,
     /// The child's group while the child is unreaped; locked across every reap.
     group: Arc<Mutex<Option<Pid>>>,
-    signal_group: fn(Pid) -> Result<(), Errno>,
     lines: Receiver<Received>,
     drained: bool,
     /// The child has exited. It stays unreaped until `finish`, so its pid still names its
@@ -200,10 +191,10 @@ pub struct FeedReader {
 impl FeedReader {
     /// Starts following every event on the board after `after`.
     pub fn start(cli: &VbCli, after: Cursor) -> Result<FeedReader, FeedError> {
-        FeedReader::start_with(cli, after, SEAMS)
+        FeedReader::start_with(cli, after, read_lines)
     }
 
-    fn start_with(cli: &VbCli, after: Cursor, seams: Seams) -> Result<FeedReader, FeedError> {
+    fn start_with(cli: &VbCli, after: Cursor, read: ReadLines) -> Result<FeedReader, FeedError> {
         assert!(!cli.url.is_empty(), "the board URL is never empty");
         assert!(!cli.profile.is_empty(), "the profile is never empty");
         assert!(!cli.vb.as_os_str().is_empty(), "the vb path is never empty");
@@ -218,35 +209,42 @@ impl FeedReader {
             "--as",
             &cli.profile,
         ];
-        let mut child = Command::new(&cli.vb)
+        let mut process = Command::new(&cli.vb);
+        process
             .args(args)
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| FeedError::Spawn(format!("{}: {error}", cli.vb.display())))?;
+            .stderr(Stdio::null());
+        let spawned = CommandWrap::from(process)
+            .wrap(ProcessGroup::leader())
+            .spawn();
+        let mut child =
+            spawned.map_err(|error| FeedError::Spawn(format!("{}: {error}", cli.vb.display())))?;
         let (sender, lines) = sync_channel(LINES_QUEUED_MAX);
-        let started = child
-            .stdout
-            .take()
-            .ok_or_else(|| "no stdout pipe".to_string());
-        let started = started.and_then(|stdout| {
-            let stdout = BufReader::with_capacity(64 * 1024, stdout);
-            let builder = thread::Builder::new().name("vb-tail".into());
-            let read = seams.read_lines;
-            let spawned = builder.spawn(move || read(stdout, &sender));
-            spawned.map_err(|error| format!("starting the reader thread: {error}"))
-        });
-        if let Err(detail) = started {
-            let _ = kill_group_with(&mut child, seams.signal_group, |child| child.kill());
-            return Err(FeedError::Spawn(detail));
-        }
-        let group = Arc::new(Mutex::new(Some(Pid::from_child(&child))));
+        let leader = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+        let started = match (leader, child.stdout().take()) {
+            (Some(leader), Some(stdout)) => {
+                let stdout = BufReader::with_capacity(64 * 1024, stdout);
+                let builder = thread::Builder::new().name("vb-tail".into());
+                let spawned = builder.spawn(move || read(stdout, &sender));
+                let spawned = spawned.map(|_| leader);
+                spawned.map_err(|error| format!("starting the reader thread: {error}"))
+            }
+            (None, _) => Err(format!("pid {} is out of range", child.id())),
+            (_, None) => Err("no stdout pipe".to_string()),
+        };
+        let leader = match started {
+            Ok(leader) => leader,
+            Err(detail) => {
+                let _ = kill_group(child.as_mut());
+                return Err(FeedError::Spawn(detail));
+            }
+        };
+        let group = Arc::new(Mutex::new(Some(leader)));
         Ok(FeedReader {
             child,
+            leader,
             group,
-            signal_group: seams.signal_group,
             lines,
             drained: false,
             exited: false,
@@ -273,7 +271,7 @@ impl FeedReader {
             // The exit is checked before every read, so a descendant that keeps stdout busy
             // cannot postpone it. A killed child is already reaped and no longer polled.
             if !self.exited && self.killed.is_none() {
-                let child = WaitId::Pid(Pid::from_child(&self.child));
+                let child = WaitId::Pid(self.leader);
                 let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
                 let polled = waitid(child, options);
                 self.exited = polled
@@ -338,7 +336,7 @@ impl FeedReader {
             group.is_some() || self.killed.is_some(),
             "only a kill reaps the child"
         );
-        let killed = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
+        let killed = kill_group(self.child.as_mut());
         *group = None;
         killed
     }
@@ -397,7 +395,7 @@ impl FeedStop {
             return Ok(());
         };
         assert!(pid.as_raw_pid() > 1, "never signal the caller's own group");
-        match (SEAMS.signal_group)(pid) {
+        match kill_process_group(pid, Signal::KILL) {
             // Darwin refuses (EPERM) to signal a group whose only member is the exited,
             // unreaped leader: nothing in it is left to stop.
             Ok(()) | Err(Errno::SRCH | Errno::PERM) => Ok(()),
@@ -467,18 +465,54 @@ fn read_lines(mut stdout: BufReader<ChildStdout>, sender: &SyncSender<Received>)
     let _ = sender.send(Received::End);
 }
 
+/// The fields every line of `vb tail --json` carries, whatever its type.
+#[derive(Deserialize)]
+struct WireHead {
+    cursor: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// `message.task` of a task's event.
+#[derive(Deserialize)]
+struct WireTask {
+    state: WireState,
+}
+
+/// The message an event is about.
+#[derive(Deserialize)]
+struct WireMessage {
+    id: String,
+    #[serde(deserialize_with = "nullable")]
+    re: Option<String>,
+    channel: String,
+    labels: BTreeMap<String, String>,
+    /// Absent or null when the message is not a task.
+    task: Option<WireTask>,
+}
+
+#[derive(Deserialize)]
+struct WireActor {
+    id: String,
+}
+
+/// The rest of an event of a type the feed names.
+#[derive(Deserialize)]
+struct WireEvent {
+    message: WireMessage,
+    /// The board leaves `actor` out of what it does itself, such as expiring a lease.
+    actor: Option<WireActor>,
+}
+
 /// One line of `vb tail --json`: `{cursor, type, payload, message, actor}`.
 pub fn parse_event(line: &str) -> Result<FeedEvent, FeedError> {
     if line.len() > FEED_LINE_BYTES_MAX {
         return Err(FeedError::LineTooLong);
     }
-    let value: Value = serde_json::from_str(line)
-        .map_err(|error| FeedError::Parse(format!("a line that is not JSON: {error}")))?;
-    let Value::Object(event) = value else {
-        return Err(FeedError::Parse("a line that is not a JSON object".into()));
-    };
-    let cursor = parse_number(string_field(&event, "cursor")?, "cursor").map(Cursor)?;
-    let kind = match string_field(&event, "type")? {
+    let head: WireHead = serde_json::from_str(line)
+        .map_err(|error| FeedError::Parse(format!("a line that is not an event: {error}")))?;
+    let cursor = parse_number(&head.cursor, "cursor").map(Cursor)?;
+    let kind = match head.kind.as_str() {
         "task.created" => EventKind::TaskCreated,
         "labels.changed" => EventKind::LabelsChanged,
         "task.claimed" => EventKind::TaskClaimed,
@@ -494,16 +528,33 @@ pub fn parse_event(line: &str) -> Result<FeedEvent, FeedError> {
         "message.posted" => EventKind::MessagePosted,
         _ => return Ok(FeedEvent::Other { cursor }),
     };
-    let message = event.get("message").and_then(Value::as_object);
-    let message = message.ok_or_else(|| field_error(cursor, "no message object"))?;
+    let event: WireEvent = serde_json::from_str(line)
+        .map_err(|error| field_error(cursor, &format!("not a {}: {error}", head.kind)))?;
+    let WireEvent { message, actor } = event;
+    if message.labels.len() > LABELS_MAX {
+        return Err(FeedError::TooManyLabels);
+    }
+    let id = parse_number(&message.id, "message.id")?;
+    // A reply's task is its thread's root; any other message is its own root.
+    let task = match &message.re {
+        None => id,
+        Some(root) => parse_number(root, "message.re")?,
+    };
+    if kind.is_task_only() && task != id {
+        return Err(field_error(cursor, "a task event on a reply"));
+    }
+    let actor = actor.map(|actor| actor.id);
+    if actor.as_ref().is_some_and(String::is_empty) {
+        return Err(field_error(cursor, "an empty actor.id"));
+    }
     let known = BoardEvent {
         cursor,
         kind,
-        task: parse_task(message, kind, cursor)?,
-        channel: string_field(message, "channel")?.to_string(),
-        labels: parse_labels(message)?,
-        state: parse_state(message, cursor)?,
-        actor: parse_actor(&event, cursor)?,
+        task: TaskId(task),
+        channel: message.channel,
+        labels: message.labels.into_iter().collect(),
+        state: message.task.map(|task| TaskState::from(task.state)),
+        actor,
     };
     if kind.is_task_only() && known.state.is_none() {
         return Err(field_error(cursor, "a task event with no message.task"));
@@ -518,12 +569,6 @@ fn field_error(cursor: Cursor, detail: &str) -> FeedError {
     FeedError::Parse(format!("event {}: {detail}", cursor.0))
 }
 
-fn string_field<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, FeedError> {
-    assert!(!key.is_empty());
-    let value = object.get(key).and_then(Value::as_str);
-    value.ok_or_else(|| FeedError::Parse(format!("an event with no string {key}")))
-}
-
 /// A cursor or id as the board prints it: canonical decimal, no sign and no leading zeros.
 fn parse_number(text: &str, name: &str) -> Result<u64, FeedError> {
     let canonical = !text.is_empty()
@@ -536,98 +581,14 @@ fn parse_number(text: &str, name: &str) -> Result<u64, FeedError> {
     Ok(number)
 }
 
-/// A reply's task is its thread's root; any other message is its own root.
-fn parse_task(
-    message: &Map<String, Value>,
-    kind: EventKind,
-    cursor: Cursor,
-) -> Result<TaskId, FeedError> {
-    let id = parse_number(string_field(message, "id")?, "message.id")?;
-    let task = match message.get("re") {
-        Some(Value::Null) => id,
-        Some(Value::String(root)) => parse_number(root, "message.re")?,
-        _ => {
-            return Err(field_error(
-                cursor,
-                "message.re is neither null nor a string",
-            ));
-        }
-    };
-    if kind.is_task_only() && task != id {
-        return Err(field_error(cursor, "a task event on a reply"));
-    }
-    Ok(TaskId(task))
-}
-
-fn parse_labels(message: &Map<String, Value>) -> Result<Vec<(String, String)>, FeedError> {
-    let labels = message.get("labels").and_then(Value::as_object);
-    let labels = labels.ok_or_else(|| FeedError::Parse("no message.labels object".into()))?;
-    if labels.len() > LABELS_MAX {
-        return Err(FeedError::TooManyLabels);
-    }
-    let mut result: Vec<(String, String)> = Vec::with_capacity(labels.len());
-    for (key, value) in labels.iter().take(LABELS_MAX) {
-        let value = value.as_str();
-        let value = value.ok_or_else(|| FeedError::Parse(format!("label {key} not a string")))?;
-        result.push((key.clone(), value.to_string()));
-    }
-    assert_eq!(result.len(), labels.len(), "no label was dropped");
-    Ok(result)
-}
-
-fn parse_state(
-    message: &Map<String, Value>,
-    cursor: Cursor,
-) -> Result<Option<TaskState>, FeedError> {
-    let task = match message.get("task") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Object(task)) => task,
-        Some(_) => return Err(field_error(cursor, "message.task is not an object")),
-    };
-    let state = task.get("state").and_then(Value::as_str);
-    let state = state.ok_or_else(|| field_error(cursor, "no string message.task.state"))?;
-    let parsed = match state {
-        "waiting" => TaskState::Waiting,
-        "ready" => TaskState::Ready,
-        "claimed" => TaskState::Claimed,
-        "blocked" => TaskState::Blocked,
-        "completed" => TaskState::Completed,
-        "failed" => TaskState::Failed,
-        "canceled" => TaskState::Canceled,
-        _ => {
-            return Err(field_error(
-                cursor,
-                &format!("unknown task state {state:?}"),
-            ));
-        }
-    };
-    Ok(Some(parsed))
-}
-
-fn parse_actor(event: &Map<String, Value>, cursor: Cursor) -> Result<Option<String>, FeedError> {
-    // The board leaves `actor` out of what it does itself, such as expiring a lease.
-    let actor = match event.get("actor") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Object(actor)) => actor,
-        Some(_) => return Err(field_error(cursor, "actor is not an object")),
-    };
-    let id = actor.get("id").and_then(Value::as_str);
-    let id = id.ok_or_else(|| field_error(cursor, "no string actor.id"))?;
-    if id.is_empty() {
-        return Err(field_error(cursor, "an empty actor.id"));
-    }
-    assert!(id.len() <= FEED_LINE_BYTES_MAX);
-    Ok(Some(id.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::write_executable;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
 
     const PERSON: &str = "local:user:zeke";
     const WORKER: &str = "local:user:zeke+w-1";
@@ -704,22 +665,20 @@ mod tests {
     }
 
     /// A reader over a stand-in `vb` whose script is `body`.
-    fn reader(name: &str, body: &str) -> (FeedReader, PathBuf) {
-        reader_with(name, body, SEAMS)
+    fn reader(body: &str) -> (FeedReader, TempDir) {
+        reader_with(body, read_lines)
     }
 
-    fn reader_with(name: &str, body: &str, seams: Seams) -> (FeedReader, PathBuf) {
-        let unique = format!("rider-feed-{name}-{}", std::process::id());
-        let dir = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&dir).unwrap();
-        let vb = dir.join("vb");
+    fn reader_with(body: &str, read: ReadLines) -> (FeedReader, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let vb = dir.path().join("vb");
         write_executable(&vb, &format!("#!/bin/sh\n{body}"));
         let cli = VbCli {
             vb,
             url: "http://127.0.0.1:1".into(),
             profile: "tester".into(),
         };
-        (FeedReader::start_with(&cli, Cursor(0), seams).unwrap(), dir)
+        (FeedReader::start_with(&cli, Cursor(0), read).unwrap(), dir)
     }
 
     #[test]
@@ -728,9 +687,8 @@ mod tests {
             "head -c {} /dev/zero | tr '\\0' x\necho\n",
             FEED_LINE_BYTES_MAX + 1
         );
-        let (mut feed, dir) = reader("long", &body);
+        let (mut feed, _dir) = reader(&body);
         let result = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert!(matches!(result, Err(FeedError::LineTooLong)), "{result:?}");
     }
 
@@ -740,9 +698,8 @@ mod tests {
             "head -c {} /dev/zero | tr '\\0' x\necho\n",
             FEED_LINE_BYTES_MAX
         );
-        let (mut feed, dir) = reader("bound", &body);
+        let (mut feed, _dir) = reader(&body);
         let result = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert!(matches!(result, Err(FeedError::Parse(_))), "{result:?}");
     }
 
@@ -754,7 +711,7 @@ mod tests {
             path.join("tail-task-expired.json").display(),
             path.join("tail-task-ready.json").display()
         );
-        let (mut feed, dir) = reader("exit", &body);
+        let (mut feed, _dir) = reader(&body);
         let expired = fixture("tail-task-expired.json");
         assert_eq!(feed.next_item().unwrap(), FeedItem::Event(expired));
         let ready = fixture("tail-task-ready.json");
@@ -764,7 +721,6 @@ mod tests {
             FeedItem::Exited { code: Some(3) }
         );
         assert!(matches!(feed.next_item(), Err(FeedError::Ended)));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -775,10 +731,9 @@ mod tests {
             r#"{"cursor":"999","type":"future.event"}"#,
             r#"{"cursor":"8","type":"future.event"}"#,
         );
-        let (mut feed, dir) = reader("skip", &body);
+        let (mut feed, _dir) = reader(&body);
         let first = feed.next_item();
         let second = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert!(matches!(first, Err(FeedError::LineTooLong)), "{first:?}");
         let other = FeedEvent::Other { cursor: Cursor(8) };
         assert_eq!(second.unwrap(), FeedItem::Event(other));
@@ -808,20 +763,18 @@ mod tests {
 
     #[test]
     fn reports_a_signalled_exit_once() {
-        let (mut feed, dir) = reader("signal", "kill -9 $$\n");
+        let (mut feed, _dir) = reader("kill -9 $$\n");
         let exited = feed.next_item();
         let after = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!(exited.unwrap(), FeedItem::Exited { code: None });
         assert!(matches!(after, Err(FeedError::Ended)), "{after:?}");
     }
 
     #[test]
     fn reports_the_exit_while_a_descendant_holds_stdout() {
-        let (mut feed, dir) = reader("descendant", "sleep 30 &\nexit 3\n");
+        let (mut feed, _dir) = reader("sleep 30 &\nexit 3\n");
         let started = Instant::now();
         let exited = feed.next_item();
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!(exited.unwrap(), FeedItem::Exited { code: Some(3) });
         assert!(started.elapsed() < Duration::from_secs(10));
     }
@@ -829,14 +782,11 @@ mod tests {
     #[test]
     fn reports_the_exit_while_a_descendant_keeps_printing() {
         const CALLS_MAX: u32 = 10_000_000;
-        let unique = format!("rider-feed-chatty-pid-{}", std::process::id());
-        let pid_file = std::env::temp_dir().join(unique);
         let body = format!(
-            "while :; do echo '{}'; done &\necho $! > '{}'\nexit 3\n",
+            "while :; do echo '{}'; done &\necho $! > \"$0.pid\"\nexit 3\n",
             r#"{"cursor":"8","type":"future.event"}"#,
-            pid_file.display(),
         );
-        let (mut feed, dir) = reader("chatty", &body);
+        let (mut feed, dir) = reader(&body);
         let started = Instant::now();
         let mut exits = Vec::new();
         for _ in 0..CALLS_MAX {
@@ -851,9 +801,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         drop(feed);
-        let pid = fs::read_to_string(&pid_file).unwrap();
-        fs::remove_file(&pid_file).unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        let pid = fs::read_to_string(dir.path().join("vb.pid")).unwrap();
         assert_eq!(exits, [FeedItem::Exited { code: Some(3) }]);
         assert!(
             elapsed < END_GRACE + Duration::from_secs(2),
@@ -891,12 +839,11 @@ mod tests {
         let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2 3
 exit 3
 "#;
-        let (mut feed, dir) = reader("slow", body);
+        let (mut feed, _dir) = reader(body);
         thread::sleep(Duration::from_millis(400));
         let first = feed.next_item().map_err(|error| error.to_string());
         thread::sleep(END_GRACE + Duration::from_millis(200));
         let rest = drain(&mut feed);
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!(first, other(1));
         let exited = Ok(FeedItem::Exited { code: Some(3) });
         assert_eq!(rest, [other(2), other(3), exited]);
@@ -907,13 +854,12 @@ exit 3
         let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2
 exit 4
 "#;
-        let (mut feed, dir) = reader("zombie", body);
+        let (mut feed, _dir) = reader(body);
         thread::sleep(Duration::from_millis(400));
         let first = feed.next_item().map_err(|error| error.to_string());
         thread::sleep(END_GRACE + Duration::from_millis(200));
         let second = feed.next_item().map_err(|error| error.to_string());
         let rest = drain(&mut feed);
-        fs::remove_dir_all(dir).unwrap();
         assert_eq!([first, second], [other(1), other(2)]);
         assert_eq!(rest, [Ok(FeedItem::Exited { code: Some(4) })]);
     }
@@ -936,22 +882,17 @@ exit 4
 
     #[test]
     fn dropping_the_feed_kills_its_process_group() {
-        let unique = format!("rider-feed-group-pid-{}", std::process::id());
-        let pid_file = std::env::temp_dir().join(unique);
         let body = format!(
-            "sleep 30 >/dev/null &\necho $! > '{}'\ncat '{}'\nsleep 30\n",
-            pid_file.display(),
+            "sleep 30 >/dev/null &\necho $! > \"$0.pid\"\ncat '{}'\nsleep 30\n",
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures/board/tail-task-ready.json")
                 .display()
         );
-        let (mut feed, dir) = reader("group", &body);
+        let (mut feed, dir) = reader(&body);
         let ready = fixture("tail-task-ready.json");
         assert_eq!(feed.next_item().unwrap(), FeedItem::Event(ready));
         drop(feed);
-        let pid = fs::read_to_string(&pid_file).unwrap();
-        fs::remove_file(&pid_file).unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        let pid = fs::read_to_string(dir.path().join("vb.pid")).unwrap();
         assert!(
             gone(pid.trim()),
             "the descendant {} outlived the feed",
@@ -965,42 +906,6 @@ exit 4
         assert!(matches!(result, Err(FeedError::LineTooLong)), "{result:?}");
     }
 
-    static SIGNALS_REFUSED: AtomicU32 = AtomicU32::new(0);
-
-    /// Refuses the first group signal as Darwin does, then signals for real.
-    fn refuse_the_first_signal(group: Pid) -> Result<(), Errno> {
-        if SIGNALS_REFUSED.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Err(Errno::PERM);
-        }
-        kill_group_signal(group)
-    }
-
-    #[test]
-    fn reports_a_descendant_that_survives_the_group_kill() {
-        let unique = format!("rider-feed-survivor-pid-{}", std::process::id());
-        let pid_file = std::env::temp_dir().join(unique);
-        let body = format!(
-            "sleep 30 >/dev/null &\necho $! > '{}'\nexit 3\n",
-            pid_file.display()
-        );
-        let seams = Seams {
-            signal_group: refuse_the_first_signal,
-            read_lines,
-        };
-        let (mut feed, dir) = reader_with("survivor", &body, seams);
-        let result = feed.next_item();
-        drop(feed);
-        let pid = fs::read_to_string(&pid_file).unwrap();
-        fs::remove_file(&pid_file).unwrap();
-        fs::remove_dir_all(dir).unwrap();
-        assert!(matches!(result, Err(FeedError::Kill(_))), "{result:?}");
-        assert!(
-            gone(pid.trim()),
-            "the descendant {} outlived the feed",
-            pid.trim()
-        );
-    }
-
     /// Starts reading only after `vb` has exited and its group has been killed.
     fn read_lines_late(stdout: BufReader<ChildStdout>, sender: &SyncSender<Received>) {
         thread::sleep(END_GRACE + Duration::from_millis(500));
@@ -1012,13 +917,8 @@ exit 4
         let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2 3
 exit 3
 "#;
-        let seams = Seams {
-            signal_group: kill_group_signal,
-            read_lines: read_lines_late,
-        };
-        let (mut feed, dir) = reader_with("late", body, seams);
+        let (mut feed, _dir) = reader_with(body, read_lines_late);
         let items = drain(&mut feed);
-        fs::remove_dir_all(dir).unwrap();
         let exited = Ok(FeedItem::Exited { code: Some(3) });
         assert_eq!(items, [other(1), other(2), other(3), exited]);
     }
