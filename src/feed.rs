@@ -623,8 +623,8 @@ fn parse_actor(event: &Map<String, Value>, cursor: Cursor) -> Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::write_executable;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
@@ -713,8 +713,7 @@ mod tests {
         let dir = std::env::temp_dir().join(unique);
         fs::create_dir_all(&dir).unwrap();
         let vb = dir.join("vb");
-        fs::write(&vb, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&vb, &format!("#!/bin/sh\n{body}"));
         let cli = VbCli {
             vb,
             url: "http://127.0.0.1:1".into(),
