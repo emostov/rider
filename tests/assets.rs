@@ -219,3 +219,23 @@ fn reviewers_clear_leftovers_only_on_a_retry_and_ask_when_the_branch_was_rewritt
         );
     }
 }
+
+#[test]
+fn testers_use_the_work_from_outside_and_report_findings_without_fixing() {
+    let prompt = asset("prompts/qa.md");
+    let rules = [
+        "The `of=<id>` label on\n   your task names the task under test.",
+        "scratch=$(mktemp -d)",
+        r#"rm -r "$scratch""#,
+        "the unhappy paths",
+        "--schema rider-finding@1",
+        "Never fix code.",
+        "push, or publish",
+        "remove each with `rm -r <path>`",
+        "a change to a tracked file: do not touch it",
+        "No blocking findings.",
+    ];
+    for rule in rules {
+        assert!(prompt.contains(rule), "prompts/qa.md lacks {rule:?}");
+    }
+}

@@ -112,6 +112,7 @@ The `role` label on a task picks the agent. A task is claimable only once it has
 | `review` | Sol 6.1 | Codex | Review <n> (Sol 6.1) | no |
 | `polish` | Sonnet 5.5 | Claude Code | Polish <n> (Sonnet 5.5) | yes |
 | `security` | Mythos 5.2 | Claude Code | Security <n> (Mythos 5.2) | no |
+| `qa` | Opus 5.5 | Claude Code | QA <n> (Opus 5.5) | no |
 
 The lead is Fable 5.2 in Claude Code, with the board profile `lead-fable-5-2`. Each worker's
 board profile is `<role>-<n>-<model>`, such as `implement-1-opus-5-5`. The table is defined
@@ -121,12 +122,12 @@ once, in `src/roles.rs`.
 
 | Label | Set by | Value |
 |---|---|---|
-| `role` | lead, required, set last | `implement`, `light`, `review`, `polish`, or `security` |
+| `role` | lead, required, set last | `implement`, `light`, `review`, `polish`, `security`, or `qa` |
 | `repo` | lead, required | absolute path of the target git repository |
 | `base` | lead | id of the task whose branch this one is cut from |
 | `from` | lead, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | lead | id of a task whose existing branch this task works on directly |
-| `of` | lead, required for `review` and `security` | id of the task under review |
+| `of` | lead, required for `review`, `security`, and `qa` | id of the task under review |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |

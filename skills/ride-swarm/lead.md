@@ -46,6 +46,7 @@ yours: decide, say why in one line, and move.
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
 | `polish` | Sonnet 5.5 | `polish-<n>-sonnet-5-5` | Polish <n> (Sonnet 5.5) | yes |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
+| `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
 `light` is a cheaper implementer with the same instructions as `implement`. Use it only
 when the brief already says exactly what to change and how to prove it: a restack, a rename,
@@ -62,12 +63,12 @@ worker take it again.
 
 | Label | Set by | Value |
 |---|---|---|
-| `role` | you, required | `implement`, `light`, `review`, `polish`, or `security` |
+| `role` | you, required | `implement`, `light`, `review`, `polish`, `security`, or `qa` |
 | `repo` | you, required | absolute path of the target git repository |
 | `base` | you | id of the task whose branch this one is cut from |
 | `from` | you, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | you | id of a task whose existing branch this task works on directly |
-| `of` | you, required for `review` and `security` | id of the task under review |
+| `of` | you, required for `review`, `security`, and `qa` | id of the task under review |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |
@@ -80,9 +81,9 @@ always the last label a task gets (see "Creating a plan").
 
 Rider checks these before starting a worker, and blocks the task as `invalid_brief` when one
 fails: `role` is present and known; `repo` is absolute and a git repository; `base`, `onto`,
-and `of` are task ids; `base` and `onto` are not both set; `review` and `security` have `of`;
-`from` is a valid branch name; the task named by `base`, `onto`, or `of` has a `branch`
-label that names a local branch. Only a task's own `branch` label that names a branch other
+and `of` are task ids; `base` and `onto` are not both set; `review`, `security`, and `qa`
+have `of`; `from` is a valid branch name; the task named by `base`, `onto`, or `of` has a
+`branch` label that names a local branch. Only a task's own `branch` label that names a branch other
 than the one its worktree is on blocks as `rider_error`. A branch checked out in another
 task's worktree blocks as `branch_busy`.
 
@@ -96,7 +97,7 @@ These rules are yours to keep. Rider does not check them:
   that has none.
 - An `onto` task must `need` every unfinished task on that branch. Otherwise two workers
   change one branch, and one is blocked or builds on the other's half-done work.
-- A `review` or `security` task must `need` its `of` task. Otherwise it reviews unfinished
+- A `review`, `security`, or `qa` task must `need` its `of` task. Otherwise it reviews unfinished
   work, or is blocked for a missing `branch`.
 - Stacks are linear: a task sees only its base's ancestry, and Rider never merges. If a task
   needs code from two sibling branches, sequence them into one stack.
@@ -128,6 +129,10 @@ These rules are yours to keep. Rider does not check them:
 - `security` is one task per stack, after polish, and for any task you judge sensitive:
   `of=<the top task>`, and `needs` every polish task in the stack, so it never runs while
   polish still moves a branch. Name the range in the brief, such as `main..HEAD`.
+- `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI. It
+  runs after the task's review: `of=<the task under test>`, and `needs` that task and its
+  review. Its brief names the flows to exercise and the unhappy paths that matter. It builds
+  the work and uses it from the outside, and reports `rider-finding@1` records like a review.
 - A completed task is a claim, not proof. Its review, or its proof command, is the check.
 
 ## Creating a plan

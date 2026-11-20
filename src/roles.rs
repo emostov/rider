@@ -15,6 +15,8 @@ pub struct RoleSpec {
     pub harness: Harness,
     pub model: &'static str,
     pub commits_expected: bool,
+    /// The role's name for people, such as "Implement" or "QA".
+    pub title: &'static str,
     /// The model's name for people, such as "Opus 5.5".
     pub model_name: &'static str,
     /// The model's name inside a Board profile, such as "opus-5-5".
@@ -29,12 +31,13 @@ pub const AGENTS_MAX: u8 = 4;
 /// The longest profile name the board accepts.
 pub const PROFILE_LEN_MAX: usize = 32;
 
-pub const ROLES: [RoleSpec; 5] = [
+pub const ROLES: [RoleSpec; 6] = [
     RoleSpec {
         label: "implement",
         harness: Harness::Claude,
         model: "claude-opus-5-5",
         commits_expected: true,
+        title: "Implement",
         model_name: "Opus 5.5",
         model_slug: "opus-5-5",
         slots: 2,
@@ -45,6 +48,7 @@ pub const ROLES: [RoleSpec; 5] = [
         harness: Harness::Claude,
         model: "claude-sonnet-5-5",
         commits_expected: true,
+        title: "Light",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
         slots: 2,
@@ -55,6 +59,7 @@ pub const ROLES: [RoleSpec; 5] = [
         harness: Harness::Codex,
         model: "gpt-6.1-sol",
         commits_expected: false,
+        title: "Review",
         model_name: "Sol 6.1",
         model_slug: "sol-6-1",
         slots: 2,
@@ -65,6 +70,7 @@ pub const ROLES: [RoleSpec; 5] = [
         harness: Harness::Claude,
         model: "claude-sonnet-5-5",
         commits_expected: true,
+        title: "Polish",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
         slots: 1,
@@ -75,10 +81,22 @@ pub const ROLES: [RoleSpec; 5] = [
         harness: Harness::Claude,
         model: "claude-mythos-5-2",
         commits_expected: false,
+        title: "Security",
         model_name: "Mythos 5.2",
         model_slug: "mythos-5-2",
         slots: 1,
         prompt_file: "security.md",
+    },
+    RoleSpec {
+        label: "qa",
+        harness: Harness::Claude,
+        model: "claude-opus-5-5",
+        commits_expected: false,
+        title: "QA",
+        model_name: "Opus 5.5",
+        model_slug: "opus-5-5",
+        slots: 1,
+        prompt_file: "qa.md",
     },
 ];
 
@@ -130,7 +148,7 @@ pub fn profile_name(spec: &RoleSpec, slot: u8) -> String {
     profile
 }
 
-/// The name of one agent for people, `<Label> <slot> (<model_name>)`, such as
+/// The name of one agent for people, `<title> <slot> (<model_name>)`, such as
 /// `Implement 1 (Opus 5.5)`. `slot` counts from 1.
 pub fn display_name(spec: &RoleSpec, slot: u8) -> String {
     assert!(
@@ -138,14 +156,9 @@ pub fn display_name(spec: &RoleSpec, slot: u8) -> String {
         "slot {slot} outside 1..={}",
         spec.slots
     );
-    assert!(spec.label.is_ascii() && !spec.label.is_empty());
-    let (first, rest) = spec.label.split_at(1);
-    let name = format!(
-        "{}{rest} {slot} ({})",
-        first.to_ascii_uppercase(),
-        spec.model_name
-    );
-    assert!(name.len() > spec.label.len() + spec.model_name.len());
+    assert!(spec.title.eq_ignore_ascii_case(spec.label));
+    let name = format!("{} {slot} ({})", spec.title, spec.model_name);
+    assert!(name.len() > spec.title.len() + spec.model_name.len());
     name
 }
 
@@ -178,6 +191,12 @@ mod tests {
         assert!(light.commits_expected);
         assert_eq!(light.slots, 2);
         assert_eq!(light.prompt_file, "implement.md");
+        let qa = role_from_label("qa").unwrap();
+        assert_eq!(qa.model, "claude-opus-5-5");
+        assert!(matches!(qa.harness, Harness::Claude));
+        assert!(!qa.commits_expected);
+        assert_eq!(qa.slots, 1);
+        assert_eq!(qa.prompt_file, "qa.md");
         assert!(role_from_label("lead").is_none());
         assert!(role_from_label("").is_none());
         assert!(ROLES.iter().map(|r| r.slots).sum::<u8>() >= AGENTS_MAX);
@@ -195,6 +214,9 @@ mod tests {
         let light = role_from_label("light").unwrap();
         assert_eq!(profile_name(light, 1), "light-1-sonnet-5-5");
         assert_eq!(display_name(light, 2), "Light 2 (Sonnet 5.5)");
+        let qa = role_from_label("qa").unwrap();
+        assert_eq!(profile_name(qa, 1), "qa-1-opus-5-5");
+        assert_eq!(display_name(qa, 1), "QA 1 (Opus 5.5)");
     }
 
     #[test]
