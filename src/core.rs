@@ -51,6 +51,8 @@ pub const FEED_RESTARTS_MAX: u8 = 10;
 pub const FEED_UPTIME_MILLIS_MIN: u64 = 60 * 1000;
 
 /// The failure reason of a task whose agent the owner killed.
+/// Upper bound on the agent records and pid files a crashed daemon's recovery reads.
+pub const LEFTOVERS_MAX: usize = 4 * AGENTS_MAX as usize * 2;
 pub const KILLED_REASON: &str = "killed by the owner";
 
 /// One role as the core sees it: its label, its profile's model part, its slots, and whether
@@ -506,6 +508,8 @@ pub struct State {
     /// The first snapshot was taken, and the claims it showed held by the core's profiles were
     /// resumed.
     recovered: bool,
+    /// Tasks whose claims are left to lapse, not resumed: an agent from before may still run.
+    unaccounted: Unaccounted,
     exited: bool,
 }
 
@@ -536,10 +540,23 @@ impl State {
             down_clients: Vec::new(),
             log_clients: Vec::new(),
             recovered: false,
+            unaccounted: Unaccounted::Tasks(Vec::new()),
             exited: false,
         };
         assert!(state.runs.is_empty());
         state
+    }
+
+    /// Leaves the claims of `unaccounted` tasks to their leases instead of resuming them.
+    pub fn leave_to_lease(&mut self, unaccounted: Unaccounted) {
+        assert!(
+            !self.recovered,
+            "recovery decides before the first snapshot"
+        );
+        if let Unaccounted::Tasks(tasks) = &unaccounted {
+            assert!(tasks.len() <= LEFTOVERS_MAX);
+        }
+        self.unaccounted = unaccounted;
     }
 
     pub fn config(&self) -> &Config {
@@ -1660,10 +1677,16 @@ fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action
     if state.stopping != Stopping::No || state.board != BoardHealth::Up {
         return;
     }
+    let Unaccounted::Tasks(unaccounted) = state.unaccounted.clone() else {
+        return;
+    };
     let roles = state.config.roles.len();
     for ListedTask { view, .. } in tasks {
         if state.runs.len() >= usize::from(state.config.agents_max) {
             break;
+        }
+        if unaccounted.contains(&view.id) {
+            continue;
         }
         let holder = view
             .claim
@@ -1824,4 +1847,82 @@ fn finish_stopping(state: &mut State, actions: &mut Vec<Action>) {
     actions.push(Action::Exit(0));
     assert!(state.runs.is_empty());
     assert!(state.pending_claims.is_empty());
+}
+
+/// An agent a crashed daemon recorded: its task, process group, and the leader's start time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub task: TaskId,
+    pub group: i32,
+    /// When the group's leader started, in seconds since the epoch.
+    pub start: u64,
+}
+
+/// A pid file a crashed daemon left for `task`: the group it names, if readable, and the
+/// record acknowledging that group, if one was written and is readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidFile {
+    pub task: TaskId,
+    pub group: Option<i32>,
+    pub ack: Option<AgentRecord>,
+}
+
+/// Tasks a crashed daemon may still have an agent for that recovery could not identify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unaccounted {
+    Tasks(Vec<TaskId>),
+    /// Neither the agents file nor the pid files could be read.
+    Every,
+}
+
+/// What recovery after a crash does: the groups to stop, and the tasks to leave to their leases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovery {
+    pub stop: Vec<AgentRecord>,
+    pub unaccounted: Unaccounted,
+}
+
+/// Decides recovery from the agents file and the pid files, `None` where unreadable; `started`
+/// gives the start time of a live group's leader. A group is stopped only when its leader
+/// started when a record says; a live group a pid file names that no record identifies leaves
+/// its task unaccounted.
+pub fn recover(
+    records: Option<&[AgentRecord]>,
+    pid_files: Option<&[PidFile]>,
+    started: &dyn Fn(i32) -> Option<u64>,
+) -> Recovery {
+    assert!(records.is_none_or(|records| records.len() <= LEFTOVERS_MAX));
+    assert!(pid_files.is_none_or(|files| files.len() <= LEFTOVERS_MAX));
+    let acks = pid_files
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|file| file.ack);
+    let mut stop: Vec<AgentRecord> = Vec::new();
+    for record in records.unwrap_or_default().iter().copied().chain(acks) {
+        let known = stop.iter().any(|stopped| stopped.group == record.group);
+        if record.group > 1 && !known && started(record.group) == Some(record.start) {
+            stop.push(record);
+        }
+    }
+    let unaccounted = match pid_files {
+        None if records.is_none() => Unaccounted::Every,
+        None => Unaccounted::Tasks(Vec::new()),
+        Some(files) => {
+            let mut tasks: Vec<TaskId> = Vec::new();
+            for file in files {
+                let identified = file.group.is_some_and(|group| {
+                    group <= 1
+                        || started(group).is_none()
+                        || stop.iter().any(|record| record.group == group)
+                });
+                if !identified && !tasks.contains(&file.task) {
+                    tasks.push(file.task);
+                }
+            }
+            Unaccounted::Tasks(tasks)
+        }
+    };
+    assert!(stop.len() <= 2 * LEFTOVERS_MAX);
+    assert!(stop.iter().all(|record| record.group > 1));
+    Recovery { stop, unaccounted }
 }

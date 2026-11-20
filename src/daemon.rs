@@ -25,8 +25,8 @@ use crate::board::{
 use crate::cli::with_vb_on_path;
 use crate::config::Limits;
 use crate::core::{
-    self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, Call, Config, Event, LEASE_MILLIS, RunId,
-    Settlement, State, Stopping,
+    self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, AgentRecord, Call, Config, Event, LEASE_MILLIS,
+    LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
 use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
@@ -95,15 +95,26 @@ const AGENTS_BYTES_MAX: u64 = 64 * 1024;
 const CURSOR_BYTES_MAX: u64 = 32;
 /// Upper bound on the agents `agents.json` names: every group of every attempt.
 const AGENT_RECORDS_MAX: usize = AGENTS_MAX as usize * AGENT_GROUPS_MAX;
-/// Upper bound on the entries read from the agents directory when clearing it.
+/// Upper bound on the entries read from the agents directory.
 const AGENT_FILES_MAX: usize = 4 * AGENT_RECORDS_MAX;
+const _: () = assert!(AGENT_FILES_MAX <= LEFTOVERS_MAX);
+const ACK_BYTES_MAX: u64 = 64;
 /// Upper bound on the agent starts and ends waiting for the recorder.
 const RECORDER_QUEUE_MAX: usize = 4 * AGENTS_MAX as usize;
 /// How often the recorder looks for a pid file that has appeared or changed.
 const RECORD_POLL_MILLIS: u64 = 100;
 const RECORDER_ROUNDS_MAX: u64 = u64::MAX;
-// Writes its own pid, which is its process group, then becomes the agent.
-const PID_WRAPPER: &str = r#"echo $$ > "$RIDER_AGENT_PID_FILE" && exec "$@""#;
+// Writes its own pid, which is its process group, then becomes the agent only once the daemon
+// has recorded that group in `agents.json` and acknowledged it, naming the pid, in the ack file.
+// Unacknowledged after about 30 s, it exits without starting the agent.
+const PID_WRAPPER: &str = r#"echo $$ > "$RIDER_AGENT_PID_FILE" || exit 1
+n=0
+until read -r group start 2>/dev/null < "$RIDER_AGENT_ACK_FILE" && [ "$group" = "$$" ]; do
+  n=$((n + 1))
+  [ "$n" -gt 600 ] && exit 1
+  sleep 0.05
+done
+exec "$@""#;
 
 /// Where the daemon's files are and how it reaches the board and its agents.
 pub struct Paths {
@@ -385,6 +396,13 @@ fn pid_file(home: &Path, task: TaskId) -> PathBuf {
     path
 }
 
+// The file acknowledging that the group a pid file names is recorded in `agents.json`.
+fn ack_file(pid_file: &Path) -> PathBuf {
+    let path = pid_file.with_extension("ack");
+    assert!(path != pid_file);
+    path
+}
+
 /// Runs the daemon in the foreground until it is stopped; returns its exit code.
 /// Runs the daemon on the role table `roles` under `limits` until it is told to stop.
 pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, DaemonError> {
@@ -406,7 +424,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
     let lease_millis = timing.lease_millis;
     let log = Log::start(&paths.home.join(LOG_FILE))?;
-    stop_leftovers(&paths.home, timing.grace_millis, &log);
+    let unaccounted = stop_leftovers(&paths.home, timing.grace_millis, &log);
     let saved_cursor = read_cursor(&paths.home, &log);
     let recorder = start_recorder(paths.home.clone())?;
     match reap::find_leaks(&paths.board_url) {
@@ -450,6 +468,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     config.lease_millis = lease_millis;
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
+    state.leave_to_lease(unaccounted);
     let code = drive(&mut state, &inputs, &jobs, &shared);
     save_cursor(&shared, state.cursor());
     shared.socket.close();
@@ -788,6 +807,10 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     let vb_dir = vb_dir.unwrap_or_else(|| "/".to_string());
     let inherited = shared.paths.inherited_path.clone();
     let pid_text = pid_file.to_string_lossy().into_owned();
+    let ack = ack_file(&pid_file);
+    let ack_text = ack.to_string_lossy().into_owned();
+    // A stale acknowledgement must never release a new agent whose pid happens to match it.
+    let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let cmd = with_vb_on_path(cmd, &vb_dir, inherited.as_deref());
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
@@ -795,6 +818,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
         args.extend(cmd.args.iter().cloned());
         let mut env = cmd.env.clone();
         env.push(("RIDER_AGENT_PID_FILE".to_string(), pid_text.clone()));
+        env.push(("RIDER_AGENT_ACK_FILE".to_string(), ack_text.clone()));
         let wrapped = CommandLine {
             program: "/bin/sh".to_string(),
             args,
@@ -806,6 +830,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     let _ = shared.recorder.send(Recorded::Started(task));
     let launched = attempt.launch(&launch);
     // The agent is gone, so its pid may be reused: nothing may signal it any more.
+    let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&pid_file);
     let _ = shared.recorder.send(Recorded::Ended(task));
     Input {
@@ -1294,7 +1319,7 @@ fn clock_line(now: SystemTime) -> String {
 /// One running agent as `agents.json` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentRecord {
+struct WireAgent {
     task: u64,
     group: i32,
     /// When the group's leader started, in seconds since the epoch.
@@ -1304,7 +1329,7 @@ struct AgentRecord {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentsFile {
-    agents: Vec<AgentRecord>,
+    agents: Vec<WireAgent>,
 }
 
 /// What the recorder is told by the workers that run agents.
@@ -1387,48 +1412,114 @@ fn read_agents(home: &Path) -> Result<Vec<AgentRecord>, String> {
     if file.agents.len() > AGENT_RECORDS_MAX {
         return Err(format!("names more than {AGENT_RECORDS_MAX} agents"));
     }
-    Ok(file.agents)
+    let records = file.agents.iter().map(|agent| AgentRecord {
+        task: TaskId(agent.task),
+        group: agent.group,
+        start: agent.start,
+    });
+    Ok(records.collect())
 }
 
-/// Stops each agent a crashed daemon left running: only a group that still exists and whose
-/// leader started when `agents.json` says, so a reused pid is never signalled.
-fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) {
+// The pid files under `home`, each with its acknowledgement; a missing directory holds none.
+fn read_pid_files(home: &Path) -> Result<Vec<PidFile>, String> {
+    let entries = match fs::read_dir(home.join(AGENTS_DIR)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut files = Vec::new();
+    for (count, entry) in entries.enumerate() {
+        if count >= AGENT_FILES_MAX {
+            return Err(format!("more than {AGENT_FILES_MAX} files"));
+        }
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().is_none_or(|extension| extension != "pid") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|stem| stem.to_str());
+        let Some(task) = stem.and_then(|stem| stem.parse::<u64>().ok()).map(TaskId) else {
+            return Err(format!("{} names no task", path.display()));
+        };
+        let group = agent_group(&path).map(|group| group.as_raw_nonzero().get());
+        let ack =
+            read_ack(&ack_file(&path)).map(|(group, start)| AgentRecord { task, group, start });
+        files.push(PidFile { task, group, ack });
+    }
+    assert!(files.len() <= AGENT_FILES_MAX);
+    Ok(files)
+}
+
+// The group and start time an ack file names, while it is there and well formed.
+fn read_ack(path: &Path) -> Option<(i32, u64)> {
+    let text = read_bounded(path, ACK_BYTES_MAX).ok()?;
+    let (group, start) = text.trim().split_once(' ')?;
+    Some((group.parse().ok()?, start.parse().ok()?))
+}
+
+/// Stops each agent a crashed daemon left running, only a group whose leader started when a
+/// record says, so a reused pid is never signalled; returns the tasks to leave to their leases.
+fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
     assert!(grace_millis > 0);
-    let records = read_agents(home).unwrap_or_else(|error| {
-        log.write(&format!("ignored {AGENTS_FILE}: {error}"));
-        Vec::new()
-    });
-    let mut groups: Vec<Pid> = Vec::with_capacity(records.len());
-    for record in &records {
-        let group = Pid::from_raw(record.group).filter(|_| record.group > 1);
-        let Some(group) = group.filter(|group| test_kill_process_group(*group).is_ok()) else {
+    let records = read_agents(home)
+        .inspect_err(|error| log.write(&format!("could not read {AGENTS_FILE}: {error}")))
+        .ok();
+    let pid_files = read_pid_files(home)
+        .inspect_err(|error| log.write(&format!("could not read the pid files: {error}")))
+        .ok();
+    let started = |group: i32| {
+        let group = Pid::from_raw(group).filter(|group| test_kill_process_group(*group).is_ok());
+        group.and_then(start_time)
+    };
+    let recovery = core::recover(records.as_deref(), pid_files.as_deref(), &started);
+    let mut groups: Vec<(Pid, u64)> = Vec::with_capacity(recovery.stop.len());
+    for record in &recovery.stop {
+        let Some(group) = Pid::from_raw(record.group) else {
             continue;
         };
-        if start_time(group) == Some(record.start) {
-            log.write(&format!(
-                "stopping #{} left from before: group {}",
-                record.task, record.group
-            ));
-            let _ = kill_process_group(group, Signal::TERM);
-            groups.push(group);
-        }
+        let (task, raw) = (record.task.0, record.group);
+        log.write(&format!("stopping #{task} left from before: group {raw}"));
+        let _ = kill_process_group(group, Signal::TERM);
+        groups.push((group, record.start));
     }
     let polls = grace_millis.div_ceil(STOP_POLL_MILLIS);
     for _ in 0..polls {
-        groups.retain(|group| test_kill_process_group(*group).is_ok());
+        groups.retain(|(group, _)| test_kill_process_group(*group).is_ok());
         if groups.is_empty() {
             break;
         }
         thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
     }
-    for group in &groups {
-        let _ = kill_process_group(*group, Signal::KILL);
+    for (group, start) in &groups {
+        // A pid that is a live group's id is never reused, so a group whose leader has exited
+        // is still the one stopped; a leader that started at another time is a reused pid.
+        if test_kill_process_group(*group).is_ok()
+            && start_time(*group).is_none_or(|now| now == *start)
+        {
+            let _ = kill_process_group(*group, Signal::KILL);
+        }
+    }
+    match &recovery.unaccounted {
+        Unaccounted::Every => {
+            log.write(
+                "leaving every held claim to its lease: no agent from before is accounted for",
+            );
+        }
+        Unaccounted::Tasks(tasks) => {
+            for task in tasks {
+                let line = format!(
+                    "leaving #{} to its lease: an agent from before may still run",
+                    task.0
+                );
+                log.write(&line);
+            }
+        }
     }
     clear_agents(home, log);
-    assert!(groups.len() <= AGENT_RECORDS_MAX);
+    assert!(groups.len() <= LEFTOVERS_MAX);
+    recovery.unaccounted
 }
 
-// Removes the agents file and every pid file, which name no agent of this daemon.
+// Removes the agents file and every pid and ack file, which name no agent of this daemon.
 fn clear_agents(home: &Path, log: &Log) {
     let agents = home.join(AGENTS_FILE);
     if let Err(error) = fs::remove_file(&agents)
@@ -1441,7 +1532,10 @@ fn clear_agents(home: &Path, log: &Log) {
     };
     for entry in entries.take(AGENT_FILES_MAX).flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|extension| extension == "pid") {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "pid" || extension == "ack")
+        {
             let _ = fs::remove_file(&path);
         }
     }
@@ -1457,10 +1551,11 @@ fn start_recorder(home: PathBuf) -> Result<SyncSender<Recorded>, DaemonError> {
 }
 
 // Keeps `agents.json` naming the group of each running agent, as its pid file names it, until
-// the daemon drops its recorder.
+// the daemon drops its recorder; acknowledges each group once a written `agents.json` names it.
 fn record_agents(home: &Path, told: &Receiver<Recorded>) {
-    let mut running: Vec<(TaskId, Option<AgentRecord>)> = Vec::new();
-    let mut written: Vec<AgentRecord> = Vec::new();
+    let mut running: Vec<(TaskId, Option<WireAgent>)> = Vec::new();
+    let mut written: Vec<WireAgent> = Vec::new();
+    let mut acked: Vec<WireAgent> = Vec::new();
     let poll = Duration::from_millis(RECORD_POLL_MILLIS);
     for _ in 0..RECORDER_ROUNDS_MAX {
         match told.recv_timeout(poll) {
@@ -1480,7 +1575,7 @@ fn record_agents(home: &Path, told: &Receiver<Recorded>) {
             if raw != record.map(|record| record.group) {
                 *record = group.zip(raw).and_then(|(group, raw)| {
                     let start = start_time(group)?;
-                    Some(AgentRecord {
+                    Some(WireAgent {
                         task: task.0,
                         group: raw,
                         start,
@@ -1488,7 +1583,7 @@ fn record_agents(home: &Path, told: &Receiver<Recorded>) {
                 });
             }
         }
-        let now: Vec<AgentRecord> = running.iter().filter_map(|(_, record)| *record).collect();
+        let now: Vec<WireAgent> = running.iter().filter_map(|(_, record)| *record).collect();
         if now != written {
             let file = AgentsFile {
                 agents: now.clone(),
@@ -1498,6 +1593,18 @@ fn record_agents(home: &Path, told: &Receiver<Recorded>) {
                 written = now;
             }
         }
+        acked.retain(|record| written.contains(record));
+        for record in &written {
+            if acked.contains(record) {
+                continue;
+            }
+            let ack = ack_file(&pid_file(home, TaskId(record.task)));
+            let text = format!("{} {}\n", record.group, record.start);
+            if write_atomically(&ack, text.as_bytes()).is_ok() {
+                acked.push(*record);
+            }
+        }
         assert!(running.len() <= AGENT_RECORDS_MAX);
+        assert!(acked.len() <= written.len());
     }
 }
