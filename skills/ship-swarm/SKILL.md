@@ -63,9 +63,8 @@ them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>`
 
 1. Read the owner's settings as `settings.md` says. When the file does not exist, ask the
    owner the questions there and write it before going on.
-2. Decide whether the branch is sensitive, and if it is, run the gate in "Sensitive
-   branches" below before anything about it leaves the machine: a packet on a public host,
-   a pushed branch, or a PR.
+2. Decide whether the branch is sensitive ("Sensitive branches" below). If it is, every
+   publication about it in the steps that follow passes the gate first.
 3. With `packet.enabled = false`, go to step 1.
 4. When the branch is settled (step 1.1), push it as a packet with the packet tool, covering
    the branch's diff from `<base>` (for `reviews`: the `writing-review-packets` skill, then
@@ -94,11 +93,24 @@ vulnerability; when its issue or task is about security; or when any review or t
 security review reported a security finding, blocking or not. When unsure, treat it as
 sensitive.
 
-Before publishing anything about it, start `sensitive.reviewers` independent reviewers:
-subagents with a fresh context (the `Agent` tool in Claude Code), each started alone. Give
-each the branch's diff, the PR body and packet text you plan to publish, the repository's
-visibility, and whether the code is already deployed. Do not give them your own view. Ask
-each to answer `safe`, `hold` or `owner` with reasons:
+Run the gate right before each publication about a sensitive branch, once the text to
+publish is written:
+
+- the packet (step 0.4), and each later patchset and packet reply (step 0.6);
+- the first push of the branch and the PR body (steps 1.2 to 1.4), as one gate;
+- each later push of new commits (steps 3.5 and 4.3);
+- each reply in a review thread (step 4.2 and 4.3), and each issue comment, the
+  issue-close comment included (step 5.2).
+
+One exemption: a reply that only names a commit (`Fixed in <sha>.`) and quotes nothing,
+when the commit itself already passed the gate.
+
+For each gate, start `sensitive.reviewers` independent reviewers: subagents with a fresh
+context (the `Agent` tool in Claude Code), each started alone. Give each the diff that is
+not yet public (the whole branch the first time, the new commits after that), the exact
+text you plan to publish, the repository's visibility, and whether the code is already
+deployed. Do not give them your own view. Ask each to answer `safe`, `hold` or `owner`
+with reasons:
 
 - `hold`: publishing would disclose an exploitable weakness that is live in production and
   not yet fixed there, a secret or credential, private data, or an internal path or host.
@@ -116,7 +128,9 @@ still live can be.
 1. Check the branch is settled: no unfinished task is `onto` it or reviews it
    (`vb tasks work/<project> --state all`), and its reviews report nothing blocking.
 2. `git -C <repo> push -u origin <branch>`. If the remote branch exists and the push is
-   rejected as non-fast-forward, stop and tell the owner: it may not be the swarm's.
+   rejected as non-fast-forward, stop and tell the owner: it may not be the swarm's. For a
+   sensitive branch, write the PR body (item 3) first, so the push and the body pass one
+   gate.
 3. Fill the repository's template (`.github/pull_request_template.md`, or a file in
    `.github/PULL_REQUEST_TEMPLATE/`) and write it to a file outside the repository. Use the
    `writing-pr-descriptions` skill when it is installed. Name the issue it closes
