@@ -1,11 +1,11 @@
 //! The simulated world: a fake board, git, process table and clock around one core.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rider::board::{TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
-    ACTIONS_MAX, Action, BoardHealth, Call, Config, Event, Phase, RunId, Settlement, State,
-    StopReason, Stopping, Untracked, step,
+    ACTIONS_MAX, Action, BoardHealth, Call, Config, Event, FEED_RESTARTS_MAX,
+    FEED_UPTIME_MILLIS_MIN, Phase, RunId, Settlement, State, StopReason, Stopping, Untracked, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -26,6 +26,18 @@ const BRANCHES: [&str; 3] = ["stack-a", "stack-b", "stack-c"];
 const SMALL_TASKS_EVERY: u64 = 4;
 /// The task bound those seeds run under.
 const SMALL_TASKS_MAX: usize = 6;
+/// How far before the requested cursor a restarted feed may start replaying.
+const REPLAY_BACK_MAX: u64 = 8;
+/// One flapping fault in this many is a burst of feeds that exit at once.
+const FLAP_EVERY: u32 = 4;
+
+/// The newest version of one task the core was told, by cursor.
+#[derive(Debug)]
+struct Told {
+    cursor: u64,
+    state: TaskState,
+    labels: Vec<(String, String)>,
+}
 
 struct FakeTask {
     id: TaskId,
@@ -52,6 +64,8 @@ struct RunLog {
     prepared: bool,
     /// The branch `Prepared` reported: the one the run's agent works on.
     branch: Option<String>,
+    /// The task the run claimed.
+    task: Option<TaskId>,
     lost: bool,
     /// `Judged` results, and the verdict of the last.
     judged: u32,
@@ -71,6 +85,16 @@ pub struct World {
     now: Timestamp,
     tasks: Vec<FakeTask>,
     feed: VecDeque<BoardEvent>,
+    /// Every event the board published, so a restarted feed can replay them.
+    history: Vec<BoardEvent>,
+    /// The feed is running: published events reach it.
+    feed_up: bool,
+    /// Restarted feeds that are still to exit at once.
+    flaps_left: u32,
+    /// Feed losses in a row, by the rule the core must follow.
+    feed_restarts: u8,
+    feed_since: Timestamp,
+    feed_delivered: bool,
     cursor: u64,
     /// Results not yet delivered, each with the id of the outstanding action it answers.
     /// A result is not delivered before its time.
@@ -82,8 +106,10 @@ pub struct World {
     next_action: u64,
     log: HashMap<RunId, RunLog>,
     settled_epochs: HashSet<(u64, u64)>,
-    /// Open tasks as the delivered feed events and snapshots told the core.
-    told_open: BTreeSet<u64>,
+    /// The newest version of each task the delivered feed events and snapshots told the core.
+    told: HashMap<u64, Told>,
+    /// Tasks whose claim was refused, with no newer news of them nor a tick since.
+    refused: HashSet<u64>,
     /// Runs whose agent has been spawned.
     spawned: HashSet<RunId>,
     /// Whether the core had been told to stop now before the current step.
@@ -107,6 +133,12 @@ impl World {
             now,
             tasks: Vec::new(),
             feed: VecDeque::new(),
+            history: Vec::new(),
+            feed_up: true,
+            flaps_left: 0,
+            feed_restarts: 0,
+            feed_since: now,
+            feed_delivered: false,
             cursor: 0,
             results: Vec::new(),
             agents: Vec::new(),
@@ -115,7 +147,8 @@ impl World {
             next_action: 0,
             log: HashMap::new(),
             settled_epochs: HashSet::new(),
-            told_open: BTreeSet::new(),
+            told: HashMap::new(),
+            refused: HashSet::new(),
             spawned: HashSet::new(),
             stopped_now: false,
             signals: 0,
@@ -178,7 +211,16 @@ impl World {
             let index = ready[self.rng.usize(0..ready.len())];
             let (event, id, _) = self.results.swap_remove(index);
             self.answer(id, &event)?;
-            return self.deliver(event);
+            let Event::FeedResumed(cursor) = event else {
+                return self.deliver(event);
+            };
+            self.resume_feed(cursor);
+            self.deliver(event)?;
+            if self.flaps_left > 0 {
+                self.flaps_left -= 1;
+                self.lose_feed();
+            }
+            return Ok(());
         }
         if choice < 60
             && let Some(event) = self.feed.pop_front()
@@ -193,13 +235,15 @@ impl World {
             88..=89 => self.lose_claim(),
             90..=91 => self.crash_agent(),
             92 => self.down_until = Timestamp(self.now.0 + self.rng.u64(1..10) * MINUTE),
-            93 => {
-                self.feed.clear();
-                let id = self.expect(None, "feed");
-                self.reply(id, Event::FeedLost);
-            }
+            93 => self.lose_feed(),
             94..=95 => self.unblock(),
             96 => self.cancel_task(),
+            97 => self.relabel_role(),
+            98 if self.rng.u32(0..FLAP_EVERY) == 0 => {
+                let restarts = u32::from(FEED_RESTARTS_MAX);
+                self.flaps_left = self.rng.u32(restarts..3 * restarts);
+                self.lose_feed();
+            }
             _ => return self.advance(),
         }
         Ok(())
@@ -257,6 +301,43 @@ impl World {
         self.publish(self.tasks.len() - 1, EventKind::TaskCreated);
     }
 
+    fn lose_feed(&mut self) {
+        if self.feed_up {
+            self.feed_up = false;
+            self.feed.clear();
+            let id = self.expect(None, "feed");
+            self.reply(id, Event::FeedLost);
+        }
+    }
+
+    /// A restarted feed replays from a little before the cursor it was asked for.
+    fn resume_feed(&mut self, cursor: Cursor) {
+        let from = cursor.0.saturating_sub(self.rng.u64(0..=REPLAY_BACK_MAX));
+        self.feed = (self.history.iter())
+            .filter(|event| event.cursor.0 > from)
+            .cloned()
+            .collect();
+        self.feed_up = true;
+    }
+
+    /// The owner adds a role to an open task, or removes the one it has.
+    fn relabel_role(&mut self) {
+        let open: Vec<usize> = (0..self.tasks.len())
+            .filter(|index| !is_closed(self.tasks[*index].state))
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let index = open[self.rng.usize(0..open.len())];
+        let role = ROLES[self.rng.usize(0..ROLES.len())].label;
+        let labels = &mut self.tasks[index].labels;
+        match labels.iter().position(|(name, _)| name == "role") {
+            Some(found) => drop(labels.remove(found)),
+            None => labels.push(("role".to_string(), role.to_string())),
+        }
+        self.publish(index, EventKind::LabelsChanged);
+    }
+
     fn lose_claim(&mut self) {
         let held: Vec<usize> = (0..self.tasks.len())
             .filter(|index| self.tasks[*index].holder.is_some())
@@ -308,7 +389,7 @@ impl World {
     fn publish(&mut self, index: usize, kind: EventKind) {
         self.cursor += 1;
         let task = &self.tasks[index];
-        self.feed.push_back(BoardEvent {
+        let event = BoardEvent {
             cursor: Cursor(self.cursor),
             kind,
             task: task.id,
@@ -316,15 +397,38 @@ impl World {
             labels: task.labels.clone(),
             state: Some(task.state),
             actor: None,
-        });
+        };
+        if self.feed_up {
+            self.feed.push_back(event.clone());
+        }
+        self.history.push(event);
     }
 
     fn deliver(&mut self, event: Event) -> Result<(), String> {
         self.note_result(&event);
         self.note_told(&event);
+        self.note_feed(&event);
+        if let Event::ClaimRefused(run) = event {
+            let claiming = (self.core.runs().iter())
+                .any(|entry| entry.id == run && entry.phase == Phase::Claiming);
+            let task = self.log.get(&run).and_then(|log| log.task);
+            if let Some(task) = task.filter(|_| claiming) {
+                self.refused.insert(task.0);
+            }
+        }
         self.stopped_now = self.core.stopping() == Stopping::Now;
         let actions = step(&mut self.core, event.clone());
         self.trace.push(format!("{event:?} -> {actions:?}"));
+        if matches!(event, Event::FeedLost)
+            && !self.core.exited()
+            && self.feed_restarts > FEED_RESTARTS_MAX
+            && self.core.board() == BoardHealth::Up
+        {
+            return Err(format!(
+                "the feed was lost {} times in a row, but the board still counts as up",
+                self.feed_restarts
+            ));
+        }
         self.check(&actions)?;
         for action in actions {
             self.perform(action)?;
@@ -383,28 +487,63 @@ impl World {
         }
     }
 
+    /// Keeps, per task, only what is newer than what the core was already told of it.
     fn note_told(&mut self, event: &Event) {
         if self.core.exited() {
             return;
         }
         match event {
-            Event::Feed(BoardEvent {
-                task,
-                state: Some(state),
-                ..
-            }) => {
-                if is_closed(*state) {
-                    self.told_open.remove(&task.0);
-                } else {
-                    self.told_open.insert(task.0);
+            Event::Tick(_) => self.refused.clear(),
+            Event::Feed(feed) => {
+                if let Some(state) = feed.state {
+                    let newer = (self.told.get(&feed.task.0))
+                        .is_none_or(|told| told.cursor < feed.cursor.0);
+                    if newer {
+                        self.tell(feed.task, feed.cursor.0, state, &feed.labels);
+                    }
                 }
             }
-            Event::Snapshot { tasks, .. } => {
-                self.told_open = tasks
-                    .iter()
-                    .filter(|view| !is_closed(view.state))
-                    .map(|view| view.id.0)
-                    .collect();
+            Event::Snapshot { tasks, cursor } => {
+                for view in tasks {
+                    let newer =
+                        (self.told.get(&view.id.0)).is_none_or(|told| told.cursor <= cursor.0);
+                    if newer {
+                        self.tell(view.id, cursor.0, view.state, &view.labels);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn tell(&mut self, task: TaskId, cursor: u64, state: TaskState, labels: &[(String, String)]) {
+        self.refused.remove(&task.0);
+        let labels = labels.to_vec();
+        self.told.insert(
+            task.0,
+            Told {
+                cursor,
+                state,
+                labels,
+            },
+        );
+    }
+
+    /// Counts feed losses in a row: a feed that delivered an event or stayed up long enough
+    /// starts the count again.
+    fn note_feed(&mut self, event: &Event) {
+        match event {
+            Event::Feed(_) => self.feed_delivered = true,
+            Event::FeedResumed(_) => {
+                self.feed_since = self.now;
+                self.feed_delivered = false;
+            }
+            Event::FeedLost => {
+                let uptime = self.now.0.saturating_sub(self.feed_since.0);
+                if self.feed_delivered || uptime >= FEED_UPTIME_MILLIS_MIN {
+                    self.feed_restarts = 0;
+                }
+                self.feed_restarts = self.feed_restarts.saturating_add(1);
             }
             _ => {}
         }
@@ -512,6 +651,7 @@ impl World {
     }
 
     fn claim(&mut self, run: RunId, task: TaskId) {
+        self.log.entry(run).or_default().task = Some(task);
         let id = self.expect(Some(run), "claim");
         if self.board_fails() {
             self.reply(id, Event::BoardFailed(Call::Claim(run)));
@@ -672,9 +812,12 @@ impl World {
         }
         self.check_agents_known()?;
         self.check_branches()?;
+        self.check_tasks_newest()?;
         let tracked = self.core.tasks().len();
         let untracked = self.core.untracked();
-        let open = self.told_open.len();
+        let open = (self.told.values())
+            .filter(|told| !is_closed(told.state))
+            .count();
         let counted = match untracked {
             Untracked::Exactly(count) => tracked + count == open,
             Untracked::AtLeast(count) => tracked + count <= open,
@@ -697,9 +840,14 @@ impl World {
         let blocked = self.core.board() != BoardHealth::Up || self.core.stopping() != Stopping::No;
         for action in actions {
             let (run, write) = match action {
-                Action::Claim { run, .. } => {
+                Action::Claim { run, task, .. } => {
                     if blocked {
                         return Err(format!("invariant 9: {action:?} while down or stopping"));
+                    }
+                    if self.refused.contains(&task.0) {
+                        return Err(format!(
+                            "{action:?} retries a refused claim before a tick or news of its task"
+                        ));
                     }
                     (*run, true)
                 }
@@ -737,6 +885,36 @@ impl World {
             };
             if write && self.log.get(&run).is_some_and(|log| log.lost) {
                 return Err(format!("invariant 4: {action:?} after its claim was lost"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every task the core tracks is as the newest version it was told, by cursor.
+    fn check_tasks_newest(&self) -> Result<(), String> {
+        if self.core.exited() {
+            return Ok(());
+        }
+        for task in self.core.tasks() {
+            let Some(told) = self.told.get(&task.id.0) else {
+                return Err(format!(
+                    "the core tracks {task:?}, which it was never told of"
+                ));
+            };
+            let role = (told.labels.iter())
+                .find(|(name, _)| name == "role")
+                .and_then(|(_, label)| self.config.roles.iter().position(|r| r.label == *label));
+            let branch = (told.labels.iter())
+                .find(|(name, _)| name == "branch")
+                .map(|(_, branch)| branch.clone());
+            let newest = !is_closed(told.state)
+                && told.state == task.state
+                && role == task.role
+                && branch == task.branch;
+            if !newest {
+                return Err(format!(
+                    "stale state: the core holds {task:?}, but the newest it was told is {told:?}"
+                ));
             }
         }
         Ok(())
