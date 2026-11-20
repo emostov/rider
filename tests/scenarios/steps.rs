@@ -245,12 +245,14 @@ struct TaskMessage {
 #[derive(Deserialize)]
 struct TaskFields {
     state: String,
+    epoch: u64,
     claim: Option<Claim>,
 }
 
 #[derive(Deserialize)]
 struct Claim {
     until: String,
+    actor: String,
 }
 
 #[derive(Deserialize)]
@@ -590,6 +592,51 @@ pub fn task_claim_until(world: &World, id: &str) -> Option<String> {
         .task
         .claim
         .map(|claim| claim.until)
+}
+
+/// How many times the task has been claimed, as the board shows it.
+pub fn task_epoch(world: &World, id: &str) -> u64 {
+    read_task(world, id).message.task.epoch
+}
+
+/// The profile holding the task's claim, as the board shows it; `None` when it is not claimed.
+pub fn task_claim_profile(world: &World, id: &str) -> Option<String> {
+    let claim = read_task(world, id).message.task.claim?;
+    // The board names a holder `<owner>+<profile>`.
+    let profile = claim
+        .actor
+        .rsplit_once('+')
+        .map(|(_, profile)| profile.to_string());
+    Some(profile.unwrap_or(claim.actor))
+}
+
+/// When the daemon is sent SIGKILL, as a crash; waits for it to be gone.
+pub fn when_the_daemon_crashes(world: &mut World) {
+    let pool = world.pool.as_ref().expect("the daemon was started");
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-KILL", &pool.child.id().to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success());
+    assert_eq!(then_the_daemon_exits(world), None);
+}
+
+/// Waits until the daemon's `agents.json` names process group `pid`.
+pub fn when_agents_json_names(world: &World, pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    let named = format!("\"group\":{pid},");
+    loop {
+        let text = fs::read_to_string(world.home.join("agents.json")).unwrap_or_default();
+        if text.contains(&named) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agents.json never named {pid}: {text}"
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
 }
 
 /// Waits up to `seconds` for process `pid` to end; returns whether it did.

@@ -1499,6 +1499,73 @@ fn rider_kill_of_a_task_the_owner_canceled_writes_nothing_to_the_task() {
 
 const LOG_POLL_MILLIS: u64 = 50;
 
+#[test]
+fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_worktree() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::Commit]);
+    given_a_running_daemon(&mut world);
+    let leftover = when_the_agent_has_started(&world, &task);
+    when_agents_json_names(&world, leftover.pid);
+    let epoch = task_epoch(&world, &task);
+    when_the_daemon_crashes(&mut world);
+    assert!(is_alive(leftover.pid), "the agent outlived the crash");
+
+    given_a_running_daemon(&mut world);
+
+    assert!(
+        when_the_process_ends_within(leftover.pid, 10),
+        "the leftover agent {} still runs:\n{}",
+        leftover.pid,
+        world.pool_log()
+    );
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+    let runs = agent_runs_for(&world, &task);
+    assert_eq!(runs.len(), 2, "{}", world.pool_log());
+    assert_eq!(runs[1].dir, runs[0].dir);
+    assert!(agent_prompt(&world, &task, 2).contains("This is a retry"));
+    assert_eq!(task_epoch(&world, &task), epoch);
+    assert_eq!(task_label(&world, &task, "attempt"), None);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_daemon_that_crashes_past_its_shortened_lease_claims_the_task_afresh_and_completes_it() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::Commit]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=3000,tick=200")]);
+    let leftover = when_the_agent_has_started(&world, &task);
+    when_agents_json_names(&world, leftover.pid);
+    let epoch = task_epoch(&world, &task);
+    let holder = task_claim_profile(&world, &task).expect("the task is claimed");
+    when_the_daemon_crashes(&mut world);
+    thread::sleep(Duration::from_secs(4));
+    // The board keeps its own hour-long lease, so its lapse is played by giving the task back.
+    let released = world.vb_as(&holder, &["tasks", "release", &task, "--json"], None);
+    assert_eq!(released.code, Some(0), "{released:?}");
+
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=3000,tick=200")]);
+
+    assert!(
+        when_the_process_ends_within(leftover.pid, 10),
+        "the leftover agent {} still runs:\n{}",
+        leftover.pid,
+        world.pool_log()
+    );
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+    assert_eq!(agent_runs_for(&world, &task).len(), 2);
+    assert_eq!(task_epoch(&world, &task), epoch + 1);
+    assert_eq!(task_label(&world, &task, "attempt"), None);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
 /// Waits until the first attempt log of `task` contains `text`.
 fn when_the_log_shows(world: &World, task: &str, text: &str) {
     let log = world.home.join("logs").join(task).join("1.jsonl");
