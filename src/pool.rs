@@ -5,7 +5,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::board::{Board, TaskId, one_line};
-use crate::core::ROLES_MAX;
+use crate::core::{LEASE_MILLIS, ROLES_MAX};
 use crate::roles::{AGENTS_MAX, RoleSpec, display_name, profile_name};
 use crate::run_task::{Ran, RunError};
 use crate::settle::Verdict;
@@ -30,6 +30,13 @@ pub const GATE_WAITS_MAX: u32 = 2 * 3600;
 // `rest` counts its pause steps as seconds.
 const _: () = assert!(PAUSE_STEP_MILLIS == 1000);
 const SECONDS_PER_DAY: u64 = 24 * 3600;
+/// The pause after a failed release before the next try.
+pub const RELEASE_RETRY_PAUSE_SECONDS: u64 = 5;
+/// Tries to release a task, one every `RELEASE_RETRY_PAUSE_SECONDS`, until its lease has lapsed.
+pub const RELEASE_TRIES_MAX: u64 = LEASE_MILLIS / 1000 / RELEASE_RETRY_PAUSE_SECONDS;
+/// A run of failed releases is reported on its first failure and on every this-many after.
+pub const RELEASE_ERRORS_REPORTED_EVERY: u64 = 60;
+const _: () = assert!(RELEASE_TRIES_MAX > 1 && RELEASE_ERRORS_REPORTED_EVERY > 1);
 /// Upper bound on the claims one slot makes before it stops.
 pub const SLOT_ROUNDS_MAX: u32 = 1_000_000;
 /// Upper bound on the slots of every role together.
@@ -272,18 +279,45 @@ pub fn slot_loop(
                 say(Event::Error(&message), Some(id));
             }
             // It goes back to be claimed by a slot of its new role, under that role's gate.
-            Ok(Ran::RoleChanged { claimed, found }) => match board.release(id) {
-                Ok(()) => {
-                    let reason = format!("claimed as {claimed}, it is now {found}");
-                    say(Event::Released(&reason), Some(id));
-                }
-                Err(error) => say(Event::Error(&error.to_string()), Some(id)),
-            },
+            Ok(Ran::RoleChanged { claimed, found }) => {
+                let reason = format!("claimed as {claimed}, it is now {found}");
+                release(board, id, &reason, &say, effects.pause);
+            }
         }
     }
     let message = format!("{SLOT_ROUNDS_MAX} claims made; this slot stops");
     say(Event::Error(&message), None);
     SlotEnd::RoundsExhausted
+}
+
+/// Releases claimed task `id` for `reason`, retrying a failed release, stopping or not, until
+/// the board takes it or the claim's lease has lapsed.
+fn release(
+    board: &dyn Board,
+    id: TaskId,
+    reason: &str,
+    say: &dyn Fn(Event, Option<TaskId>),
+    pause: &dyn Fn(),
+) {
+    assert!(!reason.is_empty());
+    for tries in 1..=RELEASE_TRIES_MAX {
+        match board.release(id) {
+            Ok(()) => {
+                say(Event::Released(reason), Some(id));
+                return;
+            }
+            Err(error) if tries % RELEASE_ERRORS_REPORTED_EVERY == 1 => {
+                let message = format!("{error} (release try {tries}; it is retried)");
+                say(Event::Error(&message), Some(id));
+            }
+            Err(_) => {}
+        }
+        for _ in 0..RELEASE_RETRY_PAUSE_SECONDS {
+            pause();
+        }
+    }
+    let message = format!("{RELEASE_TRIES_MAX} releases failed; the claim lapses with its lease");
+    say(Event::Error(&message), Some(id));
 }
 
 /// Pauses for `seconds` in steps, returning early once `stop` is set.

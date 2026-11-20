@@ -349,6 +349,38 @@ fn one_builder_at_once_runs_implement_tasks_one_by_one_while_a_review_runs_besid
 }
 
 #[test]
+fn a_pool_stopped_after_a_failed_release_of_a_task_whose_role_changed_retries_it_first() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nslots = 1\n");
+    let task = an_implement_task(&world, "Add the work.").role("light");
+    let task = when_the_lead_creates(&world, &task);
+    let releases = world.root.join("releases.log");
+    given_the_role_changes_after_the_claim_and_one_release_fails(
+        &world,
+        &task,
+        "light",
+        "implement",
+        &releases,
+    );
+    when_the_pool_starts(&mut world);
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !releases.exists() {
+        assert!(Instant::now() < deadline, "{}", world.pool_log());
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let exit = when_the_pool_is_stopped(&mut world);
+
+    assert_eq!(exit, Some(0), "{}", world.pool_log());
+    assert_eq!(task_state(&world, &task), "ready", "{}", world.pool_log());
+    let tries = fs::read_to_string(&releases).expect("read the release log");
+    assert_eq!(tries, "release\nrelease\n");
+    assert_eq!(agent_runs_for(&world, &task), vec![]);
+}
+
+#[test]
 fn a_rider_toml_giving_review_another_model_starts_the_review_agent_with_it() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
@@ -777,6 +809,27 @@ fn a_resumed_session_claude_refuses_falls_back_to_a_fresh_start_in_the_same_atte
         fallback.is_some_and(|reply| reply.contains(&built_session)),
         "{replies:?}"
     );
+}
+
+#[test]
+fn a_pool_gives_a_refused_resumes_fresh_start_only_what_remains_of_the_attempt_limit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nattempt_minutes = 1\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, true),
+    );
+    given_the_agent_will(&world, &fix, &[Behaviour::RefuseResumeSlowly]);
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+
+    assert_eq!(states, vec!["completed", "failed"], "{}", world.pool_log());
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_runs_for(&world, &fix).len(), 2);
+    assert_eq!(task_label(&world, &fix, "attempt").as_deref(), Some("1"));
 }
 
 #[test]

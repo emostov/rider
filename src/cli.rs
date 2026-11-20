@@ -1,5 +1,6 @@
 //! The command line: parse the arguments, read the environment once, and run one command.
 
+use std::cell::OnceCell;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -10,7 +11,7 @@ use std::process::Command as Process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use clap::{Parser, Subcommand};
 
@@ -494,8 +495,7 @@ fn run_slot(
         board_url: config.board_url.clone(),
         attempts: limits.attempts,
     };
-    let launch = launcher(config, limits);
-    let run = |id: TaskId| run_task(id, &env, &board, Some(slot.role), &launch);
+    let run = |id: TaskId| run_task(id, &env, &board, Some(slot.role), &launcher(config, limits));
     let pause = || thread::sleep(Duration::from_millis(PAUSE_STEP_MILLIS));
     let effects = Effects {
         run: &run,
@@ -546,15 +546,18 @@ fn launcher(
 ) -> impl Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> {
     let vb_dir = config.vb_dir().to_string_lossy().into_owned();
     let inherited = config.inherited_path.clone();
-    let seconds = limits.attempt_millis / 1000;
+    let limit = Duration::from_millis(limits.attempt_millis);
     assert!(
         config.home.to_str().is_some(),
         "the home was checked to be UTF-8"
     );
-    assert!(seconds > 0);
+    assert!(limit.as_secs() > 0);
+    // One attempt's launches share its time limit, counted from the first.
+    let started = OnceCell::new();
     move |cmd: &CommandLine, dir: &Path, log: &Path| {
+        let left = limit.saturating_sub(started.get_or_init(Instant::now).elapsed());
         let cmd = with_vb_on_path(cmd, &vb_dir, inherited.as_deref());
-        harness::run(&cmd, dir, log, seconds, LOG_BYTES_MAX)
+        harness::run(&cmd, dir, log, left.as_secs().max(1), LOG_BYTES_MAX)
     }
 }
 
