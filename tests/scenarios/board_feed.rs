@@ -3,6 +3,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::{World, write_executable};
 
@@ -80,4 +81,61 @@ fn a_feed_vb_that_exits_while_a_descendant_holds_its_output_is_restarted() {
     assert_eq!(daemon_feeds(&world).len(), 1, "{:?}", daemon_feeds(&world));
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+const RESULT_CHARS_MAX: usize = 500;
+const TAIL_REPLY_CHARS_MAX: usize = 9_000;
+
+fn task_json(world: &World, id: &str) -> serde_json::Value {
+    let text = world.vb_lead(&["read", id, "--json"], None);
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("not JSON ({error}): {text}"))
+}
+
+#[test]
+fn a_summary_starting_with_a_dash_completes_the_task_as_one_bounded_line() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::CommitDashedSummary]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let summary = fake_agent::dashed_summary(&task);
+    let words: Vec<&str> = summary.split_whitespace().collect();
+    let line: String = words.join(" ").chars().take(RESULT_CHARS_MAX).collect();
+    let json = task_json(&world, &task);
+    let result = &json["message"]["task"]["result"];
+    assert_eq!(result.as_str(), Some(line.trim_end()), "{json}");
+}
+
+#[test]
+fn a_failed_agents_log_tail_reply_keeps_whole_lines_from_the_end_within_the_limit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nattempts = 1\n");
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::FailTalkingLong]);
+
+    when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    let replies = task_replies(&world, &task);
+    let texts: Vec<&str> = replies
+        .iter()
+        .filter_map(|reply| reply["text"].as_str())
+        .collect();
+    let reply = texts
+        .iter()
+        .find(|text| text.starts_with("The whole log: "));
+    let reply = reply.unwrap_or_else(|| panic!("no log tail reply in {replies:?}"));
+    assert!(reply.chars().count() <= TAIL_REPLY_CHARS_MAX, "{reply}");
+    let lines: Vec<&str> = reply.lines().skip(1).collect();
+    let last = fake_agent::TALK_LINES - 1;
+    let expected: Vec<String> = (last + 1 - lines.len()..=last)
+        .map(fake_agent::talk_line)
+        .collect();
+    assert!(lines.len() > 20, "{reply}");
+    assert_eq!(lines, expected);
 }
