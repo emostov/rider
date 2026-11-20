@@ -38,7 +38,10 @@ fn a_task_that_failed_every_attempt_is_blocked_as_attempts_exhausted() {
 
     let reason = "The task has failed 3 attempts; change its brief or role and set the \
                   `attempt` label to 0 before reopening it.";
-    assert_eq!(block, ("attempts_exhausted".to_string(), reason.to_string()));
+    assert_eq!(
+        block,
+        ("attempts_exhausted".to_string(), reason.to_string())
+    );
 }
 
 #[test]

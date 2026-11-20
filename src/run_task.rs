@@ -1247,8 +1247,6 @@ mod tests {
     const TEXT: &str = "Extract token store\nMove the store into its own module.";
     const DONE_STREAM: &str =
         r#"{"type":"result","subtype":"success","is_error":false,"result":"Extracted the store."}"#;
-    const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as \
-         the last attempt left them, uncommitted changes included.";
 
     type Launch<'a> = dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> + 'a;
 
@@ -1362,46 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_brief_blocks_and_spawns_nothing() {
-        let (_fixture, env) = setup("run-invalid");
-        let board = FakeBoard::new(vec![view(7, &[("role", "implement")], TaskState::Claimed)]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let reason = "Set the `repo` label to the absolute path of the repository.";
-        assert_eq!(
-            calls(&board),
-            vec![format!("block 7 invalid_brief {reason}")]
-        );
-        assert!(!env.home.join("worktrees").exists());
-    }
-
-    #[test]
-    fn a_malformed_attempt_label_blocks_as_an_invalid_brief() {
-        let (fixture, env) = setup("run-attempt-label");
-        let board = FakeBoard::new(vec![task(&fixture, &[("attempt", "two")])]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let reason = "Change the `attempt` label from \"two\" to the number of failed \
-                      attempts so far, such as 1.";
-        assert_eq!(
-            calls(&board),
-            vec![format!("block 7 invalid_brief {reason}")]
-        );
-    }
-
-    #[test]
-    fn fourth_attempt_is_blocked_as_attempts_exhausted() {
-        let (fixture, env) = setup("run-exhausted");
-        let board = FakeBoard::new(vec![task(&fixture, &[("attempt", "3")])]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let reason = "The task has failed 3 attempts; change its brief or role and set the \
-                      `attempt` label to 0 before reopening it.";
-        assert_eq!(
-            calls(&board),
-            vec![format!("block 7 attempts_exhausted {reason}")]
-        );
-        assert!(!worktree(&env).exists());
-    }
-
-    #[test]
     fn a_base_task_without_a_branch_blocks_as_an_invalid_brief() {
         let (fixture, env) = setup("run-base");
         let base = view(3, &[], TaskState::Completed);
@@ -1413,24 +1371,6 @@ mod tests {
             calls(&board),
             vec![format!("block 7 invalid_brief {reason}")]
         );
-    }
-
-    #[test]
-    fn a_root_task_without_from_in_a_repository_without_a_remote_is_an_invalid_brief() {
-        let (fixture, env) = setup("run-no-from");
-        let repo = fixture.repo.to_str().unwrap();
-        let root = view(
-            7,
-            &[("role", "implement"), ("repo", repo)],
-            TaskState::Claimed,
-        );
-        let board = FakeBoard::new(vec![root]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let calls = calls(&board);
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].starts_with("block 7 invalid_brief "), "{calls:?}");
-        assert!(calls[0].contains("`from=<branch>`"), "{calls:?}");
-        assert!(!worktree(&env).exists());
     }
 
     #[test]
@@ -1463,49 +1403,6 @@ mod tests {
         );
         assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
         assert!(!worktree(&env).exists());
-    }
-
-    #[test]
-    fn successful_implement_task_is_completed_with_its_branch_label() {
-        let (fixture, env) = setup("run-ok");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let seen = RefCell::new(None);
-        let agent = committing_agent(&fixture);
-        let launch = |cmd: &CommandLine, dir: &Path, log: &Path| {
-            *seen.borrow_mut() = Some((cmd.clone(), dir.to_path_buf(), log.to_path_buf()));
-            agent(cmd, dir, log)
-        };
-        assert_eq!(
-            run(&env, &board, &launch),
-            completed("Extracted the store.")
-        );
-        let head = git(&fixture.repo, &["rev-parse", BRANCH]);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            start_call(&fixture, "main"),
-            "complete 7 Extracted the store.".to_string(),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
-        ];
-        assert_eq!(calls(&board), expected);
-        assert!(
-            !worktree(&env).exists(),
-            "a completed task's worktree is released"
-        );
-        let (cmd, dir, log) = seen.take().unwrap();
-        assert_eq!(dir, worktree(&env));
-        assert_eq!(log, env.home.join("logs").join("7").join("1.jsonl"));
-        let prompt = format!("You implement one task.\n\n# Task 7\n\n{TEXT}");
-        assert_eq!(cmd.args.last(), Some(&prompt));
-        let board_env = [
-            ("BOARD_TASK", "7"),
-            ("BOARD_PROFILE", "implement-1-opus-5-5"),
-            ("BOARD_URL", "http://127.0.0.1:4100"),
-        ];
-        let board_env: Vec<_> = board_env
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        assert_eq!(cmd.env, board_env);
     }
 
     #[test]
@@ -1591,97 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_attempt_increments_the_attempt_label() {
-        let (fixture, env) = setup("run-fail");
-        let board = FakeBoard::new(vec![task(&fixture, &[("attempt", "1")])]);
-        let logged = RefCell::new(PathBuf::new());
-        let launch = |_: &CommandLine, _: &Path, log: &Path| {
-            let lines: Vec<String> = (1..=50).map(|n| format!("line {n}")).collect();
-            write_log(log, &(lines.join("\n") + "\n"));
-            *logged.borrow_mut() = log.to_path_buf();
-            Ok(Exit::Code(2))
-        };
-        let failed = Verdict::Fail {
-            reason: "agent exited 2".to_string(),
-        };
-        assert_eq!(run(&env, &board, &launch), failed);
-        let tail: Vec<String> = (11..=50).map(|n| format!("line {n}")).collect();
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            start_call(&fixture, "main"),
-            "fail 7 agent exited 2".to_string(),
-            "set_label 7 attempt=2".to_string(),
-            tail_reply(&env, 2, &tail.join("\n")),
-        ];
-        assert_eq!(calls(&board), expected);
-        assert_eq!(
-            *logged.borrow(),
-            env.home.join("logs").join("7").join("2.jsonl")
-        );
-        assert!(worktree(&env).exists(), "a failed task keeps its worktree");
-    }
-
-    #[test]
-    fn exit_zero_without_committed_work_fails() {
-        let (fixture, env) = setup("run-nothing");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let idle = |_: &CommandLine, _: &Path, log: &Path| {
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        let reason = "no committed work: the branch has no commits of its own";
-        let expected = Verdict::Fail {
-            reason: reason.to_string(),
-        };
-        assert_eq!(run(&env, &board, &idle), expected);
-        // The fenced fail comes before the attempt label and the log reply.
-        let fenced = calls(&board).iter().rev().nth(2).cloned();
-        assert_eq!(fenced, Some(format!("fail 7 {reason}")));
-
-        let (fixture, env) = setup("run-dirty");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let dirty = |_: &CommandLine, dir: &Path, log: &Path| {
-            fixture.commit(dir, "store.rs", "pub struct Store;");
-            fs::write(dir.join("notes.txt"), "half done").unwrap();
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        let reason = "no committed work: the worktree has uncommitted changes";
-        let expected = Verdict::Fail {
-            reason: reason.to_string(),
-        };
-        assert_eq!(run(&env, &board, &dirty), expected);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            start_call(&fixture, "main"),
-            format!("fail 7 {reason}"),
-            "set_label 7 attempt=1".to_string(),
-            tail_reply(&env, 1, DONE_STREAM),
-        ];
-        assert_eq!(calls(&board), expected);
-    }
-
-    #[test]
-    fn worker_that_blocks_its_task_is_not_failed() {
-        let (fixture, env) = setup("run-blocked");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let asking = |_: &CommandLine, dir: &Path, log: &Path| {
-            fs::write(dir.join("notes.txt"), "which docs site?").unwrap();
-            write_log(log, "{}\n");
-            board.set_state(ID, TaskState::Blocked);
-            Ok(Exit::Code(1))
-        };
-        assert_eq!(run(&env, &board, &asking), Verdict::LeaveBlocked);
-        assert_eq!(
-            calls(&board),
-            vec![
-                format!("set_label 7 branch={BRANCH}"),
-                start_call(&fixture, "main")
-            ]
-        );
-    }
-
-    #[test]
     fn an_agent_that_cannot_be_run_fails_the_attempt() {
         let (fixture, env) = setup("run-spawn");
         let board = FakeBoard::new(vec![task(&fixture, &[])]);
@@ -1704,24 +1510,6 @@ mod tests {
     }
 
     #[test]
-    fn a_retry_reuses_the_worktree_and_says_so() {
-        let (fixture, env) = setup("run-retry");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let prompts = RefCell::new(Vec::new());
-        let idle = |cmd: &CommandLine, _: &Path, log: &Path| {
-            prompts.borrow_mut().push(cmd.args.last().cloned().unwrap());
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        run(&env, &board, &idle);
-        let board = FakeBoard::new(vec![task(&fixture, &[("attempt", "1")])]);
-        run(&env, &board, &idle);
-        let first = format!("You implement one task.\n\n# Task 7\n\n{TEXT}");
-        let second = format!("{first}\n\n{RETRY_NOTE}");
-        assert_eq!(*prompts.borrow(), vec![first, second]);
-    }
-
-    #[test]
     fn a_task_that_is_not_claimed_is_not_run() {
         let (fixture, env) = setup("run-unclaimed");
         let mut ready = task(&fixture, &[]);
@@ -1733,28 +1521,6 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(calls(&board), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_claim_lost_during_the_attempt_is_not_settled() {
-        let (fixture, env) = setup("run-lost");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let lost = |_: &CommandLine, _: &Path, _: &Path| {
-            board.set_state(ID, TaskState::Ready);
-            Ok(Exit::Code(1))
-        };
-        let result = run_task(ID, &env, &board, None, &lost);
-        assert!(
-            matches!(result, Err(RunError::LostClaim(TaskState::Ready))),
-            "{result:?}"
-        );
-        assert_eq!(
-            calls(&board),
-            vec![
-                format!("set_label 7 branch={BRANCH}"),
-                start_call(&fixture, "main")
-            ]
-        );
     }
 
     #[test]
@@ -1886,59 +1652,6 @@ mod tests {
         }
     }
 
-    fn rewriting_agent(
-        fixture: &Fixture,
-    ) -> impl Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> + '_ {
-        move |_, dir, log| {
-            git(dir, &["reset", "-q", "--hard", "HEAD~1"]);
-            fixture.commit(dir, "store.rs", "pub struct Store;");
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        }
-    }
-
-    #[test]
-    fn a_branch_rewritten_below_its_start_fails() {
-        let (fixture, env) = setup("run-rewrite-base");
-        let base = base_task(&fixture);
-        let board = FakeBoard::new(vec![needing(task(&fixture, &[("base", "#3")]), 3), base]);
-        let reason = "no committed work: the branch no longer contains its starting commit";
-        let expected = Verdict::Fail {
-            reason: reason.to_string(),
-        };
-        assert_eq!(run(&env, &board, &rewriting_agent(&fixture)), expected);
-    }
-
-    #[test]
-    fn a_review_that_commits_fails() {
-        let (fixture, env) = setup("run-review");
-        let base = base_task(&fixture);
-        let mut review = needing(task(&fixture, &[("of", "#3")]), 3);
-        review.labels[0].1 = "review".to_string();
-        let board = FakeBoard::new(vec![review, base]);
-        let expected = Verdict::Fail {
-            reason: "review changed the checkout".to_string(),
-        };
-        assert_eq!(run(&env, &board, &committing_agent(&fixture)), expected);
-
-        let (fixture, env) = setup("run-review-ok");
-        let base = base_task(&fixture);
-        let mut review = needing(task(&fixture, &[("of", "#3")]), 3);
-        review.labels[0].1 = "review".to_string();
-        let board = FakeBoard::new(vec![review, base]);
-        let reading = |_: &CommandLine, _: &Path, log: &Path| {
-            write_log(log, &format!("{DONE_STREAM}\n"));
-            Ok(Exit::Code(0))
-        };
-        assert_eq!(run(&env, &board, &reading), completed("completed"));
-        let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
-        let expected = vec![
-            "complete 7 completed".to_string(),
-            record(None, &head, 0, "completed"),
-        ];
-        assert_eq!(calls(&board), expected);
-    }
-
     #[test]
     fn a_retry_completes_on_work_an_earlier_attempt_committed() {
         let (fixture, env) = setup("run-earlier-work");
@@ -2039,18 +1752,6 @@ mod tests {
             );
             assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
         }
-    }
-
-    #[test]
-    fn a_branch_label_naming_another_branch_is_never_overwritten() {
-        let (fixture, env) = setup("run-label-kept");
-        let board = FakeBoard::new(vec![task(&fixture, &[("branch", "rider/7..old")])]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let reason = format!(
-            "The task's `branch` label names \"rider/7..old\" but its worktree is on branch \
-             {BRANCH}; set the label to the branch that holds the task's work."
-        );
-        assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
     }
 
     #[test]

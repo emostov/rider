@@ -6,9 +6,9 @@
     reason = "behaviours and readers for the scenarios still to come"
 )]
 mod fake_agent;
+mod run_task;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
-mod run_task;
 mod world;
 
 use std::fs;
