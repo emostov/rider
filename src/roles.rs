@@ -10,15 +10,6 @@ pub enum Harness {
     Codex,
 }
 
-impl Harness {
-    pub fn runs_skills(self) -> bool {
-        match self {
-            Harness::Claude => true,
-            Harness::Codex => false,
-        }
-    }
-}
-
 /// One role an agent can take on a task.
 #[derive(Debug, Clone)]
 pub struct RoleSpec {

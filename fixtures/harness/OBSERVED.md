@@ -43,6 +43,7 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
 - The stream begins with two `item.completed` events of `item.type == "error"` (a deprecation warning from this machine's config). These are not failures. A parser must not treat `item.type == "error"` as a run failure.
 - Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`.
 - Fixture: `codex.jsonl` (4 KB).
+- Codex loads skills from `~/.codex/skills`, as Claude Code does from `~/.claude/skills`. Not re-observed yet.
 - During a provider outage Codex prints top-level events such as
   `{"type":"error","message":"Reconnecting... 2/5 (unexpected status 503 Service Unavailable ...)"}`
   mid-turn, numbered up to `5/5`, and carries on. A turn that recovers still ends with

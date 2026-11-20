@@ -477,7 +477,7 @@ fn role_spec(
     let (slots, pool_slots) =
         slot_counts(label, role.slots, agents).map_err(|problem| error("slots", problem))?;
     let skills = role.skills.as_deref().unwrap_or_default();
-    let skills = skills_for(harness, skills).map_err(|problem| error("skills", problem))?;
+    let skills = skills_for(skills).map_err(|problem| error("skills", problem))?;
     // Validated once here; the table lives for the rest of the process.
     Ok(RoleSpec {
         label: String::leak(label.to_string()),
@@ -496,7 +496,7 @@ fn role_spec(
     })
 }
 
-fn skills_for(harness: Harness, skills: &[String]) -> Result<&'static [&'static str], String> {
+fn skills_for(skills: &[String]) -> Result<&'static [&'static str], String> {
     if skills.len() > SKILLS_MAX {
         return Err(format!("lists more than the {SKILLS_MAX} skills allowed"));
     }
@@ -511,15 +511,6 @@ fn skills_for(harness: Harness, skills: &[String]) -> Result<&'static [&'static 
             return Err(format!(
                 "{skill:?} is not a skill name: letters, digits, '-', '_' and ':', starting \
                  with a letter or digit, at most {SKILL_LEN_MAX} bytes"
-            ));
-        }
-        if !harness.runs_skills() {
-            let harness = match harness {
-                Harness::Claude => "claude",
-                Harness::Codex => "codex",
-            };
-            return Err(format!(
-                "names the skill {skill:?}, which the {harness} harness cannot run"
             ));
         }
         out.push(String::leak(skill.clone()));

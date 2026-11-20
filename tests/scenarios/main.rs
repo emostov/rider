@@ -694,22 +694,28 @@ fn a_role_key_other_than_skills_in_a_repository_table_stops_the_daemon_naming_it
 }
 
 #[test]
-fn a_skill_on_a_codex_role_stops_the_daemon_naming_the_role_and_the_skill() {
-    let Some(world) = given_a_board_and_a_repository() else {
+fn a_skill_on_a_codex_role_reaches_its_workers_prompt() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let toml = format!(
-        "[repo.\"{}\".roles.review]\nskills = [\"polish-branch\"]\n",
+        "[roles.implement]\nharness = \"codex\"\nmodel = \"gpt-test-implement\"\n\n\
+         [repo.\"{}\".roles.implement]\nskills = [\"polish-branch\"]\n",
         world.repo_label()
     );
     given_a_rider_toml(&world, &toml);
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
 
-    let output = when_rider_runs(&world, &["daemon"]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
 
-    assert_eq!(output.code, Some(1), "{output:?}");
-    assert!(output.stderr.contains("roles.review.skills"), "{output:?}");
-    assert!(output.stderr.contains("polish-branch"), "{output:?}");
-    assert!(output.stderr.contains("codex"), "{output:?}");
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_runs_for(&world, &task)[0].harness, "codex");
+    let sent = agent_prompt(&world, &task, 0);
+    let step = "Before you complete, run each of these skills in order over the task's whole \
+                PR range, every commit on its branch, and fix what each one reports: \
+                `polish-branch`.";
+    assert!(sent.trim_end().ends_with(step), "{sent}");
 }
 
 #[test]
