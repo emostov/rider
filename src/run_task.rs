@@ -1415,10 +1415,10 @@ mod tests {
     #[test]
     fn a_branch_label_naming_another_branch_is_never_overwritten() {
         let (fixture, env) = setup("run-label-kept");
-        let board = FakeBoard::new(vec![task(&fixture, &[("branch", "rider/7-old")])]);
+        let board = FakeBoard::new(vec![task(&fixture, &[("branch", "rider/7..old")])]);
         assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
         let reason = format!(
-            "The task's `branch` label names \"rider/7-old\" but its worktree is on branch \
+            "The task's `branch` label names \"rider/7..old\" but its worktree is on branch \
              {BRANCH}; set the label to the branch that holds the task's work."
         );
         assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
