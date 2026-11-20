@@ -23,7 +23,7 @@ Push a `v*` tag to create a GitHub release. Publishing to crates.io is a separat
 The workflow runs on every `v*` tag.
 
 - `validate` fails unless the tag is `v` plus the `swarm-rider` version in the manifest and the
-  tagged commit is an ancestor of `origin/main`.
+  tagged commit is an ancestor of `refs/remotes/origin/main`.
 - `fmt`, `clippy`, `test`, and `package` then run the CI checks again on Rust 1.97.1.
 - `release` creates the GitHub release with generated notes, only if all four pass.
 
