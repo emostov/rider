@@ -19,7 +19,7 @@ writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
 **The swarm** is the `rider up` daemon. It runs agents in roles you configure in
-`~/.rider/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
+`<rider home>/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
 at once. `rider config` prints the settings in effect: the built-in roles and limits with the
 file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI) or
 `tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
@@ -37,7 +37,7 @@ Install Rider: clone https://github.com/emostov/rider if you don't have it yet, 
 
 Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
-review threads) and saves the answers in `~/.rider/ship.toml`.
+review threads) and saves the answers in `<rider home>/ship.toml`.
 
 ## Quickstart
 
@@ -45,7 +45,7 @@ Rider needs Rust, Node 22, and `claude`, `codex` or `tact` on `PATH`, signed in 
 that use them. Install the Board CLI where Rider looks for it:
 
 ```sh
-npm install --prefix ~/.rider/node @vercel/board
+npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board
 ```
 
 1. Start the daemon. It starts the local board if none is running, then claims ready tasks on
@@ -86,7 +86,7 @@ are prepared to have changed. Rider never pushes or merges; work stays on local 
 
 ## Where things live
 
-Everything is under `~/.rider`, or `$RIDER_HOME` when it is set.
+Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
 
 | Path | What |
 |---|---|
