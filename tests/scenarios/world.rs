@@ -252,10 +252,18 @@ impl World {
         assert!(self.daemon.is_none(), "the daemon has exited");
         self.stop_board();
         let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
-        let mut left = world_pids(self, deadline).expect("list the world's processes");
+        let mut left = world_processes(self, deadline)
+            .expect("list the world's processes")
+            .iter()
+            .map(|process| process.pid)
+            .collect::<Vec<u32>>();
         while !left.is_empty() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(POLL_MILLIS));
-            left = world_pids(self, deadline).expect("list the world's processes");
+            left = world_processes(self, deadline)
+                .expect("list the world's processes")
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<u32>>();
         }
         assert_eq!(
             left,
