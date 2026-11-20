@@ -34,6 +34,25 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
 - The owner's loop settings (`settings.md`) choose how each loop runs. They never relax a
   rule above.
 
+## Pinging the owner
+
+The owner should hear from you when they must act, and not for every poll. Classify each
+event, then send it on `notify.channel` (`"push"` uses the harness's push notification
+tool; without one, fall back to the session):
+
+- **Urgent, ping now:** a decision only the owner can make (a disagreement, a change of
+  scope, a `threads` or `comments` value of `"ask"`); a sensitive branch held by its
+  reviewers; a packet ready for their approval; a stuck check; a push rejected because the
+  remote branch is not the swarm's; and anything that stops the ship.
+- **Milestone, digest:** a PR opened, a packet approved, CI green, a fix pushed, a thread
+  resolved, an issue closed. Send these at the end of the turn, or in one digest every
+  `notify.digest_minutes`.
+- **Routine, silent:** a poll that saw no change, a rerun of a flake, a task claimed or
+  settled. These go to the board and the logs only.
+
+A ping says what happened, what you need from the owner, and the link. One ping per event:
+do not repeat it while you wait.
+
 In the commands below, `<repo>` is the repository, `<branch>` the branch being shipped (its
 task's `branch` label; the lowest first in a stack), `<top>` the id of the last task that
 moved it, `<n>` its PR, `<base>` its parent branch.
@@ -44,15 +63,18 @@ them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>`
 
 1. Read the owner's settings as `settings.md` says. When the file does not exist, ask the
    owner the questions there and write it before going on.
-2. With `packet.enabled = false`, go to step 1.
-3. When the branch is settled (step 1.1), push it as a packet with the packet tool, covering
+2. Decide whether the branch is sensitive, and if it is, run the gate in "Sensitive
+   branches" below before anything about it leaves the machine: a packet on a public host,
+   a pushed branch, or a PR.
+3. With `packet.enabled = false`, go to step 1.
+4. When the branch is settled (step 1.1), push it as a packet with the packet tool, covering
    the branch's diff from `<base>` (for `reviews`: the `writing-review-packets` skill, then
    `reviews push --range <base>..<branch> --packet <file>`). Give the owner the link.
-4. Wait in the background with a bounded poll: every `packet.poll_seconds` read the packet's
+5. Wait in the background with a bounded poll: every `packet.poll_seconds` read the packet's
    threads (and its section decisions when `packet.approval = "decisions"`), and stop on any
    change or after `packet.cap_minutes`. At the cap, tell the owner the packet is still
    waiting, and start the poll again only when they ask.
-5. On a change:
+6. On a change:
    - **An actionable comment**: with `comments.actionable = "task"`, a fix task as in
      step 3.4, its brief quoting the comment, the file and line, and the packet link. With
      `"ask"`, ask the owner first. When the fix completes, push a new patchset to the same
@@ -61,7 +83,33 @@ them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>`
    - **A question or a disagreement**: as in step 4.2.
    - **Approval**: every section approved (`"decisions"`), or the owner says the packet is
      approved (`"owner_says"`). Go to step 1, and link the packet in the PR body.
-6. Start the poll again after each change until the packet is approved.
+7. Start the poll again after each change until the packet is approved.
+
+### Sensitive branches
+
+A branch is sensitive when it changes authentication, authorization, sessions or tokens,
+rate limits or abuse controls, cryptography or signing, secret handling, input validation
+on a public endpoint, or what data a public endpoint returns; when it fixes a
+vulnerability; when its issue or task is about security; or when any review or the
+security review reported a security finding, blocking or not. When unsure, treat it as
+sensitive.
+
+Before publishing anything about it, start `sensitive.reviewers` independent reviewers:
+subagents with a fresh context (the `Agent` tool in Claude Code), each started alone. Give
+each the branch's diff, the PR body and packet text you plan to publish, the repository's
+visibility, and whether the code is already deployed. Do not give them your own view. Ask
+each to answer `safe`, `hold` or `owner` with reasons:
+
+- `hold`: publishing would disclose an exploitable weakness that is live in production and
+  not yet fixed there, a secret or credential, private data, or an internal path or host.
+- `owner`: it is a judgment the owner should make, such as disclosure timing.
+- `safe`: none of the above.
+
+Publish only when every reviewer says `safe`. On any `hold` or `owner`, publish nothing,
+ping the owner (urgent) with each reviewer's reasons, and wait. A fix that is public on
+GitHub as an open issue is not a secret, but a write-up of how to bypass a control that is
+still live can be.
+
 
 ## 1. Open the PR
 
@@ -75,7 +123,10 @@ them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>`
    (one `Closes #<issue>` line per resolved issue) when there is one.
 4. `gh pr create --base <base> --head <branch> --title "<title>" --body-file <file>`, with
    `--draft` when `pr.draft` is true and one `--reviewer <login>` for each of
-   `pr.reviewers`. Report the PR's URL. For a stack, open the lowest branch first, then
+   `pr.reviewers`. With `pr.copilot`, request a Copilot review:
+   `gh pr edit <n> --add-reviewer @copilot`. A repository that does not allow it, or a
+   login without permission to request reviewers, is not an error: say so and go on.
+   Report the PR's URL. For a stack, open the lowest branch first, then
    each next branch with `--base` its parent branch, and say in each body which PR it
    stacks on.
 
@@ -201,6 +252,9 @@ When every check is green and no thread is unresolved:
   a rerun is cheaper.
 - Asking the settings questions again when the file exists, or treating a setting as
   permission to break a rule.
+- Pinging the owner for routine events, or holding an urgent ping for the digest.
+- Publishing a sensitive branch on your own judgment, or giving its reviewers your
+  conclusion instead of the diff.
 - Replying "fixed" or resolving a thread before the fix is pushed and CI is green.
 - Pushing a rewritten branch with a bare `--force` instead of `--force-with-lease`, or
   force-pushing a branch the swarm did not create.
