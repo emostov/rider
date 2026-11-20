@@ -1,9 +1,12 @@
 //! One attempt at one claimed task: check it, run its agent, and settle it on the board.
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
+use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -40,6 +43,9 @@ pub const TAIL_REPLY_CHARS_MAX: usize = MESSAGE_CHARS_MAX - 1_000;
 /// Upper bound on the closed `onto` tasks read to find the unfinished tasks on a branch.
 pub const ONTO_READS_MAX: usize = 32;
 // JSON writes a character as at most six, so a record with this summary fits one message.
+/// How many times start-up reads the board's identity before giving up.
+pub const IDENTITY_READS_MAX: u32 = 5;
+const IDENTITY_PAUSE_MILLIS: u64 = 1_000;
 const SUMMARY_CHARS_MAX: usize = TAIL_REPLY_CHARS_MAX / 6;
 const ATTEMPT_LABEL: &str = "attempt";
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
@@ -309,6 +315,44 @@ pub fn board_identity(url: &str, board: &dyn Board) -> Result<BoardIdentity, Boa
     let identity = BoardIdentity::new(&board.identity()?);
     *known = Some((url.to_string(), identity.clone()));
     Ok(identity)
+}
+
+/// Why start-up could not learn the identity of the board at `url`.
+#[derive(Debug)]
+pub struct IdentityUnknown {
+    pub url: String,
+    pub error: BoardError,
+}
+
+impl fmt::Display for IdentityUnknown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "could not read the identity of the board at {} in {IDENTITY_READS_MAX} tries: {}",
+            self.url, self.error
+        )
+    }
+}
+
+/// The board's identity, read up to `IDENTITY_READS_MAX` times with a pause between reads.
+pub fn board_identity_at_start(
+    url: &str,
+    board: &dyn Board,
+) -> Result<BoardIdentity, IdentityUnknown> {
+    assert!(!url.is_empty());
+    let mut reads: u32 = 0;
+    loop {
+        reads += 1;
+        assert!(reads <= IDENTITY_READS_MAX);
+        match board_identity(url, board) {
+            Ok(identity) => return Ok(identity),
+            Err(error) if reads == IDENTITY_READS_MAX => {
+                let url = url.to_string();
+                return Err(IdentityUnknown { url, error });
+            }
+            Err(_) => thread::sleep(Duration::from_millis(IDENTITY_PAUSE_MILLIS)),
+        }
+    }
 }
 
 /// Judges an attempt once its agent has ended, from the task's state and the worktree.

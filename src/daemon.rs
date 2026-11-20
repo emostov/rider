@@ -30,8 +30,8 @@ use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
-    Attempt, Env, Judgement, Prepared, RunError, board_identity, judge_attempt, launch_agent,
-    prepare_attempt, settle_attempt,
+    Attempt, Env, IdentityUnknown, Judgement, Prepared, RunError, board_identity_at_start,
+    judge_attempt, launch_agent, prepare_attempt, settle_attempt,
 };
 use crate::settle::Verdict;
 
@@ -112,6 +112,8 @@ pub enum DaemonError {
     Setting(String),
     /// The daemon's log exists and is not a regular file.
     NotAFile(PathBuf),
+    /// The board's identity could not be read at start-up.
+    Identity(IdentityUnknown),
 }
 
 impl fmt::Display for DaemonError {
@@ -130,6 +132,7 @@ impl fmt::Display for DaemonError {
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
             DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
+            DaemonError::Identity(error) => write!(f, "{error}"),
         }
     }
 }
@@ -400,13 +403,11 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         stop_now: AtomicBool::new(false),
         log,
     });
-    // Read before any claim, so no attempt spends its lease on it; a failure here is retried
-    // by the first attempt.
-    let identity = board_identity(&shared.paths.board_url, &shared.board(DAEMON_PROFILE));
+    // Read before any claim, so no attempt spends its lease on it.
+    let identity = board_identity_at_start(&shared.paths.board_url, &shared.board(DAEMON_PROFILE));
     if let Err(error) = identity {
-        shared
-            .log
-            .write(&format!("could not read the board's identity: {error}"));
+        shared.log.write(&error.to_string());
+        return Err(DaemonError::Identity(error));
     }
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;

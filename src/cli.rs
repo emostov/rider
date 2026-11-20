@@ -24,7 +24,7 @@ use crate::pool::{
 };
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
-use crate::run_task::{Env, Ran, RunError, board_identity, run_task};
+use crate::run_task::{Env, IdentityUnknown, Ran, RunError, board_identity_at_start, run_task};
 use crate::settle::Verdict;
 
 const ENVIRONMENT: &str = r#"environment:
@@ -330,6 +330,7 @@ pub enum CliError {
     Run(RunError),
     SlotsFailed(usize),
     Daemon(DaemonError),
+    Identity(IdentityUnknown),
     Reap(ReapError),
     TooManyUrls,
     ConfigFile(ConfigFileError),
@@ -356,6 +357,7 @@ impl fmt::Display for CliError {
                 write!(f, "the task is no longer claimed; it is {state:?}")
             }
             CliError::Daemon(error) => write!(f, "{error}"),
+            CliError::Identity(error) => write!(f, "{error}"),
             CliError::Reap(error) => write!(f, "{error}"),
             CliError::TooManyUrls => write!(f, "name at most {REAP_URLS_MAX} boards"),
             CliError::ConfigFile(error) => write!(f, "{error}"),
@@ -519,13 +521,8 @@ fn pool(project: &Project, config: &Config) -> Result<u8, CliError> {
         url: config.board_url.clone(),
         profile: first.profile.clone(),
     };
-    // Read before any slot claims, so no attempt spends its lease on it; a failure here is
-    // retried by the first attempt.
-    if let Err(error) = board_identity(&config.board_url, &reader) {
-        say(&format!(
-            "rider pool: could not read the board's identity: {error}"
-        ));
-    }
+    // Read before any slot claims, so no attempt spends its lease on it.
+    board_identity_at_start(&config.board_url, &reader).map_err(CliError::Identity)?;
     say(&format!(
         "rider pool: {} slots on {channel}, at most {} agents at once; \
          type stop or press Ctrl-D to stop after running tasks finish",

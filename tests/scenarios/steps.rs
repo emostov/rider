@@ -685,6 +685,20 @@ exec '{}' "$@"
     crate::world::write_executable(&world.vb, &script);
 }
 
+/// Given every `vb` call that names the board's identity channel fails, and no other.
+pub fn given_vb_fails_the_identity_read(world: &World) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" rider/identity "*) echo 'identity unavailable' >&2; exit 1;; esac
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
 /// A second `vb serve` on a port of its own, killed with its group when it drops.
 pub struct OtherBoard {
     pub url: String,

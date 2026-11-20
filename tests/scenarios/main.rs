@@ -165,6 +165,30 @@ fn the_daemon_claims_a_ready_task_within_five_seconds_of_its_role_being_set() {
 }
 
 #[test]
+fn a_board_whose_identity_cannot_be_read_stops_the_daemon_and_the_pool_before_any_claim() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add one work file."));
+    given_vb_fails_the_identity_read(&world);
+
+    let daemon = when_rider_runs(&world, &["daemon"]);
+    let pool = when_rider_runs(&world, &["pool", PROJECT]);
+
+    for started in [daemon, pool] {
+        assert_eq!(started.code, Some(1), "{started:?}");
+        assert!(started.stderr.contains(&world.url), "{started:?}");
+        assert!(
+            started.stderr.contains("identity unavailable"),
+            "{started:?}"
+        );
+    }
+    assert_eq!(task_state(&world, &task), "ready");
+    assert_eq!(task_block(&world, &task), None);
+    assert_eq!(agent_runs(&world), vec![]);
+}
+
+#[test]
 fn a_second_daemon_or_pool_on_the_same_home_exits_naming_the_holder() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
