@@ -16,10 +16,10 @@ writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
 **The swarm** is the `rider up` daemon. It runs agents in roles you configure in
-`~/.rider/rider.toml`. Each role sets
-its agents' model and prompt and how many replicas run at once. `rider config` prints the
-settings in effect. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI)
-or `tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
+`~/.rider/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
+at once. `rider config` prints the settings in effect: the built-in roles and limits with the
+file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI) or
+`tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
 for the roles that use it.
 
 ## Getting started
@@ -68,9 +68,6 @@ npm install --prefix ~/.rider/node @vercel/board
    The board's web inspector is at <http://127.0.0.1:4100>.
 
 4. Stop: `rider down`.
-
-`rider config` prints the effective `rider.toml`: the built-in roles and limits with the
-file's over them.
 
 Agents run unsandboxed, with permission prompts skipped. Point Rider only at repositories you
 are prepared to have changed. Rider never pushes or merges; work stays on local branches named
