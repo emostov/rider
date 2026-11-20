@@ -11,7 +11,10 @@ mod steps;
 mod world;
 
 use std::fs;
+use std::os::unix::process::CommandExt;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -665,4 +668,56 @@ fn claude_options(session: Option<&str>) -> Vec<String> {
         options.extend(["--resume", session, "--fork-session"].map(String::from));
     }
     options
+}
+
+#[test]
+fn a_panicking_world_kills_its_wrapped_vb_and_spares_a_process_that_names_its_path() {
+    let Some(mut world) = World::new() else {
+        return;
+    };
+    world.start_board();
+    given_vb_replies_slowly(&world, &world.root.join("replied"), 1);
+    let mut observer = Command::new("/usr/bin/tail")
+        .arg("-f")
+        .arg(world.root.join("board.log"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("start an observer of the world's board log");
+    let mut wrapped: Option<Child> = None;
+
+    let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
+        let world = world;
+        let child = world
+            .command(&world.vb)
+            .args(["tail", "--url", &world.url, "--as", world::LEAD])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("start the wrapped vb tail");
+        let child = wrapped.insert(child);
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(
+            child.try_wait().expect("poll the wrapped vb").map(|_| ()),
+            None
+        );
+        panic!("the scenario fails while its wrapped vb runs");
+    }));
+
+    assert!(unwound.is_err());
+    let survived = observer.try_wait().expect("poll the observer").map(|_| ());
+    let _ = observer.kill();
+    let _ = observer.wait();
+    assert_eq!(survived, None, "the observer was killed with the world");
+    let mut wrapped = wrapped.expect("the wrapped vb was started");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while wrapped.try_wait().expect("poll the wrapped vb").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the wrapped vb outlived its world"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
