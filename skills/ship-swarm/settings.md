@@ -2,13 +2,17 @@
 
 The owner's choices for the loops in `SKILL.md`: the owner's review in a packet, what to do
 with comments, how to watch CI, and what to do with PR review threads. They live in one TOML
-file, `<rider home>/ship.toml` (`~/.rider/ship.toml` unless `RIDER_HOME` is set), so they
-carry over between projects and sessions.
+file, `<rider home>/ship.toml` (`~/.rider/ship.toml` unless `RIDER_HOME` is set), kept per
+repository, so they carry over between sessions.
 
 ## Reading the file
 
-Read the file at the start of every ship. A key the file leaves out takes the default in the
-table below. A `[repo."<owner>/<name>"]` table overrides any key for that one repository:
+The file holds one `[repo."<owner>/<name>"]` table per repository, with sub-tables such as
+`[repo."<owner>/<name>".ci]`. Top-level keys are allowed as the owner's own defaults; the lead
+never writes them.
+
+Read the file at the start of every ship and find this repository's table. A key that table
+leaves out takes the top-level value, then the default in the Keys table:
 
 ```toml
 [ci]
@@ -16,14 +20,24 @@ poll_seconds = 30
 
 [repo."acme/api".ci]
 poll_seconds = 60
+
+[repo."acme/api".pr]
+draft = true
+reviewers = ["octocat"]
+
+[repo."acme/api".threads]
+actionable = "task"
 ```
+
+Here `acme/api` polls CI every 60 seconds; any other repository with a table polls every 30.
 
 A key or a value this file does not list is an error: tell the owner which key and which
 file, and stop. Do not guess what it meant.
 
-## The first ship: ask
+## The first ship from a repository: ask
 
-When the file does not exist, ask the owner before step 1. Ask in one round, with the
+When the file has no table for this repository, including when the file does not exist, ask
+the owner before step 1. Ask in one round, with the
 `AskUserQuestion` tool when the harness has it, otherwise as a short numbered list. Offer the
 default first in each question and say it is the default. Ask only these:
 
@@ -40,10 +54,14 @@ default first in each question and say it is the default. Ask only these:
 5. **Pings.** Where to ping (this session, or a push notification when the harness has
    one), and whether to hold routine updates for a digest.
 
-Write the answers to the file, show the owner the file, and go on. Do not ask again on a
-later ship. The owner changes a choice by editing the file or by asking you to.
+Write the answers into this repository's table only, never into the top level or another
+repository's table. Show the owner the table, and go on. Never ask again for a repository that
+has a table. The owner changes a choice by editing the file or by asking you to.
 
 ## Keys
+
+Keys are named relative to the repository's table (`ci.poll_seconds` is
+`[repo."<owner>/<name>".ci]`, `poll_seconds`).
 
 | Key | Values | Default | Used in |
 |---|---|---|---|
@@ -84,36 +102,36 @@ branch, force-push a branch the swarm did not create, or leave a review on a PR.
 ## Example
 
 ```toml
-[packet]
+[repo."acme/api".packet]
 enabled = true
 tool = "reviews"
 approval = "owner_says"
 poll_seconds = 60
 cap_minutes = 120
 
-[comments]
+[repo."acme/api".comments]
 actionable = "task"
 reply = "after_fix"
 
-[ci]
+[repo."acme/api".ci]
 poll_seconds = 30
 cap_minutes = 0
 flake_reruns = 1
 
-[pr]
+[repo."acme/api".pr]
 draft = true
 reviewers = ["octocat"]
 copilot = true
 ready = "ask"
 
-[threads]
+[repo."acme/api".threads]
 actionable = "task"
 reply = "after_green"
 
-[notify]
+[repo."acme/api".notify]
 channel = "push"
 digest_minutes = 60
 
-[sensitive]
+[repo."acme/api".sensitive]
 reviewers = 2
 ```

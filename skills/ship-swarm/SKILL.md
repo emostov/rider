@@ -61,8 +61,9 @@ them short. `gh api` has no `-R`: its path and GraphQL variables carry `<owner>`
 
 ## 0. Settings and the owner's review
 
-1. Read the owner's settings as `settings.md` says. When the file does not exist, ask the
-   owner the questions there and write it before going on.
+1. Read the owner's settings as `settings.md` says. When the file has no table for this
+   repository (or no file), ask the owner the questions there and write that table before
+   going on.
 2. Decide whether the branch is sensitive, and if it is, run the gate in "Sensitive
    branches" below before anything about it leaves the machine: a packet on a public host,
    a pushed branch, or a PR.
@@ -250,7 +251,7 @@ When every check is green and no thread is unresolved:
 - Watching CI in the foreground, or looping `gh pr checks` without `--watch`.
 - Rerunning a check more than `ci.flake_reruns` times, or calling a failure a flake because
   a rerun is cheaper.
-- Asking the settings questions again when the file exists, or treating a setting as
+- Asking the settings questions again for a repository that has a table, or treating a setting as
   permission to break a rule.
 - Pinging the owner for routine events, or holding an urgent ping for the digest.
 - Publishing a sensitive branch on your own judgment, or giving its reviewers your
