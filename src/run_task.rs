@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
-use crate::brief::{Brief, BriefError, echo, label, parse_brief};
+use crate::brief::{Brief, echo, label, parse_brief};
 use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
@@ -377,9 +377,6 @@ fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
     let invalid = |reason: String| Block::new("invalid_brief", reason);
     let mut brief = parse_brief(view).map_err(|error| invalid(error.to_string()))?;
     brief.role = role_in_repo(brief.role, &brief.repo);
-    if brief.role.needs_of && brief.of.is_none() {
-        return Err(invalid(BriefError::ReviewWithoutOf.to_string()));
-    }
     let failed = match label(view, ATTEMPT_LABEL) {
         None => 0,
         Some(value) => parse_attempts(value).ok_or_else(|| {

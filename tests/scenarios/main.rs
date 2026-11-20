@@ -658,7 +658,30 @@ fn an_unknown_key_in_a_repository_role_table_stops_the_daemon_naming_it() {
     let output = when_rider_runs(&world, &["daemon"]);
 
     assert_eq!(output.code, Some(1), "{output:?}");
-    assert!(output.stderr.contains("skils"), "{output:?}");
+    assert!(
+        output.stderr.contains("roles.implement.skils"),
+        "{output:?}"
+    );
+    assert!(output.stderr.contains("rider.toml"), "{output:?}");
+}
+
+#[test]
+fn a_role_key_other_than_skills_in_a_repository_table_stops_the_daemon_naming_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let toml = format!(
+        "[repo.\"{}\".roles.review]\nbuilds = true\nskills = [\"tidy\"]\n",
+        world.repo_label()
+    );
+    given_a_rider_toml(&world, &toml);
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("roles.review.builds"), "{output:?}");
+    let only = "only `skills` may be set per repository";
+    assert!(output.stderr.contains(only), "{output:?}");
     assert!(output.stderr.contains("rider.toml"), "{output:?}");
 }
 
@@ -706,7 +729,7 @@ fn rider_config_for_a_repository_prints_its_merged_role_table() {
     };
     let toml = format!(
         "[roles.light]\nskills = [\"tidy\"]\n\n[repo.\"{}\".roles.implement]\n\
-         model = \"claude-big-model\"\nskills = [\"polish-branch\"]\n",
+         skills = [\"polish-branch\"]\n",
         world.repo_label()
     );
     given_a_rider_toml(&world, &toml);
@@ -722,12 +745,6 @@ fn rider_config_for_a_repository_prints_its_merged_role_table() {
     assert_eq!(plain.stdout, plain_expected);
     let merged_expected = replace_role_key(
         &plain_expected,
-        "implement",
-        "model = \"claude-opus-5-5\"\n",
-        "model = \"claude-big-model\"\n",
-    );
-    let merged_expected = replace_role_key(
-        &merged_expected,
         "implement",
         "skills = []\n",
         "skills = [\"polish-branch\"]\n",

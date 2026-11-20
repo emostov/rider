@@ -127,7 +127,7 @@ struct FileShape {
 #[serde(deny_unknown_fields)]
 struct RepoShape {
     #[serde(default)]
-    roles: BTreeMap<String, RoleShape>,
+    roles: BTreeMap<String, BTreeMap<String, toml::Value>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -306,16 +306,25 @@ fn repo_settings(
         }
         let mut merged = roles.to_vec();
         let mut specs = Vec::with_capacity(repo.roles.len());
-        for (label, over) in repo.roles {
+        for (label, mut keys) in repo.roles {
             let field = format!("{prefix}roles.{label}");
             let Some((_, role)) = merged.iter_mut().find(|(known, _)| *known == label) else {
                 return Err(field_error(path, field, "is not a role".to_string()));
             };
-            if over.slots.is_some() {
-                let problem = "applies to every repository; set it under [roles]".to_string();
-                return Err(field_error(path, format!("{field}.slots"), problem));
+            let skills = keys.remove("skills");
+            if let Some(key) = keys.into_keys().next() {
+                let problem =
+                    format!("cannot be set in [{field}]: only `skills` may be set per repository");
+                return Err(field_error(path, format!("{field}.{key}"), problem));
             }
-            role.overlay(over);
+            let Some(skills) = skills else {
+                continue;
+            };
+            let skills = skills.try_into::<Vec<String>>().map_err(|_| {
+                let problem = "must be a list of skill names".to_string();
+                field_error(path, format!("{field}.skills"), problem)
+            })?;
+            role.skills = Some(skills);
             specs.push(role_spec(path, home, &prefix, &label, role, limits.agents)?);
         }
         let toml = render(path, limits, &merged)?;
