@@ -11,4 +11,6 @@ pub mod pool;
 pub mod roles;
 pub mod run_task;
 pub mod settle;
+#[cfg(test)]
+mod test_support;
 pub mod worktree;

@@ -588,8 +588,8 @@ fn say(line: &str) {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::write_executable;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use super::*;
@@ -929,8 +929,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 3\n",
             record.display()
         );
-        fs::write(bin.join("vb"), script).unwrap();
-        fs::set_permissions(bin.join("vb"), fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&bin.join("vb"), &script);
         let code = execute(&Command::Serve, &config_at(&home)).unwrap();
         assert_eq!(code, 3);
         let board = home.join("board");
