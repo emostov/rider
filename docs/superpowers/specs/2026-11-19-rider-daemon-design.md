@@ -256,8 +256,8 @@ Every one is a named constant. Values are Calls; the first three exist today.
 
 | Constant | Value | When reached |
 |---|---|---|
-| `AGENTS_MAX` | 4 | ready tasks wait |
-| per-role `slots` | 2, 2, 2, 1, 1 | ready tasks of that role wait |
+| `AGENTS_MAX` | 32 (`limits.agents` in `rider.toml` may lower it) | ready tasks wait |
+| per-role `slots` | none by default; set per role in `rider.toml` | ready tasks of that role wait |
 | `ATTEMPT_SECONDS_MAX` | 55 min | the agent is stopped; the task fails |
 | `ATTEMPTS_MAX` | 3 | blocked as `attempts_exhausted` |
 | `TASKS_MAX` | 256 | further tasks are not tracked or claimed; `rider status` says how many; they are picked up as others finish |

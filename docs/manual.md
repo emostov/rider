@@ -14,7 +14,7 @@ This is milestone 0. What works:
 - `rider serve` runs the local board.
 - `rider pool <project>` runs worker slots on the channel `work/<project>`. Each slot claims a
   ready task by its `role` label, makes a worktree and a branch, runs one agent, and then
-  completes, fails, or blocks the task. At most 4 agents run at once.
+  completes, fails, or blocks the task. Up to 32 agents run at once, as the board allows.
 - The `ride-swarm` skill (`skills/ride-swarm/`), which holds the lead's instructions
   (`lead.md`) and the result and finding schemas; and the worker prompts (`prompts/`).
 
@@ -115,8 +115,45 @@ The `role` label on a task picks the agent. A task is claimable only once it has
 | `qa` | Opus 5.5 | Claude Code | QA <n> (Opus 5.5) | no |
 
 The lead is Fable 5.2 in Claude Code, with the board profile `lead-fable-5-2`. Each worker's
-board profile is `<role>-<n>-<model>`, such as `implement-1-opus-5-5`. The table is defined
-once, in `src/roles.rs`.
+board profile is `<role>-<n>-<model>`, such as `implement-1-opus-5-5`. This is the built-in
+table; `rider.toml` (below) may change it.
+
+## Configuration
+
+`rider daemon` and `rider pool` read `$RIDER_HOME/rider.toml` when they start. Without the
+file they use the built-in roles and limits. `rider config` prints the effective
+configuration, built-in plus file, in the file's own form, so you can start a file from it.
+
+A role in the file overrides a built-in role field by field, or adds a new role (at most 16
+roles in all). A new role sets every field but `slots`. `prompt` is a built-in prompt name
+(`implement`, `review`, `polish`, `security`, `qa`) or a path to your own prompt file,
+relative to `$RIDER_HOME` or absolute. A role that does not commit needs an `of` label.
+`slots` caps how many agents of the role run at once; unset, only `limits.agents` does.
+
+```toml
+[limits]
+agents = 8           # agents at once, 1 to 32 (default 32)
+attempt_minutes = 30 # one attempt's time limit, 1 to 55 (default 55)
+
+[roles.review]
+model = "gpt-6.1-sol-mini"
+
+[roles.polish]
+slots = 1
+
+[roles.docs]
+harness = "claude"   # claude or codex
+model = "claude-sonnet-5-5"
+title = "Docs"
+model_name = "Sonnet 5.5"
+model_slug = "sonnet-5-5"
+prompt = "prompts/docs.md"
+commits = true
+```
+
+An unknown or malformed field, an unknown harness, a missing prompt file, or a limit out of
+range stops `rider daemon` and `rider pool` with an error naming the field and the file. The
+file is read once; restart to apply a change.
 
 ## Labels
 

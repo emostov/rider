@@ -48,6 +48,8 @@ yours: decide, say why in one line, and move.
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
 | `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
+This table is the default; the user's `$RIDER_HOME/rider.toml` may change or add roles, so read the effective table with `rider config`.
+
 `light` is a cheaper implementer with the same instructions as `implement`. Use it only
 when the brief already says exactly what to change and how to prove it: a restack, a rename,
 a reviewer's specific fix, a test that is spelled out. Use `implement` when the task needs

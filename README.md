@@ -15,7 +15,7 @@ the workers' questions, checks their results, and keeps you updated. It never
 writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
-**The swarm** runs up to four agents at once:
+**The swarm** runs up to 32 agents at once, as the task graph allows:
 
 | Role        | Model           | Job                                         |
 | ----------- | --------------- | ------------------------------------------- |
