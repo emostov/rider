@@ -290,6 +290,7 @@ fn three_ready_polish_tasks_never_run_more_than_one_polish_agent_at_once() {
         task
     })
     .collect();
+    given_a_rider_toml(&world, "[roles.polish]\nslots = 1\n");
     given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
     when_the_agent_has_started(&world, &tasks[0]);
     thread::sleep(Duration::from_secs(2));
@@ -304,6 +305,100 @@ fn three_ready_polish_tasks_never_run_more_than_one_polish_agent_at_once() {
     assert_eq!(world.most_agents_at_once(), 1);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_rider_toml_giving_review_another_model_starts_the_review_agent_with_it() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodel = \"gpt-test-review\"\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the new work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    let runs = agent_runs_for(&world, &review);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].harness, "codex");
+    assert_eq!(agent_model(&world, &review, 0), "gpt-test-review");
+    assert_eq!(agent_model(&world, &built, 0), "claude-opus-5-5");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_rider_toml_adding_a_role_runs_its_task_with_the_roles_own_prompt() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompt = world.root.join("docs-prompt.md");
+    fs::write(&prompt, "You write the documentation for one task.\n").expect("write a prompt");
+    let toml = format!(
+        r#"[roles.docs]
+harness = "claude"
+model = "claude-docs-model"
+title = "Docs"
+model_name = "Docs Model"
+model_slug = "docs-model"
+prompt = "{}"
+commits = true
+"#,
+        prompt.display()
+    );
+    given_a_rider_toml(&world, &toml);
+    let mut new = an_implement_task(&world, "Document the work.");
+    new.role = Some("docs".to_string());
+    let task = when_the_lead_creates(&world, &new);
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+
+    assert_eq!(agent_model(&world, &task, 0), "claude-docs-model");
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(
+        sent.starts_with("You write the documentation for one task.\n\n# Task "),
+        "{sent}"
+    );
+    then_the_branch_has_the_agents_commit(&world, &task, 0);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn an_unknown_field_in_rider_toml_stops_the_daemon_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodle = \"gpt-test-review\"\n");
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("modle"), "{output:?}");
+    assert!(output.stderr.contains("rider.toml"), "{output:?}");
+    assert!(!world.home.join("daemon.lock").exists(), "{output:?}");
+}
+
+#[test]
+fn rider_config_without_a_file_prints_the_built_in_table() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = include_str!("rider-config-default.toml");
+    assert_eq!(output.stdout, expected);
 }
 
 #[test]

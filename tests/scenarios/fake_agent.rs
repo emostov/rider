@@ -13,6 +13,7 @@ const HOLD_STEPS_PER_SECOND: u64 = 10;
 const RUNS_FILE: &str = "agent-runs.log";
 const BEHAVIOURS_DIR: &str = "agent-behaviours";
 const RELEASES_DIR: &str = "agent-releases";
+const ARGS_DIR: &str = "agent-args";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
@@ -88,6 +89,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=$(tail -n 1 "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
+printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 summary="Fake agent finished task $task attempt $attempt."
 report() {{
@@ -136,7 +138,7 @@ pub fn install(world: &Path, agents: &Path) {
     for name in ["claude", "codex"] {
         write_executable(&agents.join(name), &text);
     }
-    for dir in [BEHAVIOURS_DIR, RELEASES_DIR] {
+    for dir in [BEHAVIOURS_DIR, RELEASES_DIR, ARGS_DIR] {
         fs::create_dir_all(world.join(dir)).expect("create an agent directory");
     }
     assert!(agents.join("claude").is_file() && agents.join("codex").is_file());
@@ -149,6 +151,12 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
     let path = world.join(BEHAVIOURS_DIR).join(task);
     fs::write(&path, format!("{}\n", words.join("\n"))).expect("write an agent's plan");
     assert!(path.is_file());
+}
+
+/// The arguments attempt `attempt` of `task` was started with, one per line.
+pub fn args(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}"));
+    fs::read_to_string(&path).expect("read an agent's arguments")
 }
 
 /// Lets a holding agent of `task` go on.

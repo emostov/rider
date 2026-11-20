@@ -5,7 +5,8 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::board::{Board, TaskId, one_line};
-use crate::roles::{AGENTS_MAX, ROLES, RoleSpec, display_name, profile_name};
+use crate::core::ROLES_MAX;
+use crate::roles::{AGENTS_MAX, RoleSpec, display_name, profile_name};
 use crate::run_task::RunError;
 use crate::settle::Verdict;
 
@@ -32,7 +33,7 @@ const SECONDS_PER_DAY: u64 = 24 * 3600;
 /// Upper bound on the claims one slot makes before it stops.
 pub const SLOT_ROUNDS_MAX: u32 = 1_000_000;
 /// Upper bound on the slots of every role together.
-pub const SLOTS_MAX: usize = 32;
+pub const SLOTS_MAX: usize = ROLES_MAX * AGENTS_MAX as usize;
 /// Upper bound, in characters, on the result, reason, or error shown in one event line.
 pub const DETAIL_CHARS_MAX: usize = 120;
 
@@ -45,10 +46,11 @@ pub struct Slot {
     pub name: String,
 }
 
-/// One slot per `RoleSpec::slots` of every role, in table order.
-pub fn slots() -> Vec<Slot> {
+/// One slot per `RoleSpec::slots` of every role in `table`, in table order.
+pub fn slots(table: &'static [RoleSpec]) -> Vec<Slot> {
+    assert!(!table.is_empty() && table.len() <= ROLES_MAX);
     let mut all = Vec::with_capacity(SLOTS_MAX);
-    for role in ROLES.iter() {
+    for role in table {
         for number in 1..=role.slots {
             all.push(Slot {
                 role,
@@ -58,13 +60,13 @@ pub fn slots() -> Vec<Slot> {
             });
         }
     }
-    assert!(all.len() <= SLOTS_MAX);
-    assert!(all.len() >= usize::from(AGENTS_MAX));
+    assert!(all.len() <= SLOTS_MAX && all.len() >= table.len());
     all
 }
 
-/// A counting gate that lets at most `AGENTS_MAX` holders through at once.
+/// A counting gate that lets at most its limit of holders through at once.
 pub struct Gate {
+    limit: u8,
     running: Mutex<u8>,
     freed: Condvar,
 }
@@ -75,8 +77,11 @@ pub struct GatePass<'a> {
 }
 
 impl Gate {
-    pub fn new() -> Gate {
+    /// A gate that lets at most `limit` holders through at once.
+    pub fn new(limit: u8) -> Gate {
+        assert!(limit > 0 && limit <= AGENTS_MAX);
         Gate {
+            limit,
             running: Mutex::new(0),
             freed: Condvar::new(),
         }
@@ -93,23 +98,17 @@ impl Gate {
             if stop.load(Ordering::SeqCst) {
                 return None;
             }
-            if *running < AGENTS_MAX {
+            if *running < self.limit {
                 *running += 1;
-                assert!(*running <= AGENTS_MAX);
+                assert!(*running <= self.limit);
                 return Some(GatePass { gate: self });
             }
             let wait = Duration::from_millis(GATE_WAIT_MILLIS);
             let waited = self.freed.wait_timeout(running, wait);
             running = waited.unwrap_or_else(PoisonError::into_inner).0;
         }
-        assert!(*running <= AGENTS_MAX);
+        assert!(*running <= self.limit);
         None
-    }
-}
-
-impl Default for Gate {
-    fn default() -> Gate {
-        Gate::new()
     }
 }
 
@@ -120,7 +119,7 @@ impl Drop for GatePass<'_> {
             .running
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        assert!(*running > 0 && *running <= AGENTS_MAX);
+        assert!(*running > 0 && *running <= self.gate.limit);
         *running -= 1;
         drop(running);
         self.gate.freed.notify_one();
@@ -279,9 +278,10 @@ mod tests {
     use super::*;
     use crate::board::testing::FakeBoard;
     use crate::board::{BoardError, TaskState, TaskView};
+    use crate::roles::ROLES;
 
     fn slot(label: &str, number: u8) -> Slot {
-        let found = slots()
+        let found = slots(&ROLES)
             .into_iter()
             .find(|slot| slot.role.label == label && slot.number == number);
         found.unwrap_or_else(|| panic!("no slot {label} {number}"))
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn slots_follow_the_role_table() {
-        let all = slots();
+        let all = slots(&ROLES);
         let expected: usize = ROLES.iter().map(|role| usize::from(role.slots)).sum();
         assert_eq!(all.len(), expected);
         assert!(all.iter().any(|s| s.profile == "implement-2-opus-5-5"));
@@ -418,7 +418,7 @@ mod tests {
     fn never_more_than_four_tasks_run_at_once() {
         const TASKS: u64 = 12;
         let board = QueueBoard::new((1..=TASKS).map(Step::Task).collect());
-        let gate = Gate::new();
+        let gate = Gate::new(AGENTS_MAX);
         let stop = AtomicBool::new(false);
         let running = &board.running;
         let running_max = AtomicUsize::new(0);
@@ -442,7 +442,7 @@ mod tests {
             }
             Ok(Verdict::LeaveBlocked)
         };
-        let all = slots();
+        let all = slots(&ROLES);
         let ends: Vec<SlotEnd> = thread::scope(|scope| {
             let handles: Vec<_> = all
                 .iter()
@@ -499,7 +499,14 @@ mod tests {
             now: &epoch,
         };
         let review = slot("review", 1);
-        let end = slot_loop(&review, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &review,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         assert_eq!(
             *board.calls.borrow(),
@@ -525,8 +532,8 @@ mod tests {
             say: &quiet,
             now: &epoch,
         };
-        let gate = Gate::new();
-        for slot in slots() {
+        let gate = Gate::new(AGENTS_MAX);
+        for slot in slots(&ROLES) {
             let board = FakeBoard::new(Vec::new());
             board.claims.borrow_mut().push_back(TaskId(1));
             let end = slot_loop(&slot, "work/demo", &board, &gate, &stop, &effects);
@@ -561,7 +568,7 @@ mod tests {
             &implement,
             "work/demo",
             &board,
-            &Gate::new(),
+            &Gate::new(AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -604,7 +611,14 @@ mod tests {
             now: &epoch,
         };
         let polish = slot("polish", 1);
-        let end = slot_loop(&polish, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &polish,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         let steps = usize::try_from(CLAIM_RETRY_PAUSE_SECONDS).unwrap();
         assert_eq!(pauses.load(Ordering::SeqCst), 2 * steps);
@@ -642,7 +656,7 @@ mod tests {
             &security,
             "work/demo",
             &board,
-            &Gate::new(),
+            &Gate::new(AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -686,7 +700,14 @@ mod tests {
             now: &epoch,
         };
         let review = slot("review", 2);
-        let end = slot_loop(&review, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &review,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         assert_eq!(
             lines.into_inner().unwrap(),
@@ -731,7 +752,7 @@ mod tests {
             &implement,
             "work/demo",
             &board,
-            &Gate::new(),
+            &Gate::new(AGENTS_MAX),
             &stop,
             &effects,
         );
@@ -744,7 +765,7 @@ mod tests {
 
     #[test]
     fn the_gate_admits_at_most_its_capacity_and_frees_a_place_on_panic() {
-        let gate = Gate::new();
+        let gate = Gate::new(AGENTS_MAX);
         let panicked = thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -768,7 +789,7 @@ mod tests {
     fn a_role_with_ready_work_gets_a_place_from_idle_slots() {
         let mut board = QueueBoard::new(vec![Step::Task(1)]);
         board.role = Some("review");
-        let gate = Gate::new();
+        let gate = Gate::new(4);
         let stop = AtomicBool::new(false);
         let ran = AtomicBool::new(false);
         let run = |id: TaskId| -> Result<Verdict, RunError> {
@@ -781,7 +802,7 @@ mod tests {
         let idle = ["implement", "light"].map(|label| [slot(label, 1), slot(label, 2)]);
         let mut contenders: Vec<Slot> = idle.into_iter().flatten().collect();
         contenders.push(slot("review", 1));
-        assert_eq!(contenders.len(), usize::from(AGENTS_MAX) + 1);
+        assert_eq!(contenders.len(), usize::from(gate.limit) + 1);
         let started = Instant::now();
         thread::scope(|scope| {
             for contender in &contenders {
@@ -832,7 +853,14 @@ mod tests {
             now: &epoch,
         };
         let polish = slot("polish", 1);
-        let end = slot_loop(&polish, "work/demo", &board, &Gate::new(), &stop, &effects);
+        let end = slot_loop(
+            &polish,
+            "work/demo",
+            &board,
+            &Gate::new(AGENTS_MAX),
+            &stop,
+            &effects,
+        );
         assert_eq!(end, SlotEnd::Stopped);
         const { assert!(IDLE_PAUSE_SECONDS > 1) };
         assert_eq!(pauses.load(Ordering::SeqCst), 1);
@@ -844,14 +872,14 @@ mod tests {
 
     #[test]
     fn a_stopped_gate_gives_no_place() {
-        let gate = Gate::new();
+        let gate = Gate::new(AGENTS_MAX);
         assert!(gate.enter_unless(&AtomicBool::new(true)).is_none());
         assert_eq!(*gate.running.lock().unwrap(), 0);
     }
 
     #[test]
     fn a_slot_waiting_for_a_place_returns_soon_after_stop() {
-        let gate = Gate::new();
+        let gate = Gate::new(AGENTS_MAX);
         let go = AtomicBool::new(false);
         let full: Vec<Option<GatePass>> = (0..AGENTS_MAX).map(|_| gate.enter_unless(&go)).collect();
         assert!(full.iter().all(Option::is_some));

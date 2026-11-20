@@ -15,13 +15,14 @@ use std::time::{Duration, SystemTime};
 use clap::{Parser, Subcommand};
 
 use crate::board::{TaskId, VbCli};
+use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths, take_lock};
-use crate::harness::{CommandLine, Exit, HarnessError};
+use crate::harness::{self, CommandLine, Exit, HarnessError, LOG_BYTES_MAX};
 use crate::pool::{
     Effects, Event, Gate, PAUSE_STEP_MILLIS, Slot, SlotEnd, event_line, slot_loop, slots,
 };
-use crate::roles::{AGENTS_MAX, PROFILE_LEN_MAX};
-use crate::run_task::{Env, RunError, launch_agent, run_task};
+use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
+use crate::run_task::{Env, RunError, run_task};
 use crate::settle::Verdict;
 
 const ENVIRONMENT: &str = r#"environment:
@@ -100,6 +101,8 @@ pub enum Command {
         #[arg(value_parser = Project::parse)]
         project: Project,
     },
+    /// Print the effective rider.toml: the built-in roles and limits with the file's over them.
+    Config,
     /// One attempt at a task already claimed by $BOARD_PROFILE.
     RunTask {
         #[arg(value_name = "ID", value_parser = parse_task_id)]
@@ -301,6 +304,8 @@ pub enum CliError {
     Run(RunError),
     SlotsFailed(usize),
     Daemon(DaemonError),
+    ConfigFile(ConfigFileError),
+    TableInstalled,
 }
 
 impl fmt::Display for CliError {
@@ -323,6 +328,8 @@ impl fmt::Display for CliError {
                 write!(f, "the task is no longer claimed; it is {state:?}")
             }
             CliError::Daemon(error) => write!(f, "{error}"),
+            CliError::ConfigFile(error) => write!(f, "{error}"),
+            CliError::TableInstalled => write!(f, "the role table was already installed"),
             CliError::SlotsFailed(count) => {
                 write!(f, "{count} slots stopped before they were asked to")
             }
@@ -363,8 +370,31 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Serve => serve(config),
         Command::Daemon => daemon(config),
         Command::Pool { project } => pool(project, config),
+        Command::Config => print_config(config),
         Command::RunTask { id } => run_one(*id, config),
     }
+}
+
+// Reads rider.toml and makes its role table the process's; returns the table and limits.
+fn settings(config: &Config) -> Result<(&'static [RoleSpec], Limits), CliError> {
+    let settings = config::load(&config.home).map_err(CliError::ConfigFile)?;
+    let limits = settings.limits;
+    let table = roles::install(settings.roles).map_err(|_| CliError::TableInstalled)?;
+    assert!(!table.is_empty() && limits.agents > 0);
+    Ok((table, limits))
+}
+
+fn print_config(config: &Config) -> Result<u8, CliError> {
+    let settings = config::load(&config.home).map_err(CliError::ConfigFile)?;
+    assert!(settings.toml.ends_with('\n'));
+    let mut out = io::stdout().lock();
+    out.write_all(settings.toml.as_bytes())
+        .map_err(|error| CliError::Io {
+            action: "write",
+            path: PathBuf::from("standard output"),
+            message: error.to_string(),
+        })?;
+    Ok(0)
 }
 
 fn serve(config: &Config) -> Result<u8, CliError> {
@@ -394,6 +424,7 @@ fn serve(config: &Config) -> Result<u8, CliError> {
 }
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
+    let (table, limits) = settings(config)?;
     write_prompts(config)?;
     let paths = Paths {
         home: config.home.clone(),
@@ -403,28 +434,30 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
         inherited_path: config.inherited_path.clone(),
     };
     assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
-    daemon::run(paths).map_err(CliError::Daemon)
+    daemon::run(paths, table, limits).map_err(CliError::Daemon)
 }
 
 fn pool(project: &Project, config: &Config) -> Result<u8, CliError> {
+    let (table, limits) = settings(config)?;
     let _lock = take_lock(&config.home).map_err(CliError::Daemon)?;
     write_prompts(config)?;
     let channel = project.channel();
     let stop = Arc::new(AtomicBool::new(false));
     watch_stdin(Arc::clone(&stop));
-    let all = slots();
+    let all = slots(table);
     say(&format!(
-        "rider pool: {} slots on {channel}, at most {AGENTS_MAX} agents at once; \
+        "rider pool: {} slots on {channel}, at most {} agents at once; \
          type stop or press Ctrl-D to stop after running tasks finish",
-        all.len()
+        all.len(),
+        limits.agents
     ));
-    let gate = Gate::new();
+    let gate = Gate::new(limits.agents);
     let ends: Vec<bool> = thread::scope(|scope| {
         let handles: Vec<_> = all
             .iter()
             .map(|slot| {
                 let (channel, gate, stop) = (channel.as_str(), &gate, &*stop);
-                scope.spawn(move || run_slot(slot, channel, gate, stop, config))
+                scope.spawn(move || run_slot(slot, channel, gate, stop, config, limits))
             })
             .collect();
         let joined = handles.into_iter().map(|handle| handle.join());
@@ -446,6 +479,7 @@ fn run_slot(
     gate: &Gate,
     stop: &AtomicBool,
     config: &Config,
+    limits: Limits,
 ) -> SlotEnd {
     let board = VbCli {
         vb: config.vb_dir().join("vb"),
@@ -458,7 +492,7 @@ fn run_slot(
         profile: slot.profile.clone(),
         board_url: config.board_url.clone(),
     };
-    let launch = launcher(config);
+    let launch = launcher(config, limits);
     let run = |id: TaskId| run_task(id, &env, &board, &launch);
     let pause = || thread::sleep(Duration::from_millis(PAUSE_STEP_MILLIS));
     let effects = Effects {
@@ -473,6 +507,7 @@ fn run_slot(
 fn run_one(id: TaskId, config: &Config) -> Result<u8, CliError> {
     let profile = config.board_profile.as_ref().ok_or(CliError::NoProfile)?;
     assert!(!profile.is_empty());
+    let (_, limits) = settings(config)?;
     write_prompts(config)?;
     let board = VbCli {
         vb: config.vb_dir().join("vb"),
@@ -485,7 +520,7 @@ fn run_one(id: TaskId, config: &Config) -> Result<u8, CliError> {
         profile: profile.clone(),
         board_url: config.board_url.clone(),
     };
-    let verdict = run_task(id, &env, &board, &launcher(config)).map_err(CliError::Run)?;
+    let verdict = run_task(id, &env, &board, &launcher(config, limits)).map_err(CliError::Run)?;
     let now = SystemTime::now();
     let line = match &verdict {
         Verdict::Complete { result } => {
@@ -498,19 +533,21 @@ fn run_one(id: TaskId, config: &Config) -> Result<u8, CliError> {
     Ok(0)
 }
 
-fn launcher(config: &Config) -> impl Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> {
+fn launcher(
+    config: &Config,
+    limits: Limits,
+) -> impl Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> {
     let vb_dir = config.vb_dir().to_string_lossy().into_owned();
     let inherited = config.inherited_path.clone();
+    let seconds = limits.attempt_millis / 1000;
     assert!(
         config.home.to_str().is_some(),
         "the home was checked to be UTF-8"
     );
+    assert!(seconds > 0);
     move |cmd: &CommandLine, dir: &Path, log: &Path| {
-        launch_agent(
-            &with_vb_on_path(cmd, &vb_dir, inherited.as_deref()),
-            dir,
-            log,
-        )
+        let cmd = with_vb_on_path(cmd, &vb_dir, inherited.as_deref());
+        harness::run(&cmd, dir, log, seconds, LOG_BYTES_MAX)
     }
 }
 

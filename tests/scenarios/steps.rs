@@ -576,3 +576,25 @@ exec '{}' "$@"
     );
     crate::world::write_executable(&world.vb, &script);
 }
+
+/// Given `text` as the rider home's `rider.toml`.
+pub fn given_a_rider_toml(world: &World, text: &str) {
+    let path = world.home.join("rider.toml");
+    fs::write(&path, text).expect("write rider.toml");
+    assert!(path.is_file());
+}
+
+/// The model attempt `attempt` of `task`'s agent was started with.
+pub fn agent_model(world: &World, task: &str, attempt: u32) -> String {
+    let args = fake_agent::args(&world.root, task, attempt);
+    let mut lines = args.lines().skip_while(|line| *line != "--model");
+    assert_eq!(lines.next(), Some("--model"), "{args}");
+    lines.next().expect("a model follows --model").to_string()
+}
+
+/// The prompt attempt `attempt` of `task`'s agent was started with: everything after `--`.
+pub fn agent_prompt(world: &World, task: &str, attempt: u32) -> String {
+    let args = fake_agent::args(&world.root, task, attempt);
+    let (_, prompt) = args.split_once("\n--\n").expect("the prompt follows --");
+    prompt.to_string()
+}

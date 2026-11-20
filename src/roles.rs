@@ -1,4 +1,6 @@
-//! The fixed table of agent roles: which harness and model runs each, and how many at once.
+//! The table of agent roles: which harness and model runs each, and how many at once.
+
+use std::sync::OnceLock;
 
 /// The program that runs an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,12 +24,12 @@ pub struct RoleSpec {
     /// The model's name inside a Board profile, such as "opus-5-5".
     pub model_slug: &'static str,
     pub slots: u8,
-    /// A file name under `prompts/`.
+    /// A file name under `prompts/`, or an absolute path to the user's own prompt.
     pub prompt_file: &'static str,
 }
 
-/// Upper bound on agents running at once, across every role.
-pub const AGENTS_MAX: u8 = 4;
+/// Upper bound on agents running at once, across every role, and its default.
+pub const AGENTS_MAX: u8 = 32;
 /// The longest profile name the board accepts.
 pub const PROFILE_LEN_MAX: usize = 32;
 
@@ -40,7 +42,7 @@ pub const ROLES: [RoleSpec; 6] = [
         title: "Implement",
         model_name: "Opus 5.5",
         model_slug: "opus-5-5",
-        slots: 2,
+        slots: AGENTS_MAX,
         prompt_file: "implement.md",
     },
     RoleSpec {
@@ -51,7 +53,7 @@ pub const ROLES: [RoleSpec; 6] = [
         title: "Light",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
-        slots: 2,
+        slots: AGENTS_MAX,
         prompt_file: "implement.md",
     },
     RoleSpec {
@@ -62,7 +64,7 @@ pub const ROLES: [RoleSpec; 6] = [
         title: "Review",
         model_name: "Sol 6.1",
         model_slug: "sol-6-1",
-        slots: 2,
+        slots: AGENTS_MAX,
         prompt_file: "review.md",
     },
     RoleSpec {
@@ -73,7 +75,7 @@ pub const ROLES: [RoleSpec; 6] = [
         title: "Polish",
         model_name: "Sonnet 5.5",
         model_slug: "sonnet-5-5",
-        slots: 1,
+        slots: AGENTS_MAX,
         prompt_file: "polish.md",
     },
     RoleSpec {
@@ -84,7 +86,7 @@ pub const ROLES: [RoleSpec; 6] = [
         title: "Security",
         model_name: "Mythos 5.2",
         model_slug: "mythos-5-2",
-        slots: 1,
+        slots: AGENTS_MAX,
         prompt_file: "security.md",
     },
     RoleSpec {
@@ -95,30 +97,53 @@ pub const ROLES: [RoleSpec; 6] = [
         title: "QA",
         model_name: "Opus 5.5",
         model_slug: "opus-5-5",
-        slots: 1,
+        slots: AGENTS_MAX,
         prompt_file: "qa.md",
     },
 ];
 
-// The table is checked when the crate compiles: every role has a slot, and the slots
-// together can fill every agent.
+// The built-in table is checked when the crate compiles: every role has a slot.
 const _: () = {
-    let mut slots_total: u8 = 0;
     let mut index = 0;
     while index < ROLES.len() {
         assert!(ROLES[index].slots > 0);
         assert!(ROLES[index].slots <= AGENTS_MAX);
-        slots_total += ROLES[index].slots;
         index += 1;
     }
-    assert!(slots_total >= AGENTS_MAX);
 };
+
+static TABLE: OnceLock<&'static [RoleSpec]> = OnceLock::new();
+
+/// Makes `table` the role table for the rest of the process; it can be installed only once.
+pub fn install(table: Vec<RoleSpec>) -> Result<&'static [RoleSpec], InstallError> {
+    assert!(!table.is_empty());
+    assert!(
+        table
+            .iter()
+            .all(|role| role.slots > 0 && role.slots <= AGENTS_MAX)
+    );
+    let leaked: &'static [RoleSpec] = Vec::leak(table);
+    TABLE.set(leaked).map_err(|_| InstallError)?;
+    Ok(leaked)
+}
+
+/// A role table was already installed in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallError;
+
+/// The installed role table, or the built-in one when none was installed.
+pub fn table() -> &'static [RoleSpec] {
+    let table = TABLE.get().copied().unwrap_or(&ROLES);
+    assert!(!table.is_empty());
+    table
+}
 
 /// The role with this label, or `None` when no role has it.
 pub fn role_from_label(label: &str) -> Option<&'static RoleSpec> {
     // The label comes from board data, so an empty or unknown one is simply no role.
-    assert!(ROLES.iter().all(|role| !role.label.is_empty()));
-    let role = ROLES.iter().find(|role| role.label == label);
+    let table = table();
+    assert!(table.iter().all(|role| !role.label.is_empty()));
+    let role = table.iter().find(|role| role.label == label);
     if let Some(found) = role {
         assert_eq!(found.label, label);
         assert!(found.slots > 0);
@@ -189,17 +214,16 @@ mod tests {
         assert_eq!(light.model, "claude-sonnet-5-5");
         assert!(matches!(light.harness, Harness::Claude));
         assert!(light.commits_expected);
-        assert_eq!(light.slots, 2);
+        assert_eq!(light.slots, AGENTS_MAX);
         assert_eq!(light.prompt_file, "implement.md");
         let qa = role_from_label("qa").unwrap();
         assert_eq!(qa.model, "claude-opus-5-5");
         assert!(matches!(qa.harness, Harness::Claude));
         assert!(!qa.commits_expected);
-        assert_eq!(qa.slots, 1);
+        assert_eq!(qa.slots, AGENTS_MAX);
         assert_eq!(qa.prompt_file, "qa.md");
         assert!(role_from_label("lead").is_none());
         assert!(role_from_label("").is_none());
-        assert!(ROLES.iter().map(|r| r.slots).sum::<u8>() >= AGENTS_MAX);
     }
 
     #[test]
