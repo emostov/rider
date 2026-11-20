@@ -1,8 +1,12 @@
 //! `harness::run` against `fake_agent`, a stand-in for a real agent CLI.
 
-use rider::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, run};
+use rider::harness::{
+    CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId, command_for,
+    last_message, run, session_id, stream_reports_failure,
+};
+use rider::roles::{Harness, role_from_label};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::{Builder, TempDir};
 
@@ -21,6 +25,20 @@ impl Scratch {
         let root = dir.path().canonicalize().unwrap();
         Scratch { _dir: dir, root }
     }
+
+    fn file(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.root.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+}
+
+const PROMPT: &str = "Do the task.";
+const LINE_BYTES_MAX: usize = 4 * 1024 * 1024;
+
+fn reports_failure(harness: Harness, text: &str) -> bool {
+    let scratch = Scratch::new("stream");
+    stream_reports_failure(&harness, &scratch.file("agent.log", text))
 }
 
 fn fake(args: &[&str]) -> CommandLine {
@@ -137,4 +155,179 @@ fn a_missing_program_is_a_spawn_error() {
     cmd.program = scratch.root.join("no-such-agent").display().to_string();
     let exit = run(&cmd, &scratch.root, &log, 5, 4096);
     assert!(matches!(exit, Err(HarnessError::Spawn(_))));
+}
+
+#[test]
+fn claude_command_matches_the_recorded_form() {
+    let spec = role_from_label("implement").unwrap();
+    let c = command_for(spec, PROMPT, Path::new("/w"), None).unwrap();
+    assert_eq!(c.program, "claude");
+    let expected = [
+        "-p",
+        "--model",
+        "claude-opus-5-5",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--",
+        PROMPT,
+    ];
+    assert_eq!(c.args, expected);
+    assert_eq!(c.env, []);
+}
+
+#[test]
+fn codex_command_matches_the_recorded_form() {
+    let spec = role_from_label("review").unwrap();
+    let c = command_for(spec, PROMPT, Path::new("/w"), None).unwrap();
+    assert_eq!(c.program, "codex");
+    let expected = [
+        "exec",
+        "--model",
+        "gpt-6.1-sol",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-C",
+        "/w",
+        "--",
+        PROMPT,
+    ];
+    assert_eq!(c.args, expected);
+    assert_eq!(c.env, []);
+}
+
+#[test]
+fn a_prompt_is_one_argument_after_the_options() {
+    let prompt = "--help me\nplease";
+    let security = role_from_label("security").unwrap();
+    let c = command_for(security, prompt, Path::new("/w"), None).unwrap();
+    assert_eq!(c.args[c.args.len() - 2..], ["--", prompt]);
+    assert_eq!(c.args[1..3], ["--model", "claude-mythos-5-2"]);
+}
+
+#[test]
+fn a_prompt_a_cli_could_misread_is_an_error() {
+    let claude = role_from_label("implement").unwrap();
+    let codex = role_from_label("review").unwrap();
+    for prompt in ["", " \n\t ", "-", "mcp", "doctor", "--help"] {
+        for spec in [claude, codex] {
+            let result = command_for(spec, prompt, Path::new("/w"), None);
+            assert!(
+                matches!(result, Err(HarnessError::PromptUnsafe)),
+                "{prompt:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_oversized_prompt_is_an_error() {
+    let spec = role_from_label("implement").unwrap();
+    let prompt = "x ".repeat(PROMPT_BYTES_MAX / 2);
+    assert_eq!(prompt.len(), PROMPT_BYTES_MAX);
+    let c = command_for(spec, &prompt, Path::new("/w"), None).unwrap();
+    assert_eq!(c.args.last(), Some(&prompt));
+    let over = format!("{prompt}x");
+    let result = command_for(spec, &over, Path::new("/w"), None);
+    assert!(matches!(
+        result,
+        Err(HarnessError::PromptTooLarge { bytes }) if bytes == PROMPT_BYTES_MAX + 1
+    ));
+}
+
+#[test]
+fn the_session_id_is_read_from_the_recorded_claude_stream() {
+    let id = session_id(Path::new("fixtures/harness/claude.jsonl"));
+    let expected = SessionId::parse("20de60af-1a54-4519-8f52-8623adc5d76e");
+    assert_eq!(id, expected);
+    assert_eq!(session_id(Path::new("fixtures/harness/codex.jsonl")), None);
+    let scratch = Scratch::new("session");
+    let log = scratch.file("hostile", "{\"session_id\":\"--help\"}\n");
+    assert_eq!(session_id(&log), None);
+}
+
+#[test]
+fn last_message_is_found_in_each_recorded_stream() {
+    let cases = [(Harness::Claude, "claude"), (Harness::Codex, "codex")];
+    for (h, f) in cases {
+        let path = format!("fixtures/harness/{f}.jsonl");
+        let m = last_message(&h, Path::new(&path));
+        assert_eq!(m.as_deref(), Some("DONE"), "{f}");
+    }
+}
+
+#[test]
+fn last_message_survives_hostile_logs() {
+    let missing = Path::new("/nonexistent/rider/agent.log");
+    assert_eq!(last_message(&Harness::Claude, missing), None);
+    let huge = "y".repeat(LINE_BYTES_MAX + 10);
+    let events = r#"not json
+[1,2]
+"str"
+{"type":"result","result":7}
+{"type":"result","result":"  first  "}
+"#;
+    let scratch = Scratch::new("hostile");
+    let log = scratch.file("hostile", &format!("{huge}\n{events}{huge}"));
+    assert_eq!(
+        last_message(&Harness::Claude, &log).as_deref(),
+        Some("first")
+    );
+    assert_eq!(last_message(&Harness::Codex, &log), None);
+    let blank = scratch.file("blank", r#"{"type":"result","result":" \n "}"#);
+    assert_eq!(last_message(&Harness::Claude, &blank), None);
+}
+
+#[test]
+fn recorded_streams_report_no_failure() {
+    let cases = [(Harness::Claude, "claude"), (Harness::Codex, "codex")];
+    for (h, f) in cases {
+        let path = format!("fixtures/harness/{f}.jsonl");
+        assert!(!stream_reports_failure(&h, Path::new(&path)), "{f}");
+    }
+    let missing = Path::new("/nonexistent/rider/agent.log");
+    assert!(!stream_reports_failure(&Harness::Codex, missing));
+}
+
+#[test]
+fn failures_in_the_stream_are_reported() {
+    let claude = r#"{"type":"result","subtype":"success","is_error":true}"#;
+    assert!(reports_failure(Harness::Claude, claude));
+    let claude = r#"{"type":"result","subtype":"error_max_turns","is_error":false}"#;
+    assert!(reports_failure(Harness::Claude, claude));
+    let codex = r#"{"type":"item.completed","item":{"type":"error"}}"#;
+    assert!(!reports_failure(Harness::Codex, codex));
+    let codex = r#"{"type":"turn.failed","error":{"message":"x"}}"#;
+    assert!(reports_failure(Harness::Codex, codex));
+    let codex = r#"{"type":"error","message":"x"}"#;
+    assert!(reports_failure(Harness::Codex, codex));
+}
+
+#[test]
+fn a_codex_turn_is_judged_by_how_it_ended() {
+    let path = Path::new("fixtures/harness/codex-reconnect.jsonl");
+    assert!(!stream_reports_failure(&Harness::Codex, path));
+    let recorded = fs::read_to_string(path).unwrap();
+    let cut: Vec<&str> = recorded
+        .lines()
+        .filter(|l| !l.contains("turn.completed"))
+        .collect();
+    assert_eq!(cut.len() + 1, recorded.lines().count());
+    assert_eq!(
+        cut.iter().filter(|l| l.contains("Reconnecting...")).count(),
+        4
+    );
+    assert!(reports_failure(Harness::Codex, &cut.join("\n")));
+}
+
+#[test]
+fn reader_slots_are_returned_after_each_run() {
+    const RUNS: usize = 4 * 2 * rider::roles::AGENTS_MAX as usize / 2 + 1;
+    let scratch = Scratch::new("slots");
+    let log = scratch.root.join("agent.log");
+    for _ in 0..RUNS {
+        let exit = run(&fake(&["0", "0", "0", "0"]), &scratch.root, &log, 10, 4096);
+        assert_eq!(exit.unwrap(), Exit::Code(0));
+    }
 }
