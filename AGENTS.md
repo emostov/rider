@@ -6,7 +6,10 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 - Commit `Cargo.lock`. Commit messages are one sentence and name no tool or assistant.
 - Rider is developed with Rider. Changes to this repository are planned by the lead as tasks on the board channel `work/rider` and carried out by `rider pool rider`, so every change exercises the tool. Work done any other way is the exception and says why.
 - The board is where work is discussed. Findings, problems and deferred work found while building or using Rider go on the board (a finding record, a reply in the task's thread, or the project's deferred-work thread), not to the project's tracker. The tracker (GitHub issues or Linear, whichever the project uses) is for work that must outlive the board: only when a run ends does the lead, or a person, file one issue there for each item still open, written as a brief a stranger could act on: what happens, the fix wanted, the paths owned, the command that proves it.
-- Design: `docs/superpowers/specs/2026-11-19-rider-design.md`. Observed behaviour of Board and of each agent CLI: `docs/board-observed.md`, `docs/harness-observed.md`.
+- Security first: correctness and code security outrank features. Prefer verification (types, assertions, simulation) over trust.
+- Keep Rider simple and uncustomised: prefer fewer configuration knobs and less orchestration machinery. A feature that only tunes around a current model's weakness is suspect.
+- Goals are measurable: a change to performance or resource use states a target (10x faster, a memory bound) and measures before and after.
+- There is no `docs/` directory. AGENTS.md, README.md and the shipped skills under `skills/` are the only prose. How Board and the agent CLIs behave lives in recorded fixtures, scenarios and types.
 
 ## TigerStyle
 
@@ -14,24 +17,25 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 - Assertions are for programming errors only. Anything from the board, an agent, git, or the filesystem is external input: a bad value becomes a returned error, never a panic.
 - Every loop and every collection has an upper bound declared as a named constant. Reaching it is a returned error, not growth.
 - No recursion, no `unsafe`, no async runtime. Threads and bounded channels only.
-- When work has several independent parts (board calls, git calls, agent waits), run them in parallel and join them, not one after another, whenever their order does not matter.
+- When work has several independent parts (board calls, git calls, agent waits), run them in parallel and join them, not one after another, whenever their order does not matter. Look for sequential independent calls and make them parallel.
 - Model parallel work as actors: each thread owns its state and talks to others only through bounded channels. A full channel makes the sender wait or shed work (back pressure), never grow.
 - Functions are at most 70 lines; lines are at most 100 columns.
 - Errors are enums, handled at every call site. No `unwrap()` or `expect()` outside tests. No `thiserror` or `anyhow`.
-- TigerStyle's rule against dependencies does not apply. Use a well-maintained crate when it saves writing and maintaining code of our own.
+- Use a well-maintained crate when it saves writing and maintaining code of our own, but weigh each new one's supply-chain risk. Prefer fewer crates, and own small code rather than add a crate that pulls a large tree.
 - Use checked arithmetic (`checked_add`, `try_from`) on lengths, indices, and counts from external input, not `as` casts or bare `+`.
 - A lint suppression uses `#[expect(lint, reason = "...")]` naming the specific false positive, not a bare `#[allow]`.
 
 ## Structure for testing
 
-- Keep decisions pure and I/O at the edges, because it keeps the code simple to reason about and to simulate. Do not extract a function only so a unit test can reach it.
+- Keep decisions pure and I/O at the edges, because it keeps the code simple to reason about and to simulate. Do not extract a function only so a test can reach it.
 - Board, git, processes, the clock, and sockets sit behind traits or thin wrappers so the deterministic simulator can substitute fakes and inject faults.
-- Otherwise keep call stacks flat: inline one-use helpers and extract on the second call site. Tests don't count as call sites, and length alone doesn't justify a split.
+- Otherwise keep call stacks flat: inline one-use helpers and extract on the second call site. Length alone doesn't justify a split.
 - Board is reached only through the `Board` trait. The role table in `src/roles.rs` and the label scheme are each defined once.
 
 ## Types and data flow
 
-- Make invalid states unrepresentable with enums, domain wrappers, and private constructors. Keep each value in one authoritative place.
+- Encode every valid state in the type system and make invalid states unrepresentable with enums, domain wrappers, and private constructors. Keep each value in one authoritative place.
+- An implicit state machine (flags, `Option`s and strings that together mean a state) becomes an enum, so whole categories of bug fail to compile.
 - Parse, don't validate: run the fallible check once at the boundary and return a narrow type that carries the proof.
 - When converting an external shape (Board JSON, an agent's output stream) into our own type, name every field you rely on and reject what you don't recognise where that is safe, so a changed upstream shape fails loudly.
 - Keep missing data distinct from malformed data. Default only for intentional absence; report malformed values with the field and operation.
@@ -51,17 +55,16 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 
 ## Comments
 
-- A comment exists in exactly two cases: a `///` or `//!` doc on a public item, or a `//` stating an invariant the reader cannot recover from the code in front of them (an ordering the types don't enforce, an external CLI's quirk, a platform constraint). Delete every other comment.
-- A module's doc is a `//!` in its own file. Public docs are one line and state the contract, not the mechanism.
-- Docs describe responsibilities and contracts, not file paths or lists of current callers.
+- No `///` or `//!` docs and no module docs.
+- A `//` comment exists only for an external CLI's quirk or a platform constraint the code cannot show. Delete every other comment.
+- Invariants go into types, assertions and names, not comments.
 
 ## Tests
 
-- Test behaviour from outside, not internals. The tests exist so Rider can be rewritten: a test that would break when the code is restructured without changing what `rider` does is testing the wrong thing.
+- No unit tests. Behaviour is pinned from outside, so Rider can be rewritten: a test that would break when the code is restructured without changing what `rider` does is testing the wrong thing.
 - Behaviour a person can observe (what `rider` does to the board and to a repository) is pinned by a black-box scenario test in `tests/scenarios/`, written as Given / When / Then against the real binary. Add or change the scenario first, see it fail, then change the behaviour.
-- Keep unit tests to a minimum. Write one only where a scenario cannot reasonably reach: a decision with many input cases (parsing recorded Board or agent output, the settle judgment's table), or a fault that cannot be staged from outside (a clock jump, a signal race). Test it through the module's public interface. Do not unit-test private helpers, argument lists, message wording, or anything a scenario already covers.
-- When a scenario comes to cover what a unit test pins, delete the unit test.
-- The deterministic simulator (milestone 1) is also black-box: it drives the core through its events and checks invariants, not internals.
+- The deterministic simulator in `tests/sim/` drives the core through its events with seeded faults and checks invariants, not internals.
+- A bug found anywhere becomes a simulator seed or a scenario that fails before the fix, so it never recurs.
 - Assert on the value: `assert_eq!` with the full expected value, not `assert!(x.is_some())` or `assert!(x.is_ok())`, when the value is available.
 - Avoid `unreachable!()` in tests; use `assert_eq!`, `assert!(matches!(...))`, or a descriptive `panic!`.
 - Tests never run a real agent CLI (`claude`, `codex`, `tact`); use `fake_agent` and recorded fixtures. Tests that need a repository build one under the system temp directory and remove it.
