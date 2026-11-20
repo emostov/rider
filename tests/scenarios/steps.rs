@@ -947,3 +947,55 @@ pub fn when_the_group_is_killed(pid: u32) {
         .expect("run kill");
     assert!(status.success(), "killing group {pid} failed: {status}");
 }
+
+/// How long a scenario waits for `rider wait` to end.
+const WAIT_SECONDS_MAX: u64 = 90;
+/// The exit code of a `rider wait` that timed out.
+pub const WAIT_TIMED_OUT: i32 = 3;
+
+/// When the lead starts `rider wait <project> <args>` in the background.
+pub fn when_rider_wait_starts(world: &World, args: &[&str]) -> std::process::Child {
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command
+        .args(["wait", PROJECT])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    command.spawn().expect("start rider wait")
+}
+
+/// Then `rider wait` ends within `WAIT_SECONDS_MAX`; returns its exit code and output.
+pub fn then_rider_wait_ends(child: std::process::Child) -> crate::world::Output {
+    let (sender, ended) = std::sync::mpsc::sync_channel(1);
+    let pid = child.id();
+    thread::spawn(move || drop(sender.send(child.wait_with_output())));
+    let Ok(output) = ended.recv_timeout(Duration::from_secs(WAIT_SECONDS_MAX)) else {
+        kill_group(pid);
+        panic!("rider wait did not end within {WAIT_SECONDS_MAX} seconds");
+    };
+    let output = output.expect("wait for rider wait");
+    crate::world::Output {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Given the lead has waited once, so the next wait starts from now.
+pub fn given_the_lead_has_waited(world: &World) {
+    let output = when_rider_runs(world, &["wait", PROJECT, "--timeout", "0"]);
+    assert_eq!(output.code, Some(WAIT_TIMED_OUT), "{output:?}");
+}
+
+/// When worker `profile` claims `task`.
+pub fn when_a_worker_claims(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "claim", task, "--lease", "1h"], None);
+    assert_eq!(output.code, Some(0), "claim {task}: {output:?}");
+}
+
+/// When worker `profile` completes the `task` it holds.
+pub fn when_the_worker_completes(world: &World, profile: &str, task: &str) {
+    let output = world.vb_as(profile, &["tasks", "complete", task, "done"], None);
+    assert_eq!(output.code, Some(0), "complete {task}: {output:?}");
+}

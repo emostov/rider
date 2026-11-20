@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-use crate::board::TaskId;
+use crate::board::{self, Board, BoardError, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
+use crate::feed::{BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader};
 use crate::harness::{CommandLine, LOG_BYTES_MAX};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
@@ -45,6 +46,33 @@ pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
 const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
+/// Upper bound on the characters of a project or profile name.
+const NAME_CHARS_MAX: usize = 64;
+/// The exit code of a `rider wait` whose timeout passed with nothing to report.
+pub const WAIT_TIMED_OUT: u8 = 3;
+/// Upper bound on `rider wait --timeout`, in minutes.
+const WAIT_MINUTES_MAX: u32 = 60;
+const WAIT_MINUTES_DEFAULT: u32 = 54;
+/// The directory under the Rider home that holds each project's wait cursor.
+const WAIT_DIR: &str = "wait";
+/// The profile `rider wait` reads the board as.
+const WAIT_PROFILE: &str = "rider-wait";
+/// The profile prefix of a lead, as the ride-swarm skill names it.
+const LEAD_PREFIX: &str = "lead-";
+/// The channel of the questions for the owner.
+const DECISIONS: &str = "decisions";
+/// How long the feed must stay quiet after an event before the wait reports it.
+const WAIT_SETTLE: Duration = Duration::from_secs(2);
+/// Upper bound on the events one wait reports; the rest wait for the next.
+const WAIT_EVENTS_MAX: usize = 64;
+/// Upper bound on the feed items one wait reads.
+const WAIT_ITEMS_MAX: u64 = 1 << 20;
+/// The feed items queued ahead of `rider wait`.
+const WAIT_QUEUED_MAX: usize = 16;
+/// Upper bound on the bytes of a wait cursor file.
+const CURSOR_BYTES_MAX: u64 = 64;
+/// The task states that leave a task open.
+const OPEN_STATES: [&str; 4] = ["waiting", "ready", "claimed", "blocked"];
 
 /// The arguments rider was run with.
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
@@ -101,6 +129,25 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Block until something needs the lead, then print what happened since the last wait.
+    ///
+    /// Exits 3, printing nothing, when the timeout passes first.
+    Wait {
+        /// The project whose tasks are in work/<PROJECT>.
+        #[arg(value_name = "PROJECT", value_parser = parse_name)]
+        project: String,
+        /// The most minutes to wait.
+        #[arg(
+            long,
+            value_name = "MINUTES",
+            default_value_t = WAIT_MINUTES_DEFAULT,
+            value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
+        )]
+        timeout: u32,
+        /// The lead's profile, whose own events never end the wait; by default any lead-*.
+        #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
+        lead: Option<String>,
+    },
 }
 
 /// An argument value rider does not accept.
@@ -108,6 +155,7 @@ pub enum Command {
 pub enum UsageError {
     BadTaskId(String),
     EmptyUrl,
+    BadName(String),
 }
 
 impl fmt::Display for UsageError {
@@ -120,6 +168,10 @@ impl fmt::Display for UsageError {
                 )
             }
             UsageError::EmptyUrl => write!(f, "a board URL is empty"),
+            UsageError::BadName(text) => write!(
+                f,
+                "{text:?} is not a name: use at most {NAME_CHARS_MAX} letters, digits, - or _"
+            ),
         }
     }
 }
@@ -131,6 +183,18 @@ fn parse_url(text: &str) -> Result<String, UsageError> {
         return Err(UsageError::EmptyUrl);
     }
     assert!(!text.is_empty());
+    Ok(text.to_string())
+}
+
+fn parse_name(text: &str) -> Result<String, UsageError> {
+    let named = !text.is_empty()
+        && text.len() <= NAME_CHARS_MAX
+        && !text.starts_with('-')
+        && (text.bytes()).all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !named {
+        return Err(UsageError::BadName(text.to_string()));
+    }
+    assert!(!text.contains('/') && !text.contains('.'));
     Ok(text.to_string())
 }
 
@@ -285,6 +349,11 @@ pub enum CliError {
     TableInstalled,
     /// The task has no attempt log under the Rider home.
     NoLog(TaskId),
+    Board(BoardError),
+    /// The board's feed ended or failed while `rider wait` followed it.
+    Feed(String),
+    /// The file holding `rider wait`'s cursor holds something else.
+    BadCursor(PathBuf),
 }
 
 impl fmt::Display for CliError {
@@ -304,6 +373,11 @@ impl fmt::Display for CliError {
             CliError::ConfigFile(error) => write!(f, "{error}"),
             CliError::TableInstalled => write!(f, "the role table was already installed"),
             CliError::NoLog(id) => write!(f, "task #{} has no log", id.0),
+            CliError::Board(error) => write!(f, "{error}"),
+            CliError::Feed(why) => write!(f, "the board's feed stopped: {why}"),
+            CliError::BadCursor(path) => {
+                write!(f, "{} does not hold a board cursor", path.display())
+            }
         }
     }
 }
@@ -348,6 +422,11 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Kill { id } => kill(config, *id),
         Command::Config => print_config(config),
         Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
+        Command::Wait {
+            project,
+            timeout,
+            lead,
+        } => wait(config, project, *timeout, lead.as_deref()),
     }
 }
 
@@ -677,6 +756,267 @@ fn say(line: &str) {
     let mut out = io::stdout().lock();
     // A closed standard output must not stop the agents' work, so a failed write is dropped.
     let _ = writeln!(out, "{line}");
+}
+
+/// What happened to a task that ends a wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Happened {
+    Completed,
+    Failed,
+    Blocked,
+    Answered,
+}
+
+/// What the wait follows: the project's channel, and whose events are the lead's own.
+struct Watch<'a> {
+    channel: String,
+    lead: Option<&'a str>,
+}
+
+impl Watch<'_> {
+    fn happened(&self, event: &BoardEvent) -> Option<Happened> {
+        let profile = event
+            .actor
+            .as_deref()
+            .and_then(|actor| actor.rsplit_once('+'));
+        let by_lead = profile.is_some_and(|(_, profile)| match self.lead {
+            Some(lead) => profile == lead,
+            None => profile.starts_with(LEAD_PREFIX),
+        });
+        if by_lead {
+            return None;
+        }
+        if event.channel == self.channel {
+            return match event.kind {
+                EventKind::TaskCompleted => Some(Happened::Completed),
+                EventKind::TaskFailed => Some(Happened::Failed),
+                EventKind::TaskBlocked => Some(Happened::Blocked),
+                _ => None,
+            };
+        }
+        let answer = matches!(
+            event.kind,
+            EventKind::MessagePosted | EventKind::TaskUnblocked | EventKind::TaskCompleted
+        );
+        (event.channel == DECISIONS && answer).then_some(Happened::Answered)
+    }
+}
+
+fn wait(config: &Config, project: &str, minutes: u32, lead: Option<&str>) -> Result<u8, CliError> {
+    assert!(minutes <= WAIT_MINUTES_MAX);
+    let deadline = Instant::now() + Duration::from_secs(u64::from(minutes) * 60);
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: WAIT_PROFILE.to_string(),
+    };
+    let watch = Watch {
+        channel: format!("work/{project}"),
+        lead,
+    };
+    let path = config.home.join(WAIT_DIR).join(format!("{project}.cursor"));
+    let saved = read_cursor(&path)?;
+    let open = board.list_labelled(&watch.channel, "board.task", &OPEN_STATES);
+    let open = open.map_err(CliError::Board)?;
+    let start = saved.unwrap_or(open.cursor);
+    let idle = open.tasks.is_empty() && open.left_out == 0;
+    let until = if idle {
+        Instant::now() + WAIT_SETTLE
+    } else {
+        deadline
+    };
+    let (happened, cursor) = follow(&board, &watch, start, until)?;
+    let mut lines = describe(&board, &happened)?;
+    if !happened.is_empty() {
+        let open = board.list_labelled(&watch.channel, "board.task", &OPEN_STATES);
+        let open = open.map_err(CliError::Board)?;
+        if open.tasks.is_empty() && open.left_out == 0 {
+            lines.push("idle".to_string());
+        }
+    } else if idle {
+        lines.push("idle".to_string());
+    }
+    write_cursor(&path, cursor)?;
+    assert!(cursor >= start);
+    if lines.is_empty() {
+        return Ok(WAIT_TIMED_OUT);
+    }
+    for line in &lines {
+        say(line);
+    }
+    Ok(0)
+}
+
+/// The feed as one thread reads it: first its stopper, then each item.
+enum Followed {
+    Started(crate::feed::FeedStop),
+    Item(Result<FeedItem, FeedError>),
+}
+
+// Follows the feed from `start` until `until`, or until it is quiet for `WAIT_SETTLE` after
+// the first event that ends the wait; returns those events and the cursor of the last read.
+fn follow(
+    board: &VbCli,
+    watch: &Watch,
+    start: Cursor,
+    until: Instant,
+) -> Result<(Vec<(Happened, TaskId)>, Cursor), CliError> {
+    let (sender, items) = std::sync::mpsc::sync_channel(WAIT_QUEUED_MAX);
+    let feed = VbCli {
+        vb: board.vb.clone(),
+        url: board.url.clone(),
+        profile: board.profile.clone(),
+    };
+    let reader = thread::Builder::new()
+        .name("wait-feed".into())
+        .spawn(move || {
+            let mut reader = match FeedReader::start(&feed, start) {
+                Ok(reader) => reader,
+                Err(error) => return drop(sender.send(Followed::Item(Err(error)))),
+            };
+            if sender.send(Followed::Started(reader.stopper())).is_err() {
+                return;
+            }
+            for _ in 0..WAIT_ITEMS_MAX {
+                let item = reader.next_item();
+                let last = matches!(item, Ok(FeedItem::Exited { .. }) | Err(FeedError::Ended));
+                if sender.send(Followed::Item(item)).is_err() || last {
+                    return;
+                }
+            }
+        });
+    let reader = reader.map_err(|error| CliError::Feed(error.to_string()))?;
+    let (mut happened, mut cursor, mut stop) = (Vec::new(), start, None);
+    let mut until = until;
+    let ended = loop {
+        let left = until.saturating_duration_since(Instant::now());
+        let item = match items.recv_timeout(left) {
+            Ok(Followed::Started(stopper)) => {
+                stop = Some(stopper);
+                continue;
+            }
+            Ok(Followed::Item(item)) => item,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(CliError::Feed("the feed's reader ended".into()));
+            }
+        };
+        let event = match item {
+            Ok(FeedItem::Event(FeedEvent::Known(event))) => event,
+            Ok(FeedItem::Event(FeedEvent::Other { cursor: other })) => {
+                cursor = cursor.max(other);
+                continue;
+            }
+            Ok(FeedItem::Idle)
+            | Err(FeedError::LineTooLong | FeedError::Parse(_) | FeedError::TooManyLabels) => {
+                continue;
+            }
+            Ok(FeedItem::Exited { code }) => {
+                break Err(CliError::Feed(format!("vb tail exited with {code:?}")));
+            }
+            Err(error) => break Err(CliError::Feed(error.to_string())),
+        };
+        let Some(what) = watch.happened(&event) else {
+            cursor = cursor.max(event.cursor);
+            continue;
+        };
+        if happened.len() == WAIT_EVENTS_MAX {
+            break Ok(());
+        }
+        cursor = cursor.max(event.cursor);
+        if !happened.contains(&(what, event.task)) {
+            happened.push((what, event.task));
+        }
+        until = Instant::now() + WAIT_SETTLE;
+    };
+    if let Some(stop) = stop {
+        stop.stop()
+            .map_err(|error| CliError::Feed(error.to_string()))?;
+    }
+    drop(items);
+    let _ = reader.join();
+    ended?;
+    assert!(happened.len() <= WAIT_EVENTS_MAX && cursor >= start);
+    Ok((happened, cursor))
+}
+
+// One line for each event, its task's first line read from the board, all reads at once.
+fn describe(board: &VbCli, happened: &[(Happened, TaskId)]) -> Result<Vec<String>, CliError> {
+    assert!(happened.len() <= WAIT_EVENTS_MAX);
+    let lines: Vec<Result<String, BoardError>> = thread::scope(|scope| {
+        let reads: Vec<_> = (happened.iter())
+            .map(|&(what, id)| scope.spawn(move || describe_one(board, what, id)))
+            .collect();
+        let joined = reads.into_iter().map(|read| {
+            let read = read.join();
+            read.unwrap_or_else(|_| Err(BoardError::Io("a board read panicked".into())))
+        });
+        joined.collect()
+    });
+    let lines: Result<Vec<String>, BoardError> = lines.into_iter().collect();
+    let lines = lines.map_err(CliError::Board)?;
+    assert_eq!(lines.len(), happened.len());
+    Ok(lines)
+}
+
+fn describe_one(board: &VbCli, what: Happened, id: TaskId) -> Result<String, BoardError> {
+    let view = board.read_task(id)?;
+    let first = board::one_line(view.text.lines().next().unwrap_or_default());
+    let word = match what {
+        Happened::Completed => "completed",
+        Happened::Failed => "failed",
+        Happened::Blocked => "blocked",
+        Happened::Answered => "answered",
+    };
+    let review = (view.labels.iter()).any(|(key, value)| key == "role" && value == "review");
+    let mut line = format!("{word} #{} {first}", id.0);
+    if what == Happened::Completed && review {
+        let blocking = board.blocking_findings(id)?;
+        line.push_str(&format!(" ({blocking} blocking findings)"));
+    }
+    assert!(line.starts_with(word));
+    Ok(line.trim_end().to_string())
+}
+
+fn read_cursor(path: &Path) -> Result<Option<Cursor>, CliError> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("open", path, &error)),
+    };
+    let mut text = String::new();
+    let read = file.take(CURSOR_BYTES_MAX).read_to_string(&mut text);
+    read.map_err(|error| io_error("read", path, &error))?;
+    let digits = text.strip_suffix('\n').unwrap_or(&text);
+    let canonical = !digits.is_empty()
+        && digits.len() <= ID_DIGITS_MAX
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    let cursor = digits.parse::<u64>().ok().filter(|_| canonical);
+    let cursor = cursor.ok_or_else(|| CliError::BadCursor(path.to_path_buf()))?;
+    assert_eq!(cursor.to_string(), digits);
+    Ok(Some(Cursor(cursor)))
+}
+
+fn write_cursor(path: &Path, cursor: Cursor) -> Result<(), CliError> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| CliError::BadCursor(path.to_path_buf()))?;
+    fs::create_dir_all(dir).map_err(|error| io_error("create", dir, &error))?;
+    let partial = path.with_extension("cursor.partial");
+    let text = format!("{}\n", cursor.0);
+    fs::write(&partial, &text).map_err(|error| io_error("write", &partial, &error))?;
+    fs::rename(&partial, path).map_err(|error| io_error("rename", &partial, &error))?;
+    assert!(text.len() as u64 <= CURSOR_BYTES_MAX);
+    Ok(())
+}
+
+fn io_error(action: &'static str, path: &Path, error: &io::Error) -> CliError {
+    CliError::Io {
+        action,
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    }
 }
 
 #[cfg(test)]
