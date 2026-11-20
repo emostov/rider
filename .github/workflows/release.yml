@@ -126,7 +126,7 @@ jobs:
       - name: Run tests
         env:
           RIDER_SCENARIOS_REQUIRED: "1"
-        run: cargo test --locked --no-fail-fast
+        run: cargo test --locked --no-fail-fast -- --test-threads=2
 
   package:
     needs: validate
