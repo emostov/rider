@@ -637,6 +637,7 @@ mod tests {
         harness: Harness::Tact,
         model: "sol",
         commits_expected: false,
+        title: "Tact-test",
         model_name: "Sol",
         model_slug: "sol",
         slots: 1,

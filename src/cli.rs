@@ -40,11 +40,12 @@ pub const ARGS_MAX: usize = 4;
 /// Upper bound on what `rider pool` reads from standard input before it stops.
 pub const STDIN_BYTES_MAX: u64 = 1024 * 1024;
 /// Every role's prompt file, once each, built into the binary.
-pub const PROMPTS: [(&str, &str); 4] = [
+pub const PROMPTS: [(&str, &str); 5] = [
     ("implement.md", include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
     ("polish.md", include_str!("../prompts/polish.md")),
     ("security.md", include_str!("../prompts/security.md")),
+    ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
