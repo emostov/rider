@@ -1400,6 +1400,119 @@ fn rider_kill_stops_the_agent_and_fails_its_task_killed_by_the_owner() {
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
 
+#[test]
+fn rider_kill_of_a_resumed_agent_that_refused_its_session_starts_no_fresh_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = a_fix(&world, "Fix the work.", &built, &built, true);
+    let fix = when_the_lead_creates(&world, &fix);
+    given_the_agent_will(
+        &world,
+        &fix,
+        &[Behaviour::RefuseResumeThenHold, Behaviour::Hold],
+    );
+    given_a_running_daemon(&mut world);
+    let refusing = when_the_agent_has_started(&world, &fix);
+    when_the_log_shows(&world, &fix, "error_during_execution");
+
+    let kill = when_rider_runs(&world, &["kill", &fix]);
+
+    assert_eq!(kill.code, Some(0), "{kill:?}");
+    assert!(when_the_process_ends_within(refusing.pid, 10));
+    assert_eq!(when_the_tasks_settle(&world, &[&fix]), vec!["failed"]);
+    let runs = agent_runs_for(&world, &fix);
+    assert_eq!(
+        runs.len(),
+        1,
+        "a fresh agent started after the kill: {runs:?}"
+    );
+    assert_eq!(task_label(&world, &fix, "attempt"), Some("1".to_string()));
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn rider_logs_follow_moves_on_to_the_fresh_start_when_a_resumed_session_is_refused() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = a_fix(&world, "Fix the work.", &built, &built, true);
+    let fix = when_the_lead_creates(&world, &fix);
+    let plan = [Behaviour::RefuseResumeThenHold, Behaviour::HoldTalking];
+    given_the_agent_will(&world, &fix, &plan);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &fix);
+    when_the_log_shows(&world, &fix, "error_during_execution");
+
+    let mut follow = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    follow.args(["logs", "-f", &fix]).stdout(Stdio::piped());
+    let mut follower = follow.spawn().expect("start rider logs -f");
+    let lines = lines_of(follower.stdout.take().expect("rider logs -f output"));
+    let refusal = lines.recv_timeout(Duration::from_secs(10));
+    assert!(
+        refusal
+            .as_ref()
+            .is_ok_and(|line| line.contains("No conversation found")),
+        "{refusal:?}"
+    );
+    world.release_agent(&fix);
+    let rest: Vec<String> = lines.iter().collect();
+
+    assert_eq!(
+        follower.wait().expect("wait for rider logs -f").code(),
+        Some(0)
+    );
+    assert!(rest.contains(&fake_agent::hold_line(&fix)), "{rest:?}");
+    let summary = fake_agent::summary(&fix, 1);
+    assert!(rest.iter().any(|line| line.contains(&summary)), "{rest:?}");
+    assert_eq!(when_the_tasks_settle(&world, &[&fix]), vec!["completed"]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn rider_kill_of_a_task_the_owner_canceled_writes_nothing_to_the_task() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_a_running_daemon(&mut world);
+    let run = when_the_agent_has_started(&world, &task);
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+    let (replies, labels) = (task_replies(&world, &task), task_labels(&world, &task));
+
+    let kill = when_rider_runs(&world, &["kill", &task]);
+
+    assert_eq!(kill.code, Some(0), "{kill:?}");
+    assert!(when_the_process_ends_within(run.pid, 10));
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(task_state(&world, &task), "canceled");
+    assert_eq!(task_replies(&world, &task), replies);
+    assert_eq!(task_labels(&world, &task), labels);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+const LOG_POLL_MILLIS: u64 = 50;
+
+/// Waits until the first attempt log of `task` contains `text`.
+fn when_the_log_shows(world: &World, task: &str, text: &str) {
+    let log = world.home.join("logs").join(task).join("1.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !fs::read_to_string(&log).unwrap_or_default().contains(text) {
+        assert!(
+            Instant::now() < deadline,
+            "{} never showed {text}",
+            log.display()
+        );
+        thread::sleep(Duration::from_millis(LOG_POLL_MILLIS));
+    }
+}
+
 /// The lines `output` prints, as they come, until it closes.
 fn lines_of(output: impl Read + Send + 'static) -> Receiver<String> {
     let (lines, received) = sync_channel(1024);

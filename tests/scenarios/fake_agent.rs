@@ -44,6 +44,9 @@ pub enum Behaviour {
     RefuseResume,
     /// Like `RefuseResume`, but only after working for `SLOW_SECONDS`.
     RefuseResumeSlowly,
+    /// Like `RefuseResume`, but once it has reported the refusal it holds like `Hold` before
+    /// it exits 1.
+    RefuseResumeThenHold,
 }
 
 impl Behaviour {
@@ -59,6 +62,7 @@ impl Behaviour {
             Behaviour::HoldTalking => "hold-talking",
             Behaviour::RefuseResume => "refuse-resume",
             Behaviour::RefuseResumeSlowly => "refuse-resume-slowly",
+            Behaviour::RefuseResumeThenHold => "refuse-resume-then-hold",
         }
     }
 }
@@ -151,6 +155,14 @@ report() {{
     echo '{{"type":"result","subtype":"success","is_error":false,"result":"'"$summary"'"}}'
   fi
 }}
+hold() {{
+  step=0
+  while [ ! -e "$world/{RELEASES_DIR}/$task" ]; do
+    step=$((step + 1))
+    [ "$step" -le {steps} ] || exit 1
+    sleep 0.1
+  done
+}}
 commit() {{
   echo "work for task $task attempt $attempt" > "work-$task-$attempt.txt"
   git add "work-$task-$attempt.txt" && git commit -q -m "Work for task $task attempt $attempt"
@@ -161,24 +173,20 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
-  refuse-resume|refuse-resume-slowly)
-    [ "$behaviour" = refuse-resume ] || sleep {slow}
+  refuse-resume|refuse-resume-slowly|refuse-resume-then-hold)
+    [ "$behaviour" = refuse-resume-slowly ] && sleep {slow}
     if [ -n "$resumed" ]; then
       echo "No conversation found with session ID: $resumed" >&2
       refused='"subtype":"error_during_execution","is_error":true,"num_turns":0'
       echo '{{"type":"result",'"$refused"',"session_id":"'"$session"'"}}'
+      [ "$behaviour" = refuse-resume-then-hold ] && hold
       exit 1
     fi
     commit || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
-    step=0
-    while [ ! -e "$world/{RELEASES_DIR}/$task" ]; do
-      step=$((step + 1))
-      [ "$step" -le {steps} ] || exit 1
-      sleep 0.1
-    done
+    hold
     commit || exit 1 ;;
   *) echo "unknown behaviour $behaviour" >&2; exit 97 ;;
 esac
