@@ -5,8 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
@@ -19,7 +19,7 @@ use crate::core::{
     self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, Call, Config, Event, LEASE_MILLIS, RunId,
     Settlement, State,
 };
-use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader};
+use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
 use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::roles::{AGENTS_MAX, ROLES};
 use crate::run_task::{
@@ -50,6 +50,10 @@ pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
 const TEST_SETTINGS_MAX: usize = 4;
 const GRACE_MILLIS: u64 = KILL_GRACE_SECONDS * 1000;
 const STOP_POLL_MILLIS: u64 = 50;
+/// How long the daemon waits on exit for the feed thread once its group is killed: past the
+/// feed's own grace for its stdout to close after a kill.
+const FEED_JOIN_MILLIS_MAX: u64 = 15_000;
+const _: () = assert!(FEED_JOIN_MILLIS_MAX >= STOP_POLL_MILLIS);
 const _: () = assert!(WORKERS_MAX > AGENTS_MAX as usize && TICK_SECONDS > 0);
 const NO_CHANNEL: &str = "channel_not_found";
 const LOCK_FILE: &str = "daemon.lock";
@@ -298,6 +302,16 @@ struct Shared {
     events: SyncSender<Input>,
     lease_millis: u64,
     grace_millis: u64,
+    feed: Mutex<FeedSlot>,
+}
+
+/// The current feed thread and how to end it.
+#[derive(Default)]
+struct FeedSlot {
+    /// The daemon is exiting: no feed starts and none reports its loss.
+    stopping: bool,
+    stop: Option<FeedStop>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Shared {
@@ -330,6 +344,11 @@ impl Shared {
         let until = own.min(board);
         assert!(until <= board);
         until
+    }
+
+    fn feed(&self) -> MutexGuard<'_, FeedSlot> {
+        // Every holder leaves the slot whole between its statements.
+        self.feed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn pid_file(&self, task: TaskId) -> PathBuf {
@@ -366,6 +385,7 @@ pub fn run(paths: Paths) -> Result<u8, DaemonError> {
         events,
         lease_millis,
         grace_millis: timing.grace_millis,
+        feed: Mutex::new(FeedSlot::default()),
     });
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
@@ -375,9 +395,39 @@ pub fn run(paths: Paths) -> Result<u8, DaemonError> {
     config.lease_millis = lease_millis;
     config.attempt_millis_max = timing.attempt_millis_max;
     let mut state = State::new(config, now());
-    let code = drive(&mut state, &inputs, &jobs, &shared)?;
+    let code = drive(&mut state, &inputs, &jobs, &shared);
+    stop_feed(&shared);
+    let code = code?;
     assert!(state.exited());
     Ok(code)
+}
+
+// Kills the feed's group and waits up to `FEED_JOIN_MILLIS_MAX` for its thread to end, so
+// the reader reaps `vb tail` before the daemon exits.
+fn stop_feed(shared: &Shared) {
+    let (stop, feed) = {
+        let mut slot = shared.feed();
+        slot.stopping = true;
+        (slot.stop.take(), slot.thread.take())
+    };
+    // The thread is stored before it can take the lock to store its stop handle.
+    assert!(
+        stop.is_none() || feed.is_some(),
+        "a feed's stop comes with its thread"
+    );
+    if let Some(Err(error)) = stop.as_ref().map(FeedStop::stop) {
+        eprintln!("rider daemon: stopping the feed failed: {error}");
+    }
+    let Some(feed) = feed else { return };
+    let polls = FEED_JOIN_MILLIS_MAX / STOP_POLL_MILLIS;
+    for _ in 0..polls {
+        if feed.is_finished() {
+            let _ = feed.join();
+            return;
+        }
+        thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
+    }
+    eprintln!("rider daemon: the feed did not end within {FEED_JOIN_MILLIS_MAX} ms");
 }
 
 fn drive(
@@ -782,32 +832,56 @@ fn restart_feed(shared: &Arc<Shared>, cursor: Cursor) -> Input {
     }
 }
 
-// Starts a thread that follows the feed after `cursor` and reports its loss once.
+// Starts a thread that follows the feed after `cursor` and reports its loss once, unless
+// the daemon is exiting.
 fn start_feed(shared: &Arc<Shared>, cursor: Cursor) -> Result<(), DaemonError> {
-    let board = shared.board(DAEMON_PROFILE);
-    let events = shared.events.clone();
+    let mut slot = shared.feed();
+    if slot.stopping {
+        return Ok(());
+    }
+    let feed = Arc::clone(shared);
     let builder = thread::Builder::new().name("feed".into());
     let spawned = builder.spawn(move || {
-        let mut reader = match FeedReader::start(&board, cursor) {
-            Ok(reader) => reader,
-            Err(_) => return send(&events, Event::FeedLost),
-        };
-        for _ in 0..FEED_ITEMS_MAX {
-            match reader.next_item() {
-                Ok(FeedItem::Event(FeedEvent::Known(event))) => {
-                    if event.channel.starts_with(SUBTREE) && !send(&events, Event::Feed(event)) {
-                        return false;
-                    }
-                }
-                Ok(FeedItem::Event(FeedEvent::Other { .. }) | FeedItem::Idle) => {}
-                Err(FeedError::LineTooLong | FeedError::Parse(_) | FeedError::TooManyLabels) => {}
-                Ok(FeedItem::Exited { .. }) | Err(_) => break,
-            }
+        follow(&feed, cursor);
+        let mut slot = feed.feed();
+        slot.stop = None;
+        if !slot.stopping {
+            drop(slot);
+            send(&feed.events, Event::FeedLost);
         }
-        send(&events, Event::FeedLost)
     });
-    spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
+    let spawned = spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
+    slot.thread = Some(spawned);
+    assert!(!slot.stopping && slot.thread.is_some());
     Ok(())
+}
+
+// Follows the feed until it ends, the daemon stops it, or nobody listens.
+fn follow(shared: &Shared, cursor: Cursor) {
+    let board = shared.board(DAEMON_PROFILE);
+    let events = &shared.events;
+    let Ok(mut reader) = FeedReader::start(&board, cursor) else {
+        return;
+    };
+    {
+        let mut slot = shared.feed();
+        if slot.stopping {
+            return;
+        }
+        slot.stop = Some(reader.stopper());
+    }
+    for _ in 0..FEED_ITEMS_MAX {
+        match reader.next_item() {
+            Ok(FeedItem::Event(FeedEvent::Known(event))) => {
+                if event.channel.starts_with(SUBTREE) && !send(events, Event::Feed(event)) {
+                    return;
+                }
+            }
+            Ok(FeedItem::Event(FeedEvent::Other { .. }) | FeedItem::Idle) => {}
+            Err(FeedError::LineTooLong | FeedError::Parse(_) | FeedError::TooManyLabels) => {}
+            Ok(FeedItem::Exited { .. }) | Err(_) => return,
+        }
+    }
 }
 
 fn send(events: &SyncSender<Input>, event: Event) -> bool {

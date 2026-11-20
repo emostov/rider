@@ -213,6 +213,20 @@ fn sigterm_drains_the_running_agent_claims_nothing_new_and_exits() {
 }
 
 #[test]
+fn a_daemon_drained_by_sigterm_leaves_no_vb_tail_behind() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    assert_eq!(daemon_feeds(&world).len(), 1, "{:?}", daemon_feeds(&world));
+
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(daemon_feeds(&world), Vec::<String>::new());
+}
+
+#[test]
 fn a_second_sigterm_stops_the_agent_and_leaves_its_task_ready_with_attempt_unchanged() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;

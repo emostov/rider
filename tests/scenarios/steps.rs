@@ -508,6 +508,21 @@ pub fn when_rider_runs(world: &World, args: &[&str]) -> crate::world::Output {
     crate::world::run_bounded(command, None)
 }
 
+/// The command lines of the `vb tail` processes following the world's board as the daemon.
+pub fn daemon_feeds(world: &World) -> Vec<String> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "command="])
+        .stdin(Stdio::null());
+    let output = crate::world::run_bounded(command, None);
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let url = format!("--url {}", world.url);
+    let feeds = output.stdout.lines().filter(|line| {
+        line.contains(" tail ") && line.contains(&url) && line.contains("--as rider-daemon")
+    });
+    feeds.map(str::to_string).collect()
+}
+
 /// Whether process `pid` still exists.
 pub fn is_alive(pid: u32) -> bool {
     let status = std::process::Command::new("/bin/kill")

@@ -6,6 +6,7 @@ use std::mem;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use serde_json::{Map, Value};
 
-use crate::board::{LABELS_MAX, TaskId, TaskState, VbCli, kill_group_with};
+use crate::board::{BoardError, LABELS_MAX, TaskId, TaskState, VbCli, kill_group_with};
 
 /// Upper bound on one line of the feed, its newline excluded.
 pub const FEED_LINE_BYTES_MAX: usize = 1024 * 1024;
@@ -179,6 +180,8 @@ fn kill_group_signal(group: Pid) -> Result<(), Errno> {
 /// error, drop it and start again from the last cursor seen.
 pub struct FeedReader {
     child: Child,
+    /// The child's group while the child is unreaped; locked across every reap.
+    group: Arc<Mutex<Option<Pid>>>,
     signal_group: fn(Pid) -> Result<(), Errno>,
     lines: Receiver<Received>,
     drained: bool,
@@ -239,8 +242,10 @@ impl FeedReader {
             let _ = kill_group_with(&mut child, seams.signal_group, |child| child.kill());
             return Err(FeedError::Spawn(detail));
         }
+        let group = Arc::new(Mutex::new(Some(Pid::from_child(&child))));
         Ok(FeedReader {
             child,
+            group,
             signal_group: seams.signal_group,
             lines,
             drained: false,
@@ -312,6 +317,32 @@ impl FeedReader {
         Ok(FeedItem::Idle)
     }
 
+    /// A handle that ends this feed from another thread.
+    pub fn stopper(&self) -> FeedStop {
+        assert!(
+            !self.ended,
+            "a feed that reported its exit has nothing to stop"
+        );
+        let stop = FeedStop {
+            group: Arc::clone(&self.group),
+        };
+        assert!(Arc::strong_count(&self.group) >= 2);
+        stop
+    }
+
+    /// Kills the group and reaps the child, holding the group's lock so no `FeedStop`
+    /// signals the group's id once the child is reaped and the id may be reused.
+    fn kill_group(&mut self) -> Result<(), BoardError> {
+        let mut group = lock(&self.group);
+        assert!(
+            group.is_some() || self.killed.is_some(),
+            "only a kill reaps the child"
+        );
+        let killed = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
+        *group = None;
+        killed
+    }
+
     /// Kills the group once, leaving the lines it already wrote to be read.
     fn kill(&mut self) -> Result<(), FeedError> {
         assert!(self.killed.is_none(), "the group is killed once");
@@ -321,7 +352,7 @@ impl FeedReader {
             "the group is not gone before it is killed"
         );
         self.killed = Some(Instant::now());
-        let killed = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
+        let killed = self.kill_group();
         self.group_gone = killed.is_ok();
         killed.map_err(|error| FeedError::Kill(error.to_string()))
     }
@@ -348,9 +379,39 @@ impl Drop for FeedReader {
         // A group that is gone is not signalled again: its id may already name another group.
         if !self.group_gone {
             // Nothing more can be done about a group that cannot be signalled.
-            let _ = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
+            let _ = self.kill_group();
         }
     }
+}
+
+/// Ends a feed from another thread: its `next_item` then reports the exit.
+pub struct FeedStop {
+    group: Arc<Mutex<Option<Pid>>>,
+}
+
+impl FeedStop {
+    /// Kills the feed's process group, unless the feed has already reaped its child.
+    pub fn stop(&self) -> Result<(), FeedError> {
+        let group = lock(&self.group);
+        let Some(pid) = *group else {
+            return Ok(());
+        };
+        assert!(pid.as_raw_pid() > 1, "never signal the caller's own group");
+        match (SEAMS.signal_group)(pid) {
+            // Darwin refuses (EPERM) to signal a group whose only member is the exited,
+            // unreaped leader: nothing in it is left to stop.
+            Ok(()) | Err(Errno::SRCH | Errno::PERM) => Ok(()),
+            Err(error) => Err(FeedError::Kill(format!(
+                "group {}: {error}",
+                pid.as_raw_pid()
+            ))),
+        }
+    }
+}
+
+fn lock(group: &Mutex<Option<Pid>>) -> MutexGuard<'_, Option<Pid>> {
+    // The lock guards no invariant a panicking holder could break halfway.
+    group.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn line_event(line: Vec<u8>) -> Result<FeedItem, FeedError> {
