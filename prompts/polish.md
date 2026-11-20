@@ -61,11 +61,10 @@ Post milestones, not heartbeats: a reply is a finished step with its command and
    b. Mechanical: run the formatter and linter `AGENTS.md` names (default `cargo fmt`,
       `cargo clippy --all-targets -- -D warnings`) and fix what they report. A new lint
       suppression is a finding unless it names the lint and gives a reason.
-   c. Conform, one sweep: check the diff against every `AGENTS.md` rule that applies, for
-      dead code the branch added or left dead, and for: a comment that restates the code, a doc
-      comment on an item the branch did not create, a check for a state no caller can
-      produce, a one-use helper that adds nothing, a clone or allocation a move or borrow
-      avoids. Each finding cites its rule; drop any observation you would hedge.
+   c. Conform, one sweep: check the diff against every `AGENTS.md` rule that applies, and
+      for dead code the branch added or left dead. Then read
+      `${RIDER_HOME:-$HOME/.rider}/prompts/slop-rules.md` in full and check the diff against
+      every rule in it. Each finding cites its rule; drop any observation you would hedge.
    d. Refactor, one sweep: make a change only if its payoff is "removes", "collapses",
       "tightens", or "moves" plus a concrete object, such as "removes a clone of `brief`".
       Never change a public interface, a serialized shape, or error text.
