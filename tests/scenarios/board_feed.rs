@@ -1,11 +1,13 @@
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
-use crate::world::{World, write_executable};
+use crate::world::{Daemon, World, write_executable};
 
 const FEED_LINE_BYTES_MAX: u64 = 1024 * 1024;
 const FEED_RUNS_SECONDS_MAX: u64 = 10;
@@ -178,4 +180,103 @@ exec '{}' "$@"
     assert_eq!(agents_running(&world), 0);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+const HUNG_DAEMON_SECONDS_MAX: u64 = 60;
+
+/// Given the daemon's first identity read starts `/bin/sleep` in the background, writes its pid
+/// to `started` and runs `fragment`, and every later one fails at once.
+fn given_the_identity_read_hangs_with(world: &World, fragment: &str, started: &Path) {
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" rider/identity "*)
+  [ -e '{0}' ] && exit 1
+  /bin/sleep 120 &
+  echo $! > '{0}'
+  {fragment};;
+esac
+exit 1
+"#,
+        started.display(),
+    );
+    write_executable(&world.vb, &script);
+}
+
+/// When the daemon runs with `path` as its `PATH` until it exits; returns its exit code.
+fn when_the_daemon_runs_with_path(world: &mut World, path: &str) -> Option<i32> {
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    let child = command
+        .env("PATH", path)
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("start rider daemon");
+    world.daemon = Some(Daemon { child });
+    let daemon = world.daemon.as_mut().expect("the daemon was started");
+    let deadline = Instant::now() + Duration::from_secs(HUNG_DAEMON_SECONDS_MAX);
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().expect("poll the daemon") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon outlived a hung identity read"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    world.daemon = None;
+    status.code()
+}
+
+fn then_the_hung_identity_read_left_nothing(mut world: World, fragment: &str, path: &str) {
+    let started = world.root.join("sleep-started");
+    given_the_identity_read_hangs_with(&world, fragment, &started);
+    let path = path.replace("<world>", &world.child_path());
+
+    let exit = when_the_daemon_runs_with_path(&mut world, &path);
+
+    assert_eq!(exit, Some(1));
+    let pid = fs::read_to_string(&started).expect("the identity read started its descendant");
+    let pid: u32 = pid.trim().parse().expect("the descendant's pid");
+    // macOS hides a platform binary's environment from `ps -E`, so the world's mark misses
+    // `/bin/sleep` there and its own pid is checked as well.
+    assert!(
+        when_the_process_ends_within(pid, 5),
+        "the descendant {pid} outlived rider"
+    );
+    world.then_no_process_of_the_world_is_left();
+}
+
+#[test]
+fn a_descendant_holding_the_output_of_an_exited_vb_is_killed_at_the_call_limit() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    then_the_hung_identity_read_left_nothing(world, "exit 0", "<world>");
+}
+
+#[test]
+fn a_descendant_of_a_waiting_vb_is_killed_at_the_call_limit() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    then_the_hung_identity_read_left_nothing(world, "wait", "<world>");
+}
+
+#[test]
+fn a_descendant_of_a_waiting_vb_is_killed_with_no_kill_command_on_path() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let vb_dir = world
+        .vb
+        .parent()
+        .expect("vb has a directory")
+        .display()
+        .to_string();
+    assert!(!Path::new(&vb_dir).join("kill").exists());
+    then_the_hung_identity_read_left_nothing(world, "wait", &vb_dir);
 }
