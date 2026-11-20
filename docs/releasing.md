@@ -29,20 +29,26 @@ The workflow runs on every `v*` tag.
 
 ## Publishing to crates.io
 
-CI never publishes. The owner does it by hand from the tagged commit:
+Pushing the tag starts the release workflow, which creates the GitHub release. Only the crates.io
+publish is separate and manual. Publish in this order: push the tag, wait for the release workflow
+to pass, then publish from the tagged commit. CI never publishes.
 
 ```sh
-git switch --detach v0.2.0
-
-# Builds the tarball and compiles it in isolation.
-cargo package
-
-# Publishes that tarball.
-cargo publish
+(
+  set -e
+  tag=v0.2.0
+  git switch --detach "refs/tags/$tag"
+  test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$tag^{commit}")"
+  cargo package --locked
+  cargo publish --locked
+)
 ```
 
-The tag, the GitHub release, and the crates.io publish are separate steps. One does not
-trigger the others.
+The subshell stops at the first failing command, so a missing tag never reaches `cargo publish`.
+`cargo publish` repackages and verifies the tarball before it uploads.
+
+If a step fails and the release is unchanged, fix the cause and rerun it. Do not move the tag.
+If the source must change, bump to a new version and release again.
 
 The package is named `swarm-rider` because `rider` is taken on crates.io. The library and the
 binary are still named `rider`. The crate `swarmrider` is only a placeholder and is not used.
