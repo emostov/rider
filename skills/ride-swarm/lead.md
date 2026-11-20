@@ -52,7 +52,7 @@ yours: decide, say why in one line, and move.
 when the brief already says exactly what to change and how to prove it: a restack, a rename,
 a reviewer's specific fix, a test that is spelled out. Use `implement` when the task needs
 design judgment, touches several files that must agree, or retries something `light`
-failed. A `light` task gets a review like any `implement` task.
+failed. A `light` task gets no review task of its own.
 
 To retry a failed `light` task as `implement`, relabel first, then reopen:
 `vb label <id> role=implement --as lead-fable-5-2`, then `vb tasks reopen <id> --as
@@ -113,15 +113,19 @@ These rules are yours to keep. Rider does not check them:
 - A worker is stopped after 55 minutes. Size tasks well inside that.
 - Sizing: changes that each take under about ten minutes and touch the same files go in one
   task, not several.
-- Review policy: every task with behaviour or judgment in it gets a `review` task with `of`
-  set to it, and three or four specific things to attack. This covers every `implement` or
-  `light` task and every fix task for a blocking finding. A purely mechanical change (a
-  rename, a one-line fix a reviewer spelled out, a doc link) gets none: read its diff
-  yourself. Say what to attack, not the commit range: the reviewer finds the range from the
+- Review policy: each pull request gets one holistic `review` of its whole diff. Each
+  `implement` task (design judgment) gets its own `review` task with `of` set to it, and three
+  or four specific things to attack. A `light` task, a fix task for a finding, and a mechanical
+  change get no review task of their own: the PR's holistic review covers them, and you read
+  the diff. Say what to attack, not the commit range: the reviewer finds the range from the
   reviewed task's `start` label.
+- Blocking means a failure reachable in normal operation, a leak of processes, files or claims,
+  or a security hole. A finding that needs a rare combination is non-blocking.
+- At most two review rounds per piece of work. After the second review, either accept the piece
+  and file one GitHub issue for the remaining findings (deferred work), or change the approach.
+  Never start a third fix-and-review round on the same piece unchanged.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the
-  reviewed task>`, needing every unfinished task on that branch, and its own review unless it is purely
-  mechanical.
+  reviewed task>`, needing every unfinished task on that branch, and no review of its own.
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.
 - `polish` is one task per branch, after that branch's blocking findings are fixed:
@@ -184,20 +188,15 @@ vb label 55 role=review --as lead-fable-5-2
 ```
 
 Example: review 43 of task 41 (completed) found a blocking bug. The fix names only existing
-tasks, so it is complete in the plan; it has `onto`, so it needs no `from`. Its review names
-the fix, a sibling, so it waits; it has neither `base` nor `onto`, so it gets `from`.
+tasks, so it is complete in the plan; it has `onto`, so it needs no `from`. It gets no review
+task of its own.
 
 ```json
 [
   {"key": "fix", "text": "Fix the double free in store.rs found by review 43 ...",
-   "labels": {"role": "implement", "repo": "/abs/repo", "onto": "41"}, "needs": ["41"]},
-  {"key": "review-fix", "text": "Review the double-free fix: attack ...",
-   "labels": {"repo": "/abs/repo", "from": "main"}, "needs": [{"key": "fix"}]}
+   "labels": {"role": "implement", "repo": "/abs/repo", "onto": "41"}, "needs": ["41"]}
 ]
 ```
-
-Then `vb label <review-fix> of=<fix> --as lead-fable-5-2`, then
-`vb label <review-fix> role=review --as lead-fable-5-2`.
 
 ## Each turn
 

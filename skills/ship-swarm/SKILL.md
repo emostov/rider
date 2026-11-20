@@ -91,8 +91,8 @@ All green: step 4. The board wait from `lead.md` runs alongside it.
      failing assertion, a formatting check.
 4. A real failure becomes a fix task, created as `lead.md` describes:
    `role=implement` (or `light` when the log says exactly what to change, as a lint does),
-   `onto=<top>`, `needs` every unfinished task on that branch, and its own `review` unless
-   the fix is purely mechanical (read its diff). The brief carries the check's name, the failing log lines, and the local command that
+   `onto=<top>`, `needs` every unfinished task on that branch, and no `review` of its own
+   (read its diff; the PR's holistic review covers it). The brief carries the check's name, the failing log lines, and the local command that
    reproduces the check (from the workflow file under `.github/workflows/`).
 5. When the fix and its review complete, read the result, then push: `git -C <repo> push
    origin <branch>`. `<top>` is now the fix task. Watch again (step 2).
