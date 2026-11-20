@@ -906,7 +906,9 @@ impl World {
         match event {
             Event::Tick(_) => self.refused.clear(),
             Event::Feed(feed) => {
-                if let Some(state) = feed.state.filter(|_| feed.cursor.0 > self.listed_through) {
+                // The core drops an event at or before its cursor, as one it already reflects.
+                let through = self.listed_through.max(self.core.cursor().0);
+                if let Some(state) = feed.state.filter(|_| feed.cursor.0 > through) {
                     let newer = (self.told.get(&feed.task.0))
                         .is_none_or(|told| told.cursor < feed.cursor.0);
                     if newer {

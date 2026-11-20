@@ -732,7 +732,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             state.board = BoardHealth::Up;
             state.cursor = state.cursor.max(cursor);
             reconcile(state, &tasks, cursor, left_out);
-            if !state.recovered {
+            if !state.recovered && state.board() == BoardHealth::Up {
                 state.recovered = true;
                 resume_held(state, &tasks, actions);
             }
@@ -1541,7 +1541,7 @@ fn begin_settle(
 }
 
 fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
-    let up = state.board == BoardHealth::Up;
+    let up = state.board() == BoardHealth::Up;
     let now = state.now;
     let tries_max = state.config.settle_tries_max;
     let entry = &mut state.runs[index];
@@ -1694,7 +1694,7 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
 /// Releases late grants of given-up claims, and forgets those whose grant has lapsed.
 fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
     let now = state.now;
-    let up = state.board == BoardHealth::Up;
+    let up = state.board() == BoardHealth::Up;
     state.pending_claims.retain(|pending| now < pending.until);
     for pending in state.pending_claims.iter_mut() {
         let Some(epoch) = pending.epoch else {
@@ -1778,7 +1778,8 @@ fn new_run(
 /// Starts a run for each claimed task a listing shows held by one of the core's profiles,
 /// renewing the claim as that profile, while the limits allow.
 fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action>) {
-    if state.stopping != Stopping::No || state.board != BoardHealth::Up {
+    assert!(state.board() == BoardHealth::Up);
+    if state.stopping != Stopping::No {
         return;
     }
     let Unaccounted::Tasks(unaccounted) = state.unaccounted.clone() else {
