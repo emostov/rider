@@ -17,7 +17,8 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::board::{
-    Board, BoardError, Listing, TaskId, TaskView, Timestamp, VbCli, one_line, parse_failure_reason,
+    Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
+    parse_failure_reason,
 };
 use crate::cli::with_vb_on_path;
 use crate::config::Limits;
@@ -34,6 +35,7 @@ use crate::run_task::{
     judge_attempt, launch_agent, prepare_attempt, settle_attempt,
 };
 use crate::settle::Verdict;
+use crate::socket::{self, SOCKET_FILE, Socket};
 
 /// Upper bound on the events waiting for the core; sources block when it is full.
 pub const EVENT_QUEUE_MAX: usize = 1024;
@@ -57,6 +59,8 @@ pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
 const TEST_SETTINGS_MAX: usize = 4;
 const GRACE_MILLIS: u64 = KILL_GRACE_SECONDS * 1000;
 const STOP_POLL_MILLIS: u64 = 50;
+/// Upper bound on the agents one attempt starts: a resumed session and its fresh start.
+const AGENT_GROUPS_MAX: usize = 2;
 /// How long the daemon waits on exit for the feed thread once its group is killed: past the
 /// feed's own grace for its stdout to close after a kill.
 const FEED_JOIN_MILLIS_MAX: u64 = 15_000;
@@ -64,8 +68,11 @@ const _: () = assert!(FEED_JOIN_MILLIS_MAX >= STOP_POLL_MILLIS);
 const _: () = assert!(WORKERS_MAX > AGENTS_MAX as usize && TICK_SECONDS > 0);
 const NO_CHANNEL: &str = "channel_not_found";
 const LOCK_FILE: &str = "daemon.lock";
-const LOG_FILE: &str = "daemon.log";
+/// The daemon's log under the Rider home.
+pub const LOG_FILE: &str = "daemon.log";
 const AGENTS_DIR: &str = "agents";
+/// The directory under the Rider home holding each task's attempt logs.
+pub const LOGS_DIR: &str = "logs";
 const LOCK_BYTES_MAX: u64 = 256;
 const PID_BYTES_MAX: u64 = 32;
 const STEPS_MAX: u64 = u64::MAX;
@@ -296,6 +303,7 @@ struct Shared {
     grace_millis: u64,
     attempts: u8,
     feed: Mutex<FeedSlot>,
+    socket: Socket,
     /// The core has decided to stop now; a settlement checks it before each board write.
     stop_now: AtomicBool,
     log: Log,
@@ -393,9 +401,15 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         }
         Err(error) => log.write(&format!("could not look for leaked vb processes: {error}")),
     }
+    let socket_path = paths.home.join(SOCKET_FILE);
+    let sink_events = events.clone();
+    let sink: socket::Sink = Arc::new(move |event| send(&sink_events, event));
+    let socket = socket::listen(&socket_path, paths.home.join(LOGS_DIR), sink)
+        .map_err(io_error("listen on", &socket_path))?;
     let shared = Arc::new(Shared {
         paths,
         events,
+        socket,
         lease_millis,
         grace_millis: timing.grace_millis,
         attempts: limits.attempts,
@@ -420,6 +434,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
     let code = drive(&mut state, &inputs, &jobs, &shared);
+    shared.socket.close();
     stop_feed(&shared);
     let code = code?;
     assert!(state.exited());
@@ -466,9 +481,14 @@ fn drive(
     let mut pending: Vec<Action> = tick;
     for _ in 0..STEPS_MAX {
         for action in pending.drain(..) {
-            if let Action::Exit(code) = action {
-                return Ok(u8::try_from(code).unwrap_or(1));
-            }
+            let action = match action {
+                Action::Exit(code) => return Ok(u8::try_from(code).unwrap_or(1)),
+                Action::Reply { client, reply } => {
+                    shared.socket.reply(client, reply);
+                    continue;
+                }
+                action => action,
+            };
             if let Some(job) = dispatch(action, &mut contexts, shared) {
                 jobs.try_send(job).map_err(|error| match error {
                     TrySendError::Full(_) => DaemonError::JobsFull,
@@ -573,7 +593,11 @@ fn job(
             shared.log.write(&format!("spawned #{} {profile}", task.0));
             Box::new(move || spawn(&shared, run, task, &attempt))
         }
-        Action::StopAgent { run, task } => Box::new(move || stop_agent(&shared, run, task)),
+        Action::StopAgent { run, task } => {
+            let context = contexts.iter().find(|context| context.run == run);
+            let attempt = context.and_then(|context| context.attempt.clone());
+            Box::new(move || stop_agent(&shared, run, task, attempt.as_deref()))
+        }
         Action::Judge { run, task } => {
             let reason = "rider lost the attempt's state before judging it".to_string();
             let unjudged = Event::Judged {
@@ -612,7 +636,7 @@ fn job(
         } => Box::new(move || release(&shared, run, task, &profile)),
         Action::ListTasks => Box::new(move || list(&shared)),
         Action::RestartFeed(cursor) => Box::new(move || restart_feed(&shared, cursor)),
-        Action::Exit(_) => return Ok(None),
+        Action::Reply { .. } | Action::Exit(_) => return Ok(None),
     };
     Ok(Some(job))
 }
@@ -729,22 +753,33 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     }
 }
 
-fn stop_agent(shared: &Shared, run: RunId, task: TaskId) -> Input {
+fn stop_agent(shared: &Shared, run: RunId, task: TaskId, attempt: Option<&Attempt>) -> Input {
     assert!(shared.grace_millis > 0 && shared.grace_millis <= GRACE_MILLIS);
+    if let Some(attempt) = attempt {
+        attempt.stop();
+    }
     let path = shared.pid_file(task);
-    if let Some(group) = agent_group(&path) {
+    let mut stopped = None;
+    // A refused resume's fresh start may have begun before the attempt was told to stop.
+    for _ in 0..AGENT_GROUPS_MAX {
+        let Some(group) = agent_group(&path).filter(|group| Some(*group) != stopped) else {
+            break;
+        };
         // A group that is already gone has nothing left to stop.
         let _ = kill_process_group(group, Signal::TERM);
         let polls = shared.grace_millis.div_ceil(STOP_POLL_MILLIS);
-        for _ in 0..polls {
+        let ended = (0..polls).any(|_| {
             thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
-            // The pid file goes only once the agent is reaped.
-            if agent_group(&path) != Some(group) {
-                return Input::plain(Event::StopDone(run));
-            }
+            // The pid file names another group once a fresh start began, and goes once the
+            // attempt's last agent is reaped.
+            agent_group(&path) != Some(group)
+        });
+        if !ended {
+            let _ = kill_process_group(group, Signal::KILL);
         }
-        let _ = kill_process_group(group, Signal::KILL);
+        stopped = Some(group);
     }
+    assert!(stopped.is_none_or(|group| group.as_raw_nonzero().get() > 1));
     Input::plain(Event::StopDone(run))
 }
 
@@ -828,8 +863,16 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
         }
         // A failure decided without judging, such as the time limit, still counts the attempt.
         (Settlement::Verdict(verdict @ Verdict::Fail { .. }), Some(attempt), None) => {
-            let judgement = Judgement::uninspected(verdict.clone());
-            settle_attempt(task, &shared.env(profile), &board, attempt, &judgement)
+            match board.read_task(task).map(|view| view.state) {
+                Ok(TaskState::Claimed) => {
+                    let judgement = Judgement::uninspected(verdict.clone());
+                    settle_attempt(task, &shared.env(profile), &board, attempt, &judgement)
+                }
+                // A worker that blocked its task owns it now, however its process ended.
+                Ok(TaskState::Blocked) => Ok(()),
+                Ok(state) => Err(RunError::LostClaim(state)),
+                Err(error) => Err(RunError::Board(error)),
+            }
         }
         (Settlement::Verdict(Verdict::Fail { reason }), _, _) => {
             board.fail(task, reason).map_err(RunError::Board)

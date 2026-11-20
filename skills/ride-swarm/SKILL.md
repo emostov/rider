@@ -5,8 +5,8 @@ description: Use when the user asks to ride a swarm, start a swarm, have Rider o
 
 # Ride a swarm
 
-Rider runs a swarm of coding agents on this machine: a local board holds tasks, `rider pool
-<project>` runs one agent per ready task in its own git worktree, and a lead plans the goal
+Rider runs a swarm of coding agents on this machine: a local board holds tasks, the `rider up`
+daemon runs one agent per ready task in its own git worktree, and a lead plans the goal
 into tasks. When the user rides a swarm from this session, **this session is the lead**.
 
 `<skill>` is the directory that contains this SKILL.md. It holds `lead.md`, the lead's
@@ -24,7 +24,8 @@ answer from memory.
 | Question | Command |
 |---|---|
 | Is the board up? | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4100` (`000` is down) |
-| Which pools run? | `pgrep -fl '^rider pool '` (the last word is the project) |
+| Is the daemon up, and what is open? | `rider status` (board, running count, open tasks by project) |
+| Which agents run? | `rider agents` |
 | Which projects exist? | `vb channels list work/` |
 | A project's tasks, with each result's summary | `vb tasks work/<project> --state all` |
 | Why tasks are blocked | `vb tasks work/<project> --state blocked` |
@@ -33,8 +34,8 @@ answer from memory.
 
 1. What needs the user: open decisions, and tasks blocked as `rider_error`, `branch_busy`,
    or `attempts_exhausted`.
-2. What is running: claimed tasks, and whether a pool runs for each project with open tasks.
-   A project with ready tasks and no pool is stalled: say so.
+2. What is running: claimed tasks, and whether the daemon runs, from `rider status`.
+   Ready tasks with no daemon are stalled: say so.
 3. What finished or failed recently. For a finished `review` or `security` task, say
    whether its summary reports anything blocking, and whether a fix task exists for it.
 
@@ -61,9 +62,10 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    `vb schemas list` must list `rider-result@1` and `rider-finding@1`; register a missing
    one with `vb schemas create rider-result@1 --file <skill>/schemas/rider-result.json`
    (or `rider-finding`).
-4. **Pool.** If none runs for the project, ask the user to run `rider pool <project>` in a
-   terminal they keep open. It stops when its standard input closes, so it cannot run as
-   your background command.
+4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
+   run `rider up`, which starts it in the background, and check `rider status` again.
+   (`rider pool <project>` in a terminal the user keeps open is the fallback until it is
+   removed.)
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
    `lead-fable-5-2`. Answer the user before anything else.
 
@@ -72,11 +74,12 @@ To send a finished branch for the owner's review, open its PR, and get CI green,
 
 ## Stop the swarm
 
-Ask the user to type `stop` in the pool's terminal. Running agents finish and their tasks
-settle; nothing new is claimed. The board keeps running.
+Run `rider down`. Running agents finish and their tasks settle; nothing new is claimed.
+`rider down --now` stops every agent at once and releases its task, the attempt uncounted.
+The board keeps running.
 
 ## Common mistakes
 
 - Doing a worker's job as the lead: editing the repository, building, or running tests.
   Make it a task, except the small mechanical edit `lead.md` allows.
-- Starting a second pool for a project. Check `pgrep` first.
+- Starting a second daemon. Check `rider status` first.

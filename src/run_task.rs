@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -189,6 +190,8 @@ pub struct Attempt {
     fallback: Option<Fallback>,
     // The log of the fresh start, set once `launch` has given up the resumed session.
     fresh_log: OnceLock<PathBuf>,
+    // Set by `stop`: no agent of this attempt starts from then on.
+    stopped: AtomicBool,
 }
 
 struct Fallback {
@@ -221,7 +224,8 @@ impl Attempt {
         let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
         let refused =
             !matches!(launched, Ok(Exit::Code(0))) && harness::ended_before_any_turn(&self.log);
-        match self.fallback.as_ref().filter(|_| refused) {
+        let stopped = self.stopped.load(Ordering::SeqCst);
+        match self.fallback.as_ref().filter(|_| refused && !stopped) {
             Some(fresh) => {
                 let log = log_path(&fresh.home, self.brief.id, self.failed + 1);
                 let log = self.fresh_log.get_or_init(|| log);
@@ -229,6 +233,12 @@ impl Attempt {
             }
             None => launched,
         }
+    }
+
+    /// Keeps `launch` from starting any further agent, such as a refused resume's fresh start.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        assert!(self.stopped.load(Ordering::SeqCst));
     }
 
     // The log of the agent run whose work the attempt is judged by.
@@ -475,6 +485,7 @@ fn unneeded_on_branch(
     let open: Vec<&TaskView> = listing
         .tasks
         .iter()
+        .map(|listed| &listed.view)
         .filter(|task| task.id != view.id && in_repo(task, &brief.repo))
         .collect();
     let mut targets: Vec<TaskId> = vec![onto];
@@ -484,7 +495,8 @@ fn unneeded_on_branch(
             .then(|| parse_id_label(task, "onto").ok().flatten())
             .flatten();
         if let Some(target) = target.filter(|target| {
-            !targets.contains(target) && listing.tasks.iter().all(|task| task.id != *target)
+            !targets.contains(target)
+                && listing.tasks.iter().all(|listed| listed.view.id != *target)
         }) {
             targets.push(target);
         }
@@ -622,6 +634,7 @@ fn prepare(
         resume_note,
         fallback,
         fresh_log: OnceLock::new(),
+        stopped: AtomicBool::new(false),
     })
 }
 
