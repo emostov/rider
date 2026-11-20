@@ -27,7 +27,7 @@ use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
 use crate::run_task::{Env, Ran, RunError, run_task};
 use crate::settle::Verdict;
-use crate::socket::{Client, ClientError, SOCKET_FILE};
+use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
 const ENVIRONMENT: &str = r#"environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
@@ -113,6 +113,19 @@ pub enum Command {
     Status,
     /// Print every agent the daemon runs.
     Agents,
+    /// Print the newest attempt's log of a task; -f follows it until the agent exits.
+    Logs {
+        #[arg(value_name = "ID", value_parser = parse_task_id)]
+        id: TaskId,
+        /// Keep printing lines as the running agent writes them.
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Stop a task's agent and fail the task; the attempt counts.
+    Kill {
+        #[arg(value_name = "ID", value_parser = parse_task_id)]
+        id: TaskId,
+    },
     /// Run worker slots on the channel work/<project>.
     ///
     /// Type stop or press Ctrl-D to stop after running tasks finish.
@@ -351,6 +364,8 @@ pub enum CliError {
     TooManyUrls,
     ConfigFile(ConfigFileError),
     TableInstalled,
+    /// The task has no attempt log under the Rider home.
+    NoLog(TaskId),
 }
 
 impl fmt::Display for CliError {
@@ -379,6 +394,7 @@ impl fmt::Display for CliError {
             CliError::TooManyUrls => write!(f, "name at most {REAP_URLS_MAX} boards"),
             CliError::ConfigFile(error) => write!(f, "{error}"),
             CliError::TableInstalled => write!(f, "the role table was already installed"),
+            CliError::NoLog(id) => write!(f, "task #{} has no log", id.0),
             CliError::SlotsFailed(count) => {
                 write!(f, "{count} slots stopped before they were asked to")
             }
@@ -422,6 +438,8 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Down { now } => down(config, *now),
         Command::Status => status(config),
         Command::Agents => agents(config),
+        Command::Logs { id, follow } => logs(config, *id, *follow),
+        Command::Kill { id } => kill(config, *id),
         Command::Pool { project } => pool(project, config),
         Command::Config => print_config(config),
         Command::RunTask { id } => run_one(*id, config),
@@ -532,10 +550,12 @@ const UP_SECONDS_MAX: u64 = 30;
 const UP_POLL_MILLIS: u64 = 100;
 /// Upper bound on the lines one `rider down` prints.
 const DOWN_LINES_MAX: usize = 4096;
+/// Upper bound on the lines `rider logs -f` prints.
+const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
     if let Ok(mut client) = Client::connect(&config.home) {
-        let data = client.send("status", None).map_err(CliError::Client)?;
+        let data = client.send("status", &[]).map_err(CliError::Client)?;
         println!("rider: the daemon is already running");
         println!("{}", status_line(&data));
         return Ok(0);
@@ -573,7 +593,7 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
     for _ in 0..polls {
         if let Ok(mut client) = Client::connect(&config.home) {
-            let data = client.send("status", None).map_err(CliError::Client)?;
+            let data = client.send("status", &[]).map_err(CliError::Client)?;
             println!("{}", status_line(&data));
             return Ok(0);
         }
@@ -593,7 +613,9 @@ fn up(config: &Config) -> Result<u8, CliError> {
 
 fn down(config: &Config, now: bool) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
-    client.send("down", Some(now)).map_err(CliError::Client)?;
+    client
+        .send("down", &[("now", now.into())])
+        .map_err(CliError::Client)?;
     for _ in 0..DOWN_LINES_MAX {
         match client.next_line().map_err(CliError::Client)? {
             Some(line) => say(&line),
@@ -605,9 +627,52 @@ fn down(config: &Config, now: bool) -> Result<u8, CliError> {
     ))))
 }
 
+fn logs(config: &Config, id: TaskId, follow: bool) -> Result<u8, CliError> {
+    if follow {
+        match Client::connect(&config.home) {
+            Ok(mut client) => {
+                let fields = [("task", id.0.into()), ("follow", true.into())];
+                client.send("logs", &fields).map_err(CliError::Client)?;
+                for _ in 0..LOG_LINES_MAX {
+                    match client.next_line().map_err(CliError::Client)? {
+                        // A closed standard output ends nothing the daemon does.
+                        Some(line) => drop(writeln!(io::stdout().lock(), "{line}")),
+                        None => return Ok(0),
+                    }
+                }
+                let more = format!("more than {LOG_LINES_MAX} lines");
+                return Err(CliError::Client(ClientError::Malformed(more)));
+            }
+            // With no daemon nothing writes the log any more, so it is printed as it is.
+            Err(ClientError::NotRunning(_)) => {}
+            Err(error) => return Err(CliError::Client(error)),
+        }
+    }
+    let path = socket::newest_log(&config.home.join(daemon::LOGS_DIR), id);
+    let path = path.ok_or(CliError::NoLog(id))?;
+    let io = |error: io::Error| CliError::Io {
+        action: "read",
+        path: path.clone(),
+        message: error.to_string(),
+    };
+    let file = fs::File::open(&path).map_err(io)?;
+    let mut stdout = io::stdout().lock();
+    io::copy(&mut file.take(LOG_BYTES_MAX), &mut stdout).map_err(io)?;
+    stdout.flush().map_err(io)?;
+    Ok(0)
+}
+
+fn kill(config: &Config, id: TaskId) -> Result<u8, CliError> {
+    let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
+    let fields = [("task", id.0.into())];
+    client.send("kill", &fields).map_err(CliError::Client)?;
+    say(&format!("killed the agent of #{}", id.0));
+    Ok(0)
+}
+
 fn status(config: &Config) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
-    let data = client.send("status", None).map_err(CliError::Client)?;
+    let data = client.send("status", &[]).map_err(CliError::Client)?;
     println!("{}", status_line(&data));
     let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
     let mut projects: Vec<&str> = tasks
@@ -638,7 +703,7 @@ fn status(config: &Config) -> Result<u8, CliError> {
 
 fn agents(config: &Config) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
-    let data = client.send("agents", None).map_err(CliError::Client)?;
+    let data = client.send("agents", &[]).map_err(CliError::Client)?;
     let rows = data.as_array().map_or(&[][..], Vec::as_slice);
     if rows.is_empty() {
         println!("no agents");

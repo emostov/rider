@@ -1,13 +1,13 @@
 //! The daemon's control socket: newline-delimited JSON requests in, replies and streams out.
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use crate::board::{TaskId, TaskState};
 use crate::core::{
-    AgentRow, BoardHealth, CLIENTS_MAX, ClientId, Event, Phase, Reply, Request, StatusView,
-    Stopping, TaskRow, Untracked,
+    AgentRow, BoardHealth, CLIENTS_MAX, ClientId, ErrorCode, Event, Phase, Reply, Request,
+    StatusView, Stopping, TaskRow, Untracked,
 };
 
 /// The socket's file name under the Rider home.
@@ -39,6 +39,13 @@ const CLOSE_POLL_MILLIS: u64 = 20;
 const ACCEPTS_MAX: u64 = u64::MAX;
 const REQUESTS_MAX: u64 = u64::MAX;
 const STREAM_LINES_MAX: u64 = u64::MAX;
+/// Upper bound on one log line streamed to a client; a longer one is split.
+const LOG_LINE_BYTES_MAX: usize = 1024 * 1024;
+/// Upper bound on the log bytes read in one go.
+const LOG_READ_BYTES_MAX: u64 = 4 * 1024 * 1024;
+/// How often a followed log is read again.
+const LOG_POLL_MILLIS: u64 = 100;
+const LOG_POLLS_MAX: u64 = u64::MAX;
 /// Upper bound on writer threads kept for joining at close; finished ones are dropped first.
 const WRITERS_MAX: usize = 4 * CLIENTS_MAX;
 
@@ -54,6 +61,10 @@ struct WireRequest {
     cmd: String,
     #[serde(default)]
     now: Option<bool>,
+    #[serde(default)]
+    task: Option<u64>,
+    #[serde(default)]
+    follow: Option<bool>,
 }
 
 struct Outgoing {
@@ -228,12 +239,21 @@ fn parse_request(bytes: &[u8]) -> Result<(u64, Request), (Option<u64>, String)> 
     if wire.v != VERSION {
         return Err((Some(wire.id), format!("unknown version {}", wire.v)));
     }
-    let request = match (wire.cmd.as_str(), wire.now) {
-        ("status", None) => Request::Status,
-        ("agents", None) => Request::Agents,
-        ("down", now) => Request::Down {
+    let fields = (wire.now, wire.task.map(TaskId), wire.follow);
+    let request = match (wire.cmd.as_str(), fields) {
+        ("status", (None, None, None)) => Request::Status,
+        ("agents", (None, None, None)) => Request::Agents,
+        ("down", (now, None, None)) => Request::Down {
             now: now.unwrap_or(false),
         },
+        ("kill", (None, Some(task), None)) => Request::Kill(task),
+        ("logs", (None, Some(task), follow)) => Request::Logs {
+            task,
+            follow: follow.unwrap_or(false),
+        },
+        (cmd @ ("status" | "agents" | "down" | "kill" | "logs"), _) => {
+            return Err((Some(wire.id), format!("wrong fields for {cmd:?}")));
+        }
         (cmd, _) => return Err((Some(wire.id), format!("unknown command {cmd:?}"))),
     };
     Ok((wire.id, request))
@@ -248,7 +268,12 @@ impl Socket {
         };
         let slot = &mut guard.slots[index];
         let Some(id) = slot.request else { return };
-        if matches!(reply, Reply::Status(_) | Reply::Agents(_) | Reply::End) {
+        let last = match reply {
+            Reply::Status(_) | Reply::Agents(_) | Reply::End | Reply::Done => true,
+            Reply::Refused { .. } | Reply::Log { follow: false, .. } => true,
+            Reply::Accepted | Reply::Line(_) | Reply::Log { follow: true, .. } => false,
+        };
+        if last {
             slot.request = None;
         }
         match slot.lines.try_send(Outgoing { id, reply }) {
@@ -294,12 +319,115 @@ impl Socket {
 fn write_replies(mut stream: UnixStream, queued: &Receiver<Outgoing>, logs: &Path) {
     for _ in 0..STREAM_LINES_MAX {
         let Ok(outgoing) = queued.recv() else { break };
-        let line = reply_line(outgoing.id, &outgoing.reply, logs);
-        if stream.write_all(line.as_bytes()).is_err() {
+        let written = match outgoing.reply {
+            Reply::Log { task, follow } => {
+                stream_log(&mut stream, outgoing.id, task, follow, queued, logs)
+            }
+            reply => {
+                let line = reply_line(outgoing.id, &reply, logs);
+                stream.write_all(line.as_bytes()).is_ok()
+            }
+        };
+        if !written {
             break;
         }
     }
     let _ = stream.shutdown(Shutdown::Write);
+}
+
+/// The newest of the task's attempt logs (`*.jsonl`) under `logs`, if it has any.
+pub fn newest_log(logs: &Path, task: TaskId) -> Option<PathBuf> {
+    let entries = fs::read_dir(logs.join(task.0.to_string())).ok()?;
+    let newest = entries
+        .take(LOG_FILES_MAX)
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            path.extension().filter(|extension| *extension == "jsonl")?;
+            let metadata = entry.metadata().ok().filter(fs::Metadata::is_file)?;
+            Some((metadata.modified().ok()?, path))
+        })
+        .max()?;
+    assert!(newest.1.starts_with(logs));
+    Some(newest.1)
+}
+
+// Streams the task's newest log; with `follow`, until the core ends the stream. False once
+// the client or the socket is gone.
+fn stream_log(
+    stream: &mut UnixStream,
+    id: u64,
+    task: TaskId,
+    follow: bool,
+    queued: &Receiver<Outgoing>,
+    logs: &Path,
+) -> bool {
+    let mut file: Option<File> = None;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut ended = !follow;
+    for _ in 0..LOG_POLLS_MAX {
+        if file.is_none() {
+            file = newest_log(logs, task).and_then(|path| File::open(path).ok());
+            let ok = format!("{}\n", json!({"id": id, "ok": true}));
+            if file.is_some() && stream.write_all(ok.as_bytes()).is_err() {
+                return false;
+            }
+        }
+        let mut full = false;
+        if let Some(file) = file.as_mut() {
+            let read = file.take(LOG_READ_BYTES_MAX).read_to_end(&mut pending);
+            full = read.is_ok_and(|read| read as u64 == LOG_READ_BYTES_MAX);
+            if !write_log_lines(stream, id, &mut pending, false) {
+                return false;
+            }
+        }
+        if ended && !full {
+            let last = match file {
+                None => {
+                    let message = format!("task #{} has no log", task.0);
+                    error_line(Some(id), "unknown_task", &message)
+                }
+                Some(_) if !write_log_lines(stream, id, &mut pending, true) => return false,
+                Some(_) => format!("{}\n", json!({"id": id, "end": true})),
+            };
+            return stream.write_all(last.as_bytes()).is_ok();
+        }
+        if !ended {
+            match queued.recv_timeout(Duration::from_millis(LOG_POLL_MILLIS)) {
+                Ok(Outgoing {
+                    reply: Reply::End, ..
+                }) => ended = true,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+    false
+}
+
+// Writes each whole line in `pending` as a stream line, and the rest too when `all`; a line
+// longer than `LOG_LINE_BYTES_MAX` is split.
+fn write_log_lines(stream: &mut UnixStream, id: u64, pending: &mut Vec<u8>, all: bool) -> bool {
+    let mut start = 0;
+    let mut lines = String::new();
+    while start < pending.len() {
+        let rest = &pending[start..];
+        let (line, used) = match rest.iter().position(|byte| *byte == b'\n') {
+            Some(end) if end <= LOG_LINE_BYTES_MAX => (&rest[..end], end + 1),
+            _ if rest.len() > LOG_LINE_BYTES_MAX => {
+                (&rest[..LOG_LINE_BYTES_MAX], LOG_LINE_BYTES_MAX)
+            }
+            _ if all => (rest, rest.len()),
+            _ => break,
+        };
+        let text = String::from_utf8_lossy(line);
+        lines.push_str(&format!("{}\n", json!({"id": id, "stream": text})));
+        start += used;
+    }
+    assert!(start <= pending.len());
+    pending.drain(..start);
+    assert!(!all || pending.is_empty());
+    stream.write_all(lines.as_bytes()).is_ok()
 }
 
 fn error_line(id: Option<u64>, code: &str, message: &str) -> String {
@@ -314,7 +442,14 @@ fn reply_line(id: u64, reply: &Reply, logs: &Path) -> String {
             let rows: Vec<Value> = rows.iter().map(|row| agent_json(row, logs)).collect();
             json!({"id": id, "ok": true, "data": rows})
         }
-        Reply::Accepted => json!({"id": id, "ok": true}),
+        Reply::Accepted | Reply::Done | Reply::Log { .. } => json!({"id": id, "ok": true}),
+        Reply::Refused { code, message } => {
+            let code = match code {
+                ErrorCode::UnknownTask => "unknown_task",
+                ErrorCode::NotRunning => "not_running",
+            };
+            json!({"id": id, "ok": false, "error": {"code": code, "message": message}})
+        }
         Reply::Line(text) => json!({"id": id, "stream": text}),
         Reply::End => json!({"id": id, "end": true}),
     };
@@ -461,12 +596,13 @@ impl Client {
         })
     }
 
-    /// Sends `cmd`, with `now` for `down`, and returns the `ok` reply's data.
-    pub fn send(&mut self, cmd: &str, now: Option<bool>) -> Result<Value, ClientError> {
+    /// Sends `cmd` with its `fields`, and returns the `ok` reply's data.
+    pub fn send(&mut self, cmd: &str, fields: &[(&str, Value)]) -> Result<Value, ClientError> {
         assert!(!cmd.is_empty());
         let mut request = json!({"v": VERSION, "id": 1, "cmd": cmd});
-        if let Some(now) = now {
-            request["now"] = Value::Bool(now);
+        for (name, value) in fields {
+            assert!(!matches!(*name, "v" | "id" | "cmd"));
+            request[*name] = value.clone();
         }
         let line = format!("{request}\n");
         assert!(line.len() <= REQUEST_BYTES_MAX);

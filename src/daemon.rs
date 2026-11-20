@@ -68,7 +68,8 @@ const LOCK_FILE: &str = "daemon.lock";
 /// The daemon's log under the Rider home.
 pub const LOG_FILE: &str = "daemon.log";
 const AGENTS_DIR: &str = "agents";
-const LOGS_DIR: &str = "logs";
+/// The directory under the Rider home holding each task's attempt logs.
+pub const LOGS_DIR: &str = "logs";
 const LOCK_BYTES_MAX: u64 = 256;
 const PID_BYTES_MAX: u64 = 32;
 const STEPS_MAX: u64 = u64::MAX;
