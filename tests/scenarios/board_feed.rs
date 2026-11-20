@@ -39,26 +39,87 @@ fn feed_runs(tails: &Path) -> usize {
         .count()
 }
 
+/// The recorded canceled-task event at `cursor`, as one line.
+fn event_at(cursor: u64) -> String {
+    let recorded = include_str!("../../fixtures/board/tail-task-canceled.json");
+    let (before, after) = recorded
+        .split_once(r#""cursor":"22""#)
+        .expect("the recorded event's cursor");
+    format!("{before}\"cursor\":\"{cursor}\"{after}")
+}
+
+/// Given the first `vb tail` run prints `events` and runs `then`, logging every run's
+/// arguments in `runs`, and every later run is the real one.
+fn given_the_first_feed_prints(world: &World, events: &str, then: &str) -> std::path::PathBuf {
+    let (tails, runs) = (world.root.join("tails"), world.root.join("tail-runs"));
+    let events_file = world.root.join("events");
+    fs::write(&events_file, events).expect("write the feed's events");
+    given_vb_tail_starts_with(
+        world,
+        &tails,
+        &format!(
+            r#"echo "$*" >> '{}'; [ "$runs" -le 1 ] && {{ cat '{}'; {then}; }}"#,
+            runs.display(),
+            events_file.display()
+        ),
+    );
+    runs
+}
+
+/// When the feed is started a second time, within `FEED_RUNS_SECONDS_MAX`; returns the second
+/// run's arguments.
+fn when_the_feed_restarts(world: &World, runs: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(FEED_RUNS_SECONDS_MAX);
+    loop {
+        let text = fs::read_to_string(runs).unwrap_or_default();
+        if let Some(second) = text.lines().nth(1) {
+            return second.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the feed was not restarted: {text}\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
-fn a_feed_line_over_the_bound_is_skipped_and_the_feed_keeps_running() {
+fn the_rest_of_a_feed_line_over_the_bound_is_skipped_not_read_as_an_event() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let tails = world.root.join("tails");
-    let over = FEED_LINE_BYTES_MAX + 1;
-    given_vb_tail_starts_with(
+    let padding = "x".repeat(usize::try_from(FEED_LINE_BYTES_MAX).expect("fits") + 1);
+    let events = format!("{padding}{}{}", event_at(2_000_000), event_at(1_000_001));
+    let runs = given_the_first_feed_prints(&world, &events, "exit 3");
+
+    given_a_running_daemon(&mut world);
+    let second = when_the_feed_restarts(&world, &runs);
+
+    assert!(second.starts_with("tail --after 1000001 "), "{second}");
+    then_the_daemon_stops_cleanly(world);
+}
+
+#[test]
+fn a_descendant_that_keeps_printing_after_the_feed_vb_exits_is_killed_and_the_feed_restarts() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let events = event_at(1_000_001);
+    let runs = given_the_first_feed_prints(
         &world,
-        &tails,
-        &format!("head -c {over} /dev/zero | tr '\\0' x; echo; echo '{{\"cursor\":\"0\"}}'"),
+        &events,
+        &format!(
+            "while :; do cat '{}'; done & exit 3",
+            world.root.join("events").display()
+        ),
     );
 
     given_a_running_daemon(&mut world);
-    thread::sleep(Duration::from_secs(3));
+    let second = when_the_feed_restarts(&world, &runs);
 
-    assert_eq!(feed_runs(&tails), 1, "{}", world.daemon_log());
-    assert_eq!(daemon_feeds(&world).len(), 1, "{:?}", daemon_feeds(&world));
-    when_the_daemon_is_sent_sigterm(&world);
-    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(second.starts_with("tail --after 1000001 "), "{second}");
+    then_the_daemon_stops_cleanly(world);
 }
 
 #[test]
@@ -281,7 +342,7 @@ fn a_descendant_of_a_waiting_vb_is_killed_with_no_kill_command_on_path() {
     then_the_hung_identity_read_left_nothing(world, "wait", &vb_dir);
 }
 
-const BURST_EVENTS: u64 = 25;
+const BURST_EVENTS: u64 = 400;
 const BURST_FIRST_CURSOR: u64 = 1_000_001;
 
 #[test]
@@ -289,40 +350,192 @@ fn every_event_a_feed_vb_prints_before_it_exits_reaches_the_daemon() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let recorded = include_str!("../../fixtures/board/tail-task-canceled.json");
-    let (before, after) = recorded
-        .split_once(r#""cursor":"22""#)
-        .expect("the recorded event's cursor");
-    let last = BURST_FIRST_CURSOR + BURST_EVENTS - 1;
-    let burst: String = (BURST_FIRST_CURSOR..=last)
-        .map(|cursor| format!("{before}\"cursor\":\"{cursor}\"{after}"))
+    let highest = BURST_FIRST_CURSOR + BURST_EVENTS;
+    let middle = BURST_EVENTS / 2;
+    let burst: String = (0..BURST_EVENTS)
+        .map(|n| {
+            if n == middle {
+                highest
+            } else {
+                BURST_FIRST_CURSOR + n
+            }
+        })
+        .map(event_at)
         .collect();
-    let burst_file = world.root.join("burst");
-    fs::write(&burst_file, burst).expect("write the burst of events");
-    let (tails, runs) = (world.root.join("tails"), world.root.join("tail-runs"));
-    given_vb_tail_starts_with(
-        &world,
-        &tails,
-        &format!(
-            r#"echo "$*" >> '{}'; [ "$runs" -le 1 ] && {{ cat '{}'; exit 3; }}"#,
-            runs.display(),
-            burst_file.display()
-        ),
-    );
+    let runs = given_the_first_feed_prints(&world, &burst, "exit 3");
 
     given_a_running_daemon(&mut world);
-    let deadline = Instant::now() + Duration::from_secs(FEED_RUNS_SECONDS_MAX);
-    while feed_runs(&tails) < 2 && Instant::now() < deadline {
+    let second = when_the_feed_restarts(&world, &runs);
+
+    assert!(
+        second.starts_with(&format!("tail --after {highest} ")),
+        "{second}\n{}",
+        world.daemon_log()
+    );
+    then_the_daemon_stops_cleanly(world);
+}
+
+/// Given every `vb` run first runs `fragment`, a shell fragment seeing the run's arguments, and
+/// then the real `vb`.
+fn given_vb_first_runs(world: &World, fragment: &str) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!("#!/bin/sh\n{fragment}\nexec '{}' \"$@\"\n", real.display());
+    write_executable(&world.vb, &script);
+}
+
+/// Waits up to `seconds` for the daemon's log to contain `text`; returns whether it did.
+fn when_the_daemon_log_shows_within(world: &World, text: &str, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !world.daemon_log().contains(text) {
+        if Instant::now() >= deadline {
+            return false;
+        }
         thread::sleep(Duration::from_millis(100));
     }
+    true
+}
 
-    let runs = fs::read_to_string(&runs).unwrap_or_default();
-    let second = runs.lines().nth(1).unwrap_or_default();
+fn then_the_daemon_stops_cleanly(mut world: World) {
     assert!(
-        second.starts_with(&format!("tail --after {last} ")),
-        "the restarted feed: {runs}\n{}",
+        !world.daemon_log().contains("panicked"),
+        "{}",
         world.daemon_log()
     );
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+const COMPLETE_SECONDS_MAX: u64 = 20;
+
+#[test]
+fn a_complete_refused_as_claim_lost_is_not_retried() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Commit]);
+    let completes = world.root.join("completes");
+    let stderr = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/board/claim-lost.stderr.txt"
+    );
+    given_vb_first_runs(
+        &world,
+        &format!(
+            r#"if [ "$1 $2" = "tasks complete" ]; then
+  echo complete >> '{}'; cat '{stderr}' >&2; exit 1
+fi"#,
+            completes.display()
+        ),
+    );
+    given_a_running_daemon(&mut world);
+
+    when_the_file_exists(&world, &completes);
+    let settled = when_rider_status_shows_within(&world, "board up, 0 of", COMPLETE_SECONDS_MAX);
+
+    assert!(settled, "{}", world.daemon_log());
+    let tries = fs::read_to_string(&completes).expect("read the complete log");
+    assert_eq!(tries.lines().count(), 1, "{}", world.daemon_log());
+    then_the_daemon_stops_cleanly(world);
+}
+
+const LABELS_OVER_MAX: usize = 33;
+
+#[test]
+fn a_task_with_more_labels_than_rider_tracks_is_refused_without_a_panic() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let mut crowded = an_implement_task(&world, "Add the crowded work.");
+    for n in 0..LABELS_OVER_MAX {
+        crowded = crowded.label(&format!("extra{n}"), "x");
+    }
+    when_the_lead_creates(&world, &crowded);
+
+    when_the_daemon_is_started(&mut world, &[]);
+
+    assert!(
+        when_the_daemon_log_shows_within(&world, "the task has more than 32 labels", 20),
+        "{}",
+        world.daemon_log()
+    );
+    then_the_daemon_stops_cleanly(world);
+}
+
+const LARGE_TASKS: usize = 180;
+const LARGE_TASK_WORDS: usize = 1_980;
+const CREATORS: usize = 12;
+
+#[test]
+fn a_listing_over_the_output_bound_is_refused_without_a_panic() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let text = "日日日日 ".repeat(LARGE_TASK_WORDS);
+    thread::scope(|scope| {
+        for _ in 0..CREATORS {
+            scope.spawn(|| {
+                for _ in 0..LARGE_TASKS / CREATORS {
+                    when_the_lead_creates(&world, &NewTask::new(&text));
+                }
+            });
+        }
+    });
+
+    when_the_daemon_is_started(&mut world, &[]);
+
+    assert!(
+        when_the_daemon_log_shows_within(&world, "bytes on one stream", 30),
+        "{}",
+        world.daemon_log()
+    );
+    then_the_daemon_stops_cleanly(world);
+}
+
+const PAGE_TASKS: u64 = 200;
+const PAGES_MAX: u64 = 16;
+
+#[test]
+fn a_listing_longer_than_its_page_limit_is_refused() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    when_the_lead_creates(&world, &NewTask::new("Open the work channel."));
+    let pages = world.root.join("pages");
+    fs::create_dir(&pages).expect("create the pages directory");
+    for page in 0..=PAGES_MAX {
+        let first = page * PAGE_TASKS + 1;
+        let tasks: Vec<String> = (first..first + PAGE_TASKS)
+            .map(|id| {
+                format!(
+                    r#"{{"message":{{"id":"{id}","channel":"work/t","text":"t","labels":{{}},"task":{{"state":"ready","epoch":0,"needs":[],"claim":null}},"version":{id}}}}}"#
+                )
+            })
+            .collect();
+        let last = first + PAGE_TASKS - 1;
+        let json = format!(r#"{{"tasks":[{}],"cursor":"{last}"}}"#, tasks.join(","));
+        let name = pages.join((page * PAGE_TASKS).to_string());
+        fs::write(name, json).expect("write a listing page");
+    }
+    given_vb_first_runs(
+        &world,
+        &format!(
+            r#"if [ "$1" = tasks ] && [ "$3" = --state ]; then
+  after=0
+  for word; do [ "$previous" = --after ] && after=$word; previous=$word; done
+  exec cat '{}'/"$after"
+fi"#,
+            pages.display()
+        ),
+    );
+
+    when_the_daemon_is_started(&mut world, &[]);
+
+    assert!(
+        when_the_daemon_log_shows_within(&world, "tasks in one listing", 30),
+        "{}",
+        world.daemon_log()
+    );
+    then_the_daemon_stops_cleanly(world);
 }
