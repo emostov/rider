@@ -104,3 +104,4 @@ after a crash.
 
 The [manual](./docs/manual.md) covers prerequisites, roles, labels, watching
 and stopping the swarm, where files live, and troubleshooting.
+The [release guide](./docs/releasing.md) covers tagging and publishing.
