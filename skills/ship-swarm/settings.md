@@ -3,13 +3,13 @@
 The owner's choices for the loops in `SKILL.md`: the owner's review in a packet, what to do
 with comments, how to watch CI, and what to do with PR review threads. They live in one TOML
 file, `<rider home>/ship.toml` (`~/.rider/ship.toml` unless `RIDER_HOME` is set), kept per
-repository, so they carry over between sessions.
+repository by default, so they carry over between sessions.
 
 ## Reading the file
 
 The file holds one `[repo."<owner>/<name>"]` table per repository, with sub-tables such as
-`[repo."<owner>/<name>".ci]`. Top-level keys are allowed as the owner's own defaults; the lead
-never writes them.
+`[repo."<owner>/<name>".ci]`. Top-level keys hold the owner's defaults for every repository; the lead writes them only
+when the owner picks "every repository" in the first-ship questions.
 
 Read the file at the start of every ship and find this repository's table. A key that table
 leaves out takes the top-level value, then the default in the Keys table:
@@ -36,11 +36,15 @@ file, and stop. Do not guess what it meant.
 
 ## The first ship from a repository: ask
 
-When the file has no table for this repository, including when the file does not exist, ask
-the owner before step 1. Ask in one round, with the
+When the file has no table for this repository and no top-level keys the owner chose to set
+globally, including when the file does not exist, ask the owner before step 1. Ask in one
+round, with the
 `AskUserQuestion` tool when the harness has it, otherwise as a short numbered list. Offer the
 default first in each question and say it is the default. Ask only these:
 
+0. **Where to save the answers.** "This repository (default)" writes this repository's
+   `[repo."<owner>/<name>"]` tables. "Every repository" writes top-level keys that apply to
+   every repository.
 1. **Owner review before the PR.** Push each settled branch as a review packet and wait for
    the owner, or open the PR straight away? If a packet: which tool (`reviews` is the only one
    supported today), and what counts as approval.
@@ -54,9 +58,10 @@ default first in each question and say it is the default. Ask only these:
 5. **Pings.** Where to ping (this session, or a push notification when the harness has
    one), and whether to hold routine updates for a digest.
 
-Write the answers into this repository's table only, never into the top level or another
-repository's table. Show the owner the table, and go on. Never ask again for a repository that
-has a table. The owner changes a choice by editing the file or by asking you to.
+Write the answers where the owner chose: into this repository's tables, or, for "every
+repository", into top-level keys. Never write into another repository's table. Show the
+owner what was written, and go on. Never ask again for a repository that has a table, or when
+the file's top-level keys were set globally by the owner. The owner changes a choice by editing the file or by asking you to.
 
 ## Keys
 
