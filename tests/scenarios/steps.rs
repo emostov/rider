@@ -409,7 +409,7 @@ pub const DAEMON_START_SECONDS_MAX: u64 = 30;
 /// The line the daemon prints once it follows the board.
 pub const DAEMON_STARTED: &str = "rider daemon: following";
 
-/// The test-only setting that shortens the daemon's lease, attempt limit and tick.
+/// The test-only setting that shortens the daemon's lease, attempt limit, tick and kill grace.
 pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
 
 /// Given a running `rider daemon` that follows the board.

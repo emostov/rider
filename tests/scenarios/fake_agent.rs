@@ -32,6 +32,8 @@ pub enum Behaviour {
     ExitNonZero,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
+    /// Like `Hold`, but ignores SIGTERM.
+    HoldIgnoringTerm,
 }
 
 impl Behaviour {
@@ -43,6 +45,7 @@ impl Behaviour {
             Behaviour::Block => "block",
             Behaviour::ExitNonZero => "exit-non-zero",
             Behaviour::Hold => "hold",
+            Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
         }
     }
 }
@@ -111,7 +114,8 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
-  hold)
+  hold|hold-ignoring-term)
+    [ "$behaviour" = hold ] || trap '' TERM
     step=0
     while [ ! -e "$world/{RELEASES_DIR}/$task" ]; do
       step=$((step + 1))

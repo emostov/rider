@@ -20,7 +20,7 @@ use crate::core::{
     Settlement, State,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader};
-use crate::harness::{CommandLine, Exit, HarnessError};
+use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::roles::{AGENTS_MAX, ROLES};
 use crate::run_task::{
     Attempt, Env, Judgement, Prepared, RunError, judge_attempt, launch_agent, prepare_attempt,
@@ -44,9 +44,12 @@ pub const SUBTREE: &str = "work/";
 pub const DAEMON_PROFILE: &str = "rider-daemon";
 /// What the daemon prints once it follows the board.
 pub const FOLLOWING: &str = "rider daemon: following";
-/// The test-only setting that shortens limits: `lease=<ms>,attempt=<ms>,tick=<ms>`, any subset.
+/// The test-only setting that shortens limits: `lease=<ms>,attempt=<ms>,tick=<ms>,grace=<ms>`,
+/// any subset.
 pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
-const TEST_SETTINGS_MAX: usize = 3;
+const TEST_SETTINGS_MAX: usize = 4;
+const GRACE_MILLIS: u64 = KILL_GRACE_SECONDS * 1000;
+const STOP_POLL_MILLIS: u64 = 50;
 const _: () = assert!(WORKERS_MAX > AGENTS_MAX as usize && TICK_SECONDS > 0);
 const NO_CHANNEL: &str = "channel_not_found";
 const LOCK_FILE: &str = "daemon.lock";
@@ -125,6 +128,7 @@ struct Timing {
     lease_millis: u64,
     attempt_millis_max: u64,
     tick_millis: u64,
+    grace_millis: u64,
 }
 
 impl Timing {
@@ -133,6 +137,7 @@ impl Timing {
             lease_millis: LEASE_MILLIS,
             attempt_millis_max: ATTEMPT_MILLIS_MAX,
             tick_millis: TICK_SECONDS * 1000,
+            grace_millis: GRACE_MILLIS,
         };
         let pairs = setting
             .unwrap_or_default()
@@ -149,6 +154,7 @@ impl Timing {
                 "lease" => (&mut timing.lease_millis, 3, LEASE_MILLIS),
                 "attempt" => (&mut timing.attempt_millis_max, 1, ATTEMPT_MILLIS_MAX),
                 "tick" => (&mut timing.tick_millis, 1, TICK_SECONDS * 1000),
+                "grace" => (&mut timing.grace_millis, 1, GRACE_MILLIS),
                 _ => return Err(DaemonError::Setting(format!("unknown setting {key:?}"))),
             };
             *field = value
@@ -163,6 +169,7 @@ impl Timing {
         }
         assert!(timing.lease_millis >= 3 && timing.lease_millis <= LEASE_MILLIS);
         assert!(timing.tick_millis > 0 && timing.attempt_millis_max > 0);
+        assert!(timing.grace_millis > 0 && timing.grace_millis <= GRACE_MILLIS);
         Ok(timing)
     }
 }
@@ -290,6 +297,7 @@ struct Shared {
     paths: Paths,
     events: SyncSender<Input>,
     lease_millis: u64,
+    grace_millis: u64,
 }
 
 impl Shared {
@@ -357,6 +365,7 @@ pub fn run(paths: Paths) -> Result<u8, DaemonError> {
         paths,
         events,
         lease_millis,
+        grace_millis: timing.grace_millis,
     });
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
@@ -625,17 +634,30 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
 }
 
 fn stop_agent(shared: &Shared, run: RunId, task: TaskId) -> Input {
+    assert!(shared.grace_millis > 0 && shared.grace_millis <= GRACE_MILLIS);
     let path = shared.pid_file(task);
-    let mut text = String::new();
-    let read =
-        File::open(&path).and_then(|file| file.take(PID_BYTES_MAX).read_to_string(&mut text));
-    let group = read.ok().and_then(|_| text.trim().parse::<i32>().ok());
-    let group = group.filter(|pid| *pid > 1).and_then(Pid::from_raw);
-    if let Some(group) = group {
+    if let Some(group) = agent_group(&path) {
         // A group that is already gone has nothing left to stop.
         let _ = kill_process_group(group, Signal::TERM);
+        let polls = shared.grace_millis.div_ceil(STOP_POLL_MILLIS);
+        for _ in 0..polls {
+            thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
+            // The pid file goes only once the agent is reaped.
+            if agent_group(&path) != Some(group) {
+                return Input::plain(Event::StopDone(run));
+            }
+        }
+        let _ = kill_process_group(group, Signal::KILL);
     }
     Input::plain(Event::StopDone(run))
+}
+
+// The process group of the agent whose pid file is `path`, while it has not been reaped.
+fn agent_group(path: &Path) -> Option<Pid> {
+    let mut text = String::new();
+    let read = File::open(path).and_then(|file| file.take(PID_BYTES_MAX).read_to_string(&mut text));
+    let group = read.ok().and_then(|_| text.trim().parse::<i32>().ok());
+    group.filter(|pid| *pid > 1).and_then(Pid::from_raw)
 }
 
 fn judge(

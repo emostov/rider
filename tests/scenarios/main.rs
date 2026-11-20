@@ -232,6 +232,30 @@ fn a_second_sigterm_stops_the_agent_and_leaves_its_task_ready_with_attempt_uncha
 }
 
 #[test]
+fn a_second_sigterm_kills_an_agent_that_ignores_sigterm_within_the_grace_and_releases_its_task() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::HoldIgnoringTerm]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "grace=1000,tick=200")]);
+    let run = when_the_agent_has_started(&world, &task);
+
+    when_the_daemon_is_sent_sigterm(&world);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert!(
+        when_the_process_ends_within(run.pid, 5),
+        "the agent {} still runs:\n{}",
+        run.pid,
+        world.pool_log()
+    );
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(task_state(&world, &task), "ready");
+    assert_eq!(task_label(&world, &task, "attempt"), None);
+}
+
+#[test]
 fn three_ready_polish_tasks_never_run_more_than_one_polish_agent_at_once() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
