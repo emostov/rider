@@ -168,7 +168,13 @@ pub fn when_the_pool_starts(world: &mut World) {
 
 /// When `tasks` have all settled, within `SETTLE_SECONDS_MAX`; returns their states in order.
 pub fn when_the_tasks_settle(world: &World, tasks: &[&str]) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    when_the_tasks_settle_within(world, tasks, SETTLE_SECONDS_MAX)
+}
+
+/// When `tasks` have all settled, within `seconds`; returns their states in order.
+pub fn when_the_tasks_settle_within(world: &World, tasks: &[&str], seconds: u64) -> Vec<String> {
+    assert!(!tasks.is_empty() && seconds >= SETTLE_SECONDS_MAX);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let states: Vec<String> = tasks.iter().map(|id| task_state(world, id)).collect();
         if states.iter().all(|state| SETTLED.contains(&state.as_str())) {
@@ -176,7 +182,7 @@ pub fn when_the_tasks_settle(world: &World, tasks: &[&str]) -> Vec<String> {
         }
         if Instant::now() >= deadline {
             panic!(
-                "tasks {tasks:?} were {states:?} after {SETTLE_SECONDS_MAX} seconds; pool log:\n{}",
+                "tasks {tasks:?} were {states:?} after {seconds} seconds; pool log:\n{}",
                 world.pool_log()
             );
         }
