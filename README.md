@@ -18,10 +18,11 @@ the workers' questions, checks their results, and keeps you updated. It never
 writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
-**The swarm** runs agents in roles you configure in `~/.rider/rider.toml`. Each role sets
-its agents' model and prompt and how many replicas run at once. `rider config` prints the
-settings in effect. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI)
-or `tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
+**The swarm** is the `rider up` daemon. It runs agents in roles you configure in
+`~/.rider/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
+at once. `rider config` prints the settings in effect: the built-in roles and limits with the
+file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI) or
+`tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
 for the roles that use it.
 
 ## Getting started
@@ -38,15 +39,104 @@ Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` 
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
 review threads) and saves the answers in `~/.rider/ship.toml`.
 
+## Quickstart
+
+Rider needs Rust, Node 22, and `claude`, `codex` or `tact` on `PATH`, signed in for the roles
+that use them. Install the Board CLI where Rider looks for it:
+
+```sh
+npm install --prefix ~/.rider/node @vercel/board
+```
+
+1. Start the daemon. It starts the local board if none is running, then claims ready tasks on
+   every `work/<project>` channel:
+
+   ```sh
+   rider up
+   ```
+
+2. Start the lead: open a coding-agent session in a terminal you keep open and say "ride a
+   swarm to <goal>". The `ride-swarm` skill makes that session the lead. It plans the goal
+   into tasks on the board and watches the board with `vb wait`. Say "check my swarm" for
+   status and "stop the swarm" to stop it.
+
+3. Watch the work:
+
+   ```sh
+   rider status        # the board, the running count, and every open task by project
+   rider agents        # every agent the daemon runs
+   rider logs <id>     # the newest attempt's log of a task; -f follows it
+   ```
+
+   The board's web inspector is at <http://127.0.0.1:4100>.
+
+4. Stop: `rider down`.
+
+Agents run unsandboxed, with permission prompts skipped. Point Rider only at repositories you
+are prepared to have changed. Rider never pushes or merges; work stays on local branches named
+`rider/<task id>-<slug>`.
+
+## Stopping
+
+- `rider down` drains: running agents finish and their tasks settle, and nothing new is
+  claimed.
+- `rider down --now` stops every agent at once and releases its task, the attempt uncounted.
+- `rider kill <id>` stops one task's agent and fails the task; the attempt counts.
+- The board keeps running after the daemon stops.
+
+## Where things live
+
+Everything is under `~/.rider`, or `$RIDER_HOME` when it is set.
+
+| Path | What |
+|---|---|
+| `rider.toml` | roles and limits; optional, read when the daemon starts |
+| `ship.toml` | how `ship-swarm` runs its loops, written the first time it asks |
+| `agents.json` | each running agent's process group, so a restarted daemon can find it |
+| `cursor` | the last board event the daemon handled, so a restart resumes from it |
+| `board.json` | the board process the daemon started, kept across a restart |
+| `board/` | the local board's database |
+| `logs/<task id>/` | each attempt's agent output |
+| `worktrees/<repository>/<task id>` | a task's worktree, removed when it completes |
+| `daemon.log`, `board.log` | what the daemon and the board it started printed |
+| `rider.sock` | the daemon's control socket |
+
+## Troubleshooting
+
+- **`rider status` says the daemon is not running.** Run `rider up`. If it does not start,
+  `daemon.log` says why: an error in `rider.toml` names the field and the file.
+- **`rider daemon` exits saying `daemon.lock` is held.** Another daemon runs on the same
+  home, and the error names its pid. One daemon serves every project, so use that one.
+- **`vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
+  its first task.
+- **A failed task's log reply is cut short.** The reply keeps within the board's message
+  limit and names the whole log; `rider logs <id>` prints it.
+- **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
+  `vb label`, then `vb tasks unblock <id>`.
+- **A task is blocked as `rider_error`: "Rider will not reuse the worktree ... was not made
+  for this board".** Worktrees are named by task id, so after the board's data is replaced a
+  new task can reuse the id of an old task whose worktree is still there. Each worktree Rider
+  makes records which board it is for in a `.rider-board` file in the worktree's git
+  directory. The board's identity is the oldest post in the board's own `rider/identity`
+  channel, a random id Rider posts there when the channel is empty, so wiping, replacing, or
+  switching the board gives it a new one. The daemon reads it once when it starts: restart it
+  after replacing the board, and do not post in or delete `rider/identity`. A worktree with no
+  record, or with another board's, is left as it is. Keep what you need from the directory
+  the reason names, remove it with `git worktree remove <dir>` from the repository, then
+  `vb tasks unblock <id>`.
+- **Many `node ... vb` processes are left running.** `rider reap` lists Board CLI processes
+  whose board no longer answers; `rider reap --yes` stops them.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, refresh `Cargo.lock` with
+`cargo update -p swarm-rider --offline`, and merge it to `main` once CI passes. Then tag the
+merge commit `v<version>` and push the tag; the release workflow checks the tag against the
+manifest, runs CI again, and creates the GitHub release. Publishing to crates.io is manual.
+
 ## Status
 
 Rider is early and still developing basic features.
-
-## Docs
-
-The [manual](./docs/manual.md) covers prerequisites, roles, labels, watching
-and stopping the swarm, where files live, and troubleshooting.
-The [release guide](./docs/releasing.md) covers tagging and publishing.
 
 ## How it's built
 

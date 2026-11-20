@@ -1,47 +1,34 @@
 //! The command line: parse the arguments, read the environment once, and run one command.
 
-use std::cell::OnceCell;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-use crate::board::{TaskId, VbCli};
+use crate::board::TaskId;
 use crate::config::{self, ConfigFileError, Limits};
-use crate::daemon::{self, DaemonError, Paths, take_lock};
-use crate::harness::{self, CommandLine, Exit, HarnessError, LOG_BYTES_MAX};
-use crate::pool::{
-    Effects, Event, Gate, PAUSE_STEP_MILLIS, Slot, SlotEnd, event_line, slot_loop, slots,
-};
+use crate::daemon::{self, DaemonError, Paths};
+use crate::harness::{CommandLine, LOG_BYTES_MAX};
 use crate::reap::{self, ReapError, Stopped};
-use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
-use crate::run_task::{Env, IdentityUnknown, Ran, RunError, board_identity_at_start, run_task};
-use crate::settle::Verdict;
+use crate::roles::{self, RoleSpec};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
 const ENVIRONMENT: &str = r#"environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
-  BOARD_URL      the board's API (default http://127.0.0.1:4100/api/board)
-  BOARD_PROFILE  the profile that claimed the task, for run-task"#;
+  BOARD_URL      the board's API (default http://127.0.0.1:4100/api/board)"#;
 
-/// The longest project name.
-pub const PROJECT_LEN_MAX: usize = 64;
 /// Upper bound on the boards one `rider reap` names.
 pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
-/// Upper bound on what `rider pool` reads from standard input before it stops.
-pub const STDIN_BYTES_MAX: u64 = 1024 * 1024;
 /// Every role's prompt file and the files they read, once each, built into the binary.
 pub const PROMPTS: [(&str, &str); 6] = [
     ("implement.md", include_str!("../prompts/implement.md")),
@@ -58,31 +45,6 @@ pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
 const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
-
-/// A project name that is safe in a channel name: letters, digits, `-`, `_` and `.`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Project(String);
-
-impl Project {
-    fn parse(text: &str) -> Result<Project, UsageError> {
-        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
-        let valid = !text.is_empty()
-            && text.len() <= PROJECT_LEN_MAX
-            && text.chars().all(allowed)
-            && !text.starts_with(['-', '.']);
-        if !valid {
-            return Err(UsageError::BadProject(text.to_string()));
-        }
-        assert!(text.is_ascii() && text.len() <= PROJECT_LEN_MAX);
-        Ok(Project(text.to_string()))
-    }
-
-    /// The channel the project's tasks are on, `work/<project>`.
-    pub fn channel(&self) -> String {
-        assert!(!self.0.is_empty() && !self.0.contains('/'));
-        format!("work/{}", self.0)
-    }
-}
 
 /// The arguments rider was run with.
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
@@ -126,20 +88,8 @@ pub enum Command {
         #[arg(value_name = "ID", value_parser = parse_task_id)]
         id: TaskId,
     },
-    /// Run worker slots on the channel work/<project>.
-    ///
-    /// Type stop or press Ctrl-D to stop after running tasks finish.
-    Pool {
-        #[arg(value_parser = Project::parse)]
-        project: Project,
-    },
     /// Print the effective rider.toml: the built-in roles and limits with the file's over them.
     Config,
-    /// One attempt at a task already claimed by $BOARD_PROFILE.
-    RunTask {
-        #[arg(value_name = "ID", value_parser = parse_task_id)]
-        id: TaskId,
-    },
     /// List orphaned vb processes whose board no longer answers.
     ///
     /// Only those on the given boards if any; --yes stops them.
@@ -156,7 +106,6 @@ pub enum Command {
 /// An argument value rider does not accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsageError {
-    BadProject(String),
     BadTaskId(String),
     EmptyUrl,
 }
@@ -164,11 +113,6 @@ pub enum UsageError {
 impl fmt::Display for UsageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UsageError::BadProject(text) => write!(
-                f,
-                "{text:?} is not a project name: use 1 to {PROJECT_LEN_MAX} letters, digits, \
-                 '-', '_' or '.', not starting with '-' or '.'"
-            ),
             UsageError::BadTaskId(text) => {
                 write!(
                     f,
@@ -211,7 +155,6 @@ pub struct Vars {
     pub home: Option<OsString>,
     pub board_url: Option<OsString>,
     pub path: Option<OsString>,
-    pub board_profile: Option<OsString>,
 }
 
 /// Reads every environment variable rider uses, once.
@@ -221,7 +164,6 @@ pub fn read_vars() -> Vars {
         home: env::var_os("HOME"),
         board_url: env::var_os("BOARD_URL"),
         path: env::var_os("PATH"),
-        board_profile: env::var_os("BOARD_PROFILE"),
     }
 }
 
@@ -232,7 +174,6 @@ pub struct Config {
     pub home: PathBuf,
     pub board_url: String,
     pub inherited_path: Option<String>,
-    pub board_profile: Option<String>,
 }
 
 impl Config {
@@ -257,7 +198,6 @@ pub enum ConfigError {
     Empty(&'static str),
     /// The home holds `:`, which would split the agents' `PATH`.
     HomeHasColon(String),
-    BadProfile(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -272,11 +212,6 @@ impl fmt::Display for ConfigError {
             ConfigError::HomeHasColon(home) => {
                 write!(f, "rider's home {home:?} must not contain ':'")
             }
-            ConfigError::BadProfile(profile) => write!(
-                f,
-                "BOARD_PROFILE {profile:?} is not a profile: use at most {PROFILE_LEN_MAX} \
-                 letters, digits and '-'"
-            ),
         }
     }
 }
@@ -306,19 +241,11 @@ pub fn config(vars: Vars) -> Result<Config, ConfigError> {
     if value.contains(':') {
         return Err(ConfigError::HomeHasColon(value));
     }
-    let board_profile = text(vars.board_profile, "BOARD_PROFILE")?;
-    if let Some(profile) = &board_profile {
-        let allowed = |b: u8| b.is_ascii_alphanumeric() || b == b'-';
-        if profile.len() > PROFILE_LEN_MAX || !profile.bytes().all(allowed) {
-            return Err(ConfigError::BadProfile(profile.clone()));
-        }
-    }
     let board_url = text(vars.board_url, "BOARD_URL")?;
     let config = Config {
         home,
         board_url: board_url.unwrap_or_else(|| DEFAULT_BOARD_URL.to_string()),
         inherited_path: text(vars.path, "PATH")?,
-        board_profile,
     };
     assert!(config.home.is_absolute() && config.home.to_str().is_some());
     assert!(!config.board_url.is_empty());
@@ -339,25 +266,16 @@ pub fn with_vb_on_path(cmd: &CommandLine, vb_dir: &str, inherited: Option<&str>)
     with
 }
 
-/// Whether a line typed to `rider pool` asks it to stop.
-pub fn is_stop(line: &str) -> bool {
-    line.trim() == "stop"
-}
-
 /// A command that could not finish.
 #[derive(Debug)]
 pub enum CliError {
     Config(ConfigError),
-    NoProfile,
     Io {
         action: &'static str,
         path: PathBuf,
         message: String,
     },
-    Run(RunError),
-    SlotsFailed(usize),
     Daemon(DaemonError),
-    Identity(IdentityUnknown),
     Client(ClientError),
     /// `rider up` started a daemon that exited or never answered.
     NotStarted(String),
@@ -373,23 +291,12 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CliError::Config(error) => write!(f, "{error}"),
-            CliError::NoProfile => {
-                write!(
-                    f,
-                    "run-task needs BOARD_PROFILE, the profile that claimed the task"
-                )
-            }
             CliError::Io {
                 action,
                 path,
                 message,
             } => write!(f, "could not {action} {}: {message}", path.display()),
-            CliError::Run(RunError::Board(error)) => write!(f, "{error}"),
-            CliError::Run(RunError::LostClaim(state)) => {
-                write!(f, "the task is no longer claimed; it is {state:?}")
-            }
             CliError::Daemon(error) => write!(f, "{error}"),
-            CliError::Identity(error) => write!(f, "{error}"),
             CliError::Client(error) => write!(f, "{error}"),
             CliError::NotStarted(why) => write!(f, "the daemon did not start: {why}"),
             CliError::Reap(error) => write!(f, "{error}"),
@@ -397,9 +304,6 @@ impl fmt::Display for CliError {
             CliError::ConfigFile(error) => write!(f, "{error}"),
             CliError::TableInstalled => write!(f, "the role table was already installed"),
             CliError::NoLog(id) => write!(f, "task #{} has no log", id.0),
-            CliError::SlotsFailed(count) => {
-                write!(f, "{count} slots stopped before they were asked to")
-            }
         }
     }
 }
@@ -442,9 +346,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Agents => agents(config),
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
-        Command::Pool { project } => pool(project, config),
         Command::Config => print_config(config),
-        Command::RunTask { id } => run_one(*id, config),
         Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
     }
 }
@@ -516,21 +418,26 @@ fn serve(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    fs::create_dir_all(&dir).map_err(io("create", dir.clone()))?;
     let vb = config.vb_dir().join("vb");
+    let mut command = board_serve(&config.home, &vb).map_err(io("create", dir.clone()))?;
     // The board runs in the foreground, so it shares rider's terminal, standard input included.
-    let status = Process::new(&vb)
-        .arg("serve")
-        .arg("--dir")
-        .arg(&dir)
-        .arg("--no-open")
-        .status()
-        .map_err(io("run", vb))?;
+    let status = command.status().map_err(io("run", vb))?;
     assert!(dir.is_absolute());
     Ok(status
         .code()
         .and_then(|code| u8::try_from(code).ok())
         .unwrap_or(1))
+}
+
+/// The `vb serve` command keeping the board of the Rider home `home`; makes its directory.
+pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
+    assert!(home.is_absolute() && vb.is_absolute());
+    let dir = home.join(BOARD_DIR);
+    fs::create_dir_all(&dir)?;
+    let mut command = Process::new(vb);
+    command.arg("serve").arg("--dir").arg(&dir).arg("--no-open");
+    assert!(dir.starts_with(home));
+    Ok(command)
 }
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
@@ -765,155 +672,6 @@ fn age(value: &serde_json::Value) -> String {
     }
 }
 
-fn pool(project: &Project, config: &Config) -> Result<u8, CliError> {
-    let (table, limits) = settings(config)?;
-    let _lock = take_lock(&config.home).map_err(CliError::Daemon)?;
-    write_prompts(config)?;
-    let channel = project.channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    watch_stdin(Arc::clone(&stop));
-    let all = slots(table);
-    assert!(!all.is_empty());
-    let first = &all[0];
-    let reader = VbCli {
-        vb: config.vb_dir().join("vb"),
-        url: config.board_url.clone(),
-        profile: first.profile.clone(),
-    };
-    // Read before any slot claims, so no attempt spends its lease on it.
-    board_identity_at_start(&config.board_url, &reader).map_err(CliError::Identity)?;
-    say(&format!(
-        "rider pool: {} slots on {channel}, at most {} agents at once; \
-         type stop or press Ctrl-D to stop after running tasks finish",
-        all.len(),
-        limits.agents
-    ));
-    let gate = Gate::new(limits.agents, limits.builders_at_once);
-    let ends: Vec<bool> = thread::scope(|scope| {
-        let handles: Vec<_> = all
-            .iter()
-            .map(|slot| {
-                let (channel, gate, stop) = (channel.as_str(), &gate, &*stop);
-                scope.spawn(move || run_slot(slot, channel, gate, stop, config, limits))
-            })
-            .collect();
-        let joined = handles.into_iter().map(|handle| handle.join());
-        joined
-            .map(|end| matches!(end, Ok(SlotEnd::Stopped)))
-            .collect()
-    });
-    assert_eq!(ends.len(), all.len());
-    let failed = ends.iter().filter(|stopped| !**stopped).count();
-    if failed > 0 {
-        return Err(CliError::SlotsFailed(failed));
-    }
-    Ok(0)
-}
-
-fn run_slot(
-    slot: &Slot,
-    channel: &str,
-    gate: &Gate,
-    stop: &AtomicBool,
-    config: &Config,
-    limits: Limits,
-) -> SlotEnd {
-    let board = VbCli {
-        vb: config.vb_dir().join("vb"),
-        url: config.board_url.clone(),
-        profile: slot.profile.clone(),
-    };
-    let env = Env {
-        home: config.home.clone(),
-        prompts: config.prompts(),
-        profile: slot.profile.clone(),
-        board_url: config.board_url.clone(),
-        attempts: limits.attempts,
-    };
-    let run = |id: TaskId| run_task(id, &env, &board, Some(slot.role), &launcher(config, limits));
-    let pause = || thread::sleep(Duration::from_millis(PAUSE_STEP_MILLIS));
-    let effects = Effects {
-        run: &run,
-        pause: &pause,
-        say: &say,
-        now: &SystemTime::now,
-    };
-    slot_loop(slot, channel, &board, gate, stop, &effects)
-}
-
-fn run_one(id: TaskId, config: &Config) -> Result<u8, CliError> {
-    let profile = config.board_profile.as_ref().ok_or(CliError::NoProfile)?;
-    assert!(!profile.is_empty());
-    let (_, limits) = settings(config)?;
-    write_prompts(config)?;
-    let board = VbCli {
-        vb: config.vb_dir().join("vb"),
-        url: config.board_url.clone(),
-        profile: profile.clone(),
-    };
-    let env = Env {
-        home: config.home.clone(),
-        prompts: config.prompts(),
-        profile: profile.clone(),
-        board_url: config.board_url.clone(),
-        attempts: limits.attempts,
-    };
-    let launch = launcher(config, limits);
-    let ran = run_task(id, &env, &board, None, &launch).map_err(CliError::Run)?;
-    let Ran::Settled(verdict) = ran else {
-        panic!("a run with no claimed role never reports a role change");
-    };
-    let now = SystemTime::now();
-    let line = match &verdict {
-        Verdict::Complete { result } => {
-            event_line(Event::Completed(result), Some(id), profile, now)
-        }
-        Verdict::Fail { reason } => event_line(Event::Failed(reason), Some(id), profile, now),
-        Verdict::LeaveBlocked => event_line(Event::Blocked, Some(id), profile, now),
-    };
-    say(&line);
-    Ok(0)
-}
-
-fn launcher(
-    config: &Config,
-    limits: Limits,
-) -> impl Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> {
-    let vb_dir = config.vb_dir().to_string_lossy().into_owned();
-    let inherited = config.inherited_path.clone();
-    let limit = Duration::from_millis(limits.attempt_millis);
-    assert!(
-        config.home.to_str().is_some(),
-        "the home was checked to be UTF-8"
-    );
-    assert!(limit.as_secs() > 0);
-    // One attempt's launches share its time limit, counted from the first.
-    let started = OnceCell::new();
-    move |cmd: &CommandLine, dir: &Path, log: &Path| {
-        let left = limit.saturating_sub(started.get_or_init(Instant::now).elapsed());
-        let cmd = with_vb_on_path(cmd, &vb_dir, inherited.as_deref());
-        harness::run(&cmd, dir, log, left.as_secs().max(1), LOG_BYTES_MAX)
-    }
-}
-
-fn watch_stdin(stop: Arc<AtomicBool>) {
-    assert!(!stop.load(Ordering::SeqCst));
-    // The thread is left blocked on standard input when the pool ends some other way; it ends
-    // with the process.
-    thread::spawn(move || {
-        let lines = io::stdin().lock().take(STDIN_BYTES_MAX).lines();
-        for line in lines {
-            match line {
-                Ok(line) if is_stop(&line) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        stop.store(true, Ordering::SeqCst);
-        say("stopping: each slot finishes the task it is running and claims no more");
-    });
-}
-
 fn say(line: &str) {
     assert!(!line.is_empty());
     let mut out = io::stdout().lock();
@@ -941,10 +699,6 @@ mod tests {
         error.kind()
     }
 
-    fn project(name: &str) -> Project {
-        Project(name.to_string())
-    }
-
     fn scratch(name: &str) -> PathBuf {
         let unique = format!("rider-cli-unit-{name}-{}", std::process::id());
         let dir = std::env::temp_dir().join(unique);
@@ -958,7 +712,6 @@ mod tests {
             home: home.to_path_buf(),
             board_url: DEFAULT_BOARD_URL.to_string(),
             inherited_path: None,
-            board_profile: None,
         }
     }
 
@@ -966,15 +719,9 @@ mod tests {
     fn parses_each_command() {
         assert_eq!(parse(&["serve"]).unwrap(), Command::Serve);
         assert_eq!(parse(&["daemon"]).unwrap(), Command::Daemon);
-        for name in ["rider", "my_app.v2-x"] {
-            let pool = Command::Pool {
-                project: project(name),
-            };
-            assert_eq!(parse(&["pool", name]).unwrap(), pool);
-        }
-        let task = |id| Command::RunTask { id: TaskId(id) };
-        assert_eq!(parse(&["run-task", "42"]).unwrap(), task(42));
-        assert_eq!(parse(&["run-task", "#7"]).unwrap(), task(7));
+        let kill = |id| Command::Kill { id: TaskId(id) };
+        assert_eq!(parse(&["kill", "42"]).unwrap(), kill(42));
+        assert_eq!(parse(&["kill", "#7"]).unwrap(), kill(7));
         for help in [&["--help"][..], &["-h"], &["help"]] {
             assert_eq!(usage_help(help), clap::error::ErrorKind::DisplayHelp);
         }
@@ -993,37 +740,15 @@ mod tests {
             usage_error(&[]),
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
-        for missing in [&["pool"][..], &["run-task"]] {
+        for missing in [&["kill"][..], &["logs"]] {
             assert_eq!(usage_error(missing), ErrorKind::MissingRequiredArgument);
         }
-        for extra in [
-            &["serve", "now"][..],
-            &["pool", "a", "b"],
-            &["run-task", "1", "2"],
-        ] {
+        for extra in [&["serve", "now"][..], &["kill", "1", "2"]] {
             assert_eq!(usage_error(extra), ErrorKind::UnknownArgument);
         }
-        assert_eq!(usage_error(&["start"]), ErrorKind::InvalidSubcommand);
-    }
-
-    #[test]
-    fn rejects_project_names_unsafe_in_a_channel() {
-        let long = "a".repeat(PROJECT_LEN_MAX + 1);
-        for bad in ["", "-x", ".x", "a/b", "a b", "ü", "work/x", long.as_str()] {
-            assert_eq!(
-                usage_error(&["pool", "--", bad]),
-                clap::error::ErrorKind::ValueValidation,
-                "{bad:?}"
-            );
+        for gone in [&["start"][..], &["pool", "rider"]] {
+            assert_eq!(usage_error(gone), ErrorKind::InvalidSubcommand);
         }
-        let longest = "a".repeat(PROJECT_LEN_MAX);
-        assert_eq!(
-            parse(&["pool", &longest]).unwrap(),
-            Command::Pool {
-                project: project(&longest)
-            }
-        );
-        assert_eq!(project("rider").channel(), "work/rider");
     }
 
     #[test]
@@ -1040,14 +765,14 @@ mod tests {
             "12a",
         ] {
             assert_eq!(
-                usage_error(&["run-task", "--", bad]),
+                usage_error(&["kill", "--", bad]),
                 clap::error::ErrorKind::ValueValidation,
                 "{bad:?}"
             );
         }
         assert_eq!(
-            parse(&["run-task", "18446744073709551615"]).unwrap(),
-            Command::RunTask {
+            parse(&["kill", "18446744073709551615"]).unwrap(),
+            Command::Kill {
                 id: TaskId(u64::MAX)
             }
         );
@@ -1055,11 +780,6 @@ mod tests {
 
     #[test]
     fn usage_errors_read_as_sentences() {
-        assert_eq!(
-            UsageError::BadProject("a/b".to_string()).to_string(),
-            "\"a/b\" is not a project name: use 1 to 64 letters, digits, '-', '_' or '.', \
-             not starting with '-' or '.'"
-        );
         assert_eq!(
             UsageError::BadTaskId("x".to_string()).to_string(),
             "\"x\" is not a task id: use its number, such as 42 or #42"
@@ -1079,13 +799,11 @@ mod tests {
                 home: PathBuf::from("/Users/someone/.rider"),
                 board_url: "http://127.0.0.1:4100/api/board".to_string(),
                 inherited_path: Some("/usr/bin:/bin".to_string()),
-                board_profile: None,
             })
         );
         let vars = Vars {
             rider_home: Some("/srv/rider".into()),
             board_url: Some("http://127.0.0.1:5000/api/board".into()),
-            board_profile: Some("review-1-sol-6-1".into()),
             ..Vars::default()
         };
         assert_eq!(
@@ -1094,7 +812,6 @@ mod tests {
                 home: PathBuf::from("/srv/rider"),
                 board_url: "http://127.0.0.1:5000/api/board".to_string(),
                 inherited_path: None,
-                board_profile: Some("review-1-sol-6-1".to_string()),
             })
         );
     }
@@ -1119,15 +836,6 @@ mod tests {
             ..Vars::default()
         };
         assert_eq!(config(empty_url), Err(ConfigError::Empty("BOARD_URL")));
-        let empty_profile = Vars {
-            rider_home: Some("/srv/rider".into()),
-            board_profile: Some("".into()),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(empty_profile),
-            Err(ConfigError::Empty("BOARD_PROFILE"))
-        );
     }
 
     #[test]
@@ -1148,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_a_home_with_a_colon_and_a_malformed_profile() {
+    fn config_rejects_a_home_with_a_colon() {
         let colon = Vars {
             rider_home: Some("/srv/a:b".into()),
             ..Vars::default()
@@ -1157,18 +865,6 @@ mod tests {
             config(colon),
             Err(ConfigError::HomeHasColon("/srv/a:b".to_string()))
         );
-        for bad in [
-            "a b",
-            "line\nbreak",
-            "x".repeat(PROFILE_LEN_MAX + 1).as_str(),
-        ] {
-            let vars = Vars {
-                rider_home: Some("/srv/rider".into()),
-                board_profile: Some(bad.into()),
-                ..Vars::default()
-            };
-            assert_eq!(config(vars), Err(ConfigError::BadProfile(bad.to_string())));
-        }
     }
 
     #[test]
@@ -1214,15 +910,6 @@ mod tests {
             with.env,
             vec![("PATH".to_string(), "/h/bin:/usr/bin".to_string())]
         );
-    }
-
-    #[test]
-    fn stop_is_a_line_of_its_own() {
-        assert!(is_stop("stop"));
-        assert!(is_stop("  stop \r"));
-        assert!(!is_stop("stop now"));
-        assert!(!is_stop(""));
-        assert!(!is_stop("STOP"));
     }
 
     #[test]
@@ -1274,14 +961,6 @@ mod tests {
             format!("serve\n--dir\n{}\n--no-open\n", board.display())
         );
         assert!(!home.join("prompts").exists(), "serve copies no prompts");
-        fs::remove_dir_all(&home).unwrap();
-    }
-
-    #[test]
-    fn run_task_needs_a_board_profile() {
-        let home = scratch("run-task");
-        let error = execute(&Command::RunTask { id: TaskId(1) }, &config_at(&home)).unwrap_err();
-        assert!(matches!(error, CliError::NoProfile), "{error}");
         fs::remove_dir_all(&home).unwrap();
     }
 }

@@ -872,7 +872,9 @@ mod tests {
                 !left.is_zero(),
                 "no end of stream within {WAIT:?}: {bytes} bytes"
             );
-            stream.set_read_timeout(Some(left)).unwrap();
+            // macOS refuses the timeout with EINVAL once the daemon has closed its end;
+            // a read then returns at once, so the error is safe to ignore.
+            let _ = stream.set_read_timeout(Some(left));
             match stream.read(&mut buffer) {
                 Ok(0) => return data,
                 Ok(read) => data.extend_from_slice(&buffer[..read]),

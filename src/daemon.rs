@@ -4,27 +4,31 @@ use std::cell::Cell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs4::{FileExt, TryLockError};
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use serde::{Deserialize, Serialize};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
     Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
     parse_failure_reason,
 };
-use crate::cli::with_vb_on_path;
+use crate::cli::{board_serve, with_vb_on_path};
 use crate::config::Limits;
 use crate::core::{
-    self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, Call, Config, Event, LEASE_MILLIS, RunId,
-    Settlement, State, Stopping,
+    self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, AgentRecord, Call, Config, Event, LEASE_MILLIS,
+    LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
 use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
@@ -70,6 +74,20 @@ const NO_CHANNEL: &str = "channel_not_found";
 const LOCK_FILE: &str = "daemon.lock";
 /// The daemon's log under the Rider home.
 pub const LOG_FILE: &str = "daemon.log";
+/// The output of the board the daemon started, under the Rider home.
+pub const BOARD_LOG_FILE: &str = "board.log";
+/// The daemon log's line naming the board process the daemon started.
+pub const BOARD_STARTED: &str = "started the board, pid";
+/// The daemon log's line naming the board process a crashed daemon started, kept as its own.
+pub const BOARD_KEPT: &str = "kept the board started before, pid";
+/// The file under the Rider home naming the board process the daemon started and its start.
+pub const BOARD_FILE: &str = "board.json";
+const BOARD_FILE_BYTES_MAX: u64 = 256;
+/// How often the daemon checks that a board it kept from before still runs.
+const BOARD_POLL_MILLIS: u64 = 200;
+const BOARD_POLLS_MAX: u64 = u64::MAX;
+/// How long a board the daemon started is given to end after SIGTERM before SIGKILL.
+const BOARD_STOP_MILLIS_MAX: u64 = 10_000;
 const AGENTS_DIR: &str = "agents";
 /// The directory under the Rider home holding each task's attempt logs.
 pub const LOGS_DIR: &str = "logs";
@@ -85,8 +103,34 @@ const LOG_QUEUE_MAX: usize = 256;
 const LOG_LINES_MAX: u64 = u64::MAX;
 /// Why a settlement's board write was refused: the daemon is stopping now.
 const STOPPED: &str = "the daemon is stopping now";
-// Writes its own pid, which is its process group, then becomes the agent.
-const PID_WRAPPER: &str = r#"echo $$ > "$RIDER_AGENT_PID_FILE" && exec "$@""#;
+/// The file under the Rider home naming each running agent's process group and start time.
+pub const AGENTS_FILE: &str = "agents.json";
+/// The file under the Rider home holding the last feed cursor the core handled.
+pub const CURSOR_FILE: &str = "cursor";
+const AGENTS_BYTES_MAX: u64 = 64 * 1024;
+const CURSOR_BYTES_MAX: u64 = 32;
+/// Upper bound on the agents `agents.json` names: every group of every attempt.
+const AGENT_RECORDS_MAX: usize = AGENTS_MAX as usize * AGENT_GROUPS_MAX;
+/// Upper bound on the entries read from the agents directory.
+const AGENT_FILES_MAX: usize = 4 * AGENT_RECORDS_MAX;
+const _: () = assert!(AGENT_FILES_MAX <= LEFTOVERS_MAX);
+const ACK_BYTES_MAX: u64 = 64;
+/// Upper bound on the agent starts and ends waiting for the recorder.
+const RECORDER_QUEUE_MAX: usize = 4 * AGENTS_MAX as usize;
+/// How often the recorder looks for a pid file that has appeared or changed.
+const RECORD_POLL_MILLIS: u64 = 100;
+const RECORDER_ROUNDS_MAX: u64 = u64::MAX;
+// Writes its own pid, which is its process group, then becomes the agent only once the daemon
+// has recorded that group in `agents.json` and acknowledged it, naming the pid, in the ack file.
+// Unacknowledged after about 30 s, it exits without starting the agent.
+const PID_WRAPPER: &str = r#"echo $$ > "$RIDER_AGENT_PID_FILE" || exit 1
+n=0
+until read -r group start 2>/dev/null < "$RIDER_AGENT_ACK_FILE" && [ "$group" = "$$" ]; do
+  n=$((n + 1))
+  [ "$n" -gt 600 ] && exit 1
+  sleep 0.05
+done
+exec "$@""#;
 
 /// Where the daemon's files are and how it reaches the board and its agents.
 pub struct Paths {
@@ -303,10 +347,16 @@ struct Shared {
     grace_millis: u64,
     attempts: u8,
     feed: Mutex<FeedSlot>,
+    /// The board process the daemon started, if it had to.
+    served: Mutex<ServedSlot>,
     socket: Socket,
     /// The core has decided to stop now; a settlement checks it before each board write.
     stop_now: AtomicBool,
     log: Log,
+    /// Tells the recorder of each agent's start and end.
+    recorder: SyncSender<Recorded>,
+    /// The cursor saved before the daemon last stopped, if any.
+    saved_cursor: Option<Cursor>,
 }
 
 /// The current feed thread and how to end it.
@@ -315,6 +365,15 @@ struct FeedSlot {
     /// The daemon is exiting: no feed starts and none reports its loss.
     stopping: bool,
     stop: Option<FeedStop>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The board process the daemon started and the thread waiting on it.
+#[derive(Default)]
+struct ServedSlot {
+    /// The daemon is exiting: no board starts and none reports its exit.
+    stopping: bool,
+    group: Option<Pid>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -356,15 +415,27 @@ impl Shared {
         self.feed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn pid_file(&self, task: TaskId) -> PathBuf {
-        let path = self
-            .paths
-            .home
-            .join(AGENTS_DIR)
-            .join(format!("{}.pid", task.0));
-        assert!(path.starts_with(&self.paths.home));
-        path
+    fn served(&self) -> MutexGuard<'_, ServedSlot> {
+        // Every holder leaves the slot whole between its statements.
+        self.served.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn pid_file(&self, task: TaskId) -> PathBuf {
+        pid_file(&self.paths.home, task)
+    }
+}
+
+fn pid_file(home: &Path, task: TaskId) -> PathBuf {
+    let path = home.join(AGENTS_DIR).join(format!("{}.pid", task.0));
+    assert!(path.starts_with(home));
+    path
+}
+
+// The file acknowledging that the group a pid file names is recorded in `agents.json`.
+fn ack_file(pid_file: &Path) -> PathBuf {
+    let path = pid_file.with_extension("ack");
+    assert!(path != pid_file);
+    path
 }
 
 /// Runs the daemon in the foreground until it is stopped; returns its exit code.
@@ -388,6 +459,9 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
     let lease_millis = timing.lease_millis;
     let log = Log::start(&paths.home.join(LOG_FILE))?;
+    let unaccounted = stop_leftovers(&paths.home, timing.grace_millis, &log);
+    let saved_cursor = read_cursor(&paths.home, &log);
+    let recorder = start_recorder(paths.home.clone())?;
     match reap::find_leaks(&paths.board_url) {
         Ok(leaks) if leaks.is_empty() => {}
         Ok(leaks) => {
@@ -414,13 +488,20 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         grace_millis: timing.grace_millis,
         attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
+        served: Mutex::new(ServedSlot::default()),
         stop_now: AtomicBool::new(false),
         log,
+        recorder,
+        saved_cursor,
     });
+    let board = BoardGuard(Arc::clone(&shared));
+    serve_if_down(&shared);
     // Read before any claim, so no attempt spends its lease on it.
     let identity = board_identity_at_start(&shared.paths.board_url, &shared.board(DAEMON_PROFILE));
     if let Err(error) = identity {
         shared.log.write(&error.to_string());
+        shared.socket.close();
+        drop(board);
         return Err(DaemonError::Identity(error));
     }
     start_workers(queued, &shared.events)?;
@@ -433,12 +514,230 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     config.lease_millis = lease_millis;
     config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
+    state.leave_to_lease(unaccounted);
     let code = drive(&mut state, &inputs, &jobs, &shared);
+    save_cursor(&shared, state.cursor());
     shared.socket.close();
     stop_feed(&shared);
+    drop(board);
     let code = code?;
     assert!(state.exited());
     Ok(code)
+}
+
+// Starts the board as the daemon's own when it does not answer and its URL is on this host;
+// a board that answers is left to whoever started it.
+fn serve_if_down(shared: &Arc<Shared>) {
+    let url = &shared.paths.board_url;
+    let Some(port) = local_port(url) else { return };
+    if keep_board(shared) {
+        return;
+    }
+    match shared.board(DAEMON_PROFILE).list_open(SUBTREE) {
+        Err(error) if call_failed(&error) => {}
+        _ => return,
+    }
+    assert!(port.is_none_or(|port| !port.is_empty()));
+    if let Err(error) = start_board(shared) {
+        shared
+            .log
+            .write(&format!("starting the board failed: {error}"));
+        send(&shared.events, Event::BoardExited);
+    }
+}
+
+// The port of a board URL on this host, `Some(None)` when it names none; `None` for any
+// other host.
+fn local_port(url: &str) -> Option<Option<&str>> {
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(':') => (host, Some(port)),
+        _ => (authority, None),
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return None;
+    }
+    let port = port.filter(|port| !port.is_empty());
+    let valid = port.is_none_or(|port| port.parse::<u16>().is_ok_and(|number| number > 0));
+    valid.then_some(port)
+}
+
+// Starts `vb serve` in a process group of its own, with a thread that reports its exit
+// unless the daemon is exiting.
+fn start_board(shared: &Arc<Shared>) -> Result<(), DaemonError> {
+    let mut slot = shared.served();
+    if slot.stopping {
+        return Ok(());
+    }
+    let home = &shared.paths.home;
+    let path = home.join(BOARD_LOG_FILE);
+    let log = OpenOptions::new().create(true).append(true).open(&path);
+    let log = log.map_err(io_error("open", &path))?;
+    let err = log.try_clone().map_err(io_error("share", &path))?;
+    let vb = &shared.paths.vb;
+    let mut command = board_serve(home, vb).map_err(io_error("create the board under", home))?;
+    if let Some(Some(port)) = local_port(&shared.paths.board_url) {
+        command.arg("--port").arg(port);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(err)
+        .process_group(0);
+    let mut child = command.spawn().map_err(io_error("run", vb))?;
+    let group = Pid::from_child(&child);
+    let watcher = Arc::clone(shared);
+    let builder = thread::Builder::new().name("board".into());
+    let spawned = builder.spawn(move || {
+        let _ = child.wait();
+        board_ended(&watcher);
+    });
+    let spawned = spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
+    shared
+        .log
+        .write(&format!("{BOARD_STARTED} {}", group.as_raw_nonzero()));
+    record_board(shared, group);
+    slot.group = Some(group);
+    slot.thread = Some(spawned);
+    assert!(!slot.stopping && slot.group.is_some());
+    Ok(())
+}
+
+// Reports the end of the board the daemon owns unless the daemon is exiting.
+fn board_ended(shared: &Shared) {
+    let mut slot = shared.served();
+    slot.group = None;
+    if !slot.stopping {
+        drop(slot);
+        send(&shared.events, Event::BoardExited);
+    }
+}
+
+// Names the board group `group` in the board file, so a daemon started after this one is
+// killed keeps owning it and stops it.
+fn record_board(shared: &Shared, group: Pid) {
+    let path = shared.paths.home.join(BOARD_FILE);
+    let Some(start) = start_time(group) else {
+        shared
+            .log
+            .write("could not record the board: it already ended");
+        return;
+    };
+    let record = WireBoard {
+        group: group.as_raw_nonzero().get(),
+        start,
+    };
+    assert!(record.group > 0);
+    let written = serde_json::to_string(&record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .and_then(|text| write_atomically(&path, text.as_bytes()));
+    if let Err(error) = written {
+        let line = format!("could not record the board in {}: {error}", path.display());
+        shared.log.write(&line);
+    }
+}
+
+// Takes on as the daemon's own the board the board file names while that process, started
+// when the file says, still runs; a thread reports its end as an exit.
+fn keep_board(shared: &Arc<Shared>) -> bool {
+    let path = shared.paths.home.join(BOARD_FILE);
+    let text = match read_bounded(&path, BOARD_FILE_BYTES_MAX) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            shared
+                .log
+                .write(&format!("could not read {}: {error}", path.display()));
+            return false;
+        }
+    };
+    let Ok(record) = serde_json::from_str::<WireBoard>(&text) else {
+        shared
+            .log
+            .write(&format!("ignored {}: not a board record", path.display()));
+        return false;
+    };
+    let Some(group) = Pid::from_raw(record.group) else {
+        return false;
+    };
+    let start = record.start;
+    let runs = move |group: Pid| {
+        test_kill_process_group(group).is_ok() && start_time(group) == Some(start)
+    };
+    if !runs(group) {
+        return false;
+    }
+    let mut slot = shared.served();
+    assert!(slot.group.is_none() && !slot.stopping);
+    let watcher = Arc::clone(shared);
+    let builder = thread::Builder::new().name("board".into());
+    let spawned = builder.spawn(move || {
+        for _ in 0..BOARD_POLLS_MAX {
+            if !runs(group) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(BOARD_POLL_MILLIS));
+        }
+        board_ended(&watcher);
+    });
+    let Ok(spawned) = spawned else {
+        shared.log.write("could not watch the board started before");
+        return false;
+    };
+    slot.group = Some(group);
+    slot.thread = Some(spawned);
+    shared
+        .log
+        .write(&format!("{BOARD_KEPT} {}", group.as_raw_nonzero()));
+    true
+}
+
+/// Stops the board the daemon owns when dropped, so it ends on every exit, a panic included.
+struct BoardGuard(Arc<Shared>);
+
+impl Drop for BoardGuard {
+    fn drop(&mut self) {
+        stop_board(&self.0);
+    }
+}
+
+// Stops the board the daemon started, SIGKILL after `BOARD_STOP_MILLIS_MAX`, and waits for
+// its thread to reap it.
+fn stop_board(shared: &Shared) {
+    let (group, waiter) = {
+        let mut slot = shared.served();
+        slot.stopping = true;
+        (slot.group.take(), slot.thread.take())
+    };
+    let (Some(group), Some(waiter)) = (group, waiter) else {
+        return;
+    };
+    let _ = kill_process_group(group, Signal::TERM);
+    let polls = BOARD_STOP_MILLIS_MAX / STOP_POLL_MILLIS;
+    let ended = (0..polls).any(|_| {
+        let finished = waiter.is_finished();
+        if !finished {
+            thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
+        }
+        finished
+    });
+    if ended {
+        let _ = waiter.join();
+    } else {
+        let _ = kill_process_group(group, Signal::KILL);
+        shared
+            .log
+            .write("the board did not end after SIGTERM; sent SIGKILL");
+    }
+    let path = shared.paths.home.join(BOARD_FILE);
+    if let Err(error) = fs::remove_file(&path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        shared
+            .log
+            .write(&format!("could not remove {}: {error}", path.display()));
+    }
 }
 
 // Kills the feed's group and waits up to `FEED_JOIN_MILLIS_MAX` for its thread to end, so
@@ -477,6 +776,7 @@ fn drive(
 ) -> Result<u8, DaemonError> {
     let mut contexts: Vec<RunContext> = Vec::with_capacity(usize::from(AGENTS_MAX));
     let mut following = false;
+    let mut saved = shared.saved_cursor.unwrap_or(Cursor(0));
     let tick = step(state, Event::Tick(now()));
     let mut pending: Vec<Action> = tick;
     for _ in 0..STEPS_MAX {
@@ -498,12 +798,19 @@ fn drive(
         }
         let input = inputs.recv().map_err(|_| DaemonError::QueueClosed)?;
         if !following && let Event::Snapshot { cursor, .. } = &input.event {
-            start_feed(shared, *cursor)?;
+            // A saved cursor past the snapshot's is from another board, or one started anew.
+            let from = shared.saved_cursor.filter(|saved| saved <= cursor);
+            start_feed(shared, from.unwrap_or(*cursor))?;
             following = true;
             println!("{FOLLOWING} {SUBTREE} on {}", shared.paths.board_url);
         }
         let event = absorb(input, &mut contexts, &shared.log);
+        let ticked = matches!(event, Event::Tick(_));
         pending = step(state, event);
+        if ticked && state.cursor() != saved {
+            saved = state.cursor();
+            save_cursor(shared, saved);
+        }
         let now_stopping = state.stopping() == Stopping::Now;
         shared.stop_now.store(now_stopping, Ordering::SeqCst);
         contexts.retain(|context| state.runs().iter().any(|run| run.id == context.run));
@@ -553,7 +860,7 @@ fn absorb(input: Input, contexts: &mut [RunContext], log: &Log) -> Event {
 // The job carrying out `action`; every action but `Exit` gets one, which answers it once.
 fn dispatch(action: Action, contexts: &mut Vec<RunContext>, shared: &Arc<Shared>) -> Option<Job> {
     assert!(contexts.len() <= usize::from(AGENTS_MAX));
-    if let Action::Claim { run, task, profile } = &action {
+    if let Action::Claim { run, task, profile } | Action::Resume { run, task, profile } = &action {
         contexts.push(RunContext::new(*run, *task, profile.clone()));
     }
     match job(action, contexts, shared) {
@@ -582,6 +889,9 @@ fn job(
     let job: Job = match action {
         Action::Claim { run, task, profile } => {
             Box::new(move || claim(&shared, run, task, &profile))
+        }
+        Action::Resume { run, task, profile } => {
+            Box::new(move || resume(&shared, run, task, &profile))
         }
         Action::Prepare { run, task } => {
             let profile = find(contexts, run, lost(run, "prepare"))?.profile.clone();
@@ -636,6 +946,15 @@ fn job(
         } => Box::new(move || release(&shared, run, task, &profile)),
         Action::ListTasks => Box::new(move || list(&shared)),
         Action::RestartFeed(cursor) => Box::new(move || restart_feed(&shared, cursor)),
+        Action::RestartBoard => Box::new(move || match start_board(&shared) {
+            Ok(()) => Input::plain(Event::BoardRestarted),
+            Err(error) => {
+                shared
+                    .log
+                    .write(&format!("restarting the board failed: {error}"));
+                Input::plain(Event::BoardExited)
+            }
+        }),
         Action::Reply { .. } | Action::Exit(_) => return Ok(None),
     };
     Ok(Some(job))
@@ -650,7 +969,10 @@ fn find(contexts: &mut [RunContext], run: RunId, missing: Event) -> Result<&mut 
 fn call_failed(error: &BoardError) -> bool {
     matches!(
         error,
-        BoardError::Spawn(_) | BoardError::Io(_) | BoardError::TimedOut { .. }
+        BoardError::Spawn(_)
+            | BoardError::Io(_)
+            | BoardError::TimedOut { .. }
+            | BoardError::Unreachable { .. }
     )
 }
 
@@ -670,6 +992,35 @@ fn claim(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
         Err(error) if call_failed(&error) => Event::BoardFailed(Call::Claim(run)),
         Err(_) => Event::ClaimRefused(run),
     };
+    Input::plain(event)
+}
+
+// Renews a claim held from before a restart; it is answered as a claim, keeping its epoch.
+fn resume(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
+    assert!(!profile.is_empty());
+    let sent = now();
+    let renewed = shared.board(profile).renew(task);
+    let event = match renewed {
+        Ok(view) => match view.claim {
+            Some(claim) if view.id == task => Event::Claimed {
+                run,
+                epoch: view.epoch,
+                until: shared.lease_until(sent, claim.until),
+            },
+            _ => Event::ClaimRefused(run),
+        },
+        Err(error) if call_failed(&error) => Event::BoardFailed(Call::Claim(run)),
+        // `claim_lost` or `claim_not_held`: the task becomes ready when its lease lapses.
+        Err(_) => Event::ClaimRefused(run),
+    };
+    let outcome = match &event {
+        Event::Claimed { .. } => "renewed",
+        Event::BoardFailed(_) => "the board did not answer",
+        _ => "no longer held",
+    };
+    shared
+        .log
+        .write(&format!("resumed #{} {profile}: {outcome}", task.0));
     Input::plain(event)
 }
 
@@ -730,6 +1081,10 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     let vb_dir = vb_dir.unwrap_or_else(|| "/".to_string());
     let inherited = shared.paths.inherited_path.clone();
     let pid_text = pid_file.to_string_lossy().into_owned();
+    let ack = ack_file(&pid_file);
+    let ack_text = ack.to_string_lossy().into_owned();
+    // A stale acknowledgement must never release a new agent whose pid happens to match it.
+    let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let cmd = with_vb_on_path(cmd, &vb_dir, inherited.as_deref());
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
@@ -737,6 +1092,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
         args.extend(cmd.args.iter().cloned());
         let mut env = cmd.env.clone();
         env.push(("RIDER_AGENT_PID_FILE".to_string(), pid_text.clone()));
+        env.push(("RIDER_AGENT_ACK_FILE".to_string(), ack_text.clone()));
         let wrapped = CommandLine {
             program: "/bin/sh".to_string(),
             args,
@@ -744,9 +1100,13 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
         };
         launch_agent(&wrapped, dir, log)
     };
+    // A full queue makes the worker wait: the recorder is never far behind.
+    let _ = shared.recorder.send(Recorded::Started(task));
     let launched = attempt.launch(&launch);
     // The agent is gone, so its pid may be reused: nothing may signal it any more.
+    let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&pid_file);
+    let _ = shared.recorder.send(Recorded::Ended(task));
     Input {
         event: Event::AgentExited(run),
         extra: Extra::Launched(launched),
@@ -988,6 +1348,14 @@ impl Board for Guarded<'_> {
     }
     fn identity(&self) -> Result<String, BoardError> {
         self.board.identity()
+    }
+    fn list_labelled(
+        &self,
+        channel: &str,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Listing, BoardError> {
+        self.board.list_labelled(channel, key, values)
     }
 }
 
@@ -1231,4 +1599,306 @@ fn clock_line(now: SystemTime) -> String {
     assert!(line.len() >= "YYYY-MM-DDTHH:MM:SSZ".len());
     assert!((1..=12).contains(&month));
     line
+}
+
+/// One running agent as `agents.json` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireAgent {
+    task: u64,
+    group: i32,
+    /// When the group's leader started, in seconds since the epoch.
+    start: u64,
+}
+
+/// The board process the daemon started as the board file names it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireBoard {
+    group: i32,
+    /// When the board process started, in seconds since the epoch.
+    start: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentsFile {
+    agents: Vec<WireAgent>,
+}
+
+/// What the recorder is told by the workers that run agents.
+enum Recorded {
+    Started(TaskId),
+    Ended(TaskId),
+}
+
+/// Writes `bytes` to `path` by renaming a finished file beside it over it.
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    let staged = path.with_file_name(name);
+    assert!(staged != path);
+    fs::write(&staged, bytes)?;
+    fs::rename(&staged, path)
+}
+
+fn read_bounded(path: &Path, bytes_max: u64) -> io::Result<String> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(bytes_max.saturating_add(1))
+        .read_to_string(&mut text)?;
+    let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    if length > bytes_max {
+        let message = format!("longer than {bytes_max} bytes");
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+    }
+    Ok(text)
+}
+
+// The cursor saved under `home`; one that is missing is `None`, and so is a malformed one,
+// which is logged.
+fn read_cursor(home: &Path, log: &Log) -> Option<Cursor> {
+    let path = home.join(CURSOR_FILE);
+    let text = match read_bounded(&path, CURSOR_BYTES_MAX) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            log.write(&format!("could not read {}: {error}", path.display()));
+            return None;
+        }
+    };
+    let cursor = text.trim().parse::<u64>().ok().map(Cursor);
+    if cursor.is_none() {
+        log.write(&format!("ignored {}: not a cursor", path.display()));
+    }
+    cursor
+}
+
+fn save_cursor(shared: &Shared, cursor: Cursor) {
+    let path = shared.paths.home.join(CURSOR_FILE);
+    if let Err(error) = write_atomically(&path, format!("{}\n", cursor.0).as_bytes()) {
+        let line = format!("could not save the cursor to {}: {error}", path.display());
+        shared.log.write(&line);
+    }
+}
+
+// When process `pid` started, in seconds since the epoch, while it exists.
+fn start_time(pid: Pid) -> Option<u64> {
+    let raw = u32::try_from(pid.as_raw_nonzero().get()).ok()?;
+    let pid = sysinfo::Pid::from_u32(raw);
+    let mut system = System::new().ok()?;
+    let only = [pid];
+    let kind = ProcessRefreshKind::nothing();
+    system.refresh_processes_specifics(ProcessesToUpdate::Some(&only), true, kind);
+    let start = system.process(pid).map(sysinfo::Process::start_time);
+    start.filter(|start| *start > 0)
+}
+
+// The agents `agents.json` under `home` names; a missing file names none.
+fn read_agents(home: &Path) -> Result<Vec<AgentRecord>, String> {
+    let path = home.join(AGENTS_FILE);
+    let text = match read_bounded(&path, AGENTS_BYTES_MAX) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let file: AgentsFile = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    if file.agents.len() > AGENT_RECORDS_MAX {
+        return Err(format!("names more than {AGENT_RECORDS_MAX} agents"));
+    }
+    let records = file.agents.iter().map(|agent| AgentRecord {
+        task: TaskId(agent.task),
+        group: agent.group,
+        start: agent.start,
+    });
+    Ok(records.collect())
+}
+
+// The pid files under `home`, each with its acknowledgement; a missing directory holds none.
+fn read_pid_files(home: &Path) -> Result<Vec<PidFile>, String> {
+    let entries = match fs::read_dir(home.join(AGENTS_DIR)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut files = Vec::new();
+    for (count, entry) in entries.enumerate() {
+        if count >= AGENT_FILES_MAX {
+            return Err(format!("more than {AGENT_FILES_MAX} files"));
+        }
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().is_none_or(|extension| extension != "pid") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|stem| stem.to_str());
+        let Some(task) = stem.and_then(|stem| stem.parse::<u64>().ok()).map(TaskId) else {
+            return Err(format!("{} names no task", path.display()));
+        };
+        let group = agent_group(&path).map(|group| group.as_raw_nonzero().get());
+        let ack =
+            read_ack(&ack_file(&path)).map(|(group, start)| AgentRecord { task, group, start });
+        files.push(PidFile { task, group, ack });
+    }
+    assert!(files.len() <= AGENT_FILES_MAX);
+    Ok(files)
+}
+
+// The group and start time an ack file names, while it is there and well formed.
+fn read_ack(path: &Path) -> Option<(i32, u64)> {
+    let text = read_bounded(path, ACK_BYTES_MAX).ok()?;
+    let (group, start) = text.trim().split_once(' ')?;
+    Some((group.parse().ok()?, start.parse().ok()?))
+}
+
+/// Stops each agent a crashed daemon left running, only a group whose leader started when a
+/// record says, so a reused pid is never signalled; returns the tasks to leave to their leases.
+fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
+    assert!(grace_millis > 0);
+    let records = read_agents(home)
+        .inspect_err(|error| log.write(&format!("could not read {AGENTS_FILE}: {error}")))
+        .ok();
+    let pid_files = read_pid_files(home)
+        .inspect_err(|error| log.write(&format!("could not read the pid files: {error}")))
+        .ok();
+    let started = |group: i32| {
+        let group = Pid::from_raw(group).filter(|group| test_kill_process_group(*group).is_ok());
+        group.and_then(start_time)
+    };
+    let recovery = core::recover(records.as_deref(), pid_files.as_deref(), &started);
+    let mut groups: Vec<(Pid, u64)> = Vec::with_capacity(recovery.stop.len());
+    for record in &recovery.stop {
+        let Some(group) = Pid::from_raw(record.group) else {
+            continue;
+        };
+        let (task, raw) = (record.task.0, record.group);
+        log.write(&format!("stopping #{task} left from before: group {raw}"));
+        let _ = kill_process_group(group, Signal::TERM);
+        groups.push((group, record.start));
+    }
+    let polls = grace_millis.div_ceil(STOP_POLL_MILLIS);
+    for _ in 0..polls {
+        groups.retain(|(group, _)| test_kill_process_group(*group).is_ok());
+        if groups.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(STOP_POLL_MILLIS));
+    }
+    for (group, start) in &groups {
+        // A pid that is a live group's id is never reused, so a group whose leader has exited
+        // is still the one stopped; a leader that started at another time is a reused pid.
+        if test_kill_process_group(*group).is_ok()
+            && start_time(*group).is_none_or(|now| now == *start)
+        {
+            let _ = kill_process_group(*group, Signal::KILL);
+        }
+    }
+    match &recovery.unaccounted {
+        Unaccounted::Every => {
+            log.write(
+                "leaving every held claim to its lease: no agent from before is accounted for",
+            );
+        }
+        Unaccounted::Tasks(tasks) => {
+            for task in tasks {
+                let line = format!(
+                    "leaving #{} to its lease: an agent from before may still run",
+                    task.0
+                );
+                log.write(&line);
+            }
+        }
+    }
+    clear_agents(home, log);
+    assert!(groups.len() <= LEFTOVERS_MAX);
+    recovery.unaccounted
+}
+
+// Removes the agents file and every pid and ack file, which name no agent of this daemon.
+fn clear_agents(home: &Path, log: &Log) {
+    let agents = home.join(AGENTS_FILE);
+    if let Err(error) = fs::remove_file(&agents)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        log.write(&format!("could not remove {}: {error}", agents.display()));
+    }
+    let Ok(entries) = fs::read_dir(home.join(AGENTS_DIR)) else {
+        return;
+    };
+    for entry in entries.take(AGENT_FILES_MAX).flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "pid" || extension == "ack")
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn start_recorder(home: PathBuf) -> Result<SyncSender<Recorded>, DaemonError> {
+    assert!(home.is_absolute());
+    let (recorder, told) = sync_channel::<Recorded>(RECORDER_QUEUE_MAX);
+    let builder = thread::Builder::new().name("recorder".into());
+    let spawned = builder.spawn(move || record_agents(&home, &told));
+    spawned.map_err(|error| DaemonError::Thread(error.to_string()))?;
+    Ok(recorder)
+}
+
+// Keeps `agents.json` naming the group of each running agent, as its pid file names it, until
+// the daemon drops its recorder; acknowledges each group once a written `agents.json` names it.
+fn record_agents(home: &Path, told: &Receiver<Recorded>) {
+    let mut running: Vec<(TaskId, Option<WireAgent>)> = Vec::new();
+    let mut written: Vec<WireAgent> = Vec::new();
+    let mut acked: Vec<WireAgent> = Vec::new();
+    let poll = Duration::from_millis(RECORD_POLL_MILLIS);
+    for _ in 0..RECORDER_ROUNDS_MAX {
+        match told.recv_timeout(poll) {
+            Ok(Recorded::Started(task)) => {
+                running.retain(|(id, _)| *id != task);
+                if running.len() < AGENT_RECORDS_MAX {
+                    running.push((task, None));
+                }
+            }
+            Ok(Recorded::Ended(task)) => running.retain(|(id, _)| *id != task),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        for (task, record) in running.iter_mut() {
+            let group = agent_group(&pid_file(home, *task));
+            let raw = group.map(|group| group.as_raw_nonzero().get());
+            if raw != record.map(|record| record.group) {
+                *record = group.zip(raw).and_then(|(group, raw)| {
+                    let start = start_time(group)?;
+                    Some(WireAgent {
+                        task: task.0,
+                        group: raw,
+                        start,
+                    })
+                });
+            }
+        }
+        let now: Vec<WireAgent> = running.iter().filter_map(|(_, record)| *record).collect();
+        if now != written {
+            let file = AgentsFile {
+                agents: now.clone(),
+            };
+            let text = serde_json::to_string(&file).unwrap_or_default();
+            if write_atomically(&home.join(AGENTS_FILE), text.as_bytes()).is_ok() {
+                written = now;
+            }
+        }
+        acked.retain(|record| written.contains(record));
+        for record in &written {
+            if acked.contains(record) {
+                continue;
+            }
+            let ack = ack_file(&pid_file(home, TaskId(record.task)));
+            let text = format!("{} {}\n", record.group, record.start);
+            if write_atomically(&ack, text.as_bytes()).is_ok() {
+                acked.push(*record);
+            }
+        }
+        assert!(running.len() <= AGENT_RECORDS_MAX);
+        assert!(acked.len() <= written.len());
+    }
 }

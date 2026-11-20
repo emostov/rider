@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 use crate::fake_agent;
 
-/// The project every scenario's pool runs; its tasks go in the channel `work/<PROJECT>`.
+/// The project every scenario runs; its tasks go in the channel `work/<PROJECT>`.
 pub const PROJECT: &str = "demo";
 /// The profile the tests write tasks as.
 pub const LEAD: &str = "lead-fable-5-2";
@@ -47,21 +47,20 @@ pub struct World {
     pub url: String,
     /// Where the board started by `start_board` keeps its data.
     pub board_dir: PathBuf,
-    /// The fake `claude` and `codex` scripts, first on the pool's `PATH`.
+    /// The fake `claude` and `codex` scripts, first on the daemon's `PATH`.
     pub agents: PathBuf,
     /// Holds `node`, so the Board CLI runs without the rest of the caller's `PATH`.
     pub tools: PathBuf,
     pub vb: PathBuf,
     pub(crate) board: Option<Child>,
-    pub(crate) pool: Option<Pool>,
+    pub(crate) daemon: Option<Daemon>,
     /// Holds `root`; taken and removed last, once every process is dead.
     dir: Option<TempDir>,
 }
 
-/// A running `rider pool` and the standard input that stops it.
-pub struct Pool {
+/// A running `rider daemon`.
+pub struct Daemon {
     pub(crate) child: Child,
-    pub(crate) stdin: Option<ChildStdin>,
 }
 
 /// What a finished command printed and how it ended.
@@ -153,7 +152,7 @@ impl World {
             root,
             url,
             board: None,
-            pool: None,
+            daemon: None,
             dir: Some(dir),
         };
         let vb_dir = world.vb.parent().expect("vb has a directory");
@@ -605,7 +604,7 @@ fn world_pids(world: &World, deadline: Instant) -> Result<Vec<u32>, String> {
 /// Kills every process of the world and its group until none is left within `REAP_SECONDS_MAX`.
 fn sweep(world: &World) -> Result<(), String> {
     // Rider starts each feed and board call in a process group of its own, so killing the
-    // pool's group misses them, and they outlive a pool that exited or was killed. A process
+    // daemon's group misses them, and they outlive a daemon that exited or was killed. A process
     // forking while it is listed leaves a child that listing missed, so the world is clean
     // only once `SWEEP_QUIET_POLLS` listings in a row find nothing.
     let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
@@ -633,12 +632,12 @@ fn sweep(world: &World) -> Result<(), String> {
 impl Drop for World {
     fn drop(&mut self) {
         let mut failures: Vec<String> = Vec::with_capacity(DROP_FAILURES_MAX);
-        if let Some(mut pool) = self.pool.take()
-            && !reap(&mut pool.child)
+        if let Some(mut daemon) = self.daemon.take()
+            && !reap(&mut daemon.child)
         {
-            failures.push("the pool outlived its kill".to_string());
+            failures.push("the daemon outlived its kill".to_string());
         }
-        // After the pool is dead no new agent can start, so one sweep finds them all.
+        // After the daemon is dead no new agent can start, so one sweep finds them all.
         for pid in fake_agent::running_pids(&self.root) {
             kill(pid, true);
         }

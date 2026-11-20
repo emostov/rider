@@ -79,6 +79,8 @@ pub const TASKS_PAGE_MAX: usize = 200;
 pub const LISTING_PAGES_MAX: usize = 16;
 /// The reasons a fenced write gives when its claim is over or was never held.
 const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
+/// The reasons `vb` gives when it could not reach the board at all.
+const UNREACHABLE_REASONS: [&str; 1] = ["network_error"];
 /// The length of a time as the board prints it: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 const TIMESTAMP_LEN: usize = 24;
 /// The channel that holds the board's identity markers, in the board's own data.
@@ -121,7 +123,7 @@ pub struct TaskView {
     pub version: Cursor,
 }
 
-/// An open task as a listing shows it, with the channel it is in.
+/// A task as a listing shows it, with the channel it is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedTask {
     pub view: TaskView,
@@ -135,13 +137,13 @@ pub struct TaskPage {
     pub cursor: Cursor,
 }
 
-/// A subtree's open tasks: the first `TASKS_MAX` in the board's order, and a cursor from
+/// A subtree's listed tasks: the first `TASKS_MAX` in the board's order, and a cursor from
 /// before the first page, so a feed started there replays any change made while paging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
     pub tasks: Vec<ListedTask>,
     pub cursor: Cursor,
-    /// The open tasks past `TASKS_MAX`, which the listing does not return.
+    /// The listed tasks past `TASKS_MAX`, which the listing does not return.
     pub left_out: usize,
 }
 
@@ -157,7 +159,7 @@ pub enum BoardError {
     TooManyLabels,
     /// A task waits for more than `NEEDS_MAX` tasks.
     TooManyNeeds,
-    /// A subtree's open tasks fill more than `LISTING_PAGES_MAX` pages.
+    /// A subtree's listed tasks fill more than `LISTING_PAGES_MAX` pages.
     TooManyTasks,
     /// The board refused a write on task `id` because this profile's claim on it is over.
     ClaimLost {
@@ -178,6 +180,10 @@ pub enum BoardError {
     },
     /// Signalling `vb`'s process group failed, so its descendants may still be running.
     Kill(String),
+    /// `vb` could not reach the board; `stderr` is what it printed.
+    Unreachable {
+        stderr: String,
+    },
 }
 
 impl fmt::Display for BoardError {
@@ -205,7 +211,7 @@ impl fmt::Display for BoardError {
             BoardError::TooManyNeeds => write!(f, "the task waits for more than {NEEDS_MAX} tasks"),
             BoardError::TooManyTasks => {
                 let tasks = TASKS_PAGE_MAX * LISTING_PAGES_MAX;
-                write!(f, "more than {tasks} open tasks in one listing")
+                write!(f, "more than {tasks} tasks in one listing")
             }
             BoardError::ClaimLost { id } => write!(f, "the claim on task {} was lost", id.0),
             BoardError::OutputTooLarge => {
@@ -238,6 +244,9 @@ impl fmt::Display for BoardError {
                     one_line(message)
                 )
             }
+            BoardError::Unreachable { stderr } => {
+                write!(f, "vb could not reach the board: {}", one_line(stderr))
+            }
         }
     }
 }
@@ -268,6 +277,14 @@ pub trait Board {
     /// The board's identity: the oldest marker in its own data, posted first when it has none,
     /// so replacing or wiping the board's data changes it.
     fn identity(&self) -> Result<String, BoardError>;
+    /// The tasks in any state in `channel`, or below it when it ends in `/`, whose label `key`
+    /// has one of `values`, none empty or holding `|`.
+    fn list_labelled(
+        &self,
+        channel: &str,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Listing, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -309,6 +326,8 @@ enum Command<'a> {
     },
     List {
         subtree: &'a str,
+        state: &'static str,
+        label: Option<&'a str>,
         after: Option<Cursor>,
     },
     Label {
@@ -440,9 +459,17 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             (to_strings(&["read", channel, "--limit", &limit]), None)
         }
         Command::PostRoot { channel, text } => (to_strings(&["post", channel]), Some(text.into())),
-        Command::List { subtree, after } => {
+        Command::List {
+            subtree,
+            state,
+            label,
+            after,
+        } => {
             let limit = TASKS_PAGE_MAX.to_string();
-            let mut words = to_strings(&["tasks", subtree, "--state", "open", "--limit", &limit]);
+            let mut words = to_strings(&["tasks", subtree, "--state", state, "--limit", &limit]);
+            if let Some(label) = label {
+                words.extend(to_strings(&["--label", label]));
+            }
             if let Some(after) = after {
                 words.extend(to_strings(&["--after", &after.0.to_string()]));
             }
@@ -479,8 +506,7 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
     (words, text)
 }
 
-/// The argument list for `command`: its words as the commands in docs/board-observed.md were
-/// run, then the global `--json --url <url> --as <profile>`, then `--` and any free text, so
+/// The argument list for `command`: its words, then the global `--json --url <url> --as <profile>`, then `--` and any free text, so
 /// text that starts with `-` is never read as an option.
 fn command_args(command: &Command, url: &str, profile: &str) -> Vec<String> {
     assert!(!url.is_empty(), "the board URL is never empty");
@@ -983,10 +1009,7 @@ fn claim_outcome(output: &Output) -> Result<Option<TaskId>, BoardError> {
             return Ok(None);
         }
     }
-    Err(BoardError::Exit {
-        code: output.code,
-        stderr: output.stderr.clone(),
-    })
+    Err(exit_error(output))
 }
 
 /// The error for a failed run on task `id`: `ClaimLost` when the board refused it for the
@@ -999,6 +1022,22 @@ fn failed_on(id: TaskId, output: &Output) -> BoardError {
             parse_failure_reason(&output.stderr).or_else(|| parse_failure_reason(&output.stdout));
         if reason.is_some_and(|reason| CLAIM_LOST_REASONS.contains(&reason.as_str())) {
             return BoardError::ClaimLost { id };
+        }
+    }
+    exit_error(output)
+}
+
+/// The error for a failed run: `Unreachable` when `vb` could not reach the board, otherwise
+/// how `vb` exited.
+fn exit_error(output: &Output) -> BoardError {
+    assert!(output.code != Some(0), "only a failed run has an error");
+    if output.code.is_some() {
+        let reason =
+            parse_failure_reason(&output.stderr).or_else(|| parse_failure_reason(&output.stdout));
+        if reason.is_some_and(|reason| UNREACHABLE_REASONS.contains(&reason.as_str())) {
+            return BoardError::Unreachable {
+                stderr: output.stderr.clone(),
+            };
         }
     }
     BoardError::Exit {
@@ -1268,10 +1307,7 @@ impl VbCli {
         );
         let output = self.run(command)?;
         if output.code != Some(0) {
-            return Err(BoardError::Exit {
-                code: output.code,
-                stderr: output.stderr,
-            });
+            return Err(exit_error(&output));
         }
         assert!(output.stdout.len() <= OUTPUT_BYTES_MAX);
         Ok(output.stdout)
@@ -1414,9 +1450,37 @@ impl Board for VbCli {
             subtree.ends_with('/'),
             "a subtree is a channel prefix ending in /"
         );
+        self.list(subtree, "open", None)
+    }
+
+    fn list_labelled(
+        &self,
+        channel: &str,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Listing, BoardError> {
+        assert!(!key.is_empty() && !key.contains('=') && !key.starts_with('-'));
+        assert!(!values.is_empty());
         assert!(
-            !subtree.starts_with('-'),
-            "a subtree is never read as an option"
+            (values.iter()).all(|value| !value.is_empty() && !value.contains('|')),
+            "a label value is one alternative"
+        );
+        let label = format!("{key}={}", values.join("|"));
+        self.list(channel, "all", Some(&label))
+    }
+}
+
+impl VbCli {
+    fn list(
+        &self,
+        subtree: &str,
+        state: &'static str,
+        label: Option<&str>,
+    ) -> Result<Listing, BoardError> {
+        assert!(state == "open" || state == "all");
+        assert!(
+            !subtree.is_empty() && !subtree.starts_with('-'),
+            "a channel is never read as an option"
         );
         let read: WireCursor = parse(&self.read(&Command::Cursor { subtree })?)?;
         let cursor = Cursor(parse_id_text(&read.cursor)?.0);
@@ -1424,7 +1488,13 @@ impl Board for VbCli {
         let mut left_out: usize = 0;
         let mut after: Option<Cursor> = None;
         for _ in 0..LISTING_PAGES_MAX {
-            let page = parse_task_list(&self.read(&Command::List { subtree, after })?)?;
+            let list = Command::List {
+                subtree,
+                state,
+                label,
+                after,
+            };
+            let page = parse_task_list(&self.read(&list)?)?;
             let full = page.tasks.len() == TASKS_PAGE_MAX;
             let first = page.tasks.first().map(|task| task.view.id.0);
             if first
@@ -1550,7 +1620,13 @@ pub mod testing {
         }
 
         fn set_label(&self, id: TaskId, key: &str, value: &str) -> Result<(), BoardError> {
-            self.record(format!("set_label {} {key}={value}", id.0))
+            self.record(format!("set_label {} {key}={value}", id.0))?;
+            let mut tasks = self.tasks.borrow_mut();
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == id) {
+                task.labels.retain(|(name, _)| name != key);
+                task.labels.push((key.to_string(), value.to_string()));
+            }
+            Ok(())
         }
 
         fn reply(&self, id: TaskId, text: &str) -> Result<(), BoardError> {
@@ -1600,6 +1676,27 @@ pub mod testing {
             let tasks = self.tasks.borrow();
             let open = tasks.iter().filter(|task| !closed.contains(&task.state));
             let listed = open.map(|view| ListedTask {
+                view: view.clone(),
+                channel: "work/fake".into(),
+            });
+            Ok(Listing {
+                tasks: listed.collect(),
+                cursor: Cursor(0),
+                left_out: 0,
+            })
+        }
+
+        fn list_labelled(
+            &self,
+            _: &str,
+            key: &str,
+            values: &[&str],
+        ) -> Result<Listing, BoardError> {
+            let tasks = self.tasks.borrow();
+            let labelled = tasks.iter().filter(|task| {
+                (task.labels.iter()).any(|(k, v)| k == key && values.contains(&v.as_str()))
+            });
+            let listed = labelled.map(|view| ListedTask {
                 view: view.clone(),
                 channel: "work/fake".into(),
             });
@@ -1761,10 +1858,10 @@ mod tests {
         assert_eq!(command_stdin(&reply), Some("-tail\n-of a log"));
         let post = Command::Post {
             id,
-            schema: "rider-result@1",
+            schema: "rider-result@2",
             json: "{}",
         };
-        expect_with_text(post, &["post", "2", "--schema", "rider-result@1"], "{}");
+        expect_with_text(post, &["post", "2", "--schema", "rider-result@2"], "{}");
         let complete = Command::Complete {
             id,
             result: "-done\n  line",
@@ -1861,6 +1958,20 @@ mod tests {
         let timeout = include_str!("../fixtures/board/claim-timeout.stderr.txt");
         let killed = claim_outcome(&output(None, "", timeout));
         assert!(matches!(killed, Err(BoardError::Exit { code: None, .. })));
+    }
+
+    #[test]
+    fn a_board_vb_cannot_reach_is_unreachable_for_every_call() {
+        let unreachable = r#"{"status":"error","reason":"network_error","message":"Couldn't reach the board.","data":{"error":{"code":"unreachable","message":"the board didn't answer: fetch failed","status":502}}}"#;
+        let failed = output(Some(1), "", unreachable);
+        let is_unreachable = |error: Option<BoardError>| matches!(error, Some(BoardError::Unreachable { stderr }) if stderr == unreachable);
+        assert!(is_unreachable(claim_outcome(&failed).err()));
+        assert!(is_unreachable(lease_outcome(TaskId(2), &failed).err()));
+        let done = Command::Complete {
+            id: TaskId(2),
+            result: "done",
+        };
+        assert!(is_unreachable(write_outcome(&done, &failed).err()));
     }
 
     #[test]
@@ -2194,12 +2305,14 @@ printf '],"cursor":"%s"}}\n' $cursor
         expect(cursor, &["read", "work/", "--limit", "1"]);
         let list = Command::List {
             subtree: "work/",
+            state: "all",
+            label: Some("base=3|#3"),
             after: Some(Cursor(9)),
         };
-        let limit = ["--limit", "200", "--after", "9"];
+        let limit = ["--limit", "200", "--label", "base=3|#3", "--after", "9"];
         expect(
             list,
-            &[&["tasks", "work/", "--state", "open"][..], &limit].concat(),
+            &[&["tasks", "work/", "--state", "all"][..], &limit].concat(),
         );
     }
 

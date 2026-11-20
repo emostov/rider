@@ -7,7 +7,6 @@ pub mod daemon;
 pub mod feed;
 pub mod git;
 pub mod harness;
-pub mod pool;
 pub mod reap;
 pub mod roles;
 pub mod run_task;

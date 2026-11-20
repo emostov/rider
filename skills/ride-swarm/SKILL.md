@@ -59,13 +59,11 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    (`git -C <repo> merge --no-ff <branch>` on a clean checkout, `git merge --abort` and a
    restack task on conflict, never push), or the user merges when asked in `decisions`.
 3. **Board.** If it is down, start `rider serve` as a background command and check again.
-   `vb schemas list` must list `rider-result@1` and `rider-finding@1`; register a missing
-   one with `vb schemas create rider-result@1 --file <skill>/schemas/rider-result.json`
-   (or `rider-finding`).
+   `vb schemas list` must list `rider-result@2` and `rider-finding@1`;
+   register a missing one with `vb schemas create rider-result@2 --file
+   <skill>/schemas/rider-result@2.json` (`rider-finding@1` from `rider-finding.json`).
 4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
    run `rider up`, which starts it in the background, and check `rider status` again.
-   (`rider pool <project>` in a terminal the user keeps open is the fallback until it is
-   removed.)
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
    `lead-fable-5-2`. Answer the user before anything else.
 

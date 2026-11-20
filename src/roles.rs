@@ -28,7 +28,6 @@ pub struct RoleSpec {
     /// The model's name inside a Board profile, such as "opus-5-5".
     pub model_slug: &'static str,
     pub slots: u8,
-    /// Slot threads `rider pool` starts for the role, at most `slots`.
     pub pool_slots: u8,
     /// A file name under `prompts/`, or an absolute path to the user's own prompt.
     pub prompt_file: &'static str,

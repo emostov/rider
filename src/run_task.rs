@@ -33,6 +33,10 @@ pub const ATTEMPTS_DEFAULT: u8 = 3;
 const _: () = assert!(ATTEMPTS_DEFAULT > 0 && ATTEMPTS_DEFAULT <= ATTEMPTS_MAX);
 /// Upper bound on the bytes read from the end of a failed attempt's log.
 pub const LOG_TAIL_BYTES_MAX: u64 = 16 * 1024;
+/// Upper bound on the stacked tasks checked when a branch moves, as `rider-result@2` allows.
+pub const STACKED_CHECKS_MAX: usize = 64;
+/// Upper bound on the tasks of one branch whose stacked tasks are looked for when it moves.
+pub const BRANCH_TASKS_MAX: usize = 32;
 /// The lines of a failed attempt's log replied to its task.
 pub const LOG_TAIL_LINES: usize = 40;
 /// Upper bound on a role's prompt file.
@@ -52,7 +56,7 @@ const ATTEMPT_LABEL: &str = "attempt";
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
-const RESULT_SCHEMA: &str = "rider-result@1";
+const RESULT_SCHEMA: &str = "rider-result@2";
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the Claude session id of its latest completed attempt on one line,
@@ -131,6 +135,7 @@ struct Work {
 
 #[derive(Serialize)]
 struct ResultRecord<'a> {
+    behind: Vec<u64>,
     branch: Option<&'a str>,
     commits: u64,
     head: &'a str,
@@ -313,7 +318,7 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
 /// The identity of the board at `url`, read from it once per process and then remembered.
 pub fn board_identity(url: &str, board: &dyn Board) -> Result<BoardIdentity, BoardError> {
     assert!(!url.is_empty());
-    // Held across the read, so the slots of one pool post at most one marker between them.
+    // Held across the read, so the attempts of one daemon post at most one marker between them.
     let mut known = BOARD_IDENTITY
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -970,7 +975,25 @@ fn complete(
     let end = result.char_indices().nth(SUMMARY_CHARS_MAX);
     let summary = &result[..end.map_or(result.len(), |(index, _)| index)];
     assert!(!summary.trim().is_empty() && summary.chars().count() <= SUMMARY_CHARS_MAX);
+    // The fenced write goes first: a retry writes nothing twice, and a lost claim nothing.
+    board.complete(id, summary)?;
+    let behind = match (attempt.brief.onto, attempt.branch()) {
+        (Some(onto), Some(branch)) if work.head != attempt.reference => {
+            let (behind, cut) = stacked_behind(board, attempt, onto, branch, &work.head)
+                .unwrap_or_else(|error| (Vec::new(), Some(error)));
+            if let Some(cut) = cut {
+                let note = format!(
+                    "Rider could not check every task stacked on branch {branch}, so its \
+                     result may name too few behind: {cut}."
+                );
+                let _ = board.reply(id, &one_line(&note));
+            }
+            behind
+        }
+        _ => Vec::new(),
+    };
     let record = ResultRecord {
+        behind,
         branch: attempt.checkout.branch.as_deref(),
         commits: work.commits,
         head: &work.head,
@@ -1004,8 +1027,119 @@ fn complete(
         };
         let _ = board.reply(id, &one_line(&note));
     }
-    board.complete(id, summary)?;
     Ok(())
+}
+
+// A branch's tasks are those labelled with it in the completing task's channel and repository,
+// and `onto`. Returns that channel, their ids, and why the list was cut short at a bound.
+fn branch_tasks(
+    board: &dyn Board,
+    attempt: &Attempt,
+    onto: TaskId,
+    branch: &str,
+) -> Result<(String, Vec<u64>, Option<String>), String> {
+    assert!(attempt.brief.onto == Some(onto));
+    let id = attempt.brief.id;
+    if branch.contains('|') {
+        return Err("its name holds `|`, which a label filter cannot name".to_string());
+    }
+    let named = board
+        .list_labelled(SUBTREE, BRANCH_LABEL, &[branch])
+        .map_err(|error| error.to_string())?;
+    let mut cut = (named.left_out > 0).then(|| {
+        format!(
+            "{} of its tasks were past the listing's bound",
+            named.left_out
+        )
+    });
+    let own = named.tasks.iter().find(|task| task.view.id == id);
+    let channel = own.ok_or_else(|| format!("task #{} is not listed on it", id.0))?;
+    let channel = &channel.channel;
+    let mut on_branch: Vec<u64> = vec![onto.0];
+    let mine = (named.tasks.iter())
+        .filter(|task| task.channel == *channel && same_repo(&task.view, &attempt.brief.repo))
+        .filter(|task| label(&task.view, BRANCH_LABEL) == Some(branch));
+    for task in mine {
+        if on_branch.contains(&task.view.id.0) {
+            continue;
+        }
+        if on_branch.len() == BRANCH_TASKS_MAX {
+            cut.get_or_insert(format!("it holds more than {BRANCH_TASKS_MAX} tasks"));
+            break;
+        }
+        on_branch.push(task.view.id.0);
+    }
+    assert!(!on_branch.is_empty() && on_branch.len() <= BRANCH_TASKS_MAX);
+    Ok((channel.clone(), on_branch, cut))
+}
+
+fn same_repo(view: &TaskView, repo: &Path) -> bool {
+    label(view, "repo").is_some_and(|own| Path::new(own) == repo)
+}
+
+// A task is stacked on `branch` when its `base` names one of the branch's tasks, and behind
+// when its own branch does not contain `head`. Besides the behind tasks, returns why the
+// check was cut short when a bound was reached.
+fn stacked_behind(
+    board: &dyn Board,
+    attempt: &Attempt,
+    onto: TaskId,
+    branch: &str,
+    head: &str,
+) -> Result<(Vec<u64>, Option<String>), String> {
+    assert!(git::is_commit_id(head), "a branch head is a commit id");
+    let dir = &attempt.checkout.dir;
+    let (channel, on_branch, mut cut) = branch_tasks(board, attempt, onto, branch)?;
+    let names: Vec<String> = (on_branch.iter())
+        .flat_map(|task| [task.to_string(), format!("#{task}")])
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let stacked = board
+        .list_labelled(&channel, "base", &names)
+        .map_err(|error| error.to_string())?;
+    if stacked.left_out > 0 {
+        let left_out = stacked.left_out;
+        cut.get_or_insert(format!(
+            "{left_out} stacked tasks were past the listing's bound"
+        ));
+    }
+    let id_of = |value: &str| value.strip_prefix('#').unwrap_or(value).parse::<u64>().ok();
+    let mut behind: Vec<u64> = Vec::new();
+    let mut checked: usize = 0;
+    for view in stacked
+        .tasks
+        .iter()
+        .map(|task| &task.view)
+        .filter(|view| same_repo(view, &attempt.brief.repo))
+    {
+        let base = label(view, "base").and_then(id_of);
+        let Some(own) = label(view, BRANCH_LABEL).filter(|own| *own != branch) else {
+            continue;
+        };
+        if !base.is_some_and(|base| on_branch.contains(&base)) {
+            continue;
+        }
+        if checked == STACKED_CHECKS_MAX {
+            cut.get_or_insert(format!(
+                "more than {STACKED_CHECKS_MAX} tasks are stacked on it"
+            ));
+            break;
+        }
+        checked += 1;
+        let full = format!("refs/heads/{own}");
+        let text = |error: GitError| error.to_string();
+        // A stacked task whose branch is not here, or cannot be named to git, is not judged.
+        let safe = git::is_safe_ref(own) && git::is_safe_ref(&full);
+        if !safe || !git::branch_exists(dir, own).map_err(text)? {
+            continue;
+        }
+        let own_head = git::commit_of(dir, &full).map_err(text)?;
+        if !git::is_ancestor(dir, head, &own_head).map_err(text)? {
+            behind.push(view.id.0);
+        }
+    }
+    assert!(behind.len() <= checked && checked <= STACKED_CHECKS_MAX);
+    Ok((behind, cut))
 }
 
 fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Result<(), RunError> {
@@ -1022,14 +1156,20 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     } else {
         message_tail(&tail, budget)
     };
-    // The tail only informs; losing it must not leave the attempt uncounted.
+    // The fenced write goes first, so nothing is written for a task whose claim was lost.
+    board.fail(id, reason)?;
+    let failed = attempt.failed + 1;
+    // The task is failed already: a lost label or log reply must not retry the `fail`.
+    if board
+        .set_label(id, ATTEMPT_LABEL, &failed.to_string())
+        .is_err()
+    {
+        let note = format!("Rider could not set the `attempt` label to {failed}.");
+        let _ = board.reply(id, &note);
+    }
     if board.reply(id, &format!("{header}\n{tail}")).is_err() {
         let _ = board.reply(id, &header);
     }
-    let failed = attempt.failed + 1;
-    // Counting before failing means a lost `fail` over-counts, never under-counts.
-    board.set_label(id, ATTEMPT_LABEL, &failed.to_string())?;
-    board.fail(id, reason)?;
     Ok(())
 }
 
@@ -1184,9 +1324,14 @@ mod tests {
     }
 
     fn record(branch: Option<&str>, head: &str, commits: u64, summary: &str) -> String {
-        let record =
-            json!({"branch": branch, "head": head, "commits": commits, "summary": summary});
-        format!("post_structured 7 rider-result@1 {record}")
+        let record = json!({
+            "branch": branch,
+            "head": head,
+            "commits": commits,
+            "summary": summary,
+            "behind": [],
+        });
+        format!("post_structured 7 rider-result@2 {record}")
     }
 
     fn run(env: &Env, board: &FakeBoard, launch: &Launch) -> Verdict {
@@ -1324,8 +1469,8 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
             "complete 7 Extracted the store.".to_string(),
+            record(Some(BRANCH), &head, 1, "Extracted the store."),
         ];
         assert_eq!(calls(&board), expected);
         assert!(
@@ -1360,14 +1505,14 @@ mod tests {
         let verdict = run(&env, &board, &committing_agent(&fixture));
         assert_eq!(verdict, completed("Extracted the store."));
         let head = git(&fixture.repo, &["rev-parse", BRANCH]);
-        let json = json!({"branch": BRANCH, "head": head, "commits": 1,
+        let json = json!({"behind": [], "branch": BRANCH, "head": head, "commits": 1,
             "summary": "Extracted the store."});
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
+            "complete 7 Extracted the store.".to_string(),
             record(Some(BRANCH), &head, 1, "Extracted the store."),
             format!("reply 7 {json}"),
-            "complete 7 Extracted the store.".to_string(),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1391,6 +1536,7 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
+            "complete 7 Extracted the store.".to_string(),
             record(Some(BRANCH), &head, 1, "Extracted the store."),
             format!(
                 "reply 7 Kept the worktree at {dir}, so branch {BRANCH} stays checked out \
@@ -1399,7 +1545,6 @@ mod tests {
                  in progress.",
                 dir = dir.display()
             ),
-            "complete 7 Extracted the store.".to_string(),
         ];
         assert_eq!(calls(&board), expected);
         assert!(dir.join("store.rs").exists());
@@ -1451,9 +1596,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 2, &tail.join("\n")),
-            "set_label 7 attempt=2".to_string(),
             "fail 7 agent exited 2".to_string(),
+            "set_label 7 attempt=2".to_string(),
+            tail_reply(&env, 2, &tail.join("\n")),
         ];
         assert_eq!(calls(&board), expected);
         assert_eq!(
@@ -1476,8 +1621,9 @@ mod tests {
             reason: reason.to_string(),
         };
         assert_eq!(run(&env, &board, &idle), expected);
-        let last = calls(&board).last().cloned();
-        assert_eq!(last, Some(format!("fail 7 {reason}")));
+        // The fenced fail comes before the attempt label and the log reply.
+        let fenced = calls(&board).iter().rev().nth(2).cloned();
+        assert_eq!(fenced, Some(format!("fail 7 {reason}")));
 
         let (fixture, env) = setup("run-dirty");
         let board = FakeBoard::new(vec![task(&fixture, &[])]);
@@ -1495,9 +1641,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 1, DONE_STREAM),
-            "set_label 7 attempt=1".to_string(),
             format!("fail 7 {reason}"),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, DONE_STREAM),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1537,9 +1683,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 1, NO_OUTPUT),
-            "set_label 7 attempt=1".to_string(),
             format!("fail 7 {reason}"),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, NO_OUTPUT),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1615,14 +1761,12 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
-            tail_reply(&env, 2, NO_OUTPUT),
-            "set_label 7 attempt=2".to_string(),
             "fail 7 agent exited on a signal".to_string(),
         ];
         assert_eq!(
             calls(&board),
             expected,
-            "the attempt is counted before the failure"
+            "nothing is written before the failure is"
         );
     }
 
@@ -1639,10 +1783,10 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             start_call(&fixture, "main"),
+            "fail 7 agent exited on a signal".to_string(),
+            "set_label 7 attempt=1".to_string(),
             tail_reply(&env, 1, NO_OUTPUT),
             format!("reply 7 {}", log_line(&env, 1)),
-            "set_label 7 attempt=1".to_string(),
-            "fail 7 agent exited on a signal".to_string(),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1716,7 +1860,7 @@ mod tests {
             let (verdict, calls) = judged(&env, &board, &wander);
             assert_eq!(verdict, expected, "{args:?}");
             assert_eq!(
-                calls.last(),
+                calls.iter().rev().nth(2),
                 Some(&format!("fail 7 {}", verdict_reason(&expected)))
             );
         }
@@ -1776,8 +1920,8 @@ mod tests {
         assert_eq!(run(&env, &board, &reading), completed("completed"));
         let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
         let expected = vec![
-            record(None, &head, 0, "completed"),
             "complete 7 completed".to_string(),
+            record(None, &head, 0, "completed"),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1798,9 +1942,9 @@ mod tests {
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
             format!("set_label 7 start={start}"),
-            tail_reply(&env, 1, NO_OUTPUT),
-            "set_label 7 attempt=1".to_string(),
             "fail 7 agent exited 1".to_string(),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, NO_OUTPUT),
         ];
         assert_eq!(calls(&board), expected);
 
@@ -1814,8 +1958,8 @@ mod tests {
         let head = git(&fixture.repo, &["rev-parse", BRANCH]);
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
             "complete 7 Extracted the store.".to_string(),
+            record(Some(BRANCH), &head, 1, "Extracted the store."),
         ];
         assert_eq!(calls(&board), expected);
     }
@@ -1835,9 +1979,9 @@ mod tests {
         assert_eq!(run(&env, &board, &idle), expected);
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
-            tail_reply(&env, 1, DONE_STREAM),
-            "set_label 7 attempt=1".to_string(),
             format!("fail 7 {reason}"),
+            "set_label 7 attempt=1".to_string(),
+            tail_reply(&env, 1, DONE_STREAM),
         ];
         assert_eq!(
             calls(&board),
@@ -1928,8 +2072,8 @@ mod tests {
         let head = git(&fixture.repo, &["rev-parse", BRANCH]);
         let expected = vec![
             format!("set_label 7 branch={BRANCH}"),
-            record(Some(BRANCH), &head, 1, "Extracted the store."),
             "complete 7 Extracted the store.".to_string(),
+            record(Some(BRANCH), &head, 1, "Extracted the store."),
         ];
         assert_eq!(calls(&board), expected);
     }

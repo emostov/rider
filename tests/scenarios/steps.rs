@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,20 +13,20 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::fake_agent::{self, Behaviour, Run};
-use crate::world::{MAIN, PROJECT, Pool, World};
+use crate::world::{Daemon, MAIN, PROJECT, World};
 
 /// How long a scenario waits for its tasks to settle.
 pub const SETTLE_SECONDS_MAX: u64 = 90;
-/// How long `stop` may take to end the pool.
-pub const POOL_STOP_SECONDS_MAX: u64 = 90;
+/// How long SIGTERM may take to end the daemon.
+pub const DAEMON_STOP_SECONDS_MAX: u64 = 90;
 /// The task states that end an attempt.
 pub const SETTLED: [&str; 4] = ["completed", "failed", "blocked", "canceled"];
 const POLL_MILLIS: u64 = 200;
 const LIST_LIMIT: &str = "500";
 const SCHEMAS: [(&str, &str); 2] = [
     (
-        "rider-result@1",
-        "skills/ride-swarm/schemas/rider-result.json",
+        "rider-result@2",
+        "skills/ride-swarm/schemas/rider-result@2.json",
     ),
     (
         "rider-finding@1",
@@ -78,7 +77,13 @@ impl NewTask {
 pub fn given_a_board_and_a_repository() -> Option<World> {
     let mut world = World::new()?;
     world.start_board();
-    register_schemas(&world);
+    given_the_schemas_and_a_repository(&world);
+    Some(world)
+}
+
+/// Given the board answers: Rider's schemas on it, and a scratch repository with one commit.
+pub fn given_the_schemas_and_a_repository(world: &World) {
+    register_schemas(world);
     fs::create_dir_all(&world.repo).expect("create the repository");
     let repo = world.repo.clone();
     for args in [
@@ -93,7 +98,6 @@ pub fn given_a_board_and_a_repository() -> Option<World> {
     world.git_ok(&["add", "README.md"]);
     world.git_ok(&["commit", "-q", "-m", "Start the scratch repository"]);
     assert_eq!(world.git_ok(&["branch", "--show-current"]), MAIN);
-    Some(world)
 }
 
 fn register_schemas(world: &World) {
@@ -205,25 +209,6 @@ pub fn when_the_lead_creates(world: &World, task: &NewTask) -> String {
     id
 }
 
-/// When the pool starts: `rider pool <PROJECT>` with its standard input piped.
-pub fn when_the_pool_starts(world: &mut World) {
-    assert!(world.pool.is_none(), "one pool per world");
-    let log = fs::File::create(world.root.join("pool.log")).expect("create the pool log");
-    let err = log.try_clone().expect("share the pool log");
-    let mut child = world
-        .command(Path::new(env!("CARGO_BIN_EXE_rider")))
-        .args(["pool", PROJECT])
-        .stdin(Stdio::piped())
-        .stdout(log)
-        .stderr(err)
-        .process_group(0)
-        .spawn()
-        .expect("start rider pool");
-    let stdin = child.stdin.take();
-    assert!(stdin.is_some());
-    world.pool = Some(Pool { child, stdin });
-}
-
 /// When `tasks` have all settled, within `SETTLE_SECONDS_MAX`; returns their states in order.
 pub fn when_the_tasks_settle(world: &World, tasks: &[&str]) -> Vec<String> {
     when_the_tasks_settle_within(world, tasks, SETTLE_SECONDS_MAX)
@@ -240,48 +225,27 @@ pub fn when_the_tasks_settle_within(world: &World, tasks: &[&str], seconds: u64)
         }
         if Instant::now() >= deadline {
             panic!(
-                "tasks {tasks:?} were {states:?} after {seconds} seconds; pool log:\n{}",
-                world.pool_log()
+                "tasks {tasks:?} were {states:?} after {seconds} seconds; daemon log:\n{}",
+                world.daemon_log()
             );
         }
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
 }
 
-/// When the pool is told `stop`; returns its exit code once it has exited.
-// The pool stays in the world until it has exited, so a panic here still lets Drop kill it.
-pub fn when_the_pool_is_stopped(world: &mut World) -> Option<i32> {
-    let pool = world.pool.as_mut().expect("the pool was started");
-    let mut stdin = pool.stdin.take().expect("the pool's standard input");
-    stdin.write_all(b"stop\n").expect("write stop");
-    drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(POOL_STOP_SECONDS_MAX);
-    let status = loop {
-        if let Some(status) = pool.child.try_wait().expect("poll the pool") {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the pool did not stop within {POOL_STOP_SECONDS_MAX} seconds"
-        );
-        thread::sleep(Duration::from_millis(POLL_MILLIS));
-    };
-    world.pool = None;
-    status.code()
-}
-
-/// When the pool runs until `tasks` settle, each within `SETTLE_SECONDS_MAX` of the one before,
-/// and is then stopped; returns the states and exit.
-pub fn when_the_pool_runs_until_settled(
+/// When the daemon runs until `tasks` settle, each within `SETTLE_SECONDS_MAX` of the one
+/// before, and is then sent SIGTERM; returns the states and exit.
+pub fn when_the_daemon_runs_until_settled(
     world: &mut World,
     tasks: &[&str],
 ) -> (Vec<String>, Option<i32>) {
-    when_the_pool_starts(world);
+    given_a_running_daemon(world);
     let states: Vec<String> = tasks
         .iter()
         .flat_map(|task| when_the_tasks_settle(world, &[task]))
         .collect();
-    let exit = when_the_pool_is_stopped(world);
+    when_the_daemon_is_sent_sigterm(world);
+    let exit = then_the_daemon_exits(world);
     assert_eq!(states.len(), tasks.len());
     (states, exit)
 }
@@ -313,6 +277,7 @@ struct TaskMessage {
 #[derive(Deserialize)]
 struct TaskFields {
     state: String,
+    epoch: u64,
     claim: Option<Claim>,
     blocked: Option<Blocked>,
 }
@@ -326,6 +291,7 @@ struct Blocked {
 #[derive(Deserialize)]
 struct Claim {
     until: String,
+    actor: String,
 }
 
 #[derive(Deserialize)]
@@ -506,9 +472,9 @@ impl World {
         self.repo.to_str().expect("UTF-8 path")
     }
 
-    /// What the pool printed so far.
-    pub fn pool_log(&self) -> String {
-        fs::read_to_string(self.root.join("pool.log")).unwrap_or_default()
+    /// What the daemon printed so far.
+    pub fn daemon_log(&self) -> String {
+        fs::read_to_string(self.root.join("daemon-output.log")).unwrap_or_default()
     }
 
     /// Lets a fake agent told to `Hold` on `task` go on.
@@ -529,6 +495,12 @@ pub const DAEMON_STARTED: &str = "rider daemon: following";
 
 /// The test-only setting that shortens the daemon's lease, attempt limit, tick and kill grace.
 pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
+/// The daemon log's line naming a board process the daemon started, before its pid.
+pub const BOARD_STARTED: &str = "started the board, pid";
+/// The daemon log's line naming a board process a killed daemon started, kept as its own.
+pub const BOARD_KEPT: &str = "kept the board started before, pid";
+/// How long a held `vb` call waits for its release, in tenths of a second.
+const HELD_TENTHS_MAX: u32 = 1200;
 
 /// Given a running `rider daemon` that follows the board.
 pub fn given_a_running_daemon(world: &mut World) {
@@ -537,8 +509,9 @@ pub fn given_a_running_daemon(world: &mut World) {
 
 /// Given a running `rider daemon` with `env` added to the world's environment.
 pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
-    assert!(world.pool.is_none(), "one daemon per world");
-    let log = fs::File::create(world.root.join("pool.log")).expect("create the daemon output");
+    assert!(world.daemon.is_none(), "one daemon per world");
+    let log =
+        fs::File::create(world.root.join("daemon-output.log")).expect("create the daemon output");
     let err = log.try_clone().expect("share the daemon output");
     let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
     command.envs(env.iter().copied());
@@ -549,13 +522,13 @@ pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
         .process_group(0)
         .spawn()
         .expect("start rider daemon");
-    world.pool = Some(Pool { child, stdin: None });
+    world.daemon = Some(Daemon { child });
     let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
-    while !world.pool_log().contains(DAEMON_STARTED) {
+    while !world.daemon_log().contains(DAEMON_STARTED) {
         assert!(
             Instant::now() < deadline,
             "the daemon did not start within {DAEMON_START_SECONDS_MAX} seconds:\n{}",
-            world.pool_log()
+            world.daemon_log()
         );
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
@@ -563,31 +536,31 @@ pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
 
 /// When the daemon is sent SIGTERM.
 pub fn when_the_daemon_is_sent_sigterm(world: &World) {
-    let pool = world.pool.as_ref().expect("the daemon was started");
+    let daemon = world.daemon.as_ref().expect("the daemon was started");
     let status = std::process::Command::new("/bin/kill")
-        .args(["-TERM", &pool.child.id().to_string()])
+        .args(["-TERM", &daemon.child.id().to_string()])
         .stdin(Stdio::null())
         .status()
         .expect("run kill");
     assert!(status.success());
 }
 
-/// Then the daemon exits within `POOL_STOP_SECONDS_MAX`; returns its exit code.
+/// Then the daemon exits within `DAEMON_STOP_SECONDS_MAX`; returns its exit code.
 pub fn then_the_daemon_exits(world: &mut World) -> Option<i32> {
-    let pool = world.pool.as_mut().expect("the daemon was started");
-    let deadline = Instant::now() + Duration::from_secs(POOL_STOP_SECONDS_MAX);
+    let daemon = world.daemon.as_mut().expect("the daemon was started");
+    let deadline = Instant::now() + Duration::from_secs(DAEMON_STOP_SECONDS_MAX);
     let status = loop {
-        if let Some(status) = pool.child.try_wait().expect("poll the daemon") {
+        if let Some(status) = daemon.child.try_wait().expect("poll the daemon") {
             break status;
         }
         assert!(
             Instant::now() < deadline,
-            "the daemon did not exit within {POOL_STOP_SECONDS_MAX} seconds:\n{}",
-            world.pool_log()
+            "the daemon did not exit within {DAEMON_STOP_SECONDS_MAX} seconds:\n{}",
+            world.daemon_log()
         );
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     };
-    world.pool = None;
+    world.daemon = None;
     status.code()
 }
 
@@ -613,7 +586,7 @@ pub fn when_the_agent_has_started(world: &World, task: &str) -> Run {
         assert!(
             Instant::now() < deadline,
             "no agent started on task {task}:\n{}",
-            world.pool_log()
+            world.daemon_log()
         );
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
@@ -673,6 +646,51 @@ pub fn task_claim_until(world: &World, id: &str) -> Option<String> {
         .map(|claim| claim.until)
 }
 
+/// How many times the task has been claimed, as the board shows it.
+pub fn task_epoch(world: &World, id: &str) -> u64 {
+    read_task(world, id).message.task.epoch
+}
+
+/// The profile holding the task's claim, as the board shows it; `None` when it is not claimed.
+pub fn task_claim_profile(world: &World, id: &str) -> Option<String> {
+    let claim = read_task(world, id).message.task.claim?;
+    // The board names a holder `<owner>+<profile>`.
+    let profile = claim
+        .actor
+        .rsplit_once('+')
+        .map(|(_, profile)| profile.to_string());
+    Some(profile.unwrap_or(claim.actor))
+}
+
+/// When the daemon is sent SIGKILL, as a crash; waits for it to be gone.
+pub fn when_the_daemon_crashes(world: &mut World) {
+    let daemon = world.daemon.as_ref().expect("the daemon was started");
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-KILL", &daemon.child.id().to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success());
+    assert_eq!(then_the_daemon_exits(world), None);
+}
+
+/// Waits until the daemon's `agents.json` names process group `pid`.
+pub fn when_agents_json_names(world: &World, pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    let named = format!("\"group\":{pid},");
+    loop {
+        let text = fs::read_to_string(world.home.join("agents.json")).unwrap_or_default();
+        if text.contains(&named) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agents.json never named {pid}: {text}"
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
 /// When `id`'s claim has been renewed past `first`, within `SETTLE_SECONDS_MAX`; returns its end.
 pub fn when_the_claim_moves_past(world: &World, id: &str, first: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
@@ -685,7 +703,7 @@ pub fn when_the_claim_moves_past(world: &World, id: &str, first: &str) -> String
         assert!(
             Instant::now() < deadline,
             "the claim on task {id} stayed until {until}:\n{}",
-            world.pool_log()
+            world.daemon_log()
         );
         thread::sleep(Duration::from_millis(POLL_MILLIS));
     }
@@ -710,16 +728,40 @@ pub fn agents_running(world: &World) -> usize {
     fake_agent::running_pids(&world.root).len()
 }
 
-/// Given every `vb reply` touches `marker` and then waits `seconds` before it runs.
-pub fn given_vb_replies_slowly(world: &World, marker: &Path, seconds: u32) {
+/// Given every `vb` run whose arguments contain the word `word` touches `marker` and then
+/// waits `seconds` before it runs.
+pub fn given_vb_runs_slowly(world: &World, word: &str, marker: &Path, seconds: u32) {
+    assert!(!word.is_empty() && !word.contains(['\'', ' ']));
     let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
     fs::remove_file(&world.vb).expect("remove the Board CLI link");
     let script = format!(
         r#"#!/bin/sh
-case " $* " in *" reply "*) : > '{}'; sleep {seconds};; esac
+case " $* " in *" {word} "*) : > '{}'; sleep {seconds};; esac
 exec '{}' "$@"
 "#,
         marker.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb` run whose arguments contain the word `word` touches `marker` and then
+/// waits, up to `HELD_TENTHS_MAX` tenths of a second, until `release` exists.
+pub fn given_vb_waits_for(world: &World, word: &str, marker: &Path, release: &Path) {
+    assert!(!word.is_empty() && !word.contains(['\'', ' ']));
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" {word} "*)
+  : > '{}'
+  n=0
+  while [ ! -e '{}' ] && [ $n -lt {HELD_TENTHS_MAX} ]; do sleep 0.1; n=$((n + 1)); done;;
+esac
+exec '{}' "$@"
+"#,
+        marker.display(),
+        release.display(),
         real.display()
     );
     crate::world::write_executable(&world.vb, &script);
@@ -735,6 +777,41 @@ case " $* " in *" rider/identity "*) echo 'identity unavailable' >&2; exit 1;; e
 exec '{}' "$@"
 "#,
         real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Waits until `path` exists.
+pub fn when_the_file_exists(world: &World, path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared:\n{}",
+            path.display(),
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// Given the first `times` `vb tasks complete` calls each fail, logged as lines in `completes`.
+pub fn given_vb_fails_complete(world: &World, times: u32, completes: &Path) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = tasks ] && [ "$2" = complete ]; then
+  echo complete >> '{completes}'
+  if [ "$(wc -l < '{completes}')" -le {times} ]; then
+    echo 'injected complete failure' >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"#,
+        completes = completes.display(),
+        real = real.display(),
     );
     crate::world::write_executable(&world.vb, &script);
 }
@@ -898,47 +975,6 @@ pub fn line_for_pid(output: &str, pid: u32) -> Option<String> {
     Some(format!("{prefix}<age> {command}"))
 }
 
-/// Given the lead sets `task`'s role to `role` as a slot of `claimed` first reads it, and the
-/// first `vb tasks release` of `task` fails; every release is logged as a line in `releases`.
-pub fn given_the_role_changes_after_the_claim_and_one_release_fails(
-    world: &World,
-    task: &str,
-    claimed: &str,
-    role: &str,
-    releases: &Path,
-) {
-    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
-    fs::remove_file(&world.vb).expect("remove the Board CLI link");
-    let changed = world.root.join("role-changed");
-    let failed = world.root.join("release-failed");
-    let script = format!(
-        r#"#!/bin/sh
-if [ "$1" = read ] && [ "$2" = '{task}' ] && [ ! -e '{changed}' ]; then
-  case " $* " in *" --as {claimed}-"*)
-    : > '{changed}'
-    '{real}' label '{task}' role={role} --url '{url}' --as '{lead}' > /dev/null || exit 1 ;;
-  esac
-fi
-if [ "$1" = tasks ] && [ "$2" = release ] && [ "$3" = '{task}' ]; then
-  echo release >> '{releases}'
-  if [ ! -e '{failed}' ]; then
-    : > '{failed}'
-    echo 'injected release failure' >&2
-    exit 1
-  fi
-fi
-exec '{real}' "$@"
-"#,
-        changed = changed.display(),
-        failed = failed.display(),
-        releases = releases.display(),
-        real = real.display(),
-        url = world.url,
-        lead = crate::world::LEAD,
-    );
-    crate::world::write_executable(&world.vb, &script);
-}
-
 /// Given `text` as the rider home's `rider.toml`.
 pub fn given_a_rider_toml(world: &World, text: &str) {
     let path = world.home.join("rider.toml");
@@ -959,4 +995,40 @@ pub fn agent_prompt(world: &World, task: &str, attempt: u32) -> String {
     let args = fake_agent::args(&world.root, task, attempt);
     let (_, prompt) = args.split_once("\n--\n").expect("the prompt follows --");
     prompt.to_string()
+}
+
+/// The pids of the board processes the daemon started, oldest first, from its log.
+pub fn boards_the_daemon_started(world: &World) -> Vec<u32> {
+    let log = fs::read_to_string(world.home.join("daemon.log")).unwrap_or_default();
+    (log.lines())
+        .filter(|line| line.contains(BOARD_STARTED))
+        .filter_map(|line| line.rsplit(' ').next()?.parse().ok())
+        .collect()
+}
+
+/// Waits up to `seconds` until the daemon has started `count` board processes; returns them.
+pub fn when_the_daemon_has_started_boards(world: &World, count: usize, seconds: u64) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let boards = boards_the_daemon_started(world);
+        if boards.len() >= count {
+            return boards;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon started {boards:?}, not {count} boards:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When the process group led by `pid` is sent SIGKILL.
+pub fn when_the_group_is_killed(pid: u32) {
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "killing group {pid} failed: {status}");
 }
