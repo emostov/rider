@@ -308,7 +308,6 @@ pub fn board_identity(url: &str, board: &dyn Board) -> Result<BoardIdentity, Boa
     }
     let identity = BoardIdentity::new(&board.identity()?);
     *known = Some((url.to_string(), identity.clone()));
-    assert!(known.is_some());
     Ok(identity)
 }
 
@@ -436,7 +435,8 @@ fn unneeded_on_branch(
         .collect();
     let mut targets: Vec<TaskId> = vec![onto];
     for task in &open {
-        let target = (label(task, BRANCH_LABEL).is_none())
+        let target = label(task, BRANCH_LABEL)
+            .is_none()
             .then(|| parse_id_label(task, "onto").ok().flatten())
             .flatten();
         if let Some(target) = target.filter(|target| {
