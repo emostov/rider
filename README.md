@@ -8,6 +8,9 @@ You tell one lead agent what you want. The lead splits the goal into tasks on a
 local board. Rider runs one agent per task, each in its own git worktree, with
 a model picked for the job.
 
+Fully configurable per repo so you can have sane workflows across both your most
+ambitious personal projects and more cautious production work.
+
 ## How it works
 
 **The lead** is your coding-agent session, guided by the `ride-swarm` skill. It plans the work, answers
@@ -17,7 +20,9 @@ channel while the rest of the work goes on.
 
 **The swarm** runs agents in roles you configure in `~/.rider/rider.toml`. Each role sets
 its agents' model and prompt and how many replicas run at once. `rider config` prints the
-settings in effect.
+settings in effect. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI)
+or `tact`, chosen per role with `harness` in `rider.toml`; each must be installed and signed in
+for the roles that use it.
 
 ## Getting started
 
