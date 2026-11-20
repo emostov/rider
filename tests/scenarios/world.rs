@@ -26,11 +26,13 @@ pub const MAIN: &str = "main";
 
 const COMMAND_SECONDS_MAX: u64 = 30;
 const OUTPUT_BYTES_MAX: u64 = 4 << 20;
+const LISTING_BYTES_MAX: u64 = 64 << 20;
 const BOARD_START_SECONDS_MAX: u64 = 30;
 const POLL_MILLIS: u64 = 100;
 const REAP_SECONDS_MAX: u64 = 5;
+const SWEEP_QUIET_POLLS: u32 = 5;
 const EVENTS_MAX: usize = 3;
-const AGENT_PIDS_MAX: usize = 256;
+const WORLD_PIDS_MAX: usize = 256;
 const PROCESSES_MAX: usize = 65_536;
 const DROP_FAILURES_MAX: usize = 4;
 const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -290,12 +292,12 @@ enum Event {
     Failed(RunError),
 }
 
-fn read_all(stream: impl Read, send: SyncSender<Event>, wrap: fn(String) -> Event) {
+fn read_all(stream: impl Read, send: SyncSender<Event>, wrap: fn(String) -> Event, most: u64) {
     let mut bytes = Vec::new();
-    let read = stream.take(OUTPUT_BYTES_MAX + 1).read_to_end(&mut bytes);
+    let read = stream.take(most + 1).read_to_end(&mut bytes);
     let event = match read {
         Err(error) => Event::Failed(RunError::Read(error)),
-        Ok(_) if u64::try_from(bytes.len()).map_or(true, |n| n > OUTPUT_BYTES_MAX) => {
+        Ok(_) if u64::try_from(bytes.len()).map_or(true, |n| n > most) => {
             Event::Failed(RunError::OutputTooLong)
         }
         Ok(_) => wrap(String::from_utf8_lossy(&bytes).into_owned()),
@@ -322,7 +324,19 @@ pub fn run_bounded(command: Command, input: Option<&str>) -> Output {
 
 /// Runs `command` in its own process group, feeding `input` and reading both outputs, and
 /// kills it and its group when the whole exchange fails or outlives `COMMAND_SECONDS_MAX`.
-pub fn run_within(mut command: Command, input: Option<&str>) -> Result<Output, RunError> {
+pub fn run_within(command: Command, input: Option<&str>) -> Result<Output, RunError> {
+    let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS_MAX);
+    run_until(command, input, deadline, OUTPUT_BYTES_MAX)
+}
+
+/// Runs `command` as `run_within` does, but until `deadline` and with `most` bytes per output.
+fn run_until(
+    mut command: Command,
+    input: Option<&str>,
+    deadline: Instant,
+    most: u64,
+) -> Result<Output, RunError> {
+    assert!(most > 0);
     if input.is_some() {
         command.stdin(Stdio::piped());
     }
@@ -330,7 +344,6 @@ pub fn run_within(mut command: Command, input: Option<&str>) -> Result<Output, R
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS_MAX);
     let mut child = command.spawn().map_err(RunError::Spawn)?;
     let (send, receive) = sync_channel(EVENTS_MAX);
     let mut events = 0;
@@ -348,15 +361,15 @@ pub fn run_within(mut command: Command, input: Option<&str>) -> Result<Output, R
     }
     if let Some(stdout) = child.stdout.take() {
         let send = send.clone();
-        thread::spawn(move || read_all(stdout, send, Event::Stdout));
+        thread::spawn(move || read_all(stdout, send, Event::Stdout, most));
         events += 1;
     }
     if let Some(stderr) = child.stderr.take() {
-        thread::spawn(move || read_all(stderr, send, Event::Stderr));
+        thread::spawn(move || read_all(stderr, send, Event::Stderr, most));
         events += 1;
     }
     assert!(events <= EVENTS_MAX);
-    let finished = finish_within(&mut child, &receive, events, deadline);
+    let finished = finish_within(&mut child, &receive, events, deadline, most);
     match finished {
         Ok(output) => Ok(output),
         Err(_) if !reap(&mut child) => Err(RunError::Unkilled),
@@ -369,6 +382,7 @@ fn finish_within(
     receive: &Receiver<Event>,
     mut events: usize,
     deadline: Instant,
+    most: u64,
 ) -> Result<Output, RunError> {
     let step = Duration::from_millis(POLL_MILLIS / 10);
     let mut output = Output {
@@ -406,15 +420,16 @@ fn finish_within(
         }
         events -= 1;
     }
-    let within = |text: &str| u64::try_from(text.len()).is_ok_and(|n| n <= OUTPUT_BYTES_MAX);
+    let within = |text: &str| u64::try_from(text.len()).is_ok_and(|n| n <= most);
     assert!(within(&output.stdout) && within(&output.stderr));
     Ok(output)
 }
 
 fn kill(pid: u32, group: bool) {
     assert!(pid > 1, "never signal init or every process");
-    let pid = i32::try_from(pid).ok().and_then(Pid::from_raw);
-    let pid = pid.expect("a running process's pid is positive");
+    let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return;
+    };
     // The target may already be gone; whoever needs it dead checks that afterwards.
     let _ = if group {
         kill_process_group(pid, Signal::KILL)
@@ -439,15 +454,33 @@ fn reap(child: &mut Child) -> bool {
     false
 }
 
-/// The pids of processes running this world's fake agents, found by their scripts' literal
-/// paths as whole words of their command lines.
-fn agent_pids(world: &World) -> Result<Vec<u32>, String> {
-    let scripts = ["claude", "codex"].map(|name| world.agents.join(name).display().to_string());
+/// Records `pid` as one of the world's processes, failing past `WORLD_PIDS_MAX` of them.
+fn own(pids: &mut Vec<u32>, pid: u32) -> Result<(), String> {
+    if pid <= 1 || pid == std::process::id() {
+        return Ok(());
+    }
+    if pids.len() == WORLD_PIDS_MAX {
+        return Err(format!(
+            "over {WORLD_PIDS_MAX} of the world's processes run"
+        ));
+    }
+    pids.push(pid);
+    assert!(pids.len() <= WORLD_PIDS_MAX);
+    Ok(())
+}
+
+/// The pids of the processes that carry this world's `WORLD_VAR`: every process the world
+/// started and every descendant that kept its environment, whatever its command line.
+#[cfg(target_os = "macos")]
+fn world_pids(world: &World, deadline: Instant) -> Result<Vec<u32>, String> {
+    let mark = format!("{}={}", fake_agent::WORLD_VAR, world.root.display());
     let mut command = Command::new("/bin/ps");
+    // `-E` appends each process's environment, as `NAME=value` words, to its command line.
     command
-        .args(["-A", "-ww", "-o", "pid=,command="])
+        .args(["-E", "-A", "-ww", "-o", "pid=,command="])
         .stdin(Stdio::null());
-    let output = run_within(command, None).map_err(|error| format!("ps failed: {error:?}"))?;
+    let output = run_until(command, None, deadline, LISTING_BYTES_MAX)
+        .map_err(|error| format!("ps failed: {error:?}"))?;
     if output.code != Some(0) {
         return Err(format!("ps exited {:?}: {}", output.code, output.stderr));
     }
@@ -461,22 +494,83 @@ fn agent_pids(world: &World) -> Result<Vec<u32>, String> {
         let pid: u32 = pid
             .parse()
             .map_err(|_| format!("unrecognised ps line {line:?}"))?;
-        let runs_agent = scripts.iter().any(|script| {
-            rest.match_indices(script.as_str()).any(|(at, _)| {
-                let after = &rest[at..][script.len()..];
-                (at == 0 || rest[..at].ends_with(' '))
-                    && (after.is_empty() || after.starts_with(' '))
-            })
-        });
-        if runs_agent && pid > 1 {
-            if pids.len() == AGENT_PIDS_MAX {
-                return Err(format!("over {AGENT_PIDS_MAX} fake agents are running"));
-            }
-            pids.push(pid);
+        if rest.split(' ').any(|word| word == mark) {
+            own(&mut pids, pid)?;
         }
     }
-    assert!(pids.len() <= AGENT_PIDS_MAX);
     Ok(pids)
+}
+
+/// The pids of the processes that carry this world's `WORLD_VAR`: every process the world
+/// started and every descendant that kept its environment, whatever its command line.
+#[cfg(target_os = "linux")]
+fn world_pids(world: &World, deadline: Instant) -> Result<Vec<u32>, String> {
+    let mark = format!("{}={}", fake_agent::WORLD_VAR, world.root.display());
+    let entries = fs::read_dir("/proc").map_err(|error| format!("reading /proc: {error}"))?;
+    let mut pids = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= PROCESSES_MAX {
+            return Err(format!("/proc lists over {PROCESSES_MAX} entries"));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("listing /proc outlived {REAP_SECONDS_MAX} seconds"));
+        }
+        let entry = entry.map_err(|error| format!("reading /proc: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        // A process that ended, or that another user owns, is not the world's.
+        let Ok(file) = fs::File::open(entry.path().join("environ")) else {
+            continue;
+        };
+        let mut environ = Vec::new();
+        if file
+            .take(LISTING_BYTES_MAX)
+            .read_to_end(&mut environ)
+            .is_err()
+        {
+            continue;
+        }
+        if environ
+            .split(|&byte| byte == 0)
+            .any(|word| word == mark.as_bytes())
+        {
+            own(&mut pids, pid)?;
+        }
+    }
+    Ok(pids)
+}
+
+/// Kills every process of the world and its group until none is left within `REAP_SECONDS_MAX`.
+fn sweep(world: &World) -> Result<(), String> {
+    // Rider starts each feed and board call in a process group of its own, so killing the
+    // pool's group misses them, and they outlive a pool that exited or was killed. A process
+    // forking while it is listed leaves a child that listing missed, so the world is clean
+    // only once `SWEEP_QUIET_POLLS` listings in a row find nothing.
+    let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
+    let mut quiet = 0;
+    let mut last = Vec::new();
+    while quiet < SWEEP_QUIET_POLLS {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the world's processes {last:?} outlived {REAP_SECONDS_MAX} seconds of sweeping"
+            ));
+        }
+        last = world_pids(world, deadline)?;
+        quiet = if last.is_empty() { quiet + 1 } else { 0 };
+        for &pid in &last {
+            kill(pid, true);
+            kill(pid, false);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(Duration::from_millis(POLL_MILLIS).min(left));
+    }
+    assert_eq!(quiet, SWEEP_QUIET_POLLS);
+    Ok(())
 }
 
 impl Drop for World {
@@ -491,19 +585,14 @@ impl Drop for World {
         for pid in fake_agent::running_pids(&self.root) {
             kill(pid, true);
         }
-        match agent_pids(self) {
-            Ok(pids) => {
-                for pid in pids {
-                    kill(pid, true);
-                    kill(pid, false);
-                }
-            }
-            Err(why) => failures.push(why),
-        }
         if let Some(mut board) = self.board.take()
             && !reap(&mut board)
         {
             failures.push("the board outlived its kill".to_string());
+        }
+        // A live process can still write into the directory, so all die before it is removed.
+        if let Err(why) = sweep(self) {
+            failures.push(why);
         }
         if let Some(dir) = self.dir.take()
             && let Err(error) = dir.close()
