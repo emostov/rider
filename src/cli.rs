@@ -24,7 +24,7 @@ use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
-use crate::harness::{CommandLine, LOG_BYTES_MAX};
+use crate::harness::LOG_BYTES_MAX;
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
@@ -227,7 +227,6 @@ pub struct Vars {
     pub rider_home: Option<OsString>,
     pub home: Option<OsString>,
     pub board_url: Option<OsString>,
-    pub path: Option<OsString>,
 }
 
 /// Reads every environment variable rider uses, once.
@@ -236,20 +235,26 @@ pub fn read_vars() -> Vars {
         rider_home: env::var_os("RIDER_HOME"),
         home: env::var_os("HOME"),
         board_url: env::var_os("BOARD_URL"),
-        path: env::var_os("PATH"),
     }
 }
 
 /// Where rider's files are and how to reach the board, checked once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// Absolute and UTF-8.
-    pub home: PathBuf,
-    pub board_url: String,
-    pub inherited_path: Option<String>,
+    // Absolute and UTF-8.
+    home: PathBuf,
+    board_url: String,
 }
 
 impl Config {
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn board_url(&self) -> &str {
+        &self.board_url
+    }
+
     fn vb_dir(&self) -> PathBuf {
         self.home.join(VB_DIR)
     }
@@ -291,52 +296,36 @@ impl fmt::Display for ConfigError {
 
 /// Checks the environment variables and fills in defaults.
 pub fn config(vars: Vars) -> Result<Config, ConfigError> {
-    let text = |value: Option<OsString>, var: &'static str| match value {
-        None => Ok(None),
-        Some(value) => match value.into_string() {
-            Ok(text) if text.is_empty() && var != "PATH" => Err(ConfigError::Empty(var)),
-            Ok(text) => Ok(Some(text)),
-            Err(_) => Err(ConfigError::NotUnicode(var)),
-        },
+    let text = |value: OsString, var: &'static str| match value.into_string() {
+        Ok(text) if text.is_empty() => Err(ConfigError::Empty(var)),
+        Ok(text) => Ok(text),
+        Err(_) => Err(ConfigError::NotUnicode(var)),
     };
-    let home = match (
-        text(vars.rider_home, "RIDER_HOME")?,
-        text(vars.home, "HOME")?,
-    ) {
-        (Some(rider_home), _) => (PathBuf::from(&rider_home), "RIDER_HOME", rider_home),
-        (None, Some(home)) => (Path::new(&home).join(HOME_DEFAULT_DIR), "HOME", home),
+    let (home, var, value) = match (vars.rider_home, vars.home) {
+        (Some(rider_home), _) => {
+            let value = text(rider_home, "RIDER_HOME")?;
+            (PathBuf::from(&value), "RIDER_HOME", value)
+        }
+        (None, Some(home)) => {
+            let value = text(home, "HOME")?;
+            (Path::new(&value).join(HOME_DEFAULT_DIR), "HOME", value)
+        }
         (None, None) => return Err(ConfigError::NoHome),
     };
-    let (home, var, value) = home;
     if !home.is_absolute() {
         return Err(ConfigError::NotAbsolute { var, value });
     }
     if value.contains(':') {
         return Err(ConfigError::HomeHasColon(value));
     }
-    let board_url = text(vars.board_url, "BOARD_URL")?;
-    let config = Config {
-        home,
-        board_url: board_url.unwrap_or_else(|| DEFAULT_BOARD_URL.to_string()),
-        inherited_path: text(vars.path, "PATH")?,
+    let board_url = match vars.board_url {
+        Some(url) => text(url, "BOARD_URL")?,
+        None => DEFAULT_BOARD_URL.to_string(),
     };
+    let config = Config { home, board_url };
     assert!(config.home.is_absolute() && config.home.to_str().is_some());
     assert!(!config.board_url.is_empty());
     Ok(config)
-}
-
-/// `cmd` with `vb_dir` put first on its `PATH`, ahead of `inherited` when there is one.
-pub fn with_vb_on_path(cmd: &CommandLine, vb_dir: &str, inherited: Option<&str>) -> CommandLine {
-    assert!(!vb_dir.is_empty() && !vb_dir.contains(':'));
-    let path = match inherited {
-        Some(inherited) if !inherited.is_empty() => format!("{vb_dir}:{inherited}"),
-        _ => vb_dir.to_string(),
-    };
-    let mut with = cmd.clone();
-    with.env.retain(|(name, _)| name != "PATH");
-    with.env.push(("PATH".to_string(), path));
-    assert!(with.env.iter().filter(|(name, _)| name == "PATH").count() == 1);
-    with
 }
 
 /// A command that could not finish.
@@ -454,7 +443,7 @@ fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliErro
     if urls.len() > REAP_URLS_MAX {
         return Err(CliError::TooManyUrls);
     }
-    let leaks = reap::find_leaks_on(&config.board_url, urls).map_err(CliError::Reap)?;
+    let leaks = reap::find_leaks_on(config.board_url(), urls).map_err(CliError::Reap)?;
     for leak in &leaks {
         say(&reap::leak_line(leak));
     }
@@ -547,7 +536,6 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
         prompts: config.prompts(),
         vb: config.vb_dir().join("vb"),
         board_url: config.board_url.clone(),
-        inherited_path: config.inherited_path.clone(),
     };
     assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
@@ -1160,7 +1148,6 @@ mod tests {
         Config {
             home: home.to_path_buf(),
             board_url: DEFAULT_BOARD_URL.to_string(),
-            inherited_path: None,
         }
     }
 
@@ -1239,7 +1226,6 @@ mod tests {
     fn config_defaults_to_home_and_the_local_board() {
         let vars = Vars {
             home: Some("/Users/someone".into()),
-            path: Some("/usr/bin:/bin".into()),
             ..Vars::default()
         };
         assert_eq!(
@@ -1247,7 +1233,6 @@ mod tests {
             Ok(Config {
                 home: PathBuf::from("/Users/someone/.rider"),
                 board_url: "http://127.0.0.1:4100/api/board".to_string(),
-                inherited_path: Some("/usr/bin:/bin".to_string()),
             })
         );
         let vars = Vars {
@@ -1260,7 +1245,6 @@ mod tests {
             Ok(Config {
                 home: PathBuf::from("/srv/rider"),
                 board_url: "http://127.0.0.1:5000/api/board".to_string(),
-                inherited_path: None,
             })
         );
     }
@@ -1296,12 +1280,15 @@ mod tests {
             ..Vars::default()
         };
         assert_eq!(config(home), Err(ConfigError::NotUnicode("RIDER_HOME")));
-        let path = Vars {
+        let ignored = Vars {
             rider_home: Some("/srv/rider".into()),
-            path: bad(),
+            home: bad(),
             ..Vars::default()
         };
-        assert_eq!(config(path), Err(ConfigError::NotUnicode("PATH")));
+        assert_eq!(
+            config(ignored).map(|config| config.home),
+            Ok(PathBuf::from("/srv/rider"))
+        );
     }
 
     #[test]
@@ -1313,51 +1300,6 @@ mod tests {
         assert_eq!(
             config(colon),
             Err(ConfigError::HomeHasColon("/srv/a:b".to_string()))
-        );
-    }
-
-    #[test]
-    fn puts_vb_first_on_the_agents_path() {
-        let cmd = CommandLine {
-            program: "claude".to_string(),
-            args: vec!["-p".to_string()],
-            env: vec![("BOARD_TASK".to_string(), "7".to_string())],
-        };
-        let with = with_vb_on_path(&cmd, "/h/node/node_modules/.bin", Some("/usr/bin:/bin"));
-        assert_eq!(
-            with,
-            CommandLine {
-                program: "claude".to_string(),
-                args: vec!["-p".to_string()],
-                env: vec![
-                    ("BOARD_TASK".to_string(), "7".to_string()),
-                    (
-                        "PATH".to_string(),
-                        "/h/node/node_modules/.bin:/usr/bin:/bin".to_string()
-                    ),
-                ],
-            }
-        );
-        let alone = with_vb_on_path(&cmd, "/h/node/node_modules/.bin", None);
-        assert_eq!(
-            alone.env[1],
-            ("PATH".to_string(), "/h/node/node_modules/.bin".to_string())
-        );
-        let empty = with_vb_on_path(&cmd, "/h/bin", Some(""));
-        assert_eq!(empty.env[1], ("PATH".to_string(), "/h/bin".to_string()));
-    }
-
-    #[test]
-    fn a_path_the_command_already_sets_is_replaced() {
-        let cmd = CommandLine {
-            program: "codex".to_string(),
-            args: Vec::new(),
-            env: vec![("PATH".to_string(), "/old".to_string())],
-        };
-        let with = with_vb_on_path(&cmd, "/h/bin", Some("/usr/bin"));
-        assert_eq!(
-            with.env,
-            vec![("PATH".to_string(), "/h/bin:/usr/bin".to_string())]
         );
     }
 

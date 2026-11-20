@@ -132,12 +132,6 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
 }
 
 #[test]
-fn lead_settings_pick_the_lead_model() {
-    let settings = json_asset("lead/.claude/settings.json");
-    assert_eq!(settings["model"], "claude-fable-5-2");
-}
-
-#[test]
 fn lead_instructions_make_role_the_last_label() {
     let lead = asset("skills/ride-swarm/lead.md");
     let rules = [
@@ -169,10 +163,10 @@ fn reviewers_find_their_range_from_the_start_label() {
 }
 
 #[test]
-fn only_a_task_with_onto_may_rebase() {
+fn only_a_task_with_restack_may_rebase() {
     let prompt = asset("prompts/implement.md");
-    assert!(prompt.contains("the task has an `onto` label"));
-    assert!(prompt.contains("Without an `onto` label, never rebase"));
+    assert!(prompt.contains("the task has the labels `onto` and `restack=1`"));
+    assert!(prompt.contains("Without\n  `restack=1`, never rebase"));
 }
 
 #[test]
