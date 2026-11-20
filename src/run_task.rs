@@ -1301,8 +1301,9 @@ mod tests {
             reason: reason.to_string(),
         };
         assert_eq!(run(&env, &board, &idle), expected);
-        let last = calls(&board).last().cloned();
-        assert_eq!(last, Some(format!("fail 7 {reason}")));
+        // The fenced fail comes before the attempt label and the log reply.
+        let fenced = calls(&board).iter().rev().nth(2).cloned();
+        assert_eq!(fenced, Some(format!("fail 7 {reason}")));
 
         let (fixture, env) = setup("run-dirty");
         let board = FakeBoard::new(vec![task(&fixture, &[])]);
@@ -1539,7 +1540,7 @@ mod tests {
             let (verdict, calls) = judged(&env, &board, &wander);
             assert_eq!(verdict, expected, "{args:?}");
             assert_eq!(
-                calls.last(),
+                calls.iter().rev().nth(2),
                 Some(&format!("fail 7 {}", verdict_reason(&expected)))
             );
         }
@@ -1583,8 +1584,8 @@ mod tests {
         let head = git(&fixture.repo, &["rev-parse", "rider/3-store"]);
         let expected = vec![
             "set_label 7 branch=rider/3-store".to_string(),
-            "complete 7 Extracted the store.".to_string(),
             start,
+            "complete 7 Extracted the store.".to_string(),
             record(Some("rider/3-store"), &head, 1, "Extracted the store."),
         ];
         assert_eq!(calls(&board), expected);

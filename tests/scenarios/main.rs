@@ -648,20 +648,20 @@ fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_wr
 }
 
 #[test]
-fn a_second_sigterm_while_a_failure_is_being_written_releases_the_task_uncounted() {
+fn a_second_sigterm_while_the_fenced_fail_is_in_flight_finishes_the_failure() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_the_agent_will(&world, &task, &[Behaviour::ExitNonZero]);
-    let marker = world.root.join("reply-started");
-    given_vb_replies_slowly(&world, &marker, 3);
+    let marker = world.root.join("fail-started");
+    given_vb_runs_slowly(&world, "fail", &marker, 3);
     given_a_running_daemon(&mut world);
     let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
     while !marker.exists() {
         assert!(
             Instant::now() < deadline,
-            "no reply began:\n{}",
+            "no fail began:\n{}",
             world.pool_log()
         );
         thread::sleep(Duration::from_millis(100));
@@ -671,10 +671,42 @@ fn a_second_sigterm_while_a_failure_is_being_written_releases_the_task_uncounted
     when_the_daemon_is_sent_sigterm(&world);
 
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
-    assert_eq!(task_state(&world, &task), "ready");
-    assert_eq!(task_label(&world, &task, "attempt"), None);
+    assert_eq!(task_state(&world, &task), "failed");
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
     let log = fs::read_to_string(world.home.join("daemon.log")).expect("read daemon.log");
-    assert!(log.contains("instead of settling: stop-now"), "{log}");
+    assert!(
+        log.contains("after stop-now: it was written before"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_task_onto_one_that_is_still_settling_waits_for_its_worktree_and_completes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
+    // The result record is posted after the fenced complete and before the worktree is
+    // released, so the fix is ready while the branch is still checked out.
+    given_vb_runs_slowly(&world, "post", &world.root.join("posted"), 3);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&built, &fix]);
+
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(agent_runs_for(&world, &fix).len(), 1);
+    assert_eq!(
+        task_label(&world, &fix, "branch"),
+        task_label(&world, &built, "branch")
+    );
 }
 
 #[test]
@@ -1141,7 +1173,7 @@ fn a_panicking_world_kills_its_wrapped_vb_and_spares_a_process_that_names_its_pa
         return;
     };
     world.start_board();
-    given_vb_replies_slowly(&world, &world.root.join("replied"), 1);
+    given_vb_runs_slowly(&world, "reply", &world.root.join("replied"), 1);
     let mut observer = Command::new("/usr/bin/tail")
         .arg("-f")
         .arg(world.root.join("board.log"))

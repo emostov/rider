@@ -156,6 +156,8 @@ pub struct Task {
     /// Index into the config's roles; `None` when the task has no known role.
     pub role: Option<usize>,
     pub branch: Option<String>,
+    /// The task whose branch this one continues, from its `onto` label.
+    pub onto: Option<TaskId>,
     /// The project the task's channel names under `work/`, if it names one.
     pub project: Option<String>,
     /// The task's board version: the cursor of the newest event this was learned from.
@@ -986,6 +988,7 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         state: task_state,
         role: role_of(&state.config, &feed.labels),
         branch: label(&feed.labels, "branch"),
+        onto: onto_of(&feed.labels),
         project: project_of(&feed.channel),
         seen: feed.cursor,
         claim_refused: false,
@@ -1147,6 +1150,7 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
                 state: view.state,
                 role: role_of(&state.config, &view.labels),
                 branch: label(&view.labels, "branch"),
+                onto: onto_of(&view.labels),
                 project: project_of(channel),
                 seen: view.version,
                 claim_refused: false,
@@ -1181,6 +1185,14 @@ fn label(labels: &[(String, String)], key: &str) -> Option<String> {
     assert!(labels.len() <= LABELS_MAX);
     let found = labels.iter().find(|(name, _)| name == key);
     found.map(|(_, value)| value.clone())
+}
+
+// A malformed `onto` is left to preparation, which blocks the task as an invalid brief.
+fn onto_of(labels: &[(String, String)]) -> Option<TaskId> {
+    assert!(labels.len() <= LABELS_MAX);
+    let value = label(labels, "onto")?;
+    let digits = value.strip_prefix('#').unwrap_or(&value);
+    digits.parse::<u64>().ok().map(TaskId)
 }
 
 fn role_of(config: &Config, labels: &[(String, String)]) -> Option<usize> {
@@ -1742,10 +1754,13 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
         let Some(role) = role else {
             continue;
         };
-        let taken = state
-            .runs
-            .iter()
-            .any(|run| run.task == task.id || (task.branch.is_some() && run.branch == task.branch));
+        // A task `onto` one whose run is still settling waits: that run's worktree holds the
+        // branch until its settle releases it.
+        let taken = state.runs.iter().any(|run| {
+            run.task == task.id
+                || (task.branch.is_some() && run.branch == task.branch)
+                || task.onto == Some(run.task)
+        });
         if task.state != TaskState::Ready || taken {
             continue;
         }
