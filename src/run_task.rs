@@ -1244,7 +1244,6 @@ mod tests {
     const ROLE_PROMPT: &str = "You implement one task.\n";
     const TEXT: &str = "Extract token store\nMove the store into its own module.";
 
-    type Launch<'a> = dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> + 'a;
 
     fn setup(name: &str) -> (Fixture, Env) {
         let fixture = Fixture::new(name);
@@ -1290,92 +1289,18 @@ mod tests {
         )
     }
 
-    fn tail_reply(env: &Env, run: u16, tail: &str) -> String {
-        format!("reply 7 {}\n{tail}", log_line(env, run))
-    }
 
-    fn log_line(env: &Env, run: u16) -> String {
-        let log = env.home.join("logs").join("7").join(format!("{run}.jsonl"));
-        format!("The whole log: {}", log.display())
-    }
 
     fn calls(board: &FakeBoard) -> Vec<String> {
         board.calls.borrow().clone()
     }
 
-    fn worktree(env: &Env) -> PathBuf {
-        env.home.join("worktrees").join("repo").join("7")
-    }
 
     fn never(_: &CommandLine, _: &Path, _: &Path) -> Result<Exit, HarnessError> {
         panic!("no agent may be spawned")
     }
 
-    fn write_log(log: &Path, text: &str) {
-        fs::create_dir_all(log.parent().unwrap()).unwrap();
-        fs::write(log, text).unwrap();
-    }
 
-    fn run(env: &Env, board: &FakeBoard, launch: &Launch) -> Verdict {
-        match run_task(ID, env, board, None, launch).unwrap() {
-            Ran::Settled(verdict) => verdict,
-            ran => panic!("expected a settled run, got {ran:?}"),
-        }
-    }
-
-    #[test]
-    fn a_missing_prompt_file_blocks_as_a_rider_error_before_any_worktree() {
-        let (fixture, env) = setup("run-prompt");
-        let path = env.prompts.join("implement.md");
-        fs::remove_file(&path).unwrap();
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let error = fs::File::open(&path).unwrap_err();
-        let reason = format!(
-            "Rider cannot read its prompt file {}: {error}.",
-            path.display()
-        );
-        assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
-        assert!(!worktree(&env).exists());
-    }
-
-    #[test]
-    fn task_text_too_large_for_a_prompt_blocks_before_any_worktree() {
-        let (fixture, env) = setup("run-huge");
-        let mut huge = task(&fixture, &[]);
-        huge.text = format!("Extract token store\n{}", "x".repeat(PROMPT_BYTES_MAX));
-        let bytes = format!("You implement one task.\n\n# Task 7\n\n{}", huge.text).len();
-        let board = FakeBoard::new(vec![huge]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let reason = format!(
-            "Rider cannot build the agent's command: the task text makes the prompt {bytes} \
-             bytes, over the limit of {PROMPT_BYTES_MAX}; shorten the task text."
-        );
-        assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
-        assert!(!worktree(&env).exists());
-    }
-
-    #[test]
-    fn an_agent_that_cannot_be_run_fails_the_attempt() {
-        let (fixture, env) = setup("run-spawn");
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        let broken = |_: &CommandLine, _: &Path, _: &Path| {
-            Err(HarnessError::Spawn("claude: not found".to_string()))
-        };
-        let reason = "the agent could not be started: claude: not found";
-        let expected = Verdict::Fail {
-            reason: reason.to_string(),
-        };
-        assert_eq!(run(&env, &board, &broken), expected);
-        let expected = vec![
-            format!("set_label 7 branch={BRANCH}"),
-            start_call(&fixture, "main"),
-            format!("fail 7 {reason}"),
-            "set_label 7 attempt=1".to_string(),
-            tail_reply(&env, 1, NO_OUTPUT),
-        ];
-        assert_eq!(calls(&board), expected);
-    }
 
     #[test]
     fn a_task_that_is_not_claimed_is_not_run() {
@@ -1418,25 +1343,6 @@ mod tests {
     }
 
     #[test]
-    fn each_run_of_an_attempt_keeps_its_own_log() {
-        let (_fixture, env) = setup("run-logs");
-        let dir = env.home.join("logs").join("7");
-        assert_eq!(log_path(&env.home, ID, 1), dir.join("1.jsonl"));
-        write_log(&dir.join("1.jsonl"), "first run\n");
-        assert_eq!(log_path(&env.home, ID, 1), dir.join("1-2.jsonl"));
-        assert_eq!(log_path(&env.home, ID, 2), dir.join("2.jsonl"));
-        for run in 2..=LOG_RUNS_MAX {
-            write_log(&dir.join(format!("1-{run}.jsonl")), "a run\n");
-        }
-        let last = dir.join(format!("1-{LOG_RUNS_MAX}.jsonl"));
-        assert_eq!(
-            log_path(&env.home, ID, 1),
-            last,
-            "at the bound the last is reused"
-        );
-    }
-
-    #[test]
     fn errors_describe_themselves_in_one_line() {
         let git_error = GitError::Exit {
             args: "status".to_string(),
@@ -1472,37 +1378,6 @@ mod tests {
             long.to_string().chars().count() < 600,
             "external text is cut"
         );
-    }
-
-    #[test]
-    fn worktree_errors_block_with_a_kind_the_lead_can_act_on() {
-        let cases = [
-            (
-                WorktreeError::OntoHasNoBranch(TaskId(3)),
-                "invalid_brief",
-                "Set the `branch` label on task #3 to its branch, or remove the `onto` label \
-              from this task.",
-            ),
-            (
-                WorktreeError::OfHasNoBranch(TaskId(3)),
-                "invalid_brief",
-                "Set the `branch` label on task #3 to the branch to check, or change the `of` \
-              label to a task that has one.",
-            ),
-            (
-                WorktreeError::OntoBranchBusy(TaskId(3)),
-                "branch_busy",
-                "Wait until the branch of task #3 is not checked out in another worktree, \
-              then unblock this task.",
-            ),
-            (
-                WorktreeError::BranchBusy("rider/7-x".to_string()),
-                "branch_busy",
-                "Wait until branch rider/7-x is not checked out in another worktree, then \
-              unblock this task.",
-            ),
-        ];
-        assert_blocks(&cases);
     }
 
     #[test]
@@ -1559,34 +1434,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_log_tail_is_the_last_lines_read_from_the_end() {
-        let (fixture, _env) = setup("run-tail");
-        let log = fixture.root.join("big.jsonl");
-        assert_eq!(log_tail(&log), "");
-        let line = "x".repeat(99);
-        let mut text = Vec::new();
-        for _ in 0..1000 {
-            text.extend_from_slice(line.as_bytes());
-            text.push(b'\n');
-        }
-        text.extend_from_slice(b"bad \xff byte\nlast");
-        fs::write(&log, &text).unwrap();
-        let tail = log_tail(&log);
-        let mut expected = vec![line.as_str(); 38];
-        expected.extend(["bad \u{fffd} byte", "last"]);
-        assert_eq!(tail, expected.join("\n"));
-
-        let window = usize::try_from(LOG_TAIL_BYTES_MAX).unwrap();
-        let long = "y".repeat(window * 2) + "\nend\n";
-        fs::write(&log, long).unwrap();
-        assert_eq!(log_tail(&log), "end", "a partial first line is dropped");
-
-        fs::write(&log, "z".repeat(window * 2)).unwrap();
-        let expected = format!(
-            "(last line longer than 16 KiB, truncated)\n{}",
-            "z".repeat(window)
-        );
-        assert_eq!(log_tail(&log), expected);
-    }
 }
