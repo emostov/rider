@@ -213,16 +213,19 @@ impl FeedReader {
             return Err(FeedError::Ended);
         }
         for _ in 0..POLLS_MAX {
+            let mut received = None;
             if self.drained {
                 thread::sleep(POLL_INTERVAL);
             } else {
                 match self.lines.recv_timeout(POLL_INTERVAL) {
-                    Ok(Received::Line(line)) => return line_event(line),
-                    Ok(Received::Failed(error)) => return Err(error),
+                    Ok(Received::Line(line)) => received = Some(line_event(line)),
+                    Ok(Received::Failed(error)) => received = Some(Err(error)),
                     Ok(Received::End) | Err(RecvTimeoutError::Disconnected) => self.drained = true,
                     Err(RecvTimeoutError::Timeout) => {}
                 }
             }
+            // The exit is checked whatever arrived, so a descendant that keeps stdout busy
+            // cannot postpone it.
             if !self.exited {
                 let child = WaitId::Pid(Pid::from_child(&self.child));
                 let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
@@ -231,14 +234,17 @@ impl FeedReader {
                     .map_err(|error| FeedError::Io(error.to_string()))?
                     .is_some();
             }
-            if !self.drained && !self.exited {
-                continue;
+            if self.drained || self.exited {
+                // A descendant may hold stdout after `vb` exits, or `vb` may close it and keep
+                // running: either way the other end gets `END_GRACE` from the first of the
+                // two, which later output does not extend, then the group is killed.
+                let since = *self.ending_since.get_or_insert_with(Instant::now);
+                if self.drained && self.exited || since.elapsed() >= END_GRACE {
+                    return self.finish();
+                }
             }
-            // A descendant may hold stdout after `vb` exits, or `vb` may close it and keep
-            // running: either way the other end gets `END_GRACE`, then the group is killed.
-            let since = *self.ending_since.get_or_insert_with(Instant::now);
-            if self.drained && self.exited || since.elapsed() >= END_GRACE {
-                return self.finish();
+            if let Some(item) = received {
+                return item;
             }
         }
         assert!(!self.ended);
@@ -675,6 +681,62 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_exit_while_a_descendant_keeps_printing() {
+        const CALLS_MAX: u32 = 10_000_000;
+        let unique = format!("rider-feed-chatty-pid-{}", std::process::id());
+        let pid_file = std::env::temp_dir().join(unique);
+        let body = format!(
+            "while :; do echo '{}'; done &\necho $! > '{}'\nexit 3\n",
+            r#"{"cursor":"8","type":"future.event"}"#,
+            pid_file.display(),
+        );
+        let (mut feed, dir) = reader("chatty", &body);
+        let started = Instant::now();
+        let mut exits = Vec::new();
+        for _ in 0..CALLS_MAX {
+            match feed.next_item() {
+                Ok(FeedItem::Event(_)) => {
+                    let elapsed = started.elapsed();
+                    assert!(elapsed < Duration::from_secs(10), "no exit in {elapsed:?}");
+                }
+                Err(FeedError::Ended) => break,
+                item => exits.push(item.unwrap()),
+            }
+        }
+        let elapsed = started.elapsed();
+        drop(feed);
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        fs::remove_file(&pid_file).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(exits, [FeedItem::Exited { code: Some(3) }]);
+        assert!(
+            elapsed < END_GRACE + Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
+        assert!(
+            gone(pid.trim()),
+            "the descendant {} outlived the feed",
+            pid.trim()
+        );
+    }
+
+    /// Whether the process `pid` is gone within five seconds.
+    fn gone(pid: &str) -> bool {
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            !alive()
+        })
+    }
+
+    #[test]
     fn dropping_the_feed_kills_its_process_group() {
         let unique = format!("rider-feed-group-pid-{}", std::process::id());
         let pid_file = std::env::temp_dir().join(unique);
@@ -692,19 +754,11 @@ mod tests {
         let pid = fs::read_to_string(&pid_file).unwrap();
         fs::remove_file(&pid_file).unwrap();
         fs::remove_dir_all(dir).unwrap();
-        let alive = || {
-            Command::new("kill")
-                .args(["-0", pid.trim()])
-                .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
-        };
-        let gone = (0..100).any(|_| {
-            std::thread::sleep(Duration::from_millis(50));
-            !alive()
-        });
-        assert!(gone, "the descendant {} outlived the feed", pid.trim());
+        assert!(
+            gone(pid.trim()),
+            "the descendant {} outlived the feed",
+            pid.trim()
+        );
     }
 
     #[test]
