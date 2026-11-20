@@ -139,3 +139,43 @@ fn a_failed_agents_log_tail_reply_keeps_whole_lines_from_the_end_within_the_limi
     assert!(lines.len() > 20, "{reply}");
     assert_eq!(lines, expected);
 }
+
+const CLOSED_URL: &str = "http://127.0.0.1:9/api/board";
+
+#[test]
+fn a_claim_by_a_vb_that_cannot_reach_the_board_marks_the_board_down() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" claim "*)
+  previous=
+  for word; do
+    shift
+    [ "$previous" = --url ] && word='{CLOSED_URL}'
+    set -- "$@" "$word"
+    previous=$word
+  done;;
+esac
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    write_executable(&world.vb, &script);
+    given_a_running_daemon(&mut world);
+
+    let down = when_rider_status_shows_within(&world, "board down, 0 of", 60);
+
+    assert!(
+        down,
+        "rider status never said the board was down:\n{}",
+        world.daemon_log()
+    );
+    assert_eq!(agents_running(&world), 0);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
