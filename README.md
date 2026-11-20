@@ -46,15 +46,6 @@ Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` 
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
 review threads) and saves the answers in `~/.rider/ship.toml`.
 
-## Safety
-
-- **Agents run unsandboxed, with permission prompts skipped.** They can read
-  and change anything your user can. Only point Rider at repositories you are
-  prepared to have changed.
-- **The Rider binary never pushes, opens a pull request, or merges.** Work stays on
-  local branches named `rider/<task id>-<slug>`. The `ship-swarm` skill pushes branches
-  and opens pull requests only when you ask it to.
-
 ## Status
 
 Rider is early. `rider daemon` runs the swarm from the board's event feed; `rider up`,
