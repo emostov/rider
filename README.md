@@ -41,9 +41,7 @@ review threads) and saves the answers in `~/.rider/ship.toml`.
 
 ## Status
 
-Rider is early. `rider daemon` runs the swarm from the board's event feed; `rider up`,
-`rider status` and `rider chat` are next. Until then, the `ride-swarm` skill asks you to
-run `rider pool <project>` in a terminal of your own.
+Rider is early and still developing basic features.
 
 ## Docs
 
