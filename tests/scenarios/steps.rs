@@ -403,3 +403,176 @@ impl World {
         fake_agent::most_at_once(&self.root)
     }
 }
+
+/// How long a scenario waits for the daemon to say it is following the board.
+pub const DAEMON_START_SECONDS_MAX: u64 = 30;
+/// The line the daemon prints once it follows the board.
+pub const DAEMON_STARTED: &str = "rider daemon: following";
+
+/// The test-only setting that shortens the daemon's lease, attempt limit, tick and kill grace.
+pub const TEST_MILLIS_VAR: &str = "RIDER_TEST_MILLIS";
+
+/// Given a running `rider daemon` that follows the board.
+pub fn given_a_running_daemon(world: &mut World) {
+    given_a_running_daemon_with(world, &[]);
+}
+
+/// Given a running `rider daemon` with `env` added to the world's environment.
+pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
+    assert!(world.pool.is_none(), "one daemon per world");
+    let log = fs::File::create(world.root.join("pool.log")).expect("create the daemon output");
+    let err = log.try_clone().expect("share the daemon output");
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command.envs(env.iter().copied());
+    let child = command
+        .arg("daemon")
+        .stdout(log)
+        .stderr(err)
+        .process_group(0)
+        .spawn()
+        .expect("start rider daemon");
+    world.pool = Some(Pool { child, stdin: None });
+    let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
+    while !world.pool_log().contains(DAEMON_STARTED) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not start within {DAEMON_START_SECONDS_MAX} seconds:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When the daemon is sent SIGTERM.
+pub fn when_the_daemon_is_sent_sigterm(world: &World) {
+    let pool = world.pool.as_ref().expect("the daemon was started");
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-TERM", &pool.child.id().to_string()])
+        .stdin(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success());
+}
+
+/// Then the daemon exits within `POOL_STOP_SECONDS_MAX`; returns its exit code.
+pub fn then_the_daemon_exits(world: &mut World) -> Option<i32> {
+    let pool = world.pool.as_mut().expect("the daemon was started");
+    let deadline = Instant::now() + Duration::from_secs(POOL_STOP_SECONDS_MAX);
+    let status = loop {
+        if let Some(status) = pool.child.try_wait().expect("poll the daemon") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not exit within {POOL_STOP_SECONDS_MAX} seconds:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    };
+    world.pool = None;
+    status.code()
+}
+
+/// Waits up to `seconds` for `task` to leave `ready`; returns the state it was found in.
+pub fn when_the_task_leaves_ready_within(world: &World, task: &str, seconds: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let state = task_state(world, task);
+        if state != "ready" || Instant::now() >= deadline {
+            return state;
+        }
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// Waits until a fake agent has started on `task`; returns its run.
+pub fn when_the_agent_has_started(world: &World, task: &str) -> Run {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    loop {
+        if let Some(run) = agent_runs_for(world, task).into_iter().next() {
+            return run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no agent started on task {task}:\n{}",
+            world.pool_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// Runs `rider <args>` on the world's home to its end.
+pub fn when_rider_runs(world: &World, args: &[&str]) -> crate::world::Output {
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command.args(args);
+    crate::world::run_bounded(command, None)
+}
+
+/// The command lines of the `vb tail` processes following the world's board as the daemon.
+pub fn daemon_feeds(world: &World) -> Vec<String> {
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "command="])
+        .stdin(Stdio::null());
+    let output = crate::world::run_bounded(command, None);
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let url = format!("--url {}", world.url);
+    let feeds = output.stdout.lines().filter(|line| {
+        line.contains(" tail ") && line.contains(&url) && line.contains("--as rider-daemon")
+    });
+    feeds.map(str::to_string).collect()
+}
+
+/// Whether process `pid` still exists.
+pub fn is_alive(pid: u32) -> bool {
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run kill");
+    status.success()
+}
+
+/// A task's claim lease end, as the board shows it; `None` when it is not claimed.
+pub fn task_claim_until(world: &World, id: &str) -> Option<String> {
+    let read = read_task(world, id);
+    let until = read
+        .pointer("/message/task/claim/until")
+        .and_then(Value::as_str);
+    until.map(str::to_string)
+}
+
+/// Waits up to `seconds` for process `pid` to end; returns whether it did.
+pub fn when_the_process_ends_within(pid: u32, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        if !is_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// How many fake agents are running now.
+pub fn agents_running(world: &World) -> usize {
+    fake_agent::running_pids(&world.root).len()
+}
+
+/// Given every `vb reply` touches `marker` and then waits `seconds` before it runs.
+pub fn given_vb_replies_slowly(world: &World, marker: &Path, seconds: u32) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" reply "*) : > '{}'; sleep {seconds};; esac
+exec '{}' "$@"
+"#,
+        marker.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}

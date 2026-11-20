@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::json;
 
@@ -84,21 +85,14 @@ impl Block {
         );
         Block { reason, kind }
     }
-}
 
-struct Attempt {
-    brief: Brief,
-    failed: u16,
-    retry: bool,
-    checkout: Checkout,
-    // Where the task's branch started: its `start` label, else where this attempt started.
-    reference: String,
-    cmd: CommandLine,
-    log: PathBuf,
-    // Why the task resumes, or starts fresh though `resume=1` asked otherwise.
-    resume_note: Option<String>,
-    // When `cmd` resumes a session: that session, and the command that starts fresh instead.
-    fallback: Option<(SessionId, CommandLine)>,
+    fn prepared(self) -> Prepared {
+        assert!(!self.kind.is_empty());
+        Prepared::Blocked {
+            kind: self.kind,
+            reason: self.reason,
+        }
+    }
 }
 
 struct Work {
@@ -121,6 +115,105 @@ pub fn run_task(
     board: &dyn Board,
     launch: &dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError>,
 ) -> Result<Verdict, RunError> {
+    let attempt = match prepare_attempt(id, env, board)? {
+        Prepared::Ready(attempt) => attempt,
+        Prepared::Blocked { kind, reason } => {
+            board.block(id, &reason, kind)?;
+            return Ok(Verdict::LeaveBlocked);
+        }
+    };
+    let launched = attempt.launch(launch);
+    let judgement = judge_attempt(id, board, &attempt, launched)?;
+    settle_attempt(id, env, board, &attempt, &judgement)?;
+    Ok(judgement.verdict)
+}
+
+/// An attempt whose brief was checked and whose worktree is ready for its agent.
+pub struct Attempt {
+    brief: Brief,
+    failed: u16,
+    retry: bool,
+    checkout: Checkout,
+    // Where the task's branch started: its `start` label, else where this attempt started.
+    reference: String,
+    cmd: CommandLine,
+    log: PathBuf,
+    // Why the task resumes, or starts fresh though `resume=1` asked otherwise.
+    resume_note: Option<String>,
+    // When `cmd` resumes a session: that session, and the command that starts fresh instead.
+    fallback: Option<Fallback>,
+    // The log of the fresh start, set once `launch` has given up the resumed session.
+    fresh_log: OnceLock<PathBuf>,
+}
+
+struct Fallback {
+    session: SessionId,
+    cmd: CommandLine,
+    home: PathBuf,
+}
+
+impl Attempt {
+    /// The branch the attempt works on, when the task has one.
+    pub fn branch(&self) -> Option<&str> {
+        let branch = self.checkout.branch.as_deref();
+        assert!(branch.is_none_or(|branch| !branch.is_empty()));
+        branch
+    }
+
+    /// Runs the attempt's agent in its worktree through `launch`, logging to its own log.
+    pub fn launch(
+        &self,
+        launch: &dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError>,
+    ) -> Result<Exit, HarnessError> {
+        assert!(self.checkout.dir.is_absolute() && self.log.is_absolute());
+        assert!(!self.cmd.program.is_empty());
+        assert!(self.fresh_log.get().is_none(), "an attempt launches once");
+        let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
+        let refused =
+            !matches!(launched, Ok(Exit::Code(0))) && harness::ended_before_any_turn(&self.log);
+        match self.fallback.as_ref().filter(|_| refused) {
+            Some(fresh) => {
+                let log = log_path(&fresh.home, self.brief.id, self.failed + 1);
+                let log = self.fresh_log.get_or_init(|| log);
+                launch(&fresh.cmd, &self.checkout.dir, log)
+            }
+            None => launched,
+        }
+    }
+
+    // The log of the agent run whose work the attempt is judged by.
+    fn log(&self) -> &Path {
+        self.fresh_log.get().unwrap_or(&self.log)
+    }
+}
+
+/// What preparing an attempt came to: an attempt to run, or a block to write instead.
+pub enum Prepared {
+    Ready(Box<Attempt>),
+    Blocked { kind: &'static str, reason: String },
+}
+
+/// How an attempt's agent did, judged from its exit, its log and its worktree.
+pub struct Judgement {
+    pub verdict: Verdict,
+    work: Option<Work>,
+}
+
+impl Judgement {
+    /// A failure decided without inspecting the attempt's worktree, such as its time limit.
+    pub fn uninspected(verdict: Verdict) -> Judgement {
+        assert!(matches!(verdict, Verdict::Fail { .. }));
+        let judgement = Judgement {
+            verdict,
+            work: None,
+        };
+        assert!(judgement.work.is_none());
+        judgement
+    }
+}
+
+/// Checks a claimed task's brief and readies its worktree, labelling its branch and start.
+pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepared, RunError> {
     assert!(env.home.is_absolute() && env.home.to_str().is_some());
     assert!(!env.profile.is_empty() && !env.board_url.is_empty());
     let view = board.read_task(id)?;
@@ -132,17 +225,13 @@ pub fn run_task(
     let start = start_label.filter(|value| git::is_commit_id(value));
     let prepared =
         validate(&view).and_then(|(brief, failed)| prepare(brief, failed, start, env, board));
-    let mut attempt = match prepared {
+    let attempt = match prepared {
         Ok(attempt) => attempt,
-        Err(block) => {
-            board.block(id, &block.reason, block.kind)?;
-            return Ok(Verdict::LeaveBlocked);
-        }
+        Err(block) => return Ok(block.prepared()),
     };
     if let Some(branch) = &attempt.checkout.branch {
         if let Some(block) = label_branch(id, board, &view, branch)? {
-            board.block(id, &block.reason, block.kind)?;
-            return Ok(Verdict::LeaveBlocked);
+            return Ok(block.prepared());
         }
         if !attempt.retry && start_label.is_none() {
             board.set_label(id, START_LABEL, &attempt.checkout.start_head)?;
@@ -152,31 +241,50 @@ pub fn run_task(
         // The note only informs; losing it must not stop the attempt.
         let _ = board.reply(id, note);
     }
-    let mut launched = launch(&attempt.cmd, &attempt.checkout.dir, &attempt.log);
-    let refused =
-        !matches!(launched, Ok(Exit::Code(0))) && harness::ended_before_any_turn(&attempt.log);
-    if let Some((session, fresh)) = attempt.fallback.take().filter(|_| refused) {
+    Ok(Prepared::Ready(Box::new(attempt)))
+}
+
+/// Judges an attempt once its agent has ended, from the task's state and the worktree.
+pub fn judge_attempt(
+    id: TaskId,
+    board: &dyn Board,
+    attempt: &Attempt,
+    launched: Result<Exit, HarnessError>,
+) -> Result<Judgement, RunError> {
+    if let Some(fresh) = attempt.fallback.as_ref()
+        && attempt.fresh_log.get().is_some()
+    {
         let note = format!(
-            "Claude could not resume session {} before doing any work, so the attempt is \
-             starting fresh.",
-            session.as_str()
+            "Claude could not resume session {} before doing any work, so the attempt ran \
+             again starting fresh.",
+            fresh.session.as_str()
         );
         // The note only informs; losing it must not stop the attempt.
         let _ = board.reply(id, &note);
-        attempt.log = log_path(&env.home, id, attempt.failed + 1);
-        attempt.cmd = fresh;
-        launched = launch(&attempt.cmd, &attempt.checkout.dir, &attempt.log);
     }
-    let (verdict, work) = inspect(id, board, &attempt, launched)?;
-    match (&verdict, work) {
+    let (verdict, work) = inspect(id, board, attempt, launched)?;
+    assert!(!matches!(verdict, Verdict::Complete { .. }) || work.is_some());
+    Ok(Judgement { verdict, work })
+}
+
+/// Writes a judged attempt to the board: completes or fails the task, or leaves it blocked.
+pub fn settle_attempt(
+    id: TaskId,
+    env: &Env,
+    board: &dyn Board,
+    attempt: &Attempt,
+    judgement: &Judgement,
+) -> Result<(), RunError> {
+    assert!(attempt.brief.id == id);
+    match (&judgement.verdict, &judgement.work) {
         (Verdict::Complete { result }, Some(work)) => {
-            complete(id, env, board, &attempt, result, &work)?
+            complete(id, env, board, attempt, result, work)?
         }
         (Verdict::Complete { .. }, None) => panic!("a completion always has inspected work"),
-        (Verdict::Fail { reason }, _) => fail(id, board, &attempt, reason)?,
+        (Verdict::Fail { reason }, _) => fail(id, board, attempt, reason)?,
         (Verdict::LeaveBlocked, _) => {}
     }
-    Ok(verdict)
+    Ok(())
 }
 
 // A task's `branch` label is written once and never changed to another branch.
@@ -280,7 +388,11 @@ fn prepare(
     };
     let cmd = command(resume.as_ref())?;
     let fallback = match resume {
-        Some(session) => Some((session, command(None)?)),
+        Some(session) => Some(Fallback {
+            session,
+            cmd: command(None)?,
+            home: env.home.clone(),
+        }),
         None => None,
     };
     let checkout = worktree::prepare(&brief, board, &env.home);
@@ -301,6 +413,7 @@ fn prepare(
         log,
         resume_note,
         fallback,
+        fresh_log: OnceLock::new(),
     })
 }
 
@@ -366,7 +479,7 @@ fn session_path(home: &Path, id: TaskId) -> PathBuf {
 fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     let path = session_path(home, attempt.brief.id);
     let session = match attempt.brief.role.harness {
-        Harness::Claude => harness::session_id(&attempt.log),
+        Harness::Claude => harness::session_id(attempt.log()),
         Harness::Codex | Harness::Tact => None,
     };
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
@@ -542,11 +655,11 @@ fn inspect(
         }
     };
     let harness = &attempt.brief.role.harness;
-    let last_message = harness::last_message(harness, &attempt.log);
+    let last_message = harness::last_message(harness, attempt.log());
     let outcome = Outcome {
         exit,
         state_after,
-        stream_failed: harness::stream_reports_failure(harness, &attempt.log),
+        stream_failed: harness::stream_reports_failure(harness, attempt.log()),
         clean: evidence.clean,
         branch: attempt.checkout.branch.as_deref(),
         on_branch: evidence.on_branch,
@@ -668,8 +781,8 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
         "a failure always states its reason"
     );
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
-    let header = format!("The whole log: {}", attempt.log.display());
-    let tail = log_tail(&attempt.log);
+    let header = format!("The whole log: {}", attempt.log().display());
+    let tail = log_tail(attempt.log());
     let budget = TAIL_REPLY_CHARS_MAX.saturating_sub(header.chars().count() + 1);
     let tail = if tail.trim().is_empty() {
         NO_OUTPUT

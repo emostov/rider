@@ -209,6 +209,8 @@ pub struct Run {
 pub struct PendingClaim {
     pub run: RunId,
     pub task: TaskId,
+    /// The profile the claim was sent as, which a release of a late grant writes as.
+    pub profile: String,
     /// When any grant of the claim has lapsed.
     pub until: Timestamp,
     /// The granted epoch, once known.
@@ -335,6 +337,7 @@ pub enum Action {
         run: RunId,
         task: TaskId,
         epoch: u64,
+        profile: String,
     },
     ListTasks,
     RestartFeed(Cursor),
@@ -922,11 +925,13 @@ fn give_up(state: &mut State, index: usize, until: Timestamp, epoch: Option<u64>
     let entry = &state.runs[index];
     // A closing write in flight is answered like the pending claim's own release.
     let (run, task, releasing) = (entry.id, entry.task, entry.settling);
+    let profile = state.profile(entry.role, entry.slot);
     remove_run(state, index);
     if now < until {
         state.pending_claims.push(PendingClaim {
             run,
             task,
+            profile,
             until,
             epoch,
             releasing,
@@ -1085,6 +1090,7 @@ fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         return;
     }
     let (run, task, epoch) = (entry.id, entry.task, entry.epoch);
+    let (role, slot) = (entry.role, entry.slot);
     // After stop-now no attempt counts: whatever was decided, the claim is released.
     if state.stopping == Stopping::Now {
         entry.settlement = Some(Settlement::Release);
@@ -1094,7 +1100,12 @@ fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
     };
     entry.settling = true;
     actions.push(match settlement {
-        Settlement::Release => Action::Release { run, task, epoch },
+        Settlement::Release => Action::Release {
+            run,
+            task,
+            epoch,
+            profile: state.profile(role, slot),
+        },
         settlement => Action::Settle {
             run,
             task,
@@ -1230,8 +1241,13 @@ fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
         };
         if up && !pending.releasing && now >= pending.retry_at {
             pending.releasing = true;
-            let (run, task) = (pending.run, pending.task);
-            actions.push(Action::Release { run, task, epoch });
+            let (run, task, profile) = (pending.run, pending.task, pending.profile.clone());
+            actions.push(Action::Release {
+                run,
+                task,
+                epoch,
+                profile,
+            });
         }
     }
     assert!(state.pending_claims.len() <= PENDING_CLAIMS_MAX);

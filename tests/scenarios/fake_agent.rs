@@ -33,6 +33,8 @@ pub enum Behaviour {
     ExitNonZero,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
+    /// Like `Hold`, but ignores SIGTERM.
+    HoldIgnoringTerm,
     /// As `claude --resume` of a session Claude no longer has: reports the refusal and exits 1
     /// when started with `--resume`; otherwise commits like `Commit`.
     RefuseResume,
@@ -47,6 +49,7 @@ impl Behaviour {
             Behaviour::Block => "block",
             Behaviour::ExitNonZero => "exit-non-zero",
             Behaviour::Hold => "hold",
+            Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::RefuseResume => "refuse-resume",
         }
     }
@@ -151,7 +154,8 @@ case "$behaviour" in
       exit 1
     fi
     commit || exit 1 ;;
-  hold)
+  hold|hold-ignoring-term)
+    [ "$behaviour" = hold ] || trap '' TERM
     step=0
     while [ ! -e "$world/{RELEASES_DIR}/$task" ]; do
       step=$((step + 1))

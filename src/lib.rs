@@ -2,6 +2,7 @@ pub mod board;
 pub mod brief;
 pub mod cli;
 pub mod core;
+pub mod daemon;
 pub mod feed;
 pub mod git;
 pub mod harness;

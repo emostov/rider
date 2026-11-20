@@ -83,6 +83,8 @@ struct RunLog {
     time_limited: bool,
     settles: u32,
     settle_failures: u32,
+    /// The profile the run's claim was sent as.
+    profile: Option<String>,
 }
 
 pub struct World {
@@ -643,7 +645,9 @@ impl World {
                 epoch,
                 settlement,
             } => self.close(run, task, epoch, Some(settlement))?,
-            Action::Release { run, task, epoch } => self.close(run, task, epoch, None)?,
+            Action::Release {
+                run, task, epoch, ..
+            } => self.close(run, task, epoch, None)?,
             Action::ListTasks => self.list(),
             Action::RestartFeed(cursor) => {
                 let id = self.expect(None, "feed");
@@ -891,7 +895,8 @@ impl World {
         let blocked = self.core.board() != BoardHealth::Up || self.core.stopping() != Stopping::No;
         for action in actions {
             let (run, write) = match action {
-                Action::Claim { run, task, .. } => {
+                Action::Claim { run, task, profile } => {
+                    self.log.entry(*run).or_default().profile = Some(profile.clone());
                     if blocked {
                         return Err(format!("invariant 9: {action:?} while down or stopping"));
                     }
@@ -902,7 +907,14 @@ impl World {
                     }
                     (*run, true)
                 }
-                Action::Renew { run, .. } | Action::Release { run, .. } => (*run, true),
+                Action::Renew { run, .. } => (*run, true),
+                Action::Release { run, profile, .. } => {
+                    let claimed = self.log.entry(*run).or_default().profile.as_ref();
+                    if claimed != Some(profile) {
+                        return Err(format!("{action:?} is not as the claim's {claimed:?}"));
+                    }
+                    (*run, true)
+                }
                 Action::Settle {
                     run, settlement, ..
                 } => {
