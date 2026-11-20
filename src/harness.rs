@@ -144,8 +144,8 @@ impl SessionId {
     }
 }
 
-/// The command line that runs `spec` on `prompt` in `dir`, continuing session `resume` when
-/// given (Claude only); the prompt is last, after `--`.
+/// The command line that runs `spec` on `prompt` in `dir`, starting from a fork of session
+/// `resume` when given (Claude only); the prompt is last, after `--`.
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,
@@ -199,7 +199,12 @@ pub fn command_for(
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
     if let Some(session) = resume {
-        args.extend(["--resume".to_string(), session.0.clone()]);
+        // Without `--fork-session` Claude appends to the resumed session in place.
+        args.extend([
+            "--resume".to_string(),
+            session.0.clone(),
+            "--fork-session".to_string(),
+        ]);
     }
     args.push("--".to_string());
     args.push(prompt.to_string());
@@ -649,6 +654,27 @@ pub fn session_id(log: &Path) -> Option<SessionId> {
     let id = found.flatten();
     assert!(id.as_ref().is_none_or(|id| !id.0.is_empty()));
     id
+}
+
+/// Whether the Claude stream at `log` shows a run that ended in error before its first turn,
+/// as when `--resume` names a session Claude cannot open; false when the log is unreadable.
+pub fn ended_before_any_turn(log: &Path) -> bool {
+    let mut results = 0u64;
+    let mut refused = false;
+    let mut turned = false;
+    let read = scan(log, |event| match text_at(event, "/type") {
+        Some("result") => {
+            results = results.saturating_add(1);
+            let is_error = event.pointer("/is_error").and_then(Value::as_bool);
+            let turns = event.pointer("/num_turns").and_then(Value::as_u64);
+            refused = is_error == Some(true) && turns == Some(0);
+        }
+        Some("assistant" | "user") => turned = true,
+        _ => {}
+    });
+    let before = read && results == 1 && refused && !turned;
+    assert!(results <= LINES_MAX, "scan reads at most LINES_MAX events");
+    before
 }
 
 /// Whether the stream at `log` records a failed run; false when the log is unreadable.
