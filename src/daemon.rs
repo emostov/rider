@@ -1335,8 +1335,13 @@ impl Board for Guarded<'_> {
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
         self.board.list_open(subtree)
     }
-    fn list_after(&self, subtree: &str, after: TaskId) -> Result<Listing, BoardError> {
-        self.board.list_after(subtree, after)
+    fn list_labelled(
+        &self,
+        channel: &str,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Listing, BoardError> {
+        self.board.list_labelled(channel, key, values)
     }
 }
 

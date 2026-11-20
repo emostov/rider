@@ -468,12 +468,13 @@ mod tests {
             panic!("the pool never lists {subtree}")
         }
 
-        fn list_after(
+        fn list_labelled(
             &self,
-            subtree: &str,
-            _: TaskId,
+            channel: &str,
+            _: &str,
+            _: &[&str],
         ) -> Result<crate::board::Listing, BoardError> {
-            panic!("the pool never lists {subtree}")
+            panic!("the pool never lists {channel}")
         }
     }
 

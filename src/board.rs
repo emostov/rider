@@ -263,8 +263,14 @@ pub trait Board {
     fn release(&self, id: TaskId) -> Result<(), BoardError>;
     /// The open tasks in `subtree`, a channel prefix ending in `/`, and every channel below it.
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError>;
-    /// The tasks in `subtree` in any state whose ids are after `after`.
-    fn list_after(&self, subtree: &str, after: TaskId) -> Result<Listing, BoardError>;
+    /// The tasks in any state in `channel`, or below it when it ends in `/`, whose label `key`
+    /// has one of `values`, none empty or holding `|`.
+    fn list_labelled(
+        &self,
+        channel: &str,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Listing, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -300,6 +306,7 @@ enum Command<'a> {
     List {
         subtree: &'a str,
         state: &'static str,
+        label: Option<&'a str>,
         after: Option<Cursor>,
     },
     Label {
@@ -429,10 +436,14 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
         Command::List {
             subtree,
             state,
+            label,
             after,
         } => {
             let limit = TASKS_PAGE_MAX.to_string();
             let mut words = to_strings(&["tasks", subtree, "--state", state, "--limit", &limit]);
+            if let Some(label) = label {
+                words.extend(to_strings(&["--label", label]));
+            }
             if let Some(after) = after {
                 words.extend(to_strings(&["--after", &after.0.to_string()]));
             }
@@ -1294,11 +1305,27 @@ impl Board for VbCli {
     }
 
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
+        assert!(
+            subtree.ends_with('/'),
+            "a subtree is a channel prefix ending in /"
+        );
         self.list(subtree, "open", None)
     }
 
-    fn list_after(&self, subtree: &str, after: TaskId) -> Result<Listing, BoardError> {
-        self.list(subtree, "all", Some(Cursor(after.0)))
+    fn list_labelled(
+        &self,
+        channel: &str,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Listing, BoardError> {
+        assert!(!key.is_empty() && !key.contains('=') && !key.starts_with('-'));
+        assert!(!values.is_empty());
+        assert!(
+            (values.iter()).all(|value| !value.is_empty() && !value.contains('|')),
+            "a label value is one alternative"
+        );
+        let label = format!("{key}={}", values.join("|"));
+        self.list(channel, "all", Some(&label))
     }
 }
 
@@ -1307,26 +1334,23 @@ impl VbCli {
         &self,
         subtree: &str,
         state: &'static str,
-        start: Option<Cursor>,
+        label: Option<&str>,
     ) -> Result<Listing, BoardError> {
         assert!(state == "open" || state == "all");
         assert!(
-            subtree.ends_with('/'),
-            "a subtree is a channel prefix ending in /"
-        );
-        assert!(
-            !subtree.starts_with('-'),
-            "a subtree is never read as an option"
+            !subtree.is_empty() && !subtree.starts_with('-'),
+            "a channel is never read as an option"
         );
         let read: WireCursor = parse(&self.read(&Command::Cursor { subtree })?)?;
         let cursor = Cursor(parse_id_text(&read.cursor)?.0);
         let mut tasks: Vec<ListedTask> = Vec::new();
         let mut left_out: usize = 0;
-        let mut after = start;
+        let mut after: Option<Cursor> = None;
         for _ in 0..LISTING_PAGES_MAX {
             let list = Command::List {
                 subtree,
                 state,
+                label,
                 after,
             };
             let page = parse_task_list(&self.read(&list)?)?;
@@ -1510,10 +1534,17 @@ pub mod testing {
             })
         }
 
-        fn list_after(&self, _: &str, after: TaskId) -> Result<Listing, BoardError> {
+        fn list_labelled(
+            &self,
+            _: &str,
+            key: &str,
+            values: &[&str],
+        ) -> Result<Listing, BoardError> {
             let tasks = self.tasks.borrow();
-            let later = tasks.iter().filter(|task| task.id.0 > after.0);
-            let listed = later.map(|view| ListedTask {
+            let labelled = tasks.iter().filter(|task| {
+                (task.labels.iter()).any(|(k, v)| k == key && values.contains(&v.as_str()))
+            });
+            let listed = labelled.map(|view| ListedTask {
                 view: view.clone(),
                 channel: "work/fake".into(),
             });
@@ -2122,13 +2153,14 @@ printf '],"cursor":"%s"}}\n' $cursor
         expect(cursor, &["read", "work/", "--limit", "1"]);
         let list = Command::List {
             subtree: "work/",
-            state: "open",
+            state: "all",
+            label: Some("base=3|#3"),
             after: Some(Cursor(9)),
         };
-        let limit = ["--limit", "200", "--after", "9"];
+        let limit = ["--limit", "200", "--label", "base=3|#3", "--after", "9"];
         expect(
             list,
-            &[&["tasks", "work/", "--state", "open"][..], &limit].concat(),
+            &[&["tasks", "work/", "--state", "all"][..], &limit].concat(),
         );
     }
 

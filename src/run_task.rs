@@ -31,6 +31,8 @@ const _: () = assert!(ATTEMPTS_DEFAULT > 0 && ATTEMPTS_DEFAULT <= ATTEMPTS_MAX);
 pub const LOG_TAIL_BYTES_MAX: u64 = 16 * 1024;
 /// Upper bound on the stacked tasks checked when a branch moves, as `rider-result@2` allows.
 pub const STACKED_CHECKS_MAX: usize = 64;
+/// Upper bound on the tasks of one branch whose stacked tasks are looked for when it moves.
+pub const BRANCH_TASKS_MAX: usize = 32;
 /// The lines of a failed attempt's log replied to its task.
 pub const LOG_TAIL_LINES: usize = 40;
 /// Upper bound on a role's prompt file.
@@ -801,15 +803,16 @@ fn complete(
     board.complete(id, summary)?;
     let behind = match (attempt.brief.onto, attempt.branch()) {
         (Some(onto), Some(branch)) if work.head != attempt.reference => {
-            stacked_behind(board, &attempt.checkout.dir, onto, branch, &work.head).unwrap_or_else(
-                |error| {
-                    let note = format!(
-                        "Rider could not check the tasks stacked on branch {branch}: {error}."
-                    );
-                    let _ = board.reply(id, &one_line(&note));
-                    Vec::new()
-                },
-            )
+            let (behind, cut) = stacked_behind(board, attempt, onto, branch, &work.head)
+                .unwrap_or_else(|error| (Vec::new(), Some(error)));
+            if let Some(cut) = cut {
+                let note = format!(
+                    "Rider could not check every task stacked on branch {branch}, so its \
+                     result may name too few behind: {cut}."
+                );
+                let _ = board.reply(id, &one_line(&note));
+            }
+            behind
         }
         _ => Vec::new(),
     };
@@ -851,36 +854,88 @@ fn complete(
     Ok(())
 }
 
-// A task is stacked on `branch` when its `base` is `onto` or a task labelled with `branch`;
-// one is behind when its own branch does not contain `head`. Tasks stacked on `onto` come
-// after it, so only later tasks are listed.
+// A branch's tasks are those labelled with it in the completing task's channel and repository,
+// and `onto`. Returns that channel, their ids, and why the list was cut short at a bound.
+fn branch_tasks(
+    board: &dyn Board,
+    attempt: &Attempt,
+    onto: TaskId,
+    branch: &str,
+) -> Result<(String, Vec<u64>, Option<String>), String> {
+    assert!(attempt.brief.onto == Some(onto));
+    let id = attempt.brief.id;
+    if branch.contains('|') {
+        return Err("its name holds `|`, which a label filter cannot name".to_string());
+    }
+    let named = board
+        .list_labelled(SUBTREE, BRANCH_LABEL, &[branch])
+        .map_err(|error| error.to_string())?;
+    let mut cut = (named.left_out > 0).then(|| {
+        format!(
+            "{} of its tasks were past the listing's bound",
+            named.left_out
+        )
+    });
+    let own = named.tasks.iter().find(|task| task.view.id == id);
+    let channel = own.ok_or_else(|| format!("task #{} is not listed on it", id.0))?;
+    let channel = &channel.channel;
+    let mut on_branch: Vec<u64> = vec![onto.0];
+    let mine = (named.tasks.iter())
+        .filter(|task| task.channel == *channel && same_repo(&task.view, &attempt.brief.repo))
+        .filter(|task| label(&task.view, BRANCH_LABEL) == Some(branch));
+    for task in mine {
+        if on_branch.contains(&task.view.id.0) {
+            continue;
+        }
+        if on_branch.len() == BRANCH_TASKS_MAX {
+            cut.get_or_insert(format!("it holds more than {BRANCH_TASKS_MAX} tasks"));
+            break;
+        }
+        on_branch.push(task.view.id.0);
+    }
+    assert!(!on_branch.is_empty() && on_branch.len() <= BRANCH_TASKS_MAX);
+    Ok((channel.clone(), on_branch, cut))
+}
+
+fn same_repo(view: &TaskView, repo: &Path) -> bool {
+    label(view, "repo").is_some_and(|own| Path::new(own) == repo)
+}
+
+// A task is stacked on `branch` when its `base` names one of the branch's tasks, and behind
+// when its own branch does not contain `head`. Besides the behind tasks, returns why the
+// check was cut short when a bound was reached.
 fn stacked_behind(
     board: &dyn Board,
-    dir: &Path,
+    attempt: &Attempt,
     onto: TaskId,
     branch: &str,
     head: &str,
-) -> Result<Vec<u64>, String> {
+) -> Result<(Vec<u64>, Option<String>), String> {
     assert!(git::is_commit_id(head), "a branch head is a commit id");
-    let listing = board
-        .list_after(SUBTREE, onto)
+    let dir = &attempt.checkout.dir;
+    let (channel, on_branch, mut cut) = branch_tasks(board, attempt, onto, branch)?;
+    let names: Vec<String> = (on_branch.iter())
+        .flat_map(|task| [task.to_string(), format!("#{task}")])
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let stacked = board
+        .list_labelled(&channel, "base", &names)
         .map_err(|error| error.to_string())?;
-    if listing.left_out > 0 {
-        return Err(format!(
-            "{} tasks after #{} were past the listing's bound",
-            listing.left_out, onto.0
+    if stacked.left_out > 0 {
+        let left_out = stacked.left_out;
+        cut.get_or_insert(format!(
+            "{left_out} stacked tasks were past the listing's bound"
         ));
     }
     let id_of = |value: &str| value.strip_prefix('#').unwrap_or(value).parse::<u64>().ok();
-    let views = || listing.tasks.iter().map(|task| &task.view);
-    let on_branch: Vec<u64> = views()
-        .filter(|view| label(view, BRANCH_LABEL) == Some(branch))
-        .map(|view| view.id.0)
-        .chain([onto.0])
-        .collect();
     let mut behind: Vec<u64> = Vec::new();
     let mut checked: usize = 0;
-    for view in views() {
+    for view in stacked
+        .tasks
+        .iter()
+        .map(|task| &task.view)
+        .filter(|view| same_repo(view, &attempt.brief.repo))
+    {
         let base = label(view, "base").and_then(id_of);
         let Some(own) = label(view, BRANCH_LABEL).filter(|own| *own != branch) else {
             continue;
@@ -888,12 +943,13 @@ fn stacked_behind(
         if !base.is_some_and(|base| on_branch.contains(&base)) {
             continue;
         }
-        checked = checked.checked_add(1).ok_or("too many stacked tasks")?;
-        if checked > STACKED_CHECKS_MAX {
-            return Err(format!(
+        if checked == STACKED_CHECKS_MAX {
+            cut.get_or_insert(format!(
                 "more than {STACKED_CHECKS_MAX} tasks are stacked on it"
             ));
+            break;
         }
+        checked += 1;
         let full = format!("refs/heads/{own}");
         let text = |error: GitError| error.to_string();
         // A stacked task whose branch is not here, or cannot be named to git, is not judged.
@@ -906,8 +962,8 @@ fn stacked_behind(
             behind.push(view.id.0);
         }
     }
-    assert!(behind.len() <= checked && behind.len() <= STACKED_CHECKS_MAX);
-    Ok(behind)
+    assert!(behind.len() <= checked && checked <= STACKED_CHECKS_MAX);
+    Ok((behind, cut))
 }
 
 fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Result<(), RunError> {
