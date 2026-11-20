@@ -84,7 +84,9 @@ npx skills add emostov/rider --skill ride-swarm -g
 ```
 
 Say "ride a swarm to ..." to start work and "check my swarm" for status. The
-`ship-swarm` skill, in `skills/`, carries a finished stack through pull requests.
+`ship-swarm` skill, in `skills/`, carries a finished stack through pull requests. The
+first time, it asks how you like its loops to run (a review packet before the PR, comments,
+CI, review threads) and saves the answers in `~/.rider/ship.toml`.
 
 ## Safety
 
