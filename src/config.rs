@@ -124,7 +124,6 @@ struct LimitsShape {
 enum HarnessName {
     Claude,
     Codex,
-    #[serde(skip_deserializing)]
     Tact,
 }
 
