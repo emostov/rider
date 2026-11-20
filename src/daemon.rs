@@ -20,13 +20,14 @@ use crate::board::{
     Board, BoardError, Listing, TaskId, TaskView, Timestamp, VbCli, one_line, parse_failure_reason,
 };
 use crate::cli::with_vb_on_path;
+use crate::config::Limits;
 use crate::core::{
     self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, Call, Config, Event, LEASE_MILLIS, RunId,
     Settlement, State, Stopping,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
 use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
-use crate::roles::{AGENTS_MAX, ROLES};
+use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
     Attempt, Env, Judgement, Prepared, RunError, judge_attempt, launch_agent, prepare_attempt,
     settle_attempt,
@@ -289,6 +290,7 @@ struct Shared {
     events: SyncSender<Input>,
     lease_millis: u64,
     grace_millis: u64,
+    attempts: u8,
     feed: Mutex<FeedSlot>,
     /// The core has decided to stop now; a settlement checks it before each board write.
     stop_now: AtomicBool,
@@ -323,6 +325,7 @@ impl Shared {
             prompts: self.paths.prompts.clone(),
             profile: profile.to_string(),
             board_url: self.paths.board_url.clone(),
+            attempts: self.attempts,
         }
     }
 
@@ -353,8 +356,10 @@ impl Shared {
 }
 
 /// Runs the daemon in the foreground until it is stopped; returns its exit code.
-pub fn run(paths: Paths) -> Result<u8, DaemonError> {
+/// Runs the daemon on the role table `roles` under `limits` until it is told to stop.
+pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, DaemonError> {
     assert!(paths.home.is_absolute() && paths.vb.is_absolute());
+    assert!(limits.agents > 0 && limits.agents <= AGENTS_MAX);
     let setting = std::env::var(TEST_MILLIS_VAR);
     let setting = match &setting {
         Ok(value) => Some(value.as_str()),
@@ -376,6 +381,7 @@ pub fn run(paths: Paths) -> Result<u8, DaemonError> {
         events,
         lease_millis,
         grace_millis: timing.grace_millis,
+        attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
         stop_now: AtomicBool::new(false),
         log,
@@ -383,10 +389,12 @@ pub fn run(paths: Paths) -> Result<u8, DaemonError> {
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
     start_signals(shared.events.clone())?;
-    let mut config = Config::from_roles(&ROLES);
+    let mut config = Config::from_roles(roles);
+    config.agents_max = limits.agents;
+    config.builders_max = limits.builders_at_once;
     config.reconcile_millis = RECONCILE_SECONDS * 1000;
     config.lease_millis = lease_millis;
-    config.attempt_millis_max = timing.attempt_millis_max;
+    config.attempt_millis_max = timing.attempt_millis_max.min(limits.attempt_millis);
     let mut state = State::new(config, now());
     let code = drive(&mut state, &inputs, &jobs, &shared);
     stop_feed(&shared);
@@ -624,9 +632,10 @@ fn prepare(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     match prepared {
         Ok(Prepared::Ready(attempt)) => {
             let branch = attempt.branch().map(str::to_string);
+            let role = attempt.role().label.to_string();
             let attempt = *attempt;
             Input {
-                event: Event::Prepared { run, branch },
+                event: Event::Prepared { run, branch, role },
                 extra: Extra::Attempt(Arc::new(attempt)),
             }
         }

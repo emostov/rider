@@ -1,0 +1,71 @@
+[limits]
+agents = 32
+builders_at_once = 4
+attempt_minutes = 55
+attempts = 3
+
+[roles.implement]
+harness = "claude"
+model = "claude-opus-5-5"
+title = "Implement"
+model_name = "Opus 5.5"
+model_slug = "opus-5-5"
+prompt = "implement"
+commits = true
+needs_of = false
+builds = true
+
+[roles.light]
+harness = "claude"
+model = "claude-sonnet-5-5"
+title = "Light"
+model_name = "Sonnet 5.5"
+model_slug = "sonnet-5-5"
+prompt = "implement"
+commits = true
+needs_of = false
+builds = true
+
+[roles.review]
+harness = "codex"
+model = "gpt-6.1-sol"
+title = "Review"
+model_name = "Sol 6.1"
+model_slug = "sol-6-1"
+prompt = "review"
+commits = false
+needs_of = true
+builds = false
+
+[roles.polish]
+harness = "claude"
+model = "claude-sonnet-5-5"
+title = "Polish"
+model_name = "Sonnet 5.5"
+model_slug = "sonnet-5-5"
+prompt = "polish"
+commits = true
+needs_of = false
+builds = true
+
+[roles.security]
+harness = "claude"
+model = "claude-mythos-5-2"
+title = "Security"
+model_name = "Mythos 5.2"
+model_slug = "mythos-5-2"
+prompt = "security"
+commits = false
+needs_of = true
+builds = false
+
+[roles.qa]
+harness = "claude"
+model = "claude-opus-5-5"
+title = "QA"
+model_name = "Opus 5.5"
+model_slug = "opus-5-5"
+prompt = "qa"
+commits = false
+needs_of = true
+builds = true

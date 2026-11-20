@@ -121,7 +121,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     if base.is_some() && onto.is_some() {
         return Err(BriefError::BaseAndOnto);
     }
-    if !role.commits_expected && of.is_none() {
+    if role.needs_of && of.is_none() {
         return Err(BriefError::ReviewWithoutOf);
     }
     let from = label(view, "from").map(parse_from).transpose()?;
@@ -144,7 +144,8 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     };
     assert!(brief.repo.is_absolute());
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
-    assert!(brief.role.commits_expected || brief.of.is_some());
+    assert!(!brief.role.needs_of || brief.of.is_some());
+    assert!(brief.role.commits_expected || brief.role.needs_of);
     Ok(brief)
 }
 

@@ -795,10 +795,13 @@ mod tests {
         harness: Harness::Tact,
         model: "sol",
         commits_expected: false,
+        needs_of: true,
+        builds: false,
         title: "Tact-test",
         model_name: "Sol",
         model_slug: "sol",
         slots: 1,
+        pool_slots: 1,
         prompt_file: "none.md",
     };
 

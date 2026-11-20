@@ -17,6 +17,8 @@ const ARGS_DIR: &str = "agent-args";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
+/// How long a slow agent works before it acts.
+pub const SLOW_SECONDS: u64 = 35;
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,8 @@ pub enum Behaviour {
     /// As `claude --resume` of a session Claude no longer has: reports the refusal and exits 1
     /// when started with `--resume`; otherwise commits like `Commit`.
     RefuseResume,
+    /// Like `RefuseResume`, but only after working for `SLOW_SECONDS`.
+    RefuseResumeSlowly,
 }
 
 impl Behaviour {
@@ -51,6 +55,7 @@ impl Behaviour {
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::RefuseResume => "refuse-resume",
+            Behaviour::RefuseResumeSlowly => "refuse-resume-slowly",
         }
     }
 }
@@ -94,6 +99,7 @@ pub fn summary(task: &str, attempt: u32) -> String {
 fn script() -> String {
     let steps = HOLD_SECONDS_MAX * HOLD_STEPS_PER_SECOND;
     let fail = FAIL_EXIT_CODE;
+    let slow = SLOW_SECONDS;
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -106,6 +112,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=$(tail -n 1 "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
+printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -146,7 +153,8 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
-  refuse-resume)
+  refuse-resume|refuse-resume-slowly)
+    [ "$behaviour" = refuse-resume ] || sleep {slow}
     if [ -n "$resumed" ]; then
       echo "No conversation found with session ID: $resumed" >&2
       refused='"subtype":"error_during_execution","is_error":true,"num_turns":0'
@@ -189,6 +197,12 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
     let path = world.join(BEHAVIOURS_DIR).join(task);
     fs::write(&path, format!("{}\n", words.join("\n"))).expect("write an agent's plan");
     assert!(path.is_file());
+}
+
+/// The arguments attempt `attempt` of `task` was started with, one per line.
+pub fn args(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
+    fs::read_to_string(&path).expect("read an agent's arguments")
 }
 
 /// Lets a holding agent of `task` go on.

@@ -2,7 +2,7 @@
 
 use crate::board::{BOARD_CALL_SECONDS_MAX, LABELS_MAX, TaskId, TaskState, TaskView, Timestamp};
 use crate::feed::{BoardEvent, Cursor, EventKind};
-use crate::roles::{AGENTS_MAX, RoleSpec};
+use crate::roles::{AGENTS_MAX, BUILDERS_DEFAULT, RoleSpec};
 use crate::settle::Verdict;
 
 /// Upper bound on the open tasks the core tracks.
@@ -46,12 +46,14 @@ pub const FEED_RESTARTS_MAX: u8 = 10;
 /// a restart in a row, in milliseconds.
 pub const FEED_UPTIME_MILLIS_MIN: u64 = 60 * 1000;
 
-/// One role as the core sees it: its label, its profile's model part and its slots.
+/// One role as the core sees it: its label, its profile's model part, its slots, and whether
+/// its runs count against the builders limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Role {
     pub label: String,
     pub model_slug: String,
     pub slots: u8,
+    pub builds: bool,
 }
 
 /// The role table and limits the core runs under.
@@ -59,6 +61,8 @@ pub struct Role {
 pub struct Config {
     pub roles: Vec<Role>,
     pub agents_max: u8,
+    /// Runs of building roles at once.
+    pub builders_max: u8,
     pub tasks_max: usize,
     pub lease_millis: u64,
     pub attempt_millis_max: u64,
@@ -83,11 +87,13 @@ impl Config {
                 label: spec.label.to_string(),
                 model_slug: spec.model_slug.to_string(),
                 slots: spec.slots,
+                builds: spec.builds,
             })
             .collect();
         Config {
             roles,
             agents_max: AGENTS_MAX,
+            builders_max: BUILDERS_DEFAULT,
             tasks_max: TASKS_MAX,
             lease_millis: LEASE_MILLIS,
             attempt_millis_max: ATTEMPT_MILLIS_MAX,
@@ -120,6 +126,7 @@ impl Config {
         assert!(!self.roles.is_empty() && self.roles.len() <= ROLES_MAX);
         assert!(self.roles.iter().all(|role| role.slots > 0));
         assert!(self.agents_max > 0 && self.agents_max <= AGENTS_MAX);
+        assert!(self.builders_max > 0 && self.builders_max <= AGENTS_MAX);
         assert!(self.tasks_max > 0 && self.tasks_max <= TASKS_MAX);
         assert!(self.lease_millis >= 3 && self.attempt_millis_max > 0);
         assert!(self.settle_tries_max > 0);
@@ -268,10 +275,12 @@ pub enum Event {
         until: Timestamp,
     },
     ClaimRefused(RunId),
-    /// The worktree is ready; `branch` is the branch preparation found, if any.
+    /// The worktree is ready; `branch` is the branch preparation found, if any, and `role` the
+    /// label of the role the agent would launch as.
     Prepared {
         run: RunId,
         branch: Option<String>,
+        role: String,
     },
     PrepareBlocked {
         run: RunId,
@@ -532,7 +541,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         Event::Signal => signal(state, actions),
         Event::Claimed { run, epoch, until } => on_claimed(state, run, epoch, until, actions),
         Event::ClaimRefused(run) => claim_refused(state, run),
-        Event::Prepared { run, branch } => on_prepared(state, run, branch, actions),
+        Event::Prepared { run, branch, role } => on_prepared(state, run, branch, &role, actions),
         Event::PrepareBlocked { run, kind, reason } => {
             if let Some(index) = run_in(state, run, Phase::Preparing) {
                 begin_settle(state, index, Settlement::Block { kind, reason }, actions);
@@ -1000,7 +1009,13 @@ fn on_claimed(
     actions.push(Action::Prepare { run, task });
 }
 
-fn on_prepared(state: &mut State, run: RunId, branch: Option<String>, actions: &mut Vec<Action>) {
+fn on_prepared(
+    state: &mut State,
+    run: RunId,
+    branch: Option<String>,
+    role: &str,
+    actions: &mut Vec<Action>,
+) {
     let Some(index) = run_in(state, run, Phase::Preparing) else {
         return;
     };
@@ -1017,7 +1032,10 @@ fn on_prepared(state: &mut State, run: RunId, branch: Option<String>, actions: &
         begin_settle(state, index, Settlement::Release, actions);
         return;
     }
-    if state.stopping == Stopping::Now {
+    // A task relabeled after its claim goes back, to be claimed under its new role, slot and
+    // profile, so the builders limit counts each agent by the role it launches as.
+    let relabeled = state.config.roles[state.runs[index].role].label != role;
+    if relabeled || state.stopping == Stopping::Now {
         begin_settle(state, index, Settlement::Release, actions);
         return;
     }
@@ -1306,11 +1324,18 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
     assert!(state.runs.len() <= agents_max);
 }
 
-/// The oldest claimable task, its role, and the lowest free slot of that role.
+/// The oldest claimable task, its role, and the lowest free slot of that role; a task of a
+/// building role is claimable only while fewer than `builders_max` building runs exist.
 fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
+    let roles = &state.config.roles;
+    let builders = state.runs.iter().filter(|run| roles[run.role].builds);
+    let builders_full = builders.count() >= usize::from(state.config.builders_max);
     let mut best: Option<(usize, usize, u8)> = None;
     for (index, task) in state.tasks.iter().enumerate() {
-        let Some(role) = task.role.filter(|_| !task.claim_refused) else {
+        let role = task
+            .role
+            .filter(|role| !task.claim_refused && !(builders_full && roles[*role].builds));
+        let Some(role) = role else {
             continue;
         };
         let taken = state
@@ -1340,6 +1365,7 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
         task.state == TaskState::Ready && !task.claim_refused && task.role.is_some()
     };
     assert!(best.is_none_or(|(index, _, slot)| claimable(index) && slot >= 1));
+    assert!(best.is_none_or(|(_, role, _)| !(builders_full && roles[role].builds)));
     best
 }
 

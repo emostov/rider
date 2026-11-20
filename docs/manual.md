@@ -14,7 +14,7 @@ This is milestone 0. What works:
 - `rider serve` runs the local board.
 - `rider pool <project>` runs worker slots on the channel `work/<project>`. Each slot claims a
   ready task by its `role` label, makes a worktree and a branch, runs one agent, and then
-  completes, fails, or blocks the task. At most 4 agents run at once.
+  completes, fails, or blocks the task. Up to 32 agents run at once, as the board allows.
 - The `ride-swarm` skill (`skills/ride-swarm/`), which holds the lead's instructions
   (`lead.md`) and the result and finding schemas; and the worker prompts (`prompts/`).
 
@@ -115,8 +115,64 @@ The `role` label on a task picks the agent. A task is claimable only once it has
 | `qa` | Opus 5.5 | Claude Code | QA <n> (Opus 5.5) | no |
 
 The lead is Fable 5.2 in Claude Code, with the board profile `lead-fable-5-2`. Each worker's
-board profile is `<role>-<n>-<model>`, such as `implement-1-opus-5-5`. The table is defined
-once, in `src/roles.rs`.
+board profile is `<role>-<n>-<model>`, such as `implement-1-opus-5-5`. This is the built-in
+table; `rider.toml` (below) may change it.
+
+## Configuration
+
+`rider daemon` and `rider pool` read `$RIDER_HOME/rider.toml` when they start. Without the
+file they use the built-in roles and limits. `rider config` prints the effective
+configuration, built-in plus file, in the file's own form, so you can start a file from it.
+
+A role in the file overrides a built-in role field by field, or adds a new role (at most 16
+roles in all). A new role sets every field but `needs_of`, `builds` and `slots`. `prompt` is a built-in
+prompt name (`implement`, `review`, `polish`, `security`, `qa`) or a path to your own prompt
+file: any relative path, such as `docs.md` or `prompts/docs.md`, is resolved against
+`$RIDER_HOME`, and an absolute path is used as it is. A path to one of the built-in files Rider
+rewrites in `$RIDER_HOME/prompts`, such as `prompts/review.md`, is refused; copy the file to
+another name instead. `model` is at most 128 bytes with no spaces or control characters, and
+`model_name` at most 32 bytes with no control characters. `needs_of` makes a task of the role name the task
+it checks in an `of` label; it defaults to `true` for a role that does not commit and must be
+`true` for one. `slots` caps how many agents of the role run at once; unset, only
+`limits.agents` does in `rider daemon`, and `rider pool` keeps its built-in slot counts.
+
+`builds` marks a role whose agents compile and run tests: `true` for `implement`, `light`,
+`polish` and `qa`, `false` for `review` and `security`, and `true` for a new role unless it
+says otherwise. `limits.builders_at_once` caps how many agents of building roles run at once,
+on top of `limits.agents` and each role's `slots`, in both `rider daemon` and `rider pool`. A
+ready task of a building role waits while that cap is full, just as it waits for a free slot.
+With the example below, at most 4 agents build at once while up to 8 run in all, so reviews
+keep running while builds wait.
+
+```toml
+[limits]
+agents = 8           # agents at once, 1 to 32 (default 32)
+builders_at_once = 4 # agents of building roles at once, 1 to 32 (default 4)
+attempt_minutes = 30 # one attempt's time limit, 1 to 55 (default 55)
+attempts = 2         # failed attempts before a task is blocked, 1 to 9 (default 3)
+
+[roles.review]
+model = "gpt-6.1-sol-mini"
+
+[roles.polish]
+slots = 1
+
+[roles.security]
+builds = true        # this role's agents build and test too
+
+[roles.docs]
+harness = "claude"   # claude or codex
+model = "claude-sonnet-5-5"
+title = "Docs"
+model_name = "Sonnet 5.5"
+model_slug = "sonnet-5-5"
+prompt = "prompts/docs.md"
+commits = true
+```
+
+An unknown or malformed field, an unknown harness, a missing prompt file, or a limit out of
+range stops `rider daemon` and `rider pool` with an error naming the field and the file. The
+file is read once; restart to apply a change.
 
 ## Labels
 
@@ -128,7 +184,7 @@ once, in `src/roles.rs`.
 | `from` | lead, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | lead | id of a task whose existing branch this task works on directly |
 | `of` | lead, required for `review`, `security`, and `qa` | id of the task under review |
-| `resume` | lead | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
+| `resume` | lead | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session; a role configured to run Codex starts fresh |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |

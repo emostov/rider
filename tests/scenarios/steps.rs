@@ -613,3 +613,66 @@ exec '{}' "$@"
     );
     crate::world::write_executable(&world.vb, &script);
 }
+
+/// Given the lead sets `task`'s role to `role` as a slot of `claimed` first reads it, and the
+/// first `vb tasks release` of `task` fails; every release is logged as a line in `releases`.
+pub fn given_the_role_changes_after_the_claim_and_one_release_fails(
+    world: &World,
+    task: &str,
+    claimed: &str,
+    role: &str,
+    releases: &Path,
+) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let changed = world.root.join("role-changed");
+    let failed = world.root.join("release-failed");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = read ] && [ "$2" = '{task}' ] && [ ! -e '{changed}' ]; then
+  case " $* " in *" --as {claimed}-"*)
+    : > '{changed}'
+    '{real}' label '{task}' role={role} --url '{url}' --as '{lead}' > /dev/null || exit 1 ;;
+  esac
+fi
+if [ "$1" = tasks ] && [ "$2" = release ] && [ "$3" = '{task}' ]; then
+  echo release >> '{releases}'
+  if [ ! -e '{failed}' ]; then
+    : > '{failed}'
+    echo 'injected release failure' >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"#,
+        changed = changed.display(),
+        failed = failed.display(),
+        releases = releases.display(),
+        real = real.display(),
+        url = world.url,
+        lead = crate::world::LEAD,
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given `text` as the rider home's `rider.toml`.
+pub fn given_a_rider_toml(world: &World, text: &str) {
+    let path = world.home.join("rider.toml");
+    fs::write(&path, text).expect("write rider.toml");
+    assert!(path.is_file());
+}
+
+/// The model attempt `attempt` of `task`'s agent was started with.
+pub fn agent_model(world: &World, task: &str, attempt: u32) -> String {
+    let args = fake_agent::args(&world.root, task, attempt);
+    let mut lines = args.lines().skip_while(|line| *line != "--model");
+    assert_eq!(lines.next(), Some("--model"), "{args}");
+    lines.next().expect("a model follows --model").to_string()
+}
+
+/// The prompt attempt `attempt` of `task`'s agent was started with: everything after `--`.
+pub fn agent_prompt(world: &World, task: &str, attempt: u32) -> String {
+    let args = fake_agent::args(&world.root, task, attempt);
+    let (_, prompt) = args.split_once("\n--\n").expect("the prompt follows --");
+    prompt.to_string()
+}

@@ -293,6 +293,7 @@ fn five_ready_polish_tasks_never_run_more_than_the_four_polish_slots_at_once() {
         task
     })
     .collect();
+    given_a_rider_toml(&world, "[roles.polish]\nslots = 4\n");
     given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
     when_the_agent_has_started(&world, &tasks[0]);
     thread::sleep(Duration::from_secs(2));
@@ -307,6 +308,266 @@ fn five_ready_polish_tasks_never_run_more_than_the_four_polish_slots_at_once() {
     assert_eq!(world.most_agents_at_once(), 4);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn one_builder_at_once_runs_implement_tasks_one_by_one_while_a_review_runs_beside_them() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nbuilders_at_once = 1\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let first = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
+    let second = when_the_lead_creates(&world, &an_implement_task(&world, "Add other work."));
+    let review = NewTask::new("Review the new work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &first, &[Behaviour::Hold]);
+    given_the_agent_will(&world, &second, &[Behaviour::Hold]);
+    given_the_agent_will(&world, &review, &[Behaviour::Hold]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "tick=200")]);
+
+    when_the_agent_has_started(&world, &first);
+    when_the_agent_has_started(&world, &review);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(agents_running(&world), 2);
+    assert_eq!(agent_runs_for(&world, &second).len(), 0);
+    world.release_agent(&first);
+    when_the_agent_has_started(&world, &second);
+    assert_eq!(agents_running(&world), 2);
+    world.release_agent(&second);
+    world.release_agent(&review);
+
+    let states = when_the_tasks_settle(&world, &[&built, &first, &second]);
+    assert_eq!(states, vec!["completed"; 3]);
+    assert_eq!(world.most_agents_at_once(), 2);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_pool_stopped_after_a_failed_release_of_a_task_whose_role_changed_retries_it_first() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nslots = 1\n");
+    let task = an_implement_task(&world, "Add the work.").role("light");
+    let task = when_the_lead_creates(&world, &task);
+    let releases = world.root.join("releases.log");
+    given_the_role_changes_after_the_claim_and_one_release_fails(
+        &world,
+        &task,
+        "light",
+        "implement",
+        &releases,
+    );
+    when_the_pool_starts(&mut world);
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while !releases.exists() {
+        assert!(Instant::now() < deadline, "{}", world.pool_log());
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let exit = when_the_pool_is_stopped(&mut world);
+
+    assert_eq!(exit, Some(0), "{}", world.pool_log());
+    assert_eq!(task_state(&world, &task), "ready", "{}", world.pool_log());
+    let tries = fs::read_to_string(&releases).expect("read the release log");
+    assert_eq!(tries, "release\nrelease\n");
+    assert_eq!(agent_runs_for(&world, &task), vec![]);
+}
+
+#[test]
+fn a_rider_toml_giving_review_another_model_starts_the_review_agent_with_it() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodel = \"gpt-test-review\"\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the new work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    let runs = agent_runs_for(&world, &review);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].harness, "codex");
+    assert_eq!(agent_model(&world, &review, 0), "gpt-test-review");
+    assert_eq!(agent_model(&world, &built, 0), "claude-opus-5-5");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_rider_toml_adding_a_role_runs_its_task_with_the_roles_own_prompt() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompt = world.root.join("docs-prompt.md");
+    fs::write(&prompt, "You write the documentation for one task.\n").expect("write a prompt");
+    let toml = format!(
+        r#"[roles.docs]
+harness = "claude"
+model = "claude-docs-model"
+title = "Docs"
+model_name = "Docs Model"
+model_slug = "docs-model"
+prompt = "{}"
+commits = true
+"#,
+        prompt.display()
+    );
+    given_a_rider_toml(&world, &toml);
+    let mut new = an_implement_task(&world, "Document the work.");
+    new.role = Some("docs".to_string());
+    let task = when_the_lead_creates(&world, &new);
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+
+    assert_eq!(agent_model(&world, &task, 0), "claude-docs-model");
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(
+        sent.starts_with("You write the documentation for one task.\n\n# Task "),
+        "{sent}"
+    );
+    then_the_branch_has_the_agents_commit(&world, &task, 0);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_rider_toml_allowing_one_attempt_blocks_a_task_that_failed_once_without_running_it() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nattempts = 1\n");
+    let failed_once = an_implement_task(&world, "Add the work.").label("attempt", "1");
+    let task = when_the_lead_creates(&world, &failed_once);
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["blocked"]);
+
+    assert_eq!(agent_runs_for(&world, &task).len(), 0);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn an_unknown_field_in_rider_toml_stops_the_daemon_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodle = \"gpt-test-review\"\n");
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("modle"), "{output:?}");
+    assert!(output.stderr.contains("rider.toml"), "{output:?}");
+    assert!(!world.home.join("daemon.lock").exists(), "{output:?}");
+}
+
+#[test]
+fn a_user_prompt_at_a_built_in_prompts_path_is_refused_naming_the_path() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompts = world.home.join("prompts");
+    fs::create_dir_all(&prompts).expect("create the prompts directory");
+    fs::write(prompts.join("review.md"), "My own review prompt.\n").expect("write a prompt");
+    given_a_rider_toml(&world, "[roles.review]\nprompt = \"prompts/review.md\"\n");
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("roles.review.prompt"), "{output:?}");
+    assert!(output.stderr.contains("prompts/review.md"), "{output:?}");
+    let kept = fs::read_to_string(prompts.join("review.md")).expect("read the prompt");
+    assert_eq!(kept, "My own review prompt.\n");
+}
+
+#[test]
+fn a_prompt_file_named_directly_under_the_rider_home_is_accepted() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    fs::write(world.home.join("docs.md"), "You write docs.\n").expect("write a prompt");
+    given_a_rider_toml(&world, "[roles.light]\nprompt = \"docs.md\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert!(output.stdout.contains("prompt = \"docs.md\""), "{output:?}");
+}
+
+#[test]
+fn a_model_name_with_a_newline_is_refused_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nmodel_name = \"Sonnet\\n5.5\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("roles.light.model_name"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_model_name_longer_than_its_limit_is_refused_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let long = "M".repeat(200);
+    given_a_rider_toml(&world, &format!("[roles.light]\nmodel_name = \"{long}\"\n"));
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("roles.light.model_name"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_model_with_a_control_character_is_refused_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodel = \"gpt\\u0000sol\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("roles.review.model"), "{output:?}");
+}
+
+#[test]
+fn rider_config_without_a_file_prints_the_built_in_table() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = include_str!("rider-config-default.toml");
+    assert_eq!(output.stdout, expected);
 }
 
 #[test]
@@ -551,6 +812,27 @@ fn a_resumed_session_claude_refuses_falls_back_to_a_fresh_start_in_the_same_atte
 }
 
 #[test]
+fn a_pool_gives_a_refused_resumes_fresh_start_only_what_remains_of_the_attempt_limit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nattempt_minutes = 1\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, true),
+    );
+    given_the_agent_will(&world, &fix, &[Behaviour::RefuseResumeSlowly]);
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+
+    assert_eq!(states, vec!["completed", "failed"], "{}", world.pool_log());
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_runs_for(&world, &fix).len(), 2);
+    assert_eq!(task_label(&world, &fix, "attempt").as_deref(), Some("1"));
+}
+
+#[test]
 fn the_daemon_resumes_a_fix_tasks_session_and_falls_back_to_a_fresh_start_when_refused() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
@@ -613,6 +895,31 @@ fn a_session_recorded_for_another_repository_is_not_resumed() {
     );
     let run = &agent_runs_for(&world, &fix)[0];
     assert!(run.dir.ends_with(format!("other-repo/{fix}")), "{run:?}");
+}
+
+#[test]
+fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(
+        &world,
+        "[roles.implement]\nharness = \"codex\"\nmodel = \"gpt-test-implement\"\n",
+    );
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, true),
+    );
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+
+    assert_eq!(states, vec!["completed".to_string(); 2]);
+    assert_eq!(exit, Some(0));
+    let runs = agent_runs_for(&world, &fix);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].harness, "codex");
+    assert_eq!(agent_model(&world, &fix, 0), "gpt-test-implement");
 }
 
 /// A fix of task `onto` that waits for `after`, resuming `onto`'s session when `resume`.
