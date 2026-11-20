@@ -47,23 +47,31 @@ Post milestones, not heartbeats: a reply is a finished step with its command and
 1. Read the brief and the whole thread: `vb read "$BOARD_TASK"`. Read every reply, including
    notes and failure logs from earlier attempts. If this is a retry, run `git status` and
    `git log --oneline -10` to see what the last attempt left, and continue from there.
-2. Read the repository's own rules (`AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, if present)
-   and follow them.
+2. Read and follow the repository's rules: `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, if any.
 3. Run the brief's proof command before changing anything. Reply with the command and its
    result. If it fails before you start, ask (see below); do not polish broken code.
 4. Reply with your plan: what you will tidy, and where. Stay inside the paths the brief names.
-5. Make the changes. If the `polishing-branch` skill is available, invoke it with the argument
-   `budget` and follow it to its report; it never commits, so its changes stay in the
-   worktree for steps 6 and 7. If it is not available, tidy by hand as described above.
-   After each meaningful step, reply with what you did and the command that checked it. If
-   time runs short, keep only what passes the proof command, commit it, and say in your
-   reply what was left.
-6. Run the proof command again. It must give the same result as before. If it does not,
-   undo the change that broke it.
-7. Commit everything that passes, as one commit, on the current branch: `git add <paths>` then
-   `git commit -m "<one sentence saying what changed>"`.
-8. Run `git status --porcelain`. It must print nothing. Put scratch files outside the
-   worktree (`mktemp -d`).
+5. Tidy once, steps a to e in order. Reply after each with what changed and its check. Do the
+   sweeps yourself: a helper agent per sweep re-reads the diff and rules, so it costs more; use
+   one only if your harness allows it and the diff will not fit in your own context.
+   a. Scope: the diff from the brief's base, or else the task's `start` label, in the brief's
+      paths (`git diff <base> -- <paths>`). Code the branch did not touch is out of scope.
+   b. Mechanical: run the formatter and linter `AGENTS.md` names (default `cargo fmt`,
+      `cargo clippy --all-targets -- -D warnings`) and fix what they report. A new lint
+      suppression is a finding unless it names the lint and gives a reason.
+   c. Conform, one sweep: check the diff against every `AGENTS.md` rule that applies, for
+      dead code the branch added or left dead, and for: a comment that restates the code, a doc
+      comment on an item the branch did not create, a check for a state no caller can
+      produce, a one-use helper that adds nothing, a clone or allocation a move or borrow
+      avoids. Each finding cites its rule; drop any observation you would hedge.
+   d. Refactor, one sweep: make a change only if its payoff is "removes", "collapses",
+      "tightens", or "moves" plus a concrete object, such as "removes a clone of `brief`".
+      Never change a public interface, a serialized shape, or error text.
+   e. Re-check once, only what c and d changed and their callers. No further rounds.
+   If time runs short, commit only what passes the proof command and reply with what was left.
+6. Run the proof command again. It must give step 3's result; revert any change that breaks it.
+7. Commit what passes as one commit: `git add <paths>`, then `git commit -m "<what changed>"`.
+8. `git status --porcelain` must print nothing. Put scratch files in `mktemp -d`.
 9. Reply with what changed and the proof: the proof command and its result, before and after.
 10. End with one short final message: what changed, and the command that proves behaviour
     held. That message becomes the task's result. Then stop.
