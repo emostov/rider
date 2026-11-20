@@ -1,0 +1,45 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "branch",
+    "head",
+    "commits",
+    "summary",
+    "behind"
+  ],
+  "properties": {
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The branch the task worked on, or null when it worked on none"
+    },
+    "head": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The commit the worktree was at when the attempt ended"
+    },
+    "commits": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Commits the attempt added to the branch"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The worker's final message, which is also the task's result"
+    },
+    "behind": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "description": "Tasks cut from this task's branch, directly or through another task on it, whose own branch does not contain head; empty when none are behind"
+    }
+  }
+}
