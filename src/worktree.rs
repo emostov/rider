@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn release_refuses_a_stopped_multi_commit_cherry_pick() {
         let fixture = Fixture::new("wt-release-sequencer");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         git(&fixture.repo, &["checkout", "-q", "-b", "picks"]);
@@ -1098,7 +1098,7 @@ mod tests {
     #[test]
     fn release_refuses_commits_only_the_worktrees_head_reflog_reaches() {
         let fixture = Fixture::new("wt-release-reflog");
-        let board = FakeBoard::new(Vec::new());
+        let board = FakeBoard::new(vec![task(7, None)]);
         let checkout = prepare(&brief(&fixture, "implement", "Work"), &board, &fixture.home);
         let checkout = checkout.unwrap();
         fixture.commit(&checkout.dir, "work.txt", "work");
