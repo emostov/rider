@@ -271,10 +271,13 @@ These come from the first end-to-end run (see `docs/milestone-0-run.md`).
 - **A task is blocked as `rider_error`: "Rider will not reuse the worktree ... was not made
   for this board".** Worktrees are named by task id, so after the board's data is replaced a
   new task can reuse the id of an old task whose worktree is still there. Each worktree Rider
-  makes records which board it is for (the path of `~/.rider/board/local.db` and when that
-  file was created, or the board URL when the board's data is elsewhere) in a `.rider-board`
-  file in the worktree's git directory. A worktree with no record, or with another board's,
-  is left as it is. Keep what you need from the directory the reason names, remove it with
+  makes records which board it is for in a `.rider-board` file in the worktree's git
+  directory. The board's identity lives in the board's own data: the oldest post in the
+  `rider/identity` channel, a random id Rider posts there when the channel is empty. Wiping,
+  replacing, or switching the board gives it a new identity, wherever its data lives. Rider
+  reads it once when `rider pool` or `rider daemon` starts, so restart them after replacing
+  the board. Do not post in or delete `rider/identity`. A worktree with no record, or with
+  another board's, is left as it is. Keep what you need from the directory the reason names, remove it with
   `git worktree remove <dir>` from the repository, then
   `vb tasks unblock <id> --as lead-fable-5-2`. Worktrees made before Rider kept this record
   are blocked the same way.

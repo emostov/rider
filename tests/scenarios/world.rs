@@ -45,6 +45,8 @@ pub struct World {
     pub home: PathBuf,
     pub repo: PathBuf,
     pub url: String,
+    /// Where the board started by `start_board` keeps its data.
+    pub board_dir: PathBuf,
     /// The fake `claude` and `codex` scripts, first on the pool's `PATH`.
     pub agents: PathBuf,
     /// Holds `node`, so the Board CLI runs without the rest of the caller's `PATH`.
@@ -128,10 +130,7 @@ impl World {
     /// Lays out the directories and starts nothing; `None` when `vb` or `node` is missing.
     pub fn new() -> Option<World> {
         let (installed_vb, node) = find_tools()?;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-        let port = listener.local_addr().expect("read the bound port").port();
-        assert!(port != 0 && port != 4100, "never the live board's port");
-        let url = format!("http://127.0.0.1:{port}/api/board");
+        let url = free_url();
         let temp = std::env::temp_dir().canonicalize();
         let temp = temp.expect("resolve the temporary directory");
         let dir = Builder::new().prefix("rider-scenario-").tempdir_in(temp);
@@ -144,6 +143,7 @@ impl World {
             home: root.join("rider-home"),
             agents: root.join("agents"),
             tools: root.join("tools"),
+            board_dir: root.join("board"),
             root,
             url,
             board: None,
@@ -215,7 +215,7 @@ impl World {
                 "--no-inspect",
                 "--dir",
             ])
-            .arg(self.home.join("board"))
+            .arg(&self.board_dir)
             .stdout(log)
             .stderr(err)
             .process_group(0)
@@ -232,11 +232,46 @@ impl World {
         panic!("the board did not answer within {BOARD_START_SECONDS_MAX} seconds");
     }
 
-    /// Stops the board, deletes its data, and starts a fresh board on the same port.
-    pub fn wipe_board(&mut self) {
+    fn stop_board(&mut self) {
         let mut board = self.board.take().expect("the board was started");
         assert!(reap(&mut board), "the board outlived its kill");
-        fs::remove_dir_all(self.home.join("board")).expect("delete the board's data");
+    }
+
+    /// Stops the board, deletes its data, and starts a fresh board on the same port.
+    pub fn wipe_board(&mut self) {
+        self.stop_board();
+        fs::remove_dir_all(&self.board_dir).expect("delete the board's data");
+        self.start_board();
+    }
+
+    /// Stops the board, moves its data to `dir`, and starts it again there on the same port.
+    pub fn move_board_data(&mut self, dir: PathBuf) {
+        self.stop_board();
+        fs::create_dir_all(dir.parent().expect("a data directory has a parent"))
+            .expect("create the data directory's parent");
+        fs::rename(&self.board_dir, &dir).expect("move the board's data");
+        self.board_dir = dir;
+        self.start_board();
+    }
+
+    /// Stops the board, empties its database file where it is, and starts it again.
+    pub fn reinitialise_board_in_place(&mut self) {
+        self.stop_board();
+        let data = self.board_dir.join("local.db");
+        let file = fs::OpenOptions::new().write(true).open(&data);
+        let file = file.expect("open the board's database");
+        file.set_len(0).expect("empty the board's database");
+        for journal in ["local.db-wal", "local.db-shm"] {
+            let _ = fs::remove_file(self.board_dir.join(journal));
+        }
+        self.start_board();
+    }
+
+    /// Stops the board, keeping its data, and starts a second, fresh board at another URL.
+    pub fn start_another_board(&mut self) {
+        self.stop_board();
+        self.url = free_url();
+        self.board_dir = self.root.join("another-board");
         self.start_board();
     }
 
@@ -447,6 +482,14 @@ fn kill(pid: u32, group: bool) {
 }
 
 /// Kills `child` and its process group; whether it was reaped within `REAP_SECONDS_MAX`.
+/// A board URL on a port that was free a moment ago.
+fn free_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let port = listener.local_addr().expect("read the bound port").port();
+    assert!(port != 0 && port != 4100, "never the live board's port");
+    format!("http://127.0.0.1:{port}/api/board")
+}
+
 fn reap(child: &mut Child) -> bool {
     kill(child.id(), true);
     // A child that left its group is missed by the group signal.

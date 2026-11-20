@@ -110,6 +110,33 @@ pub fn when_the_board_is_wiped(world: &mut World) {
     register_schemas(world);
 }
 
+/// When the board's database is emptied where it lies, and the board, with the schemas, starts
+/// again on it.
+pub fn when_the_board_is_reinitialised_in_place(world: &mut World) {
+    world.reinitialise_board_in_place();
+    register_schemas(world);
+}
+
+/// When the board stops, keeping its data, and rider is pointed at a second, fresh board, with
+/// the schemas, at another URL.
+pub fn when_rider_moves_to_another_board(world: &mut World) {
+    world.start_another_board();
+    register_schemas(world);
+}
+
+/// Given the board keeps its data in rider's home, where `vb serve --dir ~/.rider/board` puts it.
+pub fn given_the_board_keeps_its_data_in_rider_home(world: &mut World) {
+    let dir = world.home.join("board");
+    world.move_board_data(dir);
+}
+
+/// Given a database in rider's home's board directory that no running board uses.
+pub fn given_a_stray_board_database_in_rider_home(world: &World) {
+    let dir = world.home.join("board");
+    fs::create_dir_all(&dir).expect("create the stray board directory");
+    fs::write(dir.join("local.db"), "not this board's data\n").expect("write a stray database");
+}
+
 /// Given a worktree on a new `branch` at `id`'s worktree directory that rider did not make.
 pub fn given_a_leftover_worktree(world: &World, id: &str, branch: &str) -> PathBuf {
     let dir = worktree_dir(world, id);

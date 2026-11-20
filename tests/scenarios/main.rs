@@ -1162,18 +1162,19 @@ fn a_panicking_world_kills_its_wrapped_vb_and_spares_a_process_that_names_its_pa
     }
 }
 
-#[test]
-fn a_task_reusing_the_id_of_a_task_on_a_wiped_board_is_blocked_and_its_worktree_untouched() {
-    let Some(mut world) = given_a_board_and_a_repository() else {
-        return;
-    };
+/// Leaves a blocked task with a worktree, replaces the board with `replace`, then runs a new
+/// task that reuses the id, and checks it is blocked and the old worktree untouched.
+fn then_a_reused_id_on_a_replaced_board_is_blocked(
+    mut world: World,
+    replace: impl FnOnce(&mut World),
+) {
     let old = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_the_agent_will(&world, &old, &[Behaviour::Block, Behaviour::Commit]);
     let (states, _) = when_the_pool_runs_until_settled(&mut world, &[&old]);
     assert_eq!(states, vec!["blocked"]);
     let dir = worktree_dir(&world, &old);
     let before = worktree_state(&world, &dir);
-    when_the_board_is_wiped(&mut world);
+    replace(&mut world);
 
     let new = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&new]);
@@ -1185,6 +1186,35 @@ fn a_task_reusing_the_id_of_a_task_on_a_wiped_board_is_blocked_and_its_worktree_
     assert!(text.contains(dir.to_str().expect("UTF-8 path")), "{text}");
     assert_eq!(agent_runs_for(&world, &new).len(), 1);
     assert_eq!(worktree_state(&world, &dir), before);
+}
+
+#[test]
+fn a_task_reusing_the_id_of_a_task_on_a_wiped_board_is_blocked_and_its_worktree_untouched() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    then_a_reused_id_on_a_replaced_board_is_blocked(world, when_the_board_is_wiped);
+}
+
+#[test]
+fn a_task_reusing_an_id_on_another_board_is_blocked_despite_a_stray_database_in_rider_home() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_stray_board_database_in_rider_home(&world);
+    then_a_reused_id_on_a_replaced_board_is_blocked(world, when_rider_moves_to_another_board);
+}
+
+#[test]
+fn a_task_reusing_an_id_on_a_board_reinitialised_in_place_is_blocked() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_the_board_keeps_its_data_in_rider_home(&mut world);
+    then_a_reused_id_on_a_replaced_board_is_blocked(
+        world,
+        when_the_board_is_reinitialised_in_place,
+    );
 }
 
 #[test]

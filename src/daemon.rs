@@ -934,6 +934,9 @@ impl Board for Guarded<'_> {
     fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
         self.board.list_open(subtree)
     }
+    fn identity(&self) -> Result<String, BoardError> {
+        self.board.identity()
+    }
 }
 
 fn release(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {

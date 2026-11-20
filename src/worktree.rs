@@ -5,7 +5,6 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use crate::board::{Board, BoardError, LABELS_MAX, TaskId, TaskView};
 use crate::brief::Brief;
@@ -27,8 +26,6 @@ pub const BRANCH_LABEL: &str = "branch";
 // removed with the worktree.
 const BOARD_RECORD: &str = ".rider-board";
 const BOARD_RECORD_BYTES_MAX: u64 = 4096;
-// Where `vb serve --dir <home>/board` keeps the board's data.
-const BOARD_DATA: &str = "board/local.db";
 // What git keeps in a worktree's git directory while an operation is unfinished.
 const IN_PROGRESS: [&str; 8] = [
     "rebase-merge",
@@ -77,7 +74,7 @@ pub enum WorktreeError {
         dir: PathBuf,
         record: Record,
     },
-    /// The board's identity or the worktree's record of it could not be read or written.
+    /// The worktree's record of its board could not be read or written.
     BoardRecord {
         path: PathBuf,
         why: String,
@@ -98,35 +95,17 @@ pub enum Record {
     Different,
 }
 
-/// Which board a worktree is made for: where its data lives and when that data was created.
+/// Which board a worktree is made for: the identity the board keeps in its own data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoardIdentity(String);
 
 impl BoardIdentity {
-    /// The board whose data is under `home`, or the board at `url` when its data is elsewhere.
-    pub fn read(home: &Path, url: &str) -> Result<BoardIdentity, WorktreeError> {
-        assert!(home.is_absolute(), "rider's home is an absolute path");
-        assert!(!url.is_empty());
-        let data = home.join(BOARD_DATA);
-        let failed = |why: String| WorktreeError::BoardRecord {
-            path: data.clone(),
-            why,
-        };
-        let created = match fs::metadata(&data) {
-            Ok(metadata) => metadata
-                .created()
-                .map_err(|error| failed(error.to_string()))?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(BoardIdentity(format!("url {url}\n")));
-            }
-            Err(error) => return Err(failed(error.to_string())),
-        };
-        let since = created.duration_since(UNIX_EPOCH);
-        let since = since.map_err(|_| failed("created before 1970".to_string()))?;
-        let (seconds, nanos) = (since.as_secs(), since.subsec_nanos());
-        let identity = format!("data {}\ncreated {seconds}.{nanos:09}\n", data.display());
-        assert!(identity.starts_with("data /"));
-        Ok(BoardIdentity(identity))
+    /// The identity a board reported, as its worktrees record it.
+    pub fn new(marker: &str) -> BoardIdentity {
+        assert!(!marker.is_empty() && !marker.contains('\n'));
+        let identity = BoardIdentity(format!("board {marker}\n"));
+        assert!(u64::try_from(identity.0.len()).is_ok_and(|n| n <= BOARD_RECORD_BYTES_MAX));
+        identity
     }
 }
 
@@ -577,7 +556,7 @@ mod tests {
     const BASE_BRANCH: &str = "rider/3-token-store";
 
     fn prepare(brief: &Brief, board: &dyn Board, home: &Path) -> Result<Checkout, WorktreeError> {
-        let identity = BoardIdentity("url http://board.invalid\n".to_string());
+        let identity = BoardIdentity::new("rider board test");
         super::prepare(brief, board, home, &identity)
     }
 

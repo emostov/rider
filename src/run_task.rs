@@ -3,7 +3,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use serde::Serialize;
 
@@ -53,6 +53,8 @@ const SESSION_FILE_BYTES_MAX: usize = 4096;
 const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as the \
                           last attempt left them, uncommitted changes included.";
+
+static BOARD_IDENTITY: Mutex<Option<(String, BoardIdentity)>> = Mutex::new(None);
 
 /// Where rider keeps its files, and how its agents reach the board.
 pub struct Env {
@@ -270,7 +272,8 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
     if let Some(error) = unneeded_on_branch(&brief, &view, board)? {
         return Ok(Block::new("invalid_brief", error.to_string()).prepared());
     }
-    let attempt = match prepare(brief, failed, start, env, board) {
+    let identity = board_identity(&env.board_url, board)?;
+    let attempt = match prepare(brief, failed, start, env, board, &identity) {
         Ok(attempt) => attempt,
         Err(block) => return Ok(block.prepared()),
     };
@@ -287,6 +290,24 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
         let _ = board.reply(id, note);
     }
     Ok(Prepared::Ready(Box::new(attempt)))
+}
+
+/// The identity of the board at `url`, read from it once per process and then remembered.
+fn board_identity(url: &str, board: &dyn Board) -> Result<BoardIdentity, BoardError> {
+    assert!(!url.is_empty());
+    // Held across the read, so the slots of one pool post at most one marker between them.
+    let mut known = BOARD_IDENTITY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some((known_url, identity)) = known.as_ref()
+        && known_url == url
+    {
+        return Ok(identity.clone());
+    }
+    let identity = BoardIdentity::new(&board.identity()?);
+    *known = Some((url.to_string(), identity.clone()));
+    assert!(known.is_some());
+    Ok(identity)
 }
 
 /// Judges an attempt once its agent has ended, from the task's state and the worktree.
@@ -456,6 +477,7 @@ fn prepare(
     start: Option<&str>,
     env: &Env,
     board: &dyn Board,
+    identity: &BoardIdentity,
 ) -> Result<Attempt, Block> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
     let dir = worktree::dir_for(&brief, &env.home);
@@ -494,9 +516,7 @@ fn prepare(
         }),
         None => None,
     };
-    let identity = BoardIdentity::read(&env.home, &env.board_url);
-    let identity = identity.map_err(|error| worktree_block(&error))?;
-    let checkout = worktree::prepare(&brief, board, &env.home, &identity);
+    let checkout = worktree::prepare(&brief, board, &env.home, identity);
     let checkout = checkout.map_err(|error| worktree_block(&error))?;
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
