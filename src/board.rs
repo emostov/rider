@@ -1,16 +1,18 @@
 //! The Board trait, and its one implementation over the `vb` command-line program.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command as Process, ExitStatus, Stdio};
+use std::process::{ChildStdin, Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
-use serde_json::{Map, Value};
+use rustix::process::{Pid, test_kill_process_group};
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, Deserializer};
 
 use crate::core::TASKS_MAX;
 use crate::feed::Cursor;
@@ -317,24 +319,6 @@ struct Output {
     stderr: String,
 }
 
-impl TaskState {
-    fn from_board(state: &str) -> Option<TaskState> {
-        assert!(state.len() <= OUTPUT_BYTES_MAX);
-        let parsed = match state {
-            "waiting" => Some(TaskState::Waiting),
-            "ready" => Some(TaskState::Ready),
-            "claimed" => Some(TaskState::Claimed),
-            "blocked" => Some(TaskState::Blocked),
-            "completed" => Some(TaskState::Completed),
-            "failed" => Some(TaskState::Failed),
-            "canceled" => Some(TaskState::Canceled),
-            _ => None,
-        };
-        assert!(parsed.is_none() || state.bytes().all(|byte| byte.is_ascii_lowercase()));
-        parsed
-    }
-}
-
 /// `text` on one line: each run of whitespace becomes one space, and the line is cut to at
 /// most `RESULT_CHARS_MAX` characters, on a character boundary.
 pub(crate) fn one_line(text: &str) -> String {
@@ -538,17 +522,147 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
     }
 }
 
-fn parse_object(json: &str) -> Result<Map<String, Value>, BoardError> {
+/// Deserializes one of the board's JSON shapes from bounded output.
+fn parse<T: DeserializeOwned>(json: &str) -> Result<T, BoardError> {
     assert!(
         json.len() <= OUTPUT_BYTES_MAX,
         "output is bounded before it is parsed"
     );
-    let value: Value = serde_json::from_str(json.trim())
-        .map_err(|error| BoardError::Parse(format!("not JSON: {error}")))?;
-    match value {
-        Value::Object(object) => Ok(object),
-        _ => Err(BoardError::Parse("not a JSON object".into())),
+    serde_json::from_str(json).map_err(|error| BoardError::Parse(format!("{error}")))
+}
+
+/// Deserializes a field that must be present but may be null.
+pub(crate) fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+/// A task's state as the board prints it.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum WireState {
+    Waiting,
+    Ready,
+    Claimed,
+    Blocked,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl From<WireState> for TaskState {
+    fn from(state: WireState) -> TaskState {
+        match state {
+            WireState::Waiting => TaskState::Waiting,
+            WireState::Ready => TaskState::Ready,
+            WireState::Claimed => TaskState::Claimed,
+            WireState::Blocked => TaskState::Blocked,
+            WireState::Completed => TaskState::Completed,
+            WireState::Failed => TaskState::Failed,
+            WireState::Canceled => TaskState::Canceled,
+        }
     }
+}
+
+/// `task.claim` of a claimed task.
+#[derive(Deserialize)]
+struct WireHolder {
+    actor: String,
+    until: String,
+}
+
+/// The `task` object of a task's message.
+#[derive(Deserialize)]
+struct WireTask {
+    state: WireState,
+    epoch: u64,
+    needs: Vec<String>,
+    #[serde(deserialize_with = "nullable")]
+    claim: Option<WireHolder>,
+}
+
+/// A task's message, as `read` prints under `message` and `claim` under `task`.
+#[derive(Deserialize)]
+struct WireMessage {
+    id: String,
+    text: String,
+    labels: BTreeMap<String, String>,
+    task: WireTask,
+    version: u64,
+}
+
+/// `vb read <id> --json`: `{message, replies, cursor, schedules}`.
+#[derive(Deserialize)]
+struct WireRead {
+    message: WireMessage,
+}
+
+/// A successful `vb tasks claim --json`: `{task, claim}`, the task null when none was ready.
+#[derive(Deserialize)]
+struct WireClaimed {
+    #[serde(deserialize_with = "nullable")]
+    task: Option<WireMessage>,
+}
+
+/// The `claim` of a lease.
+#[derive(Deserialize)]
+struct WireLeaseClaim {
+    epoch: u64,
+    until: String,
+}
+
+/// `vb tasks claim <id>` or `vb tasks renew`: `{task, claim: {epoch, until}}`.
+#[derive(Deserialize)]
+struct WireLease {
+    task: WireMessage,
+    claim: WireLeaseClaim,
+}
+
+#[derive(Deserialize)]
+struct WireListed {
+    message: WireMessage,
+}
+
+/// One page of `vb tasks <subtree> --json`: `{tasks: [{message, ...}], cursor}`.
+#[derive(Deserialize)]
+struct WireListing {
+    tasks: Vec<WireListed>,
+    cursor: String,
+}
+
+/// Any read that prints the board's `cursor`, a decimal string.
+#[derive(Deserialize)]
+struct WireCursor {
+    cursor: String,
+}
+
+/// A failed run's JSON: `{status: "error", reason, message}`.
+#[derive(Deserialize)]
+struct WireFailure {
+    status: Option<String>,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct WireTaskRef {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct WireMessageRef {
+    id: String,
+    re: Option<String>,
+}
+
+/// A write's output: `{task, outcome}` or `{message, outcome}`.
+#[derive(Deserialize)]
+struct WireWrite {
+    outcome: String,
+    task: Option<WireTaskRef>,
+    message: Option<WireMessageRef>,
 }
 
 /// An ID as the board prints it: canonical decimal, no sign and no leading zeros.
@@ -572,212 +686,96 @@ fn parse_id_text(id: &str) -> Result<TaskId, BoardError> {
     Ok(TaskId(number))
 }
 
-fn parse_id(message: &Map<String, Value>, key: &str) -> Result<TaskId, BoardError> {
-    assert!(key == "id" || key == "re");
-    let id = message.get(key).and_then(Value::as_str);
-    let id = id.ok_or_else(|| BoardError::Parse(format!("no string {key}")))?;
-    parse_id_text(id)
-}
-
-fn parse_labels(message: &Map<String, Value>) -> Result<Vec<(String, String)>, BoardError> {
-    let labels = message.get("labels").and_then(Value::as_object);
-    let labels = labels.ok_or_else(|| BoardError::Parse("no labels object".into()))?;
-    if labels.len() > LABELS_MAX {
-        return Err(BoardError::TooManyLabels);
-    }
-    let mut result: Vec<(String, String)> = Vec::with_capacity(labels.len());
-    for (key, value) in labels.iter().take(LABELS_MAX) {
-        let value = value.as_str();
-        let value = value.ok_or_else(|| BoardError::Parse(format!("label {key} not a string")))?;
-        result.push((key.clone(), value.to_string()));
-    }
-    assert_eq!(result.len(), labels.len(), "no label was dropped");
-    Ok(result)
-}
-
-/// The days from 1970-01-01 to a date in or after 1970, by the proleptic Gregorian calendar.
-fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
-    assert!(year >= 1970 && (1..=12).contains(&month) && (1..=31).contains(&day));
-    // Counted from March, so the leap day falls at the end of a year.
-    let year = if month <= 2 { year - 1 } else { year };
-    let (era, year_of_era) = (year / 400, year % 400);
-    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    assert!(days < (10_000 - 1970) * 366, "a four-digit year");
-    days
-}
-
 /// A time as the board prints it, `YYYY-MM-DDTHH:MM:SS.mmmZ`, from 1970 on.
 pub fn parse_timestamp(text: &str) -> Result<Timestamp, BoardError> {
     let bad = || BoardError::Parse(format!("time {text:?} is not YYYY-MM-DDTHH:MM:SS.mmmZ"));
     let bytes = text.as_bytes();
-    if bytes.len() != TIMESTAMP_LEN || !text.is_ascii() {
+    // jiff takes any RFC 3339 time, and a leap second as :59; the board prints only this
+    // one shape of it, and never a leap second.
+    let shaped = bytes.len() == TIMESTAMP_LEN
+        && text.is_ascii()
+        && [(10, b'T'), (19, b'.'), (23, b'Z')]
+            .iter()
+            .all(|&(at, byte)| bytes[at] == byte)
+        && &text[17..19] != "60";
+    if !shaped {
         return Err(bad());
     }
-    let separators = [
-        (4, b'-'),
-        (7, b'-'),
-        (10, b'T'),
-        (13, b':'),
-        (16, b':'),
-        (19, b'.'),
-    ];
-    let shaped = separators.iter().all(|&(at, byte)| bytes[at] == byte) && bytes[23] == b'Z';
-    let number = |from: usize, to: usize| -> Option<u64> {
-        let digits = &text[from..to];
-        digits
-            .bytes()
-            .all(|byte| byte.is_ascii_digit())
-            .then(|| digits.parse().ok())?
-    };
-    let fields = [
-        (0, 4),
-        (5, 7),
-        (8, 10),
-        (11, 13),
-        (14, 16),
-        (17, 19),
-        (20, 23),
-    ];
-    let mut values = [0u64; 7];
-    for (value, &(from, to)) in values.iter_mut().zip(fields.iter()) {
-        *value = number(from, to).filter(|_| shaped).ok_or_else(bad)?;
-    }
-    let [year, month, day, hour, minute, second, millis] = values;
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_days = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let in_range = year >= 1970
-        && (1..=12).contains(&month)
-        && day >= 1
-        && usize::try_from(month - 1).is_ok_and(|index| day <= month_days[index])
-        && hour < 24
-        && minute < 60
-        && second < 60;
-    if !in_range {
-        return Err(bad());
-    }
-    let days = days_since_epoch(year, month, day);
-    let seconds = ((days * 24 + hour) * 60 + minute) * 60 + second;
-    let stamp = Timestamp(seconds * 1000 + millis);
-    assert!(millis < 1000 && stamp.0 >= seconds);
+    let parsed: jiff::Timestamp = text.parse().map_err(|_| bad())?;
+    let millis = u64::try_from(parsed.as_millisecond()).map_err(|_| bad())?;
+    let stamp = Timestamp(millis);
+    assert!(stamp.0 / 1000 == u64::try_from(parsed.as_second()).unwrap_or(u64::MAX));
     Ok(stamp)
 }
 
-/// The IDs a task waits for, from `task.needs`.
-fn parse_needs(task: &Map<String, Value>) -> Result<Vec<TaskId>, BoardError> {
-    let needs = task.get("needs").and_then(Value::as_array);
-    let needs = needs.ok_or_else(|| BoardError::Parse("no task.needs array".into()))?;
-    if needs.len() > NEEDS_MAX {
-        return Err(BoardError::TooManyNeeds);
+fn holder_from_wire(holder: WireHolder) -> Result<Claim, BoardError> {
+    if holder.actor.is_empty() {
+        return Err(BoardError::Parse("an empty task.claim.actor".into()));
     }
-    let mut result: Vec<TaskId> = Vec::with_capacity(needs.len());
-    for need in needs.iter().take(NEEDS_MAX) {
-        let need = need.as_str();
-        let need = need.ok_or_else(|| BoardError::Parse("a need is not a string".into()))?;
-        result.push(parse_id_text(need)?);
-    }
-    assert_eq!(result.len(), needs.len(), "no need was dropped");
-    Ok(result)
-}
-
-/// The holder and end of `task.claim`, or `None` when it is null.
-fn parse_task_claim(task: &Map<String, Value>) -> Result<Option<Claim>, BoardError> {
-    let claim = task
-        .get("claim")
-        .ok_or_else(|| BoardError::Parse("no task.claim".into()))?;
-    if claim.is_null() {
-        return Ok(None);
-    }
-    let holder = claim.get("actor").and_then(Value::as_str);
-    let holder = holder.filter(|holder| !holder.is_empty());
-    let holder = holder.ok_or_else(|| BoardError::Parse("no task.claim.actor".into()))?;
-    let until = claim.get("until").and_then(Value::as_str);
-    let until = until.ok_or_else(|| BoardError::Parse("no task.claim.until".into()))?;
     let claim = Claim {
-        holder: holder.to_string(),
-        until: parse_timestamp(until)?,
+        until: parse_timestamp(&holder.until)?,
+        holder: holder.actor,
     };
     assert!(!claim.holder.is_empty());
-    Ok(Some(claim))
+    Ok(claim)
 }
 
-/// A task from a message object, as `read` prints under `message` and `claim` under `task`.
-fn parse_message(message: &Map<String, Value>) -> Result<TaskView, BoardError> {
-    let id = parse_id(message, "id")?;
-    let text = message.get("text").and_then(Value::as_str);
-    let text = text
-        .ok_or_else(|| BoardError::Parse("no text".into()))?
-        .to_string();
-    let task = message.get("task").and_then(Value::as_object);
-    let task = task.ok_or_else(|| BoardError::Parse("not a task: no task object".into()))?;
-    let state = task.get("state").and_then(Value::as_str);
-    let state = state.ok_or_else(|| BoardError::Parse("not a task: no task.state".into()))?;
-    let state = TaskState::from_board(state)
-        .ok_or_else(|| BoardError::Parse(format!("unknown task state {state:?}")))?;
-    let epoch = task.get("epoch").and_then(Value::as_u64);
-    let epoch = epoch.ok_or_else(|| BoardError::Parse("no whole task.epoch".into()))?;
-    let claim = parse_task_claim(task)?;
-    let version = message.get("version").and_then(Value::as_u64);
-    let version = Cursor(version.ok_or_else(|| BoardError::Parse("no whole version".into()))?);
+/// The task a message describes.
+fn view_from_wire(message: WireMessage) -> Result<TaskView, BoardError> {
+    let WireMessage {
+        id,
+        text,
+        labels,
+        task,
+        version,
+    } = message;
+    if labels.len() > LABELS_MAX {
+        return Err(BoardError::TooManyLabels);
+    }
+    if task.needs.len() > NEEDS_MAX {
+        return Err(BoardError::TooManyNeeds);
+    }
+    let state = TaskState::from(task.state);
+    let claim = task.claim.map(holder_from_wire).transpose()?;
     if claim.is_some() != (state == TaskState::Claimed) {
         return Err(BoardError::Parse(format!(
             "a {state:?} task {} a claim",
             if claim.is_some() { "with" } else { "without" }
         )));
     }
+    let needs: Result<Vec<TaskId>, BoardError> =
+        task.needs.iter().map(|need| parse_id_text(need)).collect();
     let view = TaskView {
-        id,
+        id: parse_id_text(&id)?,
         text,
         state,
-        labels: parse_labels(message)?,
-        needs: parse_needs(task)?,
-        epoch,
+        labels: labels.into_iter().collect(),
+        needs: needs?,
+        epoch: task.epoch,
         claim,
-        version,
+        version: Cursor(version),
     };
     assert!(view.text.len() < OUTPUT_BYTES_MAX);
     assert_eq!(view.claim.is_some(), view.state == TaskState::Claimed);
     Ok(view)
 }
 
-/// A task from the output of `vb read <id> --json`: `{message, replies, cursor, schedules}`.
+/// A task from the output of `vb read <id> --json`.
 pub fn parse_task_view(json: &str) -> Result<TaskView, BoardError> {
-    let object = parse_object(json)?;
-    let message = object.get("message").and_then(Value::as_object);
-    let message = message.ok_or_else(|| BoardError::Parse("no message object".into()))?;
-    let view = parse_message(message)?;
+    let read: WireRead = parse(json)?;
+    let view = view_from_wire(read.message)?;
     assert!(view.labels.len() <= LABELS_MAX);
     Ok(view)
 }
 
-/// The claimed task from the output of a successful `vb tasks claim --json`: `{task, claim}`.
+/// The claimed task from the output of a successful `vb tasks claim --json`.
 /// `None` when the board printed a null task.
 pub fn parse_claim(json: &str) -> Result<Option<TaskId>, BoardError> {
-    let object = parse_object(json)?;
-    let task = object
-        .get("task")
-        .ok_or_else(|| BoardError::Parse("no task".into()))?;
-    if task.is_null() {
+    let claimed: WireClaimed = parse(json)?;
+    let Some(task) = claimed.task else {
         return Ok(None);
-    }
-    let task = task
-        .as_object()
-        .ok_or_else(|| BoardError::Parse("task not an object".into()))?;
-    let view = parse_message(task)?;
+    };
+    let view = view_from_wire(task)?;
     if view.state != TaskState::Claimed {
         return Err(BoardError::Parse(format!(
             "claimed task is {:?}",
@@ -787,20 +785,13 @@ pub fn parse_claim(json: &str) -> Result<Option<TaskId>, BoardError> {
     Ok(Some(view.id))
 }
 
-/// The task held under a lease, from the output of `vb tasks claim <id>` or `vb tasks renew`:
-/// `{task, claim: {epoch, until}}`, where the lease must match the task's own claim.
+/// The task held under a lease, from the output of `vb tasks claim <id>` or `vb tasks renew`,
+/// where the lease must match the task's own claim.
 pub fn parse_lease(json: &str) -> Result<TaskView, BoardError> {
-    let object = parse_object(json)?;
-    let task = object.get("task").and_then(Value::as_object);
-    let task = task.ok_or_else(|| BoardError::Parse("no task object".into()))?;
-    let view = parse_message(task)?;
-    let lease = object.get("claim").and_then(Value::as_object);
-    let lease = lease.ok_or_else(|| BoardError::Parse("no claim object".into()))?;
-    let epoch = lease.get("epoch").and_then(Value::as_u64);
-    let epoch = epoch.ok_or_else(|| BoardError::Parse("no whole claim.epoch".into()))?;
-    let until = lease.get("until").and_then(Value::as_str);
-    let until = until.ok_or_else(|| BoardError::Parse("no claim.until".into()))?;
-    let until = parse_timestamp(until)?;
+    let lease: WireLease = parse(json)?;
+    let view = view_from_wire(lease.task)?;
+    let epoch = lease.claim.epoch;
+    let until = parse_timestamp(&lease.claim.until)?;
     let held_until = view.claim.as_ref().map(|claim| claim.until);
     if epoch != view.epoch || held_until != Some(until) {
         return Err(BoardError::Parse(format!(
@@ -812,71 +803,54 @@ pub fn parse_lease(json: &str) -> Result<TaskView, BoardError> {
     Ok(view)
 }
 
-/// One page of `vb tasks <subtree> --json`: `{tasks: [{message, ...}], cursor}`.
+/// One page of `vb tasks <subtree> --json`.
 pub fn parse_task_list(json: &str) -> Result<TaskPage, BoardError> {
-    let object = parse_object(json)?;
-    let tasks = object.get("tasks").and_then(Value::as_array);
-    let tasks = tasks.ok_or_else(|| BoardError::Parse("no tasks array".into()))?;
-    if tasks.len() > TASKS_PAGE_MAX {
+    let listing: WireListing = parse(json)?;
+    let count = listing.tasks.len();
+    if count > TASKS_PAGE_MAX {
         return Err(BoardError::Parse(format!(
-            "a page of {} tasks, over the {TASKS_PAGE_MAX} asked for",
-            tasks.len()
+            "a page of {count} tasks, over the {TASKS_PAGE_MAX} asked for"
         )));
     }
-    let cursor = parse_cursor(&object)?;
-    let mut views: Vec<TaskView> = Vec::with_capacity(tasks.len());
-    for entry in tasks.iter().take(TASKS_PAGE_MAX) {
-        let message = entry.get("message").and_then(Value::as_object);
-        let message = message.ok_or_else(|| BoardError::Parse("no message object".into()))?;
-        views.push(parse_message(message)?);
-    }
-    assert_eq!(views.len(), tasks.len(), "no task was dropped");
-    Ok(TaskPage {
-        tasks: views,
-        cursor,
-    })
+    let cursor = Cursor(parse_id_text(&listing.cursor)?.0);
+    let tasks: Result<Vec<TaskView>, BoardError> = listing
+        .tasks
+        .into_iter()
+        .map(|listed| view_from_wire(listed.message))
+        .collect();
+    let tasks = tasks?;
+    assert_eq!(tasks.len(), count, "no task was dropped");
+    Ok(TaskPage { tasks, cursor })
 }
 
-/// The `cursor` a read or a listing printed, a decimal string.
-fn parse_cursor(object: &Map<String, Value>) -> Result<Cursor, BoardError> {
-    let cursor = object.get("cursor").and_then(Value::as_str);
-    let cursor = cursor.ok_or_else(|| BoardError::Parse("no string cursor".into()))?;
-    let cursor = Cursor(parse_id_text(cursor)?.0);
-    Ok(cursor)
-}
-
-/// The `reason` of a failed run, from the JSON it printed: `{status: "error", reason, message}`.
+/// The `reason` of a failed run, from the JSON it printed.
 pub fn parse_failure_reason(stderr: &str) -> Option<String> {
     assert!(
         stderr.len() <= OUTPUT_BYTES_MAX,
         "output is bounded before it is parsed"
     );
-    let object = parse_object(stderr).ok()?;
-    if object.get("status").and_then(Value::as_str) == Some("ok") {
+    let failure: WireFailure = parse(stderr).ok()?;
+    if failure.status.as_deref() == Some("ok") {
         return None;
     }
-    let reason = object.get("reason")?.as_str()?.to_string();
-    Some(reason)
+    Some(failure.reason)
 }
 
 /// The `outcome` of a write and the task it acted on. Task writes print `{task, outcome}`;
 /// `label` prints `{message: {id}, outcome}`; `reply` and `post` print the new reply as
 /// `{message, outcome}`, whose `re` is the task.
 fn parse_write(json: &str) -> Result<(String, TaskId), BoardError> {
-    let object = parse_object(json)?;
-    let outcome = object.get("outcome").and_then(Value::as_str);
-    let outcome = outcome.filter(|outcome| !outcome.is_empty());
-    let outcome = outcome.ok_or_else(|| BoardError::Parse("no outcome".into()))?;
-    let id = if let Some(task) = object.get("task").and_then(Value::as_object) {
-        parse_id(task, "id")?
-    } else {
-        let message = object.get("message").and_then(Value::as_object);
-        let message = message.ok_or_else(|| BoardError::Parse("no task or message".into()))?;
-        let is_reply = message.get("re").is_some_and(|re| !re.is_null());
-        parse_id(message, if is_reply { "re" } else { "id" })?
+    let write: WireWrite = parse(json)?;
+    if write.outcome.is_empty() {
+        return Err(BoardError::Parse("an empty outcome".into()));
+    }
+    let id = match (write.task, write.message) {
+        (Some(task), _) => parse_id_text(&task.id)?,
+        (None, Some(message)) => parse_id_text(&message.re.unwrap_or(message.id))?,
+        (None, None) => return Err(BoardError::Parse("no task or message".into())),
     };
-    assert!(!outcome.is_empty());
-    Ok((outcome.to_string(), id))
+    assert!(!write.outcome.is_empty());
+    Ok((write.outcome, id))
 }
 
 /// What a claim's run means: a task, nothing ready in time, or a failure.
@@ -998,7 +972,7 @@ fn feed(mut stdin: ChildStdin, text: String) -> Result<(), BoardError> {
 /// Polls until `child` has exited and `done` holds, or until `deadline`. `None` means time ran
 /// out first.
 fn wait_until(
-    child: &mut Child,
+    child: &mut dyn ChildWrapper,
     done: impl Fn() -> bool,
     deadline: Instant,
 ) -> Result<Option<ExitStatus>, BoardError> {
@@ -1022,59 +996,35 @@ fn wait_until(
 
 /// Sends SIGKILL to the process group `child` leads, then kills and reaps `child`. A group that
 /// is gone afterwards is not an error. A child that could not be killed is never waited on.
-pub(crate) fn kill_group(child: &mut Child) -> Result<(), BoardError> {
-    kill_group_with(
-        child,
-        |group| kill_process_group(group, Signal::KILL),
-        |child| child.kill(),
-    )
-}
-
-pub(crate) fn kill_group_with(
-    child: &mut Child,
-    signal_group: impl FnOnce(Pid) -> Result<(), Errno>,
-    kill_child: impl FnOnce(&mut Child) -> std::io::Result<()>,
-) -> Result<(), BoardError> {
-    let group = Pid::from_child(child);
-    assert!(
-        group.as_raw_pid() > 1,
-        "never signal the caller's own group"
-    );
-    let signalled = match signal_group(group) {
-        Ok(()) | Err(Errno::SRCH) => Ok(()),
-        Err(error) => Err(BoardError::Kill(format!(
-            "group {}: {error}",
-            group.as_raw_pid()
-        ))),
-    };
-    let reaped = match kill_child(child) {
-        Ok(()) => {
-            let _ = child.wait();
-            Ok(())
+pub(crate) fn kill_group(child: &mut dyn ChildWrapper) -> Result<(), BoardError> {
+    let id = child.id();
+    assert!(id > 1, "never signal the caller's own group");
+    let group = i32::try_from(id).ok().and_then(Pid::from_raw);
+    let group = group.ok_or_else(|| BoardError::Kill(format!("group {id} is not a pid")))?;
+    let signalled = child.start_kill();
+    if signalled.is_err() {
+        // The group refused the signal, so the leader is killed on its own before any wait.
+        if let Err(error) = child.inner_mut().start_kill()
+            && !matches!(child.try_wait(), Ok(Some(_)))
+        {
+            return Err(BoardError::Kill(format!("child {id}: {error}")));
         }
-        Err(error) => match child.try_wait() {
-            // `vb` already exited, so there is nothing left to kill.
-            Ok(Some(_)) => Ok(()),
-            Ok(None) | Err(_) => Err(BoardError::Kill(format!(
-                "child {}: {error}",
-                group.as_raw_pid()
-            ))),
-        },
-    };
+    }
+    let _ = child.wait();
     // Darwin refuses (EPERM) to signal a group whose only member is the exited, unreaped
     // leader. Once the leader is reaped, only an empty group answers the probe with ESRCH.
-    let signalled = match signalled {
+    match signalled {
+        Ok(()) => Ok(()),
         Err(_) if test_kill_process_group(group) == Err(Errno::SRCH) => Ok(()),
-        signalled => signalled,
-    };
-    signalled.and(reaped)
+        Err(error) => Err(BoardError::Kill(format!("group {id}: {error}"))),
+    }
 }
 
 /// Feeds `input` to `child` and reads both of its streams, each on its own thread so no full
 /// pipe can stall `vb`. Within `seconds`, `vb` must exit and every pipe must close; otherwise
 /// the whole process group is killed.
 fn collect(
-    child: &mut Child,
+    child: &mut dyn ChildWrapper,
     input: Option<String>,
     call: &'static str,
     seconds: u32,
@@ -1082,14 +1032,14 @@ fn collect(
     assert!(seconds >= CALL_SECONDS);
     let deadline = Instant::now() + Duration::from_secs(u64::from(seconds));
     let mut stdout = child
-        .stdout
+        .stdout()
         .take()
         .ok_or_else(|| BoardError::Spawn("no stdout".into()))?;
     let mut stderr = child
-        .stderr
+        .stderr()
         .take()
         .ok_or_else(|| BoardError::Spawn("no stderr".into()))?;
-    let writer = match (input, child.stdin.take()) {
+    let writer = match (input, child.stdin().take()) {
         (Some(text), Some(stdin)) => Some(start_worker("stdin", move || feed(stdin, text))?),
         (None, None) => None,
         _ => {
@@ -1147,21 +1097,24 @@ impl VbCli {
         } else {
             Stdio::null()
         };
-        let mut child = Process::new(&self.vb)
+        let mut process = Process::new(&self.vb);
+        process
             .args(&args)
-            .process_group(0)
             .stdin(stdin)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        let spawned = CommandWrap::from(process)
+            .wrap(ProcessGroup::leader())
+            .spawn();
+        let mut child = spawned
             .map_err(|error| BoardError::Spawn(format!("{}: {error}", self.vb.display())))?;
         let (call, seconds) = command_limit(command);
-        let output = collect(&mut child, input, call, seconds);
+        let output = collect(child.as_mut(), input, call, seconds);
         // A thread could not start or a stream broke: do not leave `vb` running. A timeout
         // or a failed kill has already tried to kill its group.
         match output {
             Err(BoardError::TimedOut { .. } | BoardError::Kill(_)) | Ok(_) => output,
-            Err(error) => kill_group(&mut child).and(Err(error)),
+            Err(error) => kill_group(child.as_mut()).and(Err(error)),
         }
     }
 
@@ -1301,7 +1254,8 @@ impl Board for VbCli {
             !subtree.starts_with('-'),
             "a subtree is never read as an option"
         );
-        let cursor = parse_cursor(&parse_object(&self.read(&Command::Cursor { subtree })?)?)?;
+        let read: WireCursor = parse(&self.read(&Command::Cursor { subtree })?)?;
+        let cursor = Cursor(parse_id_text(&read.cursor)?.0);
         let mut tasks: Vec<TaskView> = Vec::new();
         let mut left_out: usize = 0;
         let mut after: Option<Cursor> = None;
@@ -1487,29 +1441,9 @@ pub mod testing {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::{Error, ErrorKind};
+    use tempfile::TempDir;
 
     use crate::test_support::write_executable;
-
-    #[test]
-    fn kill_group_returns_the_error_when_neither_signal_lands() {
-        let mut child = Process::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let started = Instant::now();
-        let result = kill_group_with(
-            &mut child,
-            |_| Err(Errno::PERM),
-            |_| Err(Error::new(ErrorKind::PermissionDenied, "denied")),
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let expected = format!("group {}: {}", child.id(), Errno::PERM);
-        assert!(matches!(result, Err(BoardError::Kill(ref m)) if *m == expected));
-        kill_group(&mut child).unwrap();
-    }
 
     #[test]
     fn parses_a_recorded_task() {
@@ -1901,9 +1835,12 @@ mod tests {
         let (outcome, id) = parse_write(release).unwrap();
         assert_eq!((outcome.as_str(), id), ("released", TaskId(2)));
         let labels = [("board.task", "ready"), ("role", "implement")];
-        let object = parse_object(release).unwrap();
-        let task = object.get("task").and_then(Value::as_object).unwrap();
-        let view = parse_message(task).unwrap();
+        #[derive(Deserialize)]
+        struct Released {
+            task: WireMessage,
+        }
+        let released: Released = parse(release).unwrap();
+        let view = view_from_wire(released.task).unwrap();
         let expected = versioned(recorded(2, "task a", &labels, TaskState::Ready), 9);
         assert_eq!(view, expected);
     }
@@ -1928,10 +1865,9 @@ mod tests {
     }
 
     /// A stand-in vb in a fresh directory, running `body`.
-    fn stand_in(name: &str, body: &str) -> (VbCli, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("rider-board-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let vb = dir.join("vb");
+    fn stand_in(body: &str) -> (VbCli, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let vb = dir.path().join("vb");
         write_executable(&vb, &format!("#!/bin/sh\n{body}"));
         let board = VbCli {
             vb,
@@ -1944,7 +1880,7 @@ mod tests {
     /// A stand-in vb that reads the recorded cursor `6` and lists open tasks `1..=count` in
     /// pages, as the board does: a full page's cursor is its last id, a short page's is the
     /// event cursor `9999`.
-    fn listing_of(name: &str, count: usize) -> (VbCli, PathBuf) {
+    fn listing_of(count: usize) -> (VbCli, TempDir) {
         let task = concat!(
             r#"{"message":{"id":"%d","text":"t","labels":{},"#,
             r#""task":{"state":"ready","epoch":0,"needs":[],"claim":null},"version":%d}}"#
@@ -1967,14 +1903,13 @@ cursor=9999
 printf '],"cursor":"%s"}}\n' $cursor
 "#
         );
-        stand_in(name, &body)
+        stand_in(&body)
     }
 
     #[test]
     fn a_listing_returns_the_board_cursor() {
-        let (board, dir) = listing_of("list-cursor", 3);
+        let (board, _dir) = listing_of(3);
         let listing = board.list_open("work/");
-        fs::remove_dir_all(dir).unwrap();
         let listing = listing.unwrap();
         let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
         assert_eq!(ids, vec![1, 2, 3]);
@@ -1984,9 +1919,8 @@ printf '],"cursor":"%s"}}\n' $cursor
     #[test]
     fn a_listing_pages_up_to_the_tracked_tasks_and_counts_the_rest() {
         let count = TASKS_MAX + 201;
-        let (board, dir) = listing_of("list-pages", count);
+        let (board, _dir) = listing_of(count);
         let listing = board.list_open("work/");
-        fs::remove_dir_all(dir).unwrap();
         let listing = listing.unwrap();
         let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
         let tracked: Vec<u64> = (1..=TASKS_MAX as u64).collect();
@@ -1996,9 +1930,8 @@ printf '],"cursor":"%s"}}\n' $cursor
 
     #[test]
     fn a_listing_past_the_page_bound_is_too_many_tasks() {
-        let (board, dir) = listing_of("list-bound", TASKS_PAGE_MAX * LISTING_PAGES_MAX + 1);
+        let (board, _dir) = listing_of(TASKS_PAGE_MAX * LISTING_PAGES_MAX + 1);
         let listing = board.list_open("work/");
-        fs::remove_dir_all(dir).unwrap();
         assert!(
             matches!(listing, Err(BoardError::TooManyTasks)),
             "{listing:?}"
@@ -2055,6 +1988,7 @@ printf '],"cursor":"%s"}}\n' $cursor
             "2026-13-19T20:38:37.720Z",
             "2025-02-29T20:38:37.720Z",
             "2026-11-19T24:00:00.000Z",
+            "2026-11-19T23:59:60.000Z",
             "1969-12-31T23:59:59.999Z",
             "2026-11-19 20:38:37.720Z",
             "2026-11-+9T20:38:37.720Z",
@@ -2095,10 +2029,10 @@ printf '],"cursor":"%s"}}\n' $cursor
 
     /// Runs `read_task` against a stand-in vb made of `body`, which writes the pid to kill to
     /// `$0.pid`, and checks the call times out at the limit and that pid is gone afterwards.
-    fn times_out_and_kills(name: &str, body: &str) {
+    fn times_out_and_kills(body: &str) {
         let limit = Duration::from_secs(u64::from(CALL_SECONDS));
-        for run in 0..TIMEOUT_RUNS_MAX {
-            let (board, dir) = stand_in(&format!("{name}-{run}"), body);
+        for _ in 0..TIMEOUT_RUNS_MAX {
+            let (board, dir) = stand_in(body);
             let started = Instant::now();
             let result = board.read_task(TaskId(7));
             let took = started.elapsed();
@@ -2118,8 +2052,7 @@ printf '],"cursor":"%s"}}\n' $cursor
             );
             // On a loaded machine `sh` may be killed before it writes the pid; that run proves
             // nothing, and everything it started went with its group.
-            let Ok(pid) = fs::read_to_string(dir.join("vb.pid")) else {
-                fs::remove_dir_all(&dir).unwrap();
+            let Ok(pid) = fs::read_to_string(dir.path().join("vb.pid")) else {
                 continue;
             };
             let pid = Pid::from_raw(pid.trim().parse().unwrap()).unwrap();
@@ -2129,25 +2062,24 @@ printf '],"cursor":"%s"}}\n' $cursor
                 rustix::process::test_kill_process(pid) == Err(Errno::SRCH)
             });
             assert!(gone, "{} is still running", pid.as_raw_pid());
-            fs::remove_dir_all(&dir).unwrap();
             return;
         }
-        panic!("{name}: no run of {TIMEOUT_RUNS_MAX} wrote its pid before the limit");
+        panic!("{body}: no run of {TIMEOUT_RUNS_MAX} wrote its pid before the limit");
     }
 
     #[test]
     fn a_vb_that_never_exits_is_killed_at_the_limit() {
-        times_out_and_kills("hang", "echo $$ > \"$0.pid\"\nexec sleep 3600\n");
+        times_out_and_kills("echo $$ > \"$0.pid\"\nexec sleep 3600\n");
     }
 
     #[test]
     fn a_descendant_holding_the_output_of_an_exited_vb_is_killed_at_the_limit() {
-        times_out_and_kills("exit", "sleep 120 &\necho $! > \"$0.pid\"\nexit 0\n");
+        times_out_and_kills("sleep 120 &\necho $! > \"$0.pid\"\nexit 0\n");
     }
 
     #[test]
     fn a_descendant_of_a_waiting_vb_is_killed_at_the_limit() {
-        times_out_and_kills("wait", "sleep 120 &\necho $! > \"$0.pid\"\nwait\n");
+        times_out_and_kills("sleep 120 &\necho $! > \"$0.pid\"\nwait\n");
     }
 
     #[test]
@@ -2157,19 +2089,17 @@ printf '],"cursor":"%s"}}\n' $cursor
         if std::env::var_os(CHILD).is_some() {
             assert!(std::env::var_os("PATH").is_some_and(|path| !path.is_empty()));
             let body = "/bin/sleep 120 &\necho $! > \"$0.pid\"\nwait\n";
-            times_out_and_kills("nopath", body);
+            times_out_and_kills(body);
             return;
         }
-        let empty = std::env::temp_dir().join(format!("rider-board-path-{}", std::process::id()));
-        fs::create_dir_all(&empty).unwrap();
+        let empty = TempDir::new().unwrap();
         let ran = Process::new(std::env::current_exe().unwrap())
             .args(["--exact", "--test-threads", "1", "--", name])
-            .env("PATH", &empty)
+            .env("PATH", empty.path())
             .env(CHILD, "1")
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        fs::remove_dir_all(&empty).unwrap();
         let stdout = String::from_utf8_lossy(&ran.stdout);
         assert!(
             ran.status.success(),
