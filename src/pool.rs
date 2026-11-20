@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::board::{Board, TaskId, one_line};
+use crate::board::{Board, BoardError, TaskId, one_line};
 use crate::core::{LEASE_MILLIS, ROLES_MAX};
 use crate::roles::{AGENTS_MAX, RoleSpec, display_name, profile_name};
 use crate::run_task::{Ran, RunError};
@@ -304,6 +304,11 @@ fn release(
         match board.release(id) {
             Ok(()) => {
                 say(Event::Released(reason), Some(id));
+                return;
+            }
+            Err(error @ BoardError::ClaimLost { .. }) => {
+                let message = format!("{error} (the claim is gone; not retried)");
+                say(Event::Error(&message), Some(id));
                 return;
             }
             Err(error) if tries % RELEASE_ERRORS_REPORTED_EVERY == 1 => {
