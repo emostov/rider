@@ -59,17 +59,17 @@ CI is green.
 ## 2. Watch CI
 
 Choose `<cap>`, the most minutes to wait for CI (the longest the workflows normally run,
-doubled). Run as one background command a loop of
-`gh pr checks <n> --watch --fail-fast --interval 30` calls, repeated while a call returns
-before `<cap>` with no checks yet (right after a push) or with a check still pending.
-`--fail-fast` returns on the first failure, so a stuck check cannot hide it. Exit 0 is not
-proof of green: cancelled or skipped required checks can pass the watch. When the loop ends,
-read `gh pr checks <n> --json name,bucket,link`:
+doubled). Run as one background command a bounded poll: every 30 seconds read
+`gh pr checks <n> --json name,bucket,link`, and stop when a check has bucket `fail`, or when
+there are checks and none is `pending`, or when `<cap>` minutes have passed. No checks yet
+(right after a push) counts as still waiting. The cap is tested on every pass, so a check
+that stays queued or running cannot hold the poll open. When the poll ends, read the same
+output once more:
 
 - Green is `pass`, and `skipping` only for a check that is not required
   (`gh pr checks <n> --required --json name,bucket` lists the required ones).
 - `fail`: step 3.
-- `cancel`: rerun it once as in step 3, watch again, and report it to the owner if it is
+- `cancel`: rerun it once as in step 3, poll again, and report it to the owner if it is
   cancelled again.
 - `pending` once `<cap>` is reached: a stuck check. Report it to the owner with its link.
   Do not wait longer or rerun it.
@@ -91,8 +91,8 @@ All green: step 4. The board wait from `lead.md` runs alongside it.
      failing assertion, a formatting check.
 4. A real failure becomes a fix task, created as `lead.md` describes:
    `role=implement` (or `light` when the log says exactly what to change, as a lint does),
-   `onto=<top>`, `needs` every unfinished task on that branch, and its own `review`. The
-   brief carries the check's name, the failing log lines, and the local command that
+   `onto=<top>`, `needs` every unfinished task on that branch, and its own `review` unless
+   the fix is purely mechanical (read its diff). The brief carries the check's name, the failing log lines, and the local command that
    reproduces the check (from the workflow file under `.github/workflows/`).
 5. When the fix and its review complete, read the result, then push: `git -C <repo> push
    origin <branch>`. `<top>` is now the fix task. Watch again (step 2).

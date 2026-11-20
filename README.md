@@ -40,7 +40,7 @@ Clone this repository, open your agent in it, and paste:
 Set up Rider from this checkout by following docs/manual.md: check the
 prerequisites, install the Board CLI and its skill, run `cargo install --path .`,
 start the board with `rider serve` in the background, and register the two
-schemas in schemas/. Then tell me the commands to start the worker pool and the
+schemas in skills/ride-swarm/schemas/. Then tell me the commands to start the worker pool and the
 lead in my own terminals. Do not start any agents yourself.
 ```
 

@@ -111,14 +111,16 @@ These rules are yours to keep. Rider does not check them:
 - At most three deliverables per task. More is two tasks.
 - A worker is stopped after 55 minutes. Size tasks well inside that.
 - Sizing: changes that each take under about ten minutes and touch the same files go in one
-  task, not several. A purely mechanical change (a rename, a one-line fix a reviewer spelled
-  out, a doc link) gets no separate review task: read its diff yourself. Everything with
-  behaviour or judgment in it keeps its review.
-- Every `implement` or `light` task gets a `review` task with `of` set to it, and three or
-  four specific things to attack. Say what to attack, not the commit range: the reviewer
-  finds the range from the reviewed task's `start` label.
+  task, not several.
+- Review policy: every task with behaviour or judgment in it gets a `review` task with `of`
+  set to it, and three or four specific things to attack. This covers every `implement` or
+  `light` task and every fix task for a blocking finding. A purely mechanical change (a
+  rename, a one-line fix a reviewer spelled out, a doc link) gets none: read its diff
+  yourself. Say what to attack, not the commit range: the reviewer finds the range from the
+  reviewed task's `start` label.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the
-  reviewed task>`, needing every unfinished task on that branch, and its own review.
+  reviewed task>`, needing every unfinished task on that branch, and its own review unless it is purely
+  mechanical.
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.
 - `polish` is one task per branch, after that branch's blocking findings are fixed:
