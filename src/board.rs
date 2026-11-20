@@ -971,7 +971,7 @@ fn wait_until(
 
 /// Sends SIGKILL to the process group `child` leads, then kills and reaps `child`. A group that
 /// is already gone is not an error.
-fn kill_group(child: &mut Child) -> Result<(), BoardError> {
+pub(crate) fn kill_group(child: &mut Child) -> Result<(), BoardError> {
     let group = Pid::from_child(child);
     assert!(
         group.as_raw_pid() > 1,
