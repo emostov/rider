@@ -1369,6 +1369,9 @@ impl Board for Guarded<'_> {
     ) -> Result<Listing, BoardError> {
         self.board.list_labelled(channel, key, values)
     }
+    fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
+        self.board.blocking_findings(id)
+    }
 }
 
 fn release(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
