@@ -8,6 +8,8 @@ use std::process::{Child, ChildStdin, Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::{Map, Value};
 
 /// A task's ID on the board. The board prints IDs as decimal strings.
@@ -132,6 +134,8 @@ pub enum BoardError {
         call: &'static str,
         seconds: u32,
     },
+    /// Signalling `vb`'s process group failed, so its descendants may still be running.
+    Kill(String),
 }
 
 impl fmt::Display for BoardError {
@@ -182,6 +186,13 @@ impl fmt::Display for BoardError {
                 write!(
                     f,
                     "vb {call} did not finish within {seconds}s and was killed"
+                )
+            }
+            BoardError::Kill(message) => {
+                write!(
+                    f,
+                    "vb's process group could not be killed: {}",
+                    one_line(message)
                 )
             }
         }
@@ -958,24 +969,26 @@ fn wait_until(
     Ok(None)
 }
 
-/// Kills every process in the group `child` leads, then `child` itself, and reaps it.
-fn kill_group(child: &mut Child) {
-    let group = format!("-{}", child.id());
-    assert!(group.len() > 1);
-    let killer = Process::new("kill")
-        .args(["-s", "KILL", "--", &group])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    // Failing to kill the group leaves only `vb` to kill; there is nothing more to try.
-    if let Ok(mut killer) = killer {
-        let _ = wait_until(&mut killer, || true, Instant::now() + KILL_GRACE);
-        let _ = killer.kill();
-        let _ = killer.wait();
-    }
+/// Sends SIGKILL to the process group `child` leads, then kills and reaps `child`. A group that
+/// is already gone is not an error.
+fn kill_group(child: &mut Child) -> Result<(), BoardError> {
+    let group = Pid::from_child(child);
+    assert!(
+        group.as_raw_pid() > 1,
+        "never signal the caller's own group"
+    );
+    let signalled = match kill_process_group(group, Signal::KILL) {
+        Ok(()) => Ok(()),
+        Err(Errno::SRCH) => Ok(()),
+        Err(error) => Err(BoardError::Kill(format!(
+            "group {}: {error}",
+            group.as_raw_pid()
+        ))),
+    };
+    // `vb` itself may already be reaped, so neither result says anything more.
     let _ = child.kill();
     let _ = child.wait();
+    signalled
 }
 
 /// Feeds `input` to `child` and reads both of its streams, each on its own thread so no full
@@ -1014,7 +1027,7 @@ fn collect(
             && writer.as_ref().is_none_or(JoinHandle::is_finished)
     };
     let Some(status) = wait_until(child, done, deadline)? else {
-        kill_group(child);
+        kill_group(child)?;
         // Every writer in the group is dead, so the pipes close and the workers finish. One
         // that `vb` moved out of its group may still hold a pipe: its worker is abandoned.
         let drained = wait_until(child, done, Instant::now() + KILL_GRACE);
@@ -1066,14 +1079,11 @@ impl VbCli {
         let (call, seconds) = command_limit(command);
         let output = collect(&mut child, input, call, seconds);
         // A thread could not start or a stream broke: do not leave `vb` running. A timeout
-        // has already killed its group.
-        if output
-            .as_ref()
-            .is_err_and(|error| !matches!(error, BoardError::TimedOut { .. }))
-        {
-            kill_group(&mut child);
+        // or a failed kill has already tried to kill its group.
+        match output {
+            Err(BoardError::TimedOut { .. } | BoardError::Kill(_)) | Ok(_) => output,
+            Err(error) => kill_group(&mut child).and(Err(error)),
         }
-        output
     }
 
     fn write(&self, command: &Command) -> Result<(), BoardError> {
@@ -1875,18 +1885,13 @@ mod tests {
             "{took:?}"
         );
         let pid = fs::read_to_string(dir.join("vb.pid")).unwrap();
+        let pid = Pid::from_raw(pid.trim().parse().unwrap()).unwrap();
         // A killed descendant stays a zombie until its new parent reaps it.
         let gone = (0..100).any(|_| {
-            let alive = Process::new("kill")
-                .args(["-0", pid.trim()])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
             thread::sleep(Duration::from_millis(20));
-            !alive.success()
+            rustix::process::test_kill_process(pid) == Err(Errno::SRCH)
         });
-        assert!(gone, "{} is still running", pid.trim());
+        assert!(gone, "{} is still running", pid.as_raw_pid());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1903,5 +1908,34 @@ mod tests {
     #[test]
     fn a_descendant_of_a_waiting_vb_is_killed_at_the_limit() {
         times_out_and_kills("wait", "sleep 120 &\necho $! > \"$0.pid\"\nwait\n");
+    }
+
+    #[test]
+    fn a_descendant_is_killed_with_no_kill_command_on_path() {
+        const CHILD: &str = "RIDER_BOARD_TEST_EMPTY_PATH";
+        let name = "board::tests::a_descendant_is_killed_with_no_kill_command_on_path";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os("PATH").is_some_and(|path| !path.is_empty()));
+            let body = "/bin/sleep 120 &\necho $! > \"$0.pid\"\nwait\n";
+            times_out_and_kills("nopath", body);
+            return;
+        }
+        let empty = std::env::temp_dir().join(format!("rider-board-path-{}", std::process::id()));
+        fs::create_dir_all(&empty).unwrap();
+        let ran = Process::new(std::env::current_exe().unwrap())
+            .args(["--exact", "--test-threads", "1", "--", name])
+            .env("PATH", &empty)
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&empty).unwrap();
+        let stdout = String::from_utf8_lossy(&ran.stdout);
+        assert!(
+            ran.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
     }
 }
