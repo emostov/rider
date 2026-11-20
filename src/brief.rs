@@ -65,6 +65,12 @@ pub enum BriefError {
         unfinished: TaskId,
         onto: TaskId,
     },
+    /// `unchecked` unfinished tasks, or their `onto` tasks, lie past rider's bounds, so the
+    /// unfinished tasks on the branch of the `onto` task are not all known.
+    OntoUnchecked {
+        onto: TaskId,
+        unchecked: usize,
+    },
 }
 
 impl fmt::Display for BriefError {
@@ -140,6 +146,13 @@ impl fmt::Display for BriefError {
                 "Add task #{} to this task's needs: it is unfinished on the branch of task \
                  #{}, which this task works `onto`.",
                 unfinished.0, onto.0
+            ),
+            BriefError::OntoUnchecked { onto, unchecked } => write!(
+                f,
+                "Finish or cancel unfinished tasks, or remove the `onto` label: {unchecked} \
+                 of them are past rider's bounds, so it cannot check which are unfinished on \
+                 the branch of task #{}.",
+                onto.0
             ),
         }
     }
@@ -577,6 +590,13 @@ mod tests {
                 BriefError::OntoNotNeeded {
                     unfinished: TaskId(4),
                     onto: TaskId(3),
+                },
+                "onto",
+            ),
+            (
+                BriefError::OntoUnchecked {
+                    onto: TaskId(3),
+                    unchecked: 2,
                 },
                 "onto",
             ),

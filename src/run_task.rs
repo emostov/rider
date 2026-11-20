@@ -37,6 +37,8 @@ pub const PROMPT_FILE_BYTES_MAX: u64 = 64 * 1024;
 pub const LOG_RUNS_MAX: u16 = 16;
 /// The most characters of a failed attempt's log reply, kept well under the board's limit.
 pub const TAIL_REPLY_CHARS_MAX: usize = MESSAGE_CHARS_MAX - 1_000;
+/// Upper bound on the closed `onto` tasks read to find the unfinished tasks on a branch.
+pub const ONTO_READS_MAX: usize = 32;
 // JSON writes a character as at most six, so a record with this summary fits one message.
 const SUMMARY_CHARS_MAX: usize = TAIL_REPLY_CHARS_MAX / 6;
 const ATTEMPT_LABEL: &str = "attempt";
@@ -411,7 +413,8 @@ fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
 }
 
 // An open task on the branch an `onto` task works must be one it needs, or one that waits for
-// it; any other would race it on the branch.
+// it; any other would race it on the branch. A task works the branch named by its own `branch`
+// label or, until it has one, by its `onto` task's, in the repository of its own `repo` label.
 fn unneeded_on_branch(
     brief: &Brief,
     view: &TaskView,
@@ -421,13 +424,48 @@ fn unneeded_on_branch(
     let Some(onto) = brief.onto else {
         return Ok(None);
     };
-    let target = board.read_task(onto)?;
-    let branch = label(&target, BRANCH_LABEL);
-    let open = board.list_open(SUBTREE)?.tasks;
+    let listing = board.list_open(SUBTREE)?;
+    if listing.left_out > 0 {
+        let unchecked = listing.left_out;
+        return Ok(Some(BriefError::OntoUnchecked { onto, unchecked }));
+    }
+    let open: Vec<&TaskView> = listing
+        .tasks
+        .iter()
+        .filter(|task| task.id != view.id && in_repo(task, &brief.repo))
+        .collect();
+    let mut targets: Vec<TaskId> = vec![onto];
+    for task in &open {
+        let target = (label(task, BRANCH_LABEL).is_none())
+            .then(|| parse_id_label(task, "onto").ok().flatten())
+            .flatten();
+        if let Some(target) = target.filter(|target| {
+            !targets.contains(target) && listing.tasks.iter().all(|task| task.id != *target)
+        }) {
+            targets.push(target);
+        }
+    }
+    if targets.len() > ONTO_READS_MAX {
+        let unchecked = targets.len() - ONTO_READS_MAX;
+        return Ok(Some(BriefError::OntoUnchecked { onto, unchecked }));
+    }
+    let mut branches: Vec<(TaskId, Option<String>)> = Vec::with_capacity(targets.len());
+    for id in targets {
+        let target = board.read_task(id)?;
+        branches.push((id, label(&target, BRANCH_LABEL).map(str::to_string)));
+    }
+    let branch_of = |id: TaskId| branches.iter().find(|(read, _)| *read == id);
+    let Some((_, Some(branch))) = branch_of(onto) else {
+        return Ok(None);
+    };
     let on_branch = closure(&open, onto, |task, members| {
         let works_onto = parse_id_label(task, "onto").ok().flatten();
-        branch.is_some() && label(task, BRANCH_LABEL) == branch
-            || works_onto.is_some_and(|id| members.contains(&id))
+        let own = label(task, BRANCH_LABEL);
+        let inherited = works_onto
+            .and_then(branch_of)
+            .and_then(|(_, b)| b.as_deref());
+        own.or(inherited) == Some(branch.as_str())
+            || own.is_none() && works_onto.is_some_and(|id| members.contains(&id))
     });
     let after = closure(&open, view.id, |task, members| {
         task.needs.iter().any(|need| members.contains(need))
@@ -440,9 +478,14 @@ fn unneeded_on_branch(
     Ok(unneeded.map(|unfinished| BriefError::OntoNotNeeded { unfinished, onto }))
 }
 
+fn in_repo(task: &TaskView, repo: &Path) -> bool {
+    assert!(repo.is_absolute());
+    label(task, "repo").is_some_and(|value| Path::new(value) == repo)
+}
+
 // `seed` and every task in `open` that `joins` the members found so far, until none joins.
 fn closure(
-    open: &[TaskView],
+    open: &[&TaskView],
     seed: TaskId,
     joins: impl Fn(&TaskView, &[TaskId]) -> bool,
 ) -> Vec<TaskId> {

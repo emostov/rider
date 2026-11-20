@@ -1388,3 +1388,115 @@ fn a_restack_task_that_rebases_onto_the_named_commit_completes() {
         fake_agent::work_subject(&restack, 0)
     );
 }
+
+#[test]
+fn an_onto_task_that_does_not_need_an_unfinished_task_onto_a_completed_fix_is_blocked() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fixed = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    when_the_pool_starts(&mut world);
+    assert_eq!(
+        when_the_tasks_settle(&world, &[&built, &fixed]),
+        vec!["completed", "completed"]
+    );
+    let gate = when_the_lead_creates(&world, &NewTask::new("Finish a prerequisite."));
+    let waiting = a_fix(&world, "Fix the fix.", &fixed, &gate, false);
+    let waiting = when_the_lead_creates(&world, &waiting);
+    assert_eq!(task_state(&world, &waiting), "waiting");
+
+    let racing = a_fix(&world, "Fix the work again.", &built, &built, false);
+    let racing = when_the_lead_creates(&world, &racing);
+    let states = when_the_tasks_settle(&world, &[&racing]);
+    let exit = when_the_pool_is_stopped(&mut world);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = format!(
+        "Add task #{waiting} to this task's needs: it is unfinished on the branch of task \
+         #{built}, which this task works `onto`."
+    );
+    assert_eq!(
+        task_block(&world, &racing),
+        Some(("invalid_brief".to_string(), reason))
+    );
+    assert_eq!(agent_runs_for(&world, &racing), vec![]);
+}
+
+#[test]
+fn an_unfinished_task_on_a_same_named_branch_of_another_repository_does_not_block_a_fix() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    when_the_pool_starts(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
+    let branch = task_label(&world, &built, "branch").expect("the built task's branch");
+    let other = world.root.join("other-repository");
+    let (from, to) = (world.repo_label(), other.to_str().expect("UTF-8 path"));
+    let cloned = world.git(
+        &world.root,
+        &["clone", "--quiet", "--no-hardlinks", from, to],
+    );
+    assert_eq!(cloned.code, Some(0), "{cloned:?}");
+    assert_eq!(
+        world.git(&other, &["branch", &branch, "HEAD"]).code,
+        Some(0)
+    );
+    let (repo, branch) = (format!("repo={to}"), format!("branch={branch}"));
+    let create = [
+        "tasks",
+        "create",
+        "work/other",
+        "-",
+        "--label",
+        &repo,
+        "--label",
+        &branch,
+    ];
+    world.vb_lead(&create, Some("Finish work in another repository."));
+
+    let fix = a_fix(&world, "Fix the work.", &built, &built, false);
+    let fix = when_the_lead_creates(&world, &fix);
+    let states = when_the_tasks_settle(&world, &[&fix]);
+    let exit = when_the_pool_is_stopped(&mut world);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert_eq!(task_block(&world, &fix), None);
+}
+
+#[test]
+fn an_onto_task_is_blocked_when_the_open_tasks_are_too_many_to_check_its_branch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    when_the_pool_starts(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
+    let plan: Vec<serde_json::Value> = (0..256)
+        .map(|index| json!({"key": format!("idle-{index}"), "text": "Wait for other work."}))
+        .collect();
+    let file = world.root.join("idle-plan.json");
+    fs::write(&file, json!(plan).to_string()).expect("write the plan");
+    let file = file.to_str().expect("UTF-8 path");
+    world.vb_lead(&["tasks", "create", "work/other", "--file", file], None);
+
+    let fix = a_fix(&world, "Fix the work.", &built, &built, false);
+    let fix = when_the_lead_creates(&world, &fix);
+    let states = when_the_tasks_settle(&world, &[&fix]);
+    let exit = when_the_pool_is_stopped(&mut world);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let (kind, reason) = task_block(&world, &fix).expect("the fix's block");
+    assert_eq!(kind, "invalid_brief");
+    let start = "Finish or cancel unfinished tasks, or remove the `onto` label: ";
+    let end = format!("so it cannot check which are unfinished on the branch of task #{built}.");
+    assert!(
+        reason.starts_with(start) && reason.ends_with(&end),
+        "{reason}"
+    );
+    assert_eq!(agent_runs_for(&world, &fix), vec![]);
+}
