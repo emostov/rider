@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use serde_json::{Map, Value};
 
 /// A task's ID on the board. The board prints IDs as decimal strings.
@@ -970,7 +970,7 @@ fn wait_until(
 }
 
 /// Sends SIGKILL to the process group `child` leads, then kills and reaps `child`. A group that
-/// is already gone is not an error. A child that could not be killed is never waited on.
+/// is gone afterwards is not an error. A child that could not be killed is never waited on.
 pub(crate) fn kill_group(child: &mut Child) -> Result<(), BoardError> {
     kill_group_with(
         child,
@@ -979,7 +979,7 @@ pub(crate) fn kill_group(child: &mut Child) -> Result<(), BoardError> {
     )
 }
 
-fn kill_group_with(
+pub(crate) fn kill_group_with(
     child: &mut Child,
     signal_group: impl FnOnce(Pid) -> Result<(), Errno>,
     kill_child: impl FnOnce(&mut Child) -> std::io::Result<()>,
@@ -990,27 +990,33 @@ fn kill_group_with(
         "never signal the caller's own group"
     );
     let signalled = match signal_group(group) {
-        Ok(()) => Ok(()),
-        Err(Errno::SRCH) => Ok(()),
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
         Err(error) => Err(BoardError::Kill(format!(
             "group {}: {error}",
             group.as_raw_pid()
         ))),
     };
-    match kill_child(child) {
+    let reaped = match kill_child(child) {
         Ok(()) => {
             let _ = child.wait();
-            signalled
+            Ok(())
         }
         Err(error) => match child.try_wait() {
             // `vb` already exited, so there is nothing left to kill.
-            Ok(Some(_)) => signalled,
-            Ok(None) | Err(_) => signalled.and(Err(BoardError::Kill(format!(
+            Ok(Some(_)) => Ok(()),
+            Ok(None) | Err(_) => Err(BoardError::Kill(format!(
                 "child {}: {error}",
                 group.as_raw_pid()
-            )))),
+            ))),
         },
-    }
+    };
+    // Darwin refuses (EPERM) to signal a group whose only member is the exited, unreaped
+    // leader. Once the leader is reaped, only an empty group answers the probe with ESRCH.
+    let signalled = match signalled {
+        Err(_) if test_kill_process_group(group) == Err(Errno::SRCH) => Ok(()),
+        signalled => signalled,
+    };
+    signalled.and(reaped)
 }
 
 /// Feeds `input` to `child` and reads both of its streams, each on its own thread so no full

@@ -9,10 +9,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use serde_json::{Map, Value};
 
-use crate::board::{LABELS_MAX, TaskId, TaskState, VbCli, kill_group};
+use crate::board::{LABELS_MAX, TaskId, TaskState, VbCli, kill_group_with};
 
 /// Upper bound on one line of the feed, its newline excluded.
 pub const FEED_LINE_BYTES_MAX: usize = 1024 * 1024;
@@ -34,9 +35,9 @@ const READS_MAX: u64 = 1 << 40;
 /// How long the child's exit and the close of its stdout may lag each other.
 const END_GRACE: Duration = Duration::from_secs(2);
 
-/// Lines read after the group is killed: past what the pipe, the read buffer and the queue
-/// can hold, the rest comes from something the kill could not reach.
-const LINES_AFTER_KILL_MAX: u32 = 1 << 17;
+/// How long stdout may stay open after the group is killed: every writer in the group is
+/// dead, so only the reader catching up, or a writer outside the group, can take longer.
+const DRAIN_AFTER_KILL: Duration = Duration::from_secs(10);
 
 const POLL_MILLIS: u32 = 20;
 const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS as u64);
@@ -117,6 +118,10 @@ pub enum FeedError {
     /// A line that is not an event the board prints, with what was wrong.
     Parse(String),
     TooManyLabels,
+    /// The process group could not be killed, so something it started may still run.
+    Kill(String),
+    /// Stdout stayed open `DRAIN_AFTER_KILL` after the group was killed.
+    Undrained,
     /// The feed already reported its exit.
     Ended,
 }
@@ -134,6 +139,11 @@ impl fmt::Display for FeedError {
             FeedError::TooManyLabels => {
                 write!(formatter, "a feed event has over {LABELS_MAX} labels")
             }
+            FeedError::Kill(detail) => write!(formatter, "killing vb tail failed: {detail}"),
+            FeedError::Undrained => write!(
+                formatter,
+                "vb tail's stdout stayed open {DRAIN_AFTER_KILL:?} after its group was killed"
+            ),
             FeedError::Ended => write!(formatter, "the feed already reported its exit"),
         }
     }
@@ -147,10 +157,27 @@ enum Received {
     End,
 }
 
+/// How a feed signals its process group and reads its child's stdout.
+#[derive(Clone, Copy)]
+struct Seams {
+    signal_group: fn(Pid) -> Result<(), Errno>,
+    read_lines: fn(BufReader<ChildStdout>, &SyncSender<Received>),
+}
+
+const SEAMS: Seams = Seams {
+    signal_group: kill_group_signal,
+    read_lines,
+};
+
+fn kill_group_signal(group: Pid) -> Result<(), Errno> {
+    kill_process_group(group, Signal::KILL)
+}
+
 /// A running `vb tail` in its own process group. Dropping it kills the group. After an
 /// error, drop it and start again from the last cursor seen.
 pub struct FeedReader {
     child: Child,
+    signal_group: fn(Pid) -> Result<(), Errno>,
     lines: Receiver<Received>,
     drained: bool,
     /// The child has exited. It stays unreaped until `finish`, so its pid still names its
@@ -158,15 +185,20 @@ pub struct FeedReader {
     exited: bool,
     /// When stdout closed or the child exited, whichever came first.
     ending_since: Option<Instant>,
-    /// The group was killed; the child is reaped and what it wrote is still being read.
-    killed: bool,
-    lines_after_kill: u32,
+    /// When the group was killed; the child is reaped and what it wrote is still being read.
+    killed: Option<Instant>,
+    /// The group was killed and nothing is left in it, so dropping the feed signals nothing.
+    group_gone: bool,
     ended: bool,
 }
 
 impl FeedReader {
     /// Starts following every event on the board after `after`.
     pub fn start(cli: &VbCli, after: Cursor) -> Result<FeedReader, FeedError> {
+        FeedReader::start_with(cli, after, SEAMS)
+    }
+
+    fn start_with(cli: &VbCli, after: Cursor, seams: Seams) -> Result<FeedReader, FeedError> {
         assert!(!cli.url.is_empty(), "the board URL is never empty");
         assert!(!cli.profile.is_empty(), "the profile is never empty");
         let after = after.0.to_string();
@@ -196,21 +228,23 @@ impl FeedReader {
         let started = started.and_then(|stdout| {
             let stdout = BufReader::with_capacity(64 * 1024, stdout);
             let builder = thread::Builder::new().name("vb-tail".into());
-            let spawned = builder.spawn(move || read_lines(stdout, &sender));
+            let read = seams.read_lines;
+            let spawned = builder.spawn(move || read(stdout, &sender));
             spawned.map_err(|error| format!("starting the reader thread: {error}"))
         });
         if let Err(detail) = started {
-            let _ = kill_group(&mut child);
+            let _ = kill_group_with(&mut child, seams.signal_group, |child| child.kill());
             return Err(FeedError::Spawn(detail));
         }
         Ok(FeedReader {
             child,
+            signal_group: seams.signal_group,
             lines,
             drained: false,
             exited: false,
             ending_since: None,
-            killed: false,
-            lines_after_kill: 0,
+            killed: None,
+            group_gone: false,
             ended: false,
         })
     }
@@ -225,7 +259,7 @@ impl FeedReader {
         for _ in 0..POLLS_MAX {
             // The exit is checked before every read, so a descendant that keeps stdout busy
             // cannot postpone it. A killed child is already reaped and no longer polled.
-            if !self.exited && !self.killed {
+            if !self.exited && self.killed.is_none() {
                 let child = WaitId::Pid(Pid::from_child(&self.child));
                 let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
                 let polled = waitid(child, options);
@@ -238,32 +272,31 @@ impl FeedReader {
                 // running: either way the other end gets `END_GRACE` from the first of the
                 // two, which later output does not extend, then the group is killed.
                 let since = *self.ending_since.get_or_insert_with(Instant::now);
-                if !self.killed && since.elapsed() >= END_GRACE {
+                if self.killed.is_none() && since.elapsed() >= END_GRACE {
                     self.kill()?;
                 }
             }
             if self.drained {
-                if self.exited || self.killed {
+                if self.exited || self.killed.is_some() {
                     return self.finish();
                 }
                 thread::sleep(POLL_INTERVAL);
                 continue;
             }
-            match self.lines.recv_timeout(POLL_INTERVAL) {
-                Ok(Received::Line(line)) => {
-                    if self.killed {
-                        self.lines_after_kill = self.lines_after_kill.saturating_add(1);
-                        if self.lines_after_kill > LINES_AFTER_KILL_MAX {
-                            return self.finish();
-                        }
+            let wait = match self.killed {
+                Some(killed) => {
+                    let left = DRAIN_AFTER_KILL.saturating_sub(killed.elapsed());
+                    if left.is_zero() {
+                        return Err(FeedError::Undrained);
                     }
-                    return line_event(line);
+                    left.min(POLL_INTERVAL)
                 }
+                None => POLL_INTERVAL,
+            };
+            match self.lines.recv_timeout(wait) {
+                Ok(Received::Line(line)) => return line_event(line),
                 Ok(Received::Failed(error)) => return Err(error),
                 Ok(Received::End) | Err(RecvTimeoutError::Disconnected) => self.drained = true,
-                // Once the group is killed, what it wrote arrives without pause; a pause means
-                // stdout is held by something the kill could not reach.
-                Err(RecvTimeoutError::Timeout) if self.killed => return self.finish(),
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
@@ -273,22 +306,18 @@ impl FeedReader {
 
     /// Kills the group once, leaving the lines it already wrote to be read.
     fn kill(&mut self) -> Result<(), FeedError> {
-        assert!(!self.killed, "the group is killed once");
+        assert!(self.killed.is_none(), "the group is killed once");
         assert!(!self.ended);
-        self.killed = true;
-        let killed = kill_group(&mut self.child);
-        // Darwin refuses (EPERM) to signal a group whose only member is the exited, unreaped
-        // child, so once that child exited, a refusal leaves nothing to kill.
-        if self.exited {
-            return Ok(());
-        }
-        killed.map_err(|error| FeedError::Io(error.to_string()))
+        self.killed = Some(Instant::now());
+        let killed = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
+        self.group_gone = killed.is_ok();
+        killed.map_err(|error| FeedError::Kill(error.to_string()))
     }
 
     fn finish(&mut self) -> Result<FeedItem, FeedError> {
         assert!(!self.ended, "the exit is reported once");
-        assert!(self.drained || self.killed);
-        if !self.killed {
+        assert!(self.drained);
+        if self.killed.is_none() {
             self.kill()?;
         }
         self.ended = true;
@@ -303,10 +332,10 @@ impl FeedReader {
 
 impl Drop for FeedReader {
     fn drop(&mut self) {
-        // Once killed, the child is reaped and its pid may already name another group.
-        if !self.killed {
+        // A group that is gone is not signalled again: its id may already name another group.
+        if !self.group_gone {
             // Nothing more can be done about a group that cannot be signalled.
-            let _ = kill_group(&mut self.child);
+            let _ = kill_group_with(&mut self.child, self.signal_group, |child| child.kill());
         }
     }
 }
@@ -517,6 +546,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     const PERSON: &str = "local:user:zeke";
@@ -596,6 +626,10 @@ mod tests {
 
     /// A reader over a stand-in `vb` whose script is `body`.
     fn reader(name: &str, body: &str) -> (FeedReader, PathBuf) {
+        reader_with(name, body, SEAMS)
+    }
+
+    fn reader_with(name: &str, body: &str, seams: Seams) -> (FeedReader, PathBuf) {
         let unique = format!("rider-feed-{name}-{}", std::process::id());
         let dir = std::env::temp_dir().join(unique);
         fs::create_dir_all(&dir).unwrap();
@@ -607,7 +641,7 @@ mod tests {
             url: "http://127.0.0.1:1".into(),
             profile: "tester".into(),
         };
-        (FeedReader::start(&cli, Cursor(0)).unwrap(), dir)
+        (FeedReader::start_with(&cli, Cursor(0), seams).unwrap(), dir)
     }
 
     #[test]
@@ -851,5 +885,63 @@ exit 4
     fn rejects_an_over_long_string() {
         let result = parse_event(&" ".repeat(FEED_LINE_BYTES_MAX + 1));
         assert!(matches!(result, Err(FeedError::LineTooLong)), "{result:?}");
+    }
+
+    static SIGNALS_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+    /// Refuses the first group signal as Darwin does, then signals for real.
+    fn refuse_the_first_signal(group: Pid) -> Result<(), Errno> {
+        if SIGNALS_REFUSED.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(Errno::PERM);
+        }
+        kill_group_signal(group)
+    }
+
+    #[test]
+    fn reports_a_descendant_that_survives_the_group_kill() {
+        let unique = format!("rider-feed-survivor-pid-{}", std::process::id());
+        let pid_file = std::env::temp_dir().join(unique);
+        let body = format!(
+            "sleep 30 >/dev/null &\necho $! > '{}'\nexit 3\n",
+            pid_file.display()
+        );
+        let seams = Seams {
+            signal_group: refuse_the_first_signal,
+            read_lines,
+        };
+        let (mut feed, dir) = reader_with("survivor", &body, seams);
+        let result = feed.next_item();
+        drop(feed);
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        fs::remove_file(&pid_file).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(matches!(result, Err(FeedError::Kill(_))), "{result:?}");
+        assert!(
+            gone(pid.trim()),
+            "the descendant {} outlived the feed",
+            pid.trim()
+        );
+    }
+
+    /// Starts reading only after `vb` has exited and its group has been killed.
+    fn read_lines_late(stdout: BufReader<ChildStdout>, sender: &SyncSender<Received>) {
+        thread::sleep(END_GRACE + Duration::from_millis(500));
+        read_lines(stdout, sender);
+    }
+
+    #[test]
+    fn delivers_every_line_when_the_reader_lags_the_exit() {
+        let body = r#"printf '{"cursor":"%s","type":"x"}\n' 1 2 3
+exit 3
+"#;
+        let seams = Seams {
+            signal_group: kill_group_signal,
+            read_lines: read_lines_late,
+        };
+        let (mut feed, dir) = reader_with("late", body, seams);
+        let items = drain(&mut feed);
+        fs::remove_dir_all(dir).unwrap();
+        let exited = Ok(FeedItem::Exited { code: Some(3) });
+        assert_eq!(items, [other(1), other(2), other(3), exited]);
     }
 }
