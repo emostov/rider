@@ -1,6 +1,6 @@
 //! The daemon's decisions for workers: one pure `step` from a state and an event to actions.
 
-use crate::board::{TaskId, TaskState, TaskView, Timestamp};
+use crate::board::{BOARD_CALL_SECONDS_MAX, TaskId, TaskState, TaskView, Timestamp};
 use crate::feed::{BoardEvent, Cursor, EventKind};
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::settle::Verdict;
@@ -23,6 +23,16 @@ pub const SETTLE_PAUSE_MILLIS: u64 = 10 * 1000;
 pub const RECONCILE_MILLIS: u64 = 60 * 1000;
 /// How long a drain may last before it becomes a stop now, in milliseconds.
 pub const DRAIN_MILLIS_MAX: u64 = ATTEMPT_MILLIS_MAX + 5 * 60 * 1000;
+/// How long a claim may wait for its answer, in milliseconds.
+pub const CLAIM_MILLIS_MAX: u64 = 2 * BOARD_CALL_SECONDS_MAX as u64 * 1000;
+/// How long preparing a run may take, in milliseconds.
+pub const PREPARE_MILLIS_MAX: u64 = 10 * 60 * 1000;
+/// How long judging a run may take, in milliseconds.
+pub const JUDGE_MILLIS_MAX: u64 = 10 * 60 * 1000;
+/// How long a stopped agent may take to exit, in milliseconds.
+pub const STOP_MILLIS_MAX: u64 = 2 * 60 * 1000;
+/// Upper bound on the distinct untracked tasks the core counts.
+pub const UNTRACKED_MAX: usize = 4 * TASKS_MAX;
 /// How many feed restarts in a row are allowed before the board counts as down.
 pub const FEED_RESTARTS_MAX: u8 = 10;
 
@@ -46,6 +56,10 @@ pub struct Config {
     pub settle_pause_millis: u64,
     pub reconcile_millis: u64,
     pub drain_millis_max: u64,
+    pub claim_millis_max: u64,
+    pub prepare_millis_max: u64,
+    pub judge_millis_max: u64,
+    pub stop_millis_max: u64,
 }
 
 impl Config {
@@ -71,7 +85,25 @@ impl Config {
             settle_pause_millis: SETTLE_PAUSE_MILLIS,
             reconcile_millis: RECONCILE_MILLIS,
             drain_millis_max: DRAIN_MILLIS_MAX,
+            claim_millis_max: CLAIM_MILLIS_MAX,
+            prepare_millis_max: PREPARE_MILLIS_MAX,
+            judge_millis_max: JUDGE_MILLIS_MAX,
+            stop_millis_max: STOP_MILLIS_MAX,
         }
+    }
+
+    /// How long a run may stay in `phase`; a closing write gets at most one lease.
+    pub fn phase_millis_max(&self, phase: Phase) -> u64 {
+        let limit = match phase {
+            Phase::Claiming => self.claim_millis_max,
+            Phase::Preparing => self.prepare_millis_max,
+            Phase::Running => self.attempt_millis_max,
+            Phase::Judging => self.judge_millis_max,
+            Phase::Settling => self.lease_millis,
+            Phase::Stopping(_) | Phase::Abandoning => self.stop_millis_max,
+        };
+        assert!(limit > 0);
+        limit
     }
 
     fn assert_valid(&self) {
@@ -81,6 +113,8 @@ impl Config {
         assert!(self.tasks_max > 0 && self.tasks_max <= TASKS_MAX);
         assert!(self.lease_millis >= 3 && self.attempt_millis_max > 0);
         assert!(self.settle_tries_max > 0);
+        assert!(self.claim_millis_max > 0 && self.prepare_millis_max > 0);
+        assert!(self.judge_millis_max > 0 && self.stop_millis_max > 0);
     }
 }
 
@@ -139,7 +173,6 @@ pub struct Run {
     pub lease_until: Timestamp,
     pub attempt_start: Timestamp,
     pub phase_start: Timestamp,
-    pub branch: Option<String>,
     pub renewing: bool,
     /// The closing write, once decided; it is retried until it succeeds or runs out.
     pub settlement: Option<Settlement>,
@@ -264,7 +297,7 @@ pub enum Action {
 pub struct State {
     config: Config,
     tasks: Vec<Task>,
-    untracked: usize,
+    untracked: Vec<TaskId>,
     runs: Vec<Run>,
     next_run: u64,
     board: BoardHealth,
@@ -284,7 +317,7 @@ impl State {
         let state = State {
             config,
             tasks: Vec::new(),
-            untracked: 0,
+            untracked: Vec::new(),
             runs: Vec::new(),
             next_run: 1,
             board: BoardHealth::Up,
@@ -308,7 +341,7 @@ impl State {
     }
     /// Tasks seen but not tracked because `tasks_max` was reached.
     pub fn untracked(&self) -> usize {
-        self.untracked
+        self.untracked.len()
     }
     pub fn runs(&self) -> &[Run] {
         &self.runs
@@ -347,6 +380,7 @@ pub fn step(state: &mut State, event: Event) -> Vec<Action> {
     apply(state, event, &mut actions);
     expire_leases(state, &mut actions);
     on_time(state, &mut actions);
+    expire_phases(state, &mut actions);
     claim_ready(state, &mut actions);
     finish_stopping(state, &mut actions);
     assert!(actions.len() <= ACTIONS_MAX);
@@ -457,6 +491,7 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         if let Some(index) = index {
             state.tasks.remove(index);
         }
+        state.untracked.retain(|id| *id != feed.task);
         return;
     }
     let task = Task {
@@ -468,28 +503,44 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
     match index {
         Some(index) if labels_are_task => state.tasks[index] = task,
         Some(index) => state.tasks[index].state = task_state,
-        None if state.tasks.len() < state.config.tasks_max => state.tasks.push(task),
-        None => state.untracked = state.untracked.saturating_add(1),
+        None if state.tasks.len() < state.config.tasks_max => {
+            state.untracked.retain(|id| *id != feed.task);
+            state.tasks.push(task);
+        }
+        None => note_untracked(state, feed.task),
     }
+    assert!(state.untracked.len() <= UNTRACKED_MAX);
+}
+
+/// Past `UNTRACKED_MAX` the count stays at its bound until the next snapshot.
+fn note_untracked(state: &mut State, task: TaskId) {
+    if !state.untracked.contains(&task) && state.untracked.len() < UNTRACKED_MAX {
+        state.untracked.push(task);
+    }
+    assert!(state.untracked.len() <= UNTRACKED_MAX);
 }
 
 fn reconcile(state: &mut State, views: &[TaskView]) {
     state.tasks.clear();
-    state.untracked = 0;
-    for view in views {
-        if is_closed(view.state) {
-            continue;
+    state.untracked.clear();
+    // Tasks with a run go first, so a run's branch stays known whatever the overflow.
+    for with_run in [true, false] {
+        for view in views {
+            let has_run = state.runs.iter().any(|run| run.task == view.id);
+            if is_closed(view.state) || has_run != with_run {
+                continue;
+            }
+            if state.tasks.len() == state.config.tasks_max {
+                note_untracked(state, view.id);
+                continue;
+            }
+            state.tasks.push(Task {
+                id: view.id,
+                state: view.state,
+                role: role_of(&state.config, &view.labels),
+                branch: label(&view.labels, "branch"),
+            });
         }
-        if state.tasks.len() == state.config.tasks_max {
-            state.untracked = state.untracked.saturating_add(1);
-            continue;
-        }
-        state.tasks.push(Task {
-            id: view.id,
-            state: view.state,
-            role: role_of(&state.config, &view.labels),
-            branch: label(&view.labels, "branch"),
-        });
     }
     assert!(state.tasks.len() <= state.config.tasks_max);
     assert!(state.tasks.len() <= views.len());
@@ -665,6 +716,10 @@ fn try_settle(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         return;
     }
     let (run, task, epoch) = (entry.id, entry.task, entry.epoch);
+    // After stop-now no attempt counts: whatever was decided, the claim is released.
+    if state.stopping == Stopping::Now {
+        entry.settlement = Some(Settlement::Release);
+    }
     let Some(settlement) = entry.settlement.clone() else {
         return;
     };
@@ -749,7 +804,6 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
         stop_now(state, actions);
     }
     let renew_lead = state.config.lease_millis / 3 * 2;
-    let attempt_max = state.config.attempt_millis_max;
     for index in 0..state.runs.len() {
         let entry = &mut state.runs[index];
         if holds_claim(entry.phase)
@@ -759,13 +813,6 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
             entry.renewing = true;
             let (run, task) = (entry.id, entry.task);
             actions.push(Action::Renew { run, task });
-        }
-        if entry.phase == Phase::Running
-            && now.0 >= entry.attempt_start.0.saturating_add(attempt_max)
-        {
-            set_phase(entry, Phase::Stopping(StopReason::TimeLimit), now);
-            let (run, task) = (entry.id, entry.task);
-            actions.push(Action::StopAgent { run, task });
         }
         if entry.phase == Phase::Settling {
             try_settle(state, index, actions);
@@ -787,7 +834,6 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         state.next_run = state.next_run.saturating_add(1);
         let profile = state.profile(role, slot);
         let now = state.now;
-        let branch = state.tasks[task].branch.clone();
         let task = state.tasks[task].id;
         state.runs.push(Run {
             id,
@@ -799,7 +845,6 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
             lease_until: now,
             attempt_start: now,
             phase_start: now,
-            branch,
             renewing: false,
             settlement: None,
             settle_tries: 0,
@@ -823,10 +868,10 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
         let Some(role) = task.role else {
             continue;
         };
-        let taken = state
-            .runs
-            .iter()
-            .any(|run| run.task == task.id || (task.branch.is_some() && run.branch == task.branch));
+        let taken = state.runs.iter().any(|run| {
+            run.task == task.id
+                || (task.branch.is_some() && branch_of(state, run.task) == task.branch.as_deref())
+        });
         if task.state != TaskState::Ready || taken {
             continue;
         }
@@ -846,6 +891,52 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     }
     assert!(best.is_none_or(|(index, _, _)| index < state.tasks.len()));
     best
+}
+
+/// The branch of a tracked task; the task, not its run, holds it.
+fn branch_of(state: &State, task: TaskId) -> Option<&str> {
+    let found = state.tasks.iter().find(|entry| entry.id == task)?;
+    assert_eq!(found.id, task);
+    found.branch.as_deref()
+}
+
+fn expire_phases(state: &mut State, actions: &mut Vec<Action>) {
+    let now = state.now;
+    let mut index = 0;
+    while index < state.runs.len() {
+        let entry = &state.runs[index];
+        let limit = state.config.phase_millis_max(entry.phase);
+        let due = now.0 >= entry.phase_start.0.saturating_add(limit);
+        let before = state.runs.len();
+        if due {
+            phase_expired(state, index, actions);
+        }
+        if state.runs.len() == before {
+            index += 1;
+        }
+    }
+    assert!(state.runs.len() <= usize::from(state.config.agents_max));
+}
+
+fn phase_expired(state: &mut State, index: usize, actions: &mut Vec<Action>) {
+    let now = state.now;
+    let entry = &mut state.runs[index];
+    let (run, task) = (entry.id, entry.task);
+    match entry.phase {
+        // Whether the board granted it is unknown; an unrenewed claim lapses within the lease.
+        Phase::Claiming => remove_run(state, index),
+        Phase::Preparing | Phase::Judging => {
+            begin_settle(state, index, Settlement::Release, actions);
+        }
+        Phase::Running => {
+            set_phase(entry, Phase::Stopping(StopReason::TimeLimit), now);
+            actions.push(Action::StopAgent { run, task });
+        }
+        // The closing write is abandoned and the lease lapses, as when its tries run out.
+        Phase::Settling => remove_run(state, index),
+        // An agent that outlives its stop is treated as gone.
+        Phase::Stopping(_) | Phase::Abandoning => on_agent_exited(state, run, actions),
+    }
 }
 
 fn finish_stopping(state: &mut State, actions: &mut Vec<Action>) {

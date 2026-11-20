@@ -1,11 +1,11 @@
 //! The simulated world: a fake board, git, process table and clock around one core.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rider::board::{TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
     ACTIONS_MAX, Action, BoardHealth, Call, Config, Event, Phase, RunId, Settlement, State,
-    Stopping, step,
+    StopReason, Stopping, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -19,7 +19,13 @@ const STOP_STEPS_MAX: usize = 3000;
 const BOARD_TASKS_MAX: usize = 40;
 const SECOND: u64 = 1000;
 const MINUTE: u64 = 60 * SECOND;
+/// The longest pause between steps while a result is pending.
+const RESULT_PAUSE_MAX: u64 = 20 * SECOND;
 const BRANCHES: [&str; 3] = ["stack-a", "stack-b", "stack-c"];
+/// One seed in this many tracks few tasks, so the untracked count is exercised.
+const SMALL_TASKS_EVERY: u64 = 4;
+/// The task bound those seeds run under.
+const SMALL_TASKS_MAX: usize = 6;
 
 struct FakeTask {
     id: TaskId,
@@ -41,8 +47,13 @@ struct RunLog {
     claimed: bool,
     prepared: bool,
     lost: bool,
-    /// Results a `Settle` may follow: `Judged`, `PrepareBlocked`, or a stopped agent's exit.
-    settle_bases: u32,
+    /// `Judged` results, and the verdict of the last.
+    judged: u32,
+    verdict: Option<Verdict>,
+    /// `PrepareBlocked` was delivered: the run may be settled as blocked without a judgment.
+    blocked: bool,
+    /// The core stopped the agent at its time limit: it may be failed without a judgment.
+    time_limited: bool,
     settles: u32,
     settle_failures: u32,
 }
@@ -63,6 +74,10 @@ pub struct World {
     outstanding: Vec<(Option<RunId>, &'static str)>,
     log: HashMap<RunId, RunLog>,
     settled_epochs: HashSet<(u64, u64)>,
+    /// Open tasks as the delivered feed events and snapshots told the core.
+    told_open: BTreeSet<u64>,
+    /// Whether the core had been told to stop now before the current step.
+    stopped_now: bool,
     signals: u8,
     exited: bool,
     pub trace: Vec<String>,
@@ -70,7 +85,10 @@ pub struct World {
 
 impl World {
     pub fn new(seed: u64) -> World {
-        let config = Config::from_roles(&ROLES);
+        let mut config = Config::from_roles(&ROLES);
+        if seed % SMALL_TASKS_EVERY == SMALL_TASKS_EVERY - 1 {
+            config.tasks_max = SMALL_TASKS_MAX;
+        }
         let now = Timestamp(1_800_000_000_000);
         World {
             rng: fastrand::Rng::with_seed(seed),
@@ -86,6 +104,8 @@ impl World {
             outstanding: Vec::new(),
             log: HashMap::new(),
             settled_epochs: HashSet::new(),
+            told_open: BTreeSet::new(),
+            stopped_now: false,
             signals: 0,
             exited: false,
             trace: Vec::new(),
@@ -114,6 +134,12 @@ impl World {
             return Err(format!(
                 "the core did not exit; runs: {:?}",
                 self.core.runs()
+            ));
+        }
+        if !self.outstanding.is_empty() {
+            return Err(format!(
+                "invariant 10: actions never answered: {:?}",
+                self.outstanding
             ));
         }
         Ok(())
@@ -152,12 +178,15 @@ impl World {
     }
 
     fn advance(&mut self) -> Result<(), String> {
-        let jump = if self.rng.u32(0..200) == 0 {
+        // A pending result is a board call or a local step, answered within seconds.
+        let pause = if !self.results.is_empty() {
+            self.rng.u64(SECOND..RESULT_PAUSE_MAX)
+        } else if self.rng.u32(0..200) == 0 {
             90 * MINUTE
         } else {
-            0
+            self.rng.u64(SECOND..3 * MINUTE)
         };
-        self.now = Timestamp(self.now.0 + self.rng.u64(SECOND..3 * MINUTE) + jump);
+        self.now = Timestamp(self.now.0 + pause);
         let now = self.now;
         for index in 0..self.tasks.len() {
             if self.tasks[index].holder.is_some() && self.tasks[index].lease_until <= now {
@@ -251,6 +280,8 @@ impl World {
 
     fn deliver(&mut self, event: Event) -> Result<(), String> {
         self.note_result(&event);
+        self.note_told(&event);
+        self.stopped_now = self.core.stopping() == Stopping::Now;
         let actions = step(&mut self.core, event.clone());
         self.trace.push(format!("{event:?} -> {actions:?}"));
         self.check(&actions)?;
@@ -288,19 +319,51 @@ impl World {
         let (run, entry) = match event {
             Event::Claimed { run, .. } => (*run, "claimed"),
             Event::Prepared(run) => (*run, "prepared"),
-            Event::PrepareBlocked { run, .. } | Event::AgentExited(run) => (*run, "basis"),
-            Event::Judged { run, .. } => (*run, "basis"),
+            Event::PrepareBlocked { run, .. } => (*run, "blocked"),
+            Event::Judged { run, .. } => (*run, "judged"),
             Event::ClaimLost(run) => (*run, "lost"),
             Event::BoardFailed(Call::Settle(run) | Call::Release(run)) => (*run, "failure"),
             _ => return,
         };
         let log = self.log.entry(run).or_default();
-        match entry {
-            "claimed" => log.claimed = true,
-            "prepared" => log.prepared = true,
-            "lost" => log.lost = true,
-            "failure" => log.settle_failures += 1,
-            _ => log.settle_bases += 1,
+        match (entry, event) {
+            ("claimed", _) => log.claimed = true,
+            ("prepared", _) => log.prepared = true,
+            ("blocked", _) => log.blocked = true,
+            ("lost", _) => log.lost = true,
+            ("failure", _) => log.settle_failures += 1,
+            (_, Event::Judged { verdict, .. }) => {
+                log.judged += 1;
+                log.verdict = Some(verdict.clone());
+            }
+            _ => panic!("no log entry for {event:?}"),
+        }
+    }
+
+    fn note_told(&mut self, event: &Event) {
+        if self.core.exited() {
+            return;
+        }
+        match event {
+            Event::Feed(BoardEvent {
+                task,
+                state: Some(state),
+                ..
+            }) => {
+                if is_closed(*state) {
+                    self.told_open.remove(&task.0);
+                } else {
+                    self.told_open.insert(task.0);
+                }
+            }
+            Event::Snapshot { tasks, .. } => {
+                self.told_open = tasks
+                    .iter()
+                    .filter(|view| !is_closed(view.state))
+                    .map(|view| view.id.0)
+                    .collect();
+            }
+            _ => {}
         }
     }
 
@@ -311,8 +374,11 @@ impl World {
     fn perform(&mut self, action: Action) -> Result<(), String> {
         match action {
             Action::Claim { run, task, .. } => self.claim(run, task),
-            Action::Prepare { run, .. } => {
+            Action::Prepare { run, task } => {
                 self.outstanding.push((Some(run), "prepare"));
+                if self.rng.u32(0..3) == 0 {
+                    self.learn_branch(task);
+                }
                 let event = match self.rng.u32(0..10) {
                     0 => Event::PrepareBlocked {
                         run,
@@ -364,6 +430,24 @@ impl World {
             Action::Exit(_) => self.exited = true,
         }
         Ok(())
+    }
+
+    /// Preparing finds the task's branch, as Rider does for a task with none.
+    fn learn_branch(&mut self, task: TaskId) {
+        let Some(index) = self.tasks.iter().position(|fake| fake.id == task) else {
+            return;
+        };
+        if self.tasks[index]
+            .labels
+            .iter()
+            .any(|(name, _)| name == "branch")
+        {
+            return;
+        }
+        let branch = BRANCHES[self.rng.usize(0..BRANCHES.len())];
+        let labels = &mut self.tasks[index].labels;
+        labels.push(("branch".to_string(), branch.to_string()));
+        self.publish(index, EventKind::LabelsChanged);
     }
 
     fn holds(&self, run: RunId, task: TaskId) -> Option<usize> {
@@ -499,10 +583,12 @@ impl World {
         }
         for (index, run) in runs.iter().enumerate() {
             for other in &runs[index + 1..] {
-                let same_branch = run.branch.is_some() && run.branch == other.branch;
-                if run.task == other.task || same_branch {
+                if run.task == other.task {
                     return Err(format!("invariant 2: {run:?} and {other:?}"));
                 }
+            }
+            if run.phase == Phase::Stopping(StopReason::TimeLimit) {
+                self.log.entry(run.id).or_default().time_limited = true;
             }
             let now = self.core.now();
             let covered = self.outstanding.contains(&(Some(run.id), "renew"))
@@ -516,10 +602,21 @@ impl World {
                     "invariant 3: {run:?} runs on a lapsed lease at {now:?}"
                 ));
             }
-            let limit = run.attempt_start.0 + self.config.attempt_millis_max;
-            if run.phase == Phase::Running && now.0 >= limit {
-                return Err(format!("invariant 10: {run:?} runs past its time limit"));
+            let limit = run.phase_start.0 + self.config.phase_millis_max(run.phase);
+            if now.0 >= limit {
+                return Err(format!(
+                    "invariant 10: {run:?} is past its phase's time limit"
+                ));
             }
+        }
+        let told = self.core.tasks().len() + self.core.untracked();
+        if !self.core.exited() && told != self.told_open.len() {
+            return Err(format!(
+                "invariant 8: {} tracked and {} untracked, but {} open tasks were told",
+                self.core.tasks().len(),
+                self.core.untracked(),
+                self.told_open.len()
+            ));
         }
         if actions.len() > ACTIONS_MAX
             || self.core.tasks().len() > self.config.tasks_max
@@ -534,17 +631,32 @@ impl World {
         let blocked = self.core.board() != BoardHealth::Up || self.core.stopping() != Stopping::No;
         for action in actions {
             let (run, write) = match action {
-                Action::Claim { run, .. } => {
+                Action::Claim { run, task, .. } => {
                     if blocked {
                         return Err(format!("invariant 9: {action:?} while down or stopping"));
                     }
+                    self.check_branch_free(*run, *task)?;
                     (*run, true)
                 }
                 Action::Renew { run, .. } | Action::Release { run, .. } => (*run, true),
-                Action::Settle { run, .. } => {
+                Action::Settle {
+                    run, settlement, ..
+                } => {
+                    if self.stopped_now {
+                        return Err(format!("stop-now: {action:?} counts an attempt"));
+                    }
                     let log = self.log.entry(*run).or_default();
                     log.settles += 1;
-                    if log.settle_bases == 0 || log.settles > 1 + log.settle_failures {
+                    let judged = log.verdict.clone().map(Settlement::Verdict);
+                    let based = match settlement {
+                        _ if log.judged > 0 => {
+                            log.judged == 1 && judged.as_ref() == Some(settlement)
+                        }
+                        Settlement::Block { .. } => log.blocked,
+                        Settlement::Verdict(Verdict::Fail { .. }) => log.time_limited,
+                        _ => false,
+                    };
+                    if !based || log.settles > 1 + log.settle_failures {
                         return Err(format!("invariant 6: {action:?} without one judgment"));
                     }
                     (*run, true)
@@ -564,4 +676,34 @@ impl World {
         }
         Ok(())
     }
+
+    /// Invariant 2 for branches: a claim never shares a branch the core knows another run is on.
+    fn check_branch_free(&self, run: RunId, task: TaskId) -> Result<(), String> {
+        let branch_of = |id: TaskId| {
+            let found = self.core.tasks().iter().find(|tracked| tracked.id == id);
+            found.and_then(|tracked| tracked.branch.as_deref())
+        };
+        let Some(branch) = branch_of(task) else {
+            return Ok(());
+        };
+        let other = self
+            .core
+            .runs()
+            .iter()
+            .find(|other| other.id != run && branch_of(other.task) == Some(branch));
+        match other {
+            Some(other) => Err(format!(
+                "invariant 2: claim of task {} on {branch} while {other:?} is on it",
+                task.0
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+fn is_closed(state: TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Completed | TaskState::Failed | TaskState::Canceled
+    )
 }
