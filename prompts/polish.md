@@ -86,7 +86,7 @@ committed may finish without a new commit. If there is nothing to tidy, ask whet
 
 If `git commit` fails for a reason you cannot fix inside the brief (a signing error, a hook
 that needs something you do not have), reply with the exact command and its full error, then
-stop. Do not work around it. Findings and problems stay on the board; never file a GitHub issue.
+stop. Do not work around it. Findings and problems stay on the board; never file an issue in the project's tracker.
 
 ## Asking a question
 
