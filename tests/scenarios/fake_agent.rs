@@ -68,6 +68,8 @@ pub enum Behaviour {
     BlockThenExitNonZero,
     /// Commits like `Commit`, then points a new branch `shared-<task>` at that commit.
     CommitShared,
+    /// Holds like `Hold`, then reports success having committed nothing.
+    HoldThenNothing,
 }
 
 impl Behaviour {
@@ -94,6 +96,7 @@ impl Behaviour {
             Behaviour::LeaveBranch => "leave-branch",
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
+            Behaviour::HoldThenNothing => "hold-then-nothing",
         }
     }
 }
@@ -156,6 +159,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -219,6 +223,7 @@ case "$behaviour" in
       exit 1
     fi
     commit || exit 1 ;;
+  hold-then-nothing) hold ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
@@ -268,6 +273,15 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+/// The names of the `GIT_*` variables attempt `attempt` of `task` was started with.
+pub fn git_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.git-env"));
+    let text = fs::read_to_string(&path).expect("read an agent's git environment");
+    text.lines().map(str::to_string).collect()
 }
 
 /// The commit and the branch ref, `None` when detached, that attempt `attempt` of `task`
