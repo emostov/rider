@@ -61,6 +61,12 @@ Rider is early. `rider daemon` runs the swarm from the board's event feed; `ride
 `rider status` and `rider chat` are next. Until then, the `ride-swarm` skill asks you to
 run `rider pool <project>` in a terminal of your own.
 
+## Docs
+
+The [manual](./docs/manual.md) covers prerequisites, roles, labels, watching
+and stopping the swarm, where files live, and troubleshooting.
+The [release guide](./docs/releasing.md) covers tagging and publishing.
+
 ## How it's built
 
 - **A deterministic simulator.** The daemon's decisions are one pure function,
@@ -76,9 +82,3 @@ run `rider pool <project>` in a terminal of your own.
   outside and the code can be rewritten with confidence.
 - **Built by its own swarm.** Rider's changes are planned on the board and carried out by
   Rider's own agents, each reviewed by a different model than the one that wrote it.
-
-## Docs
-
-The [manual](./docs/manual.md) covers prerequisites, roles, labels, watching
-and stopping the swarm, where files live, and troubleshooting.
-The [release guide](./docs/releasing.md) covers tagging and publishing.
