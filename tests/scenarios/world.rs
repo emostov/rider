@@ -26,8 +26,9 @@ const OUTPUT_BYTES_MAX: u64 = 4 << 20;
 const BOARD_START_SECONDS_MAX: u64 = 30;
 const POLL_MILLIS: u64 = 100;
 const REAP_SECONDS_MAX: u64 = 5;
+const SWEEP_QUIET_POLLS: u32 = 5;
 const EVENTS_MAX: usize = 3;
-const AGENT_PIDS_MAX: usize = 256;
+const WORLD_PIDS_MAX: usize = 256;
 const PROCESSES_MAX: usize = 65_536;
 const DROP_FAILURES_MAX: usize = 4;
 const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -448,10 +449,10 @@ fn reap(child: &mut Child) -> bool {
     false
 }
 
-/// The pids of processes running this world's fake agents, found by their scripts' literal
-/// paths as whole words of their command lines.
-fn agent_pids(world: &World) -> Result<Vec<u32>, String> {
-    let scripts = ["claude", "codex"].map(|name| world.agents.join(name).display().to_string());
+/// The pids of the processes whose command lines name a path inside this world's root: every
+/// `vb` the world runs (its own linked Board CLI), `vb serve`, and the fake agents.
+fn world_pids(world: &World) -> Result<Vec<u32>, String> {
+    let inside = format!("{}/", world.root.display());
     let mut command = Command::new("/bin/ps");
     command
         .args(["-A", "-ww", "-o", "pid=,command="])
@@ -470,22 +471,43 @@ fn agent_pids(world: &World) -> Result<Vec<u32>, String> {
         let pid: u32 = pid
             .parse()
             .map_err(|_| format!("unrecognised ps line {line:?}"))?;
-        let runs_agent = scripts.iter().any(|script| {
-            rest.match_indices(script.as_str()).any(|(at, _)| {
-                let after = &rest[at..][script.len()..];
-                (at == 0 || rest[..at].ends_with(' '))
-                    && (after.is_empty() || after.starts_with(' '))
-            })
-        });
-        if runs_agent && pid > 1 {
-            if pids.len() == AGENT_PIDS_MAX {
-                return Err(format!("over {AGENT_PIDS_MAX} fake agents are running"));
+        if rest.contains(&inside) && pid > 1 && pid != std::process::id() {
+            if pids.len() == WORLD_PIDS_MAX {
+                return Err(format!(
+                    "over {WORLD_PIDS_MAX} of the world's processes run"
+                ));
             }
             pids.push(pid);
         }
     }
-    assert!(pids.len() <= AGENT_PIDS_MAX);
+    assert!(pids.len() <= WORLD_PIDS_MAX);
     Ok(pids)
+}
+
+/// Kills every process of the world and its group until none is left within `REAP_SECONDS_MAX`.
+fn sweep(world: &World) -> Result<(), String> {
+    // Rider starts each feed and board call in a process group of its own, so killing the
+    // pool's group misses them, and they outlive a pool that exited or was killed. A child
+    // forked but not yet exec'd shows the rider command line, not the world's paths, so the
+    // world is clean only once `SWEEP_QUIET_POLLS` listings in a row find nothing.
+    let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
+    let mut quiet = 0;
+    while quiet < SWEEP_QUIET_POLLS {
+        let pids = world_pids(world)?;
+        quiet = if pids.is_empty() { quiet + 1 } else { 0 };
+        if !pids.is_empty() && Instant::now() >= deadline {
+            return Err(format!(
+                "{pids:?} outlived their kill by {REAP_SECONDS_MAX} seconds"
+            ));
+        }
+        for &pid in &pids {
+            kill(pid, true);
+            kill(pid, false);
+        }
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+    assert_eq!(quiet, SWEEP_QUIET_POLLS);
+    Ok(())
 }
 
 impl Drop for World {
@@ -500,19 +522,13 @@ impl Drop for World {
         for pid in fake_agent::running_pids(&self.root) {
             kill(pid, true);
         }
-        match agent_pids(self) {
-            Ok(pids) => {
-                for pid in pids {
-                    kill(pid, true);
-                    kill(pid, false);
-                }
-            }
-            Err(why) => failures.push(why),
-        }
         if let Some(mut board) = self.board.take()
             && !reap(&mut board)
         {
             failures.push("the board outlived its kill".to_string());
+        }
+        if let Err(why) = sweep(self) {
+            failures.push(why);
         }
         let temp = std::env::temp_dir().canonicalize();
         if self.owns_root
