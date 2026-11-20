@@ -34,7 +34,6 @@
     "behind": {
       "type": "array",
       "maxItems": 64,
-      "uniqueItems": true,
       "items": {
         "type": "integer",
         "minimum": 1

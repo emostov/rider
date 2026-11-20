@@ -116,6 +116,8 @@ struct RunLog {
 
 pub struct World {
     rng: fastrand::Rng,
+    /// Draws which tasks work `onto` another, apart from `rng` so the other draws stay put.
+    onto_rng: fastrand::Rng,
     config: Config,
     core: State,
     now: Timestamp,
@@ -206,6 +208,7 @@ impl World {
         let now = Timestamp(1_800_000_000_000);
         World {
             rng: fastrand::Rng::with_seed(seed),
+            onto_rng: fastrand::Rng::with_seed(!seed),
             core: State::new(config.clone(), now),
             config,
             now,
@@ -597,7 +600,11 @@ impl World {
             _ => "unknown",
         };
         let mut labels = vec![("role".to_string(), role.to_string())];
-        if self.rng.bool() {
+        if id.0 > 1 && self.onto_rng.u32(0..3) == 0 {
+            let onto = self.onto_rng.u64(1..id.0);
+            labels.push(("onto".to_string(), format!("#{onto}")));
+        }
+        if self.rng.bool() && labels.len() == 1 {
             let branch = BRANCHES[self.rng.usize(0..BRANCHES.len())];
             labels.push(("branch".to_string(), branch.to_string()));
         }
@@ -980,7 +987,10 @@ impl World {
 
     fn perform(&mut self, action: Action) -> Result<(), String> {
         match action {
-            Action::Claim { run, task, profile } => self.claim(run, task, profile),
+            Action::Claim { run, task, profile } => {
+                self.check_onto_free(task)?;
+                self.claim(run, task, profile);
+            }
             Action::Resume { run, task, profile } => self.resume(run, task, &profile),
             Action::Prepare { run, task } => {
                 let id = self.expect(Some(run), "prepare");
@@ -1513,6 +1523,29 @@ impl World {
             }
         }
         Ok(())
+    }
+
+    /// Invariant 2 on onto: a task is not claimed while a settling run's worktree holds the
+    /// branch of the task it works onto, so its preparation would find that branch busy.
+    fn check_onto_free(&self, task: TaskId) -> Result<(), String> {
+        let label_of = |task: TaskId, name: &str| {
+            let fake = self.tasks.iter().find(|fake| fake.id == task)?;
+            let found = fake.labels.iter().find(|(label, _)| label == name)?;
+            Some(found.1.clone())
+        };
+        let onto = label_of(task, "onto").and_then(|onto| onto[1..].parse::<u64>().ok());
+        let Some(branch) = onto.and_then(|onto| label_of(TaskId(onto), "branch")) else {
+            return Ok(());
+        };
+        let busy = (self.core.runs().iter()).find(|run| {
+            run.phase == Phase::Settling && run.branch.as_deref() == Some(branch.as_str())
+        });
+        match busy {
+            Some(run) => Err(format!(
+                "invariant 2: claimed {task:?} onto {branch} while {run:?} settles there"
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Invariant 2 on branches: no two runs reserve one, and no two spawned runs work on one.

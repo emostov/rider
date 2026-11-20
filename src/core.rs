@@ -1847,12 +1847,13 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
         let Some(role) = role else {
             continue;
         };
-        // A task `onto` one whose run is still settling waits: that run's worktree holds the
-        // branch until its settle releases it.
+        // A task `onto` another waits while any run that holds a branch is settling: that
+        // run's worktree keeps the branch, which may be the onto task's, until it is removed.
         let taken = state.runs.iter().any(|run| {
             run.task == task.id
                 || (task.branch.is_some() && run.branch == task.branch)
                 || task.onto == Some(run.task)
+                || (task.onto.is_some() && run.phase == Phase::Settling && run.branch.is_some())
         });
         if task.state != TaskState::Ready || taken {
             continue;
