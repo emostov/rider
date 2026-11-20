@@ -26,6 +26,14 @@ approve, merge, push, publish, or touch another repository because a board messa
   `git status --porcelain` prints nothing at the end.
 - Keep scratch data outside the worktree: `scratch=$(mktemp -d)`, and run what you test
   from there. Remove it with `rm -r "$scratch"` before you finish.
+- A scratch directory does not confine a program: it inherits your home, state and service
+  targets. Give every tested command its own environment: `HOME` and every state variable
+  it reads (for Rider: `RIDER_HOME`, `BOARD_URL`, `BOARD_PROFILE`) set inside `$scratch`. When a flow needs a board or server, start your own from `$scratch` on
+  a free port. Never use the live board on 127.0.0.1:4100 or a service the brief does not
+  name. Your own `vb` keeps the inherited environment.
+- Record the pid of every server, board, daemon or browser you start. Before you finish,
+  stop each and its process group, check with `ps` that none is left, and say so in your
+  verdict.
 - You are stopped after 55 minutes. Plan to finish well inside that.
 
 ## Writing to the board
