@@ -216,10 +216,15 @@ Then `vb label <review-fix> of=<fix> --as lead-fable-5-2`, then
 7. Check open decisions: `vb tasks decisions --state blocked --json`, and `vb read <id>` for
    each. Record any that the owner has answered (see "Questions for the owner").
 8. Keep the queue full: create the next tasks with their `needs`.
-9. Wait from your place, with the Bash tool's timeout at 600000 ms:
-   `vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json`
-   Exit 1 with `reason: "timeout"` means nothing happened: run the same wait again. Any event,
-   even a reply of yours in a finished task's thread, starts the next turn.
+9. Wait for the board in the background, never in the foreground. Run this as one background
+   command (in Claude Code, the Bash tool with `run_in_background`, which notifies the session
+   when the command exits):
+   `for i in 1 2 3 4 5 6; do o=$(vb wait work/<project> --label 'board.task=completed|blocked|failed' --after <cursor> --timeout 9m --as lead-fable-5-2 --json 2>&1); echo "$o" | jq -e '.reason == "timeout"' >/dev/null 2>&1 || break; done; echo "$o"`
+   The loop repeats the 9-minute wait only when the output's own top-level `reason` is
+   `"timeout"` (nothing happened; an event's `reason` is nested, so it never matches), at most 6
+   times (54 minutes), so a quiet board does not end it early and an error never spins. Any event, even a reply of yours in a finished task's thread,
+   ends it. While it runs, answer the owner. When it ends, read its output and take the next turn; if it ended on
+   an error, report it to the owner. Never run the wait in the foreground and never sleep-poll.
 
 ## What Rider leaves on the board
 
