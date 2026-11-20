@@ -1,7 +1,19 @@
 [package]
-name = "rider"
+name = "swarm-rider"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "Ride a swarm of coding agents on your own machine"
+repository = "https://github.com/emostov/rider"
+readme = "README.md"
+keywords = ["agents", "swarm", "cli", "git", "worktree"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "prompts/*.md",
+    "src/**/*.rs",
+    "LICENSE",
+    "README.md",
+]
 
 [lib]
 name = "rider"
