@@ -517,6 +517,19 @@ fn a_prompt_file_named_directly_under_the_rider_home_is_accepted() {
 }
 
 #[test]
+fn a_role_can_select_the_tact_harness() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nharness = \"tact\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert!(output.stdout.contains("harness = \"tact\""), "{output:?}");
+}
+
+#[test]
 fn a_model_name_with_a_newline_is_refused_naming_the_field() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
@@ -582,13 +595,12 @@ fn an_agent_running_past_a_third_of_a_shortened_lease_sees_the_claim_renewed() {
     };
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_the_agent_will(&world, &task, &[Behaviour::Hold]);
-    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=3000,tick=200")]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=15000,tick=200")]);
     when_the_agent_has_started(&world, &task);
     let first = task_claim_until(&world, &task).expect("the task is claimed");
 
-    thread::sleep(Duration::from_secs(4));
+    let later = when_the_claim_moves_past(&world, &task, &first);
 
-    let later = task_claim_until(&world, &task).expect("the task is still claimed");
     assert!(later > first, "until moved from {first} to {later}");
     world.release_agent(&task);
     assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
@@ -821,7 +833,9 @@ fn a_pool_gives_a_refused_resumes_fresh_start_only_what_remains_of_the_attempt_l
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    given_a_rider_toml(&world, "[limits]\nattempt_minutes = 1\n");
+    let attempt_minutes = 1;
+    let limits = format!("[limits]\nattempt_minutes = {attempt_minutes}\n");
+    given_a_rider_toml(&world, &limits);
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     let fix = when_the_lead_creates(
         &world,
@@ -829,9 +843,14 @@ fn a_pool_gives_a_refused_resumes_fresh_start_only_what_remains_of_the_attempt_l
     );
     given_the_agent_will(&world, &fix, &[Behaviour::RefuseResumeSlowly]);
 
-    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+    when_the_pool_starts(&mut world);
+    let built_states = when_the_tasks_settle(&world, &[&built]);
+    let fix_states =
+        when_the_tasks_settle_within(&world, &[&fix], attempt_minutes * 60 + SETTLE_SECONDS_MAX);
+    let exit = when_the_pool_is_stopped(&mut world);
 
-    assert_eq!(states, vec!["completed", "failed"], "{}", world.pool_log());
+    assert_eq!(built_states, vec!["completed"], "{}", world.pool_log());
+    assert_eq!(fix_states, vec!["failed"], "{}", world.pool_log());
     assert_eq!(exit, Some(0));
     assert_eq!(agent_runs_for(&world, &fix).len(), 2);
     assert_eq!(task_label(&world, &fix, "attempt").as_deref(), Some("1"));

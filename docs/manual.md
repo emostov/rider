@@ -37,7 +37,8 @@ Rider never pushes, opens pull requests, or merges. Work stays on local branches
 
 - Rust (stable), to build `rider`.
 - Node 22, for the Board CLI.
-- `claude` (Claude Code) and `codex` (Codex CLI) on `PATH`, each signed in. The roles use the
+- `claude` (Claude Code), `codex` (Codex CLI) and `tact` on `PATH`, each signed in if a role
+  uses it. The roles use the
   models in the table below; each must be available to your account.
 - The Board CLI, installed where Rider looks for it, and its skill:
 
@@ -163,7 +164,7 @@ slots = 1
 builds = true        # this role's agents build and test too
 
 [roles.docs]
-harness = "claude"   # claude or codex
+harness = "claude"   # claude, codex or tact
 model = "claude-sonnet-5-5"
 title = "Docs"
 model_name = "Sonnet 5.5"
