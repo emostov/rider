@@ -698,7 +698,10 @@ fn find(contexts: &mut [RunContext], run: RunId, missing: Event) -> Result<&mut 
 fn call_failed(error: &BoardError) -> bool {
     matches!(
         error,
-        BoardError::Spawn(_) | BoardError::Io(_) | BoardError::TimedOut { .. }
+        BoardError::Spawn(_)
+            | BoardError::Io(_)
+            | BoardError::TimedOut { .. }
+            | BoardError::Unreachable { .. }
     )
 }
 

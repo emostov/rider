@@ -78,6 +78,8 @@ pub const TASKS_PAGE_MAX: usize = 200;
 pub const LISTING_PAGES_MAX: usize = 16;
 /// The reasons a fenced write gives when its claim is over or was never held.
 const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
+/// The reasons `vb` gives when it could not reach the board at all.
+const UNREACHABLE_REASONS: [&str; 1] = ["network_error"];
 /// The length of a time as the board prints it: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 const TIMESTAMP_LEN: usize = 24;
 
@@ -167,6 +169,10 @@ pub enum BoardError {
     },
     /// Signalling `vb`'s process group failed, so its descendants may still be running.
     Kill(String),
+    /// `vb` could not reach the board; `stderr` is what it printed.
+    Unreachable {
+        stderr: String,
+    },
 }
 
 impl fmt::Display for BoardError {
@@ -226,6 +232,9 @@ impl fmt::Display for BoardError {
                     "vb's process group could not be killed: {}",
                     one_line(message)
                 )
+            }
+            BoardError::Unreachable { stderr } => {
+                write!(f, "vb could not reach the board: {}", one_line(stderr))
             }
         }
     }
@@ -891,10 +900,7 @@ fn claim_outcome(output: &Output) -> Result<Option<TaskId>, BoardError> {
             return Ok(None);
         }
     }
-    Err(BoardError::Exit {
-        code: output.code,
-        stderr: output.stderr.clone(),
-    })
+    Err(exit_error(output))
 }
 
 /// The error for a failed run on task `id`: `ClaimLost` when the board refused it for the
@@ -907,6 +913,22 @@ fn failed_on(id: TaskId, output: &Output) -> BoardError {
             parse_failure_reason(&output.stderr).or_else(|| parse_failure_reason(&output.stdout));
         if reason.is_some_and(|reason| CLAIM_LOST_REASONS.contains(&reason.as_str())) {
             return BoardError::ClaimLost { id };
+        }
+    }
+    exit_error(output)
+}
+
+/// The error for a failed run: `Unreachable` when `vb` could not reach the board, otherwise
+/// how `vb` exited.
+fn exit_error(output: &Output) -> BoardError {
+    assert!(output.code != Some(0), "only a failed run has an error");
+    if output.code.is_some() {
+        let reason =
+            parse_failure_reason(&output.stderr).or_else(|| parse_failure_reason(&output.stdout));
+        if reason.is_some_and(|reason| UNREACHABLE_REASONS.contains(&reason.as_str())) {
+            return BoardError::Unreachable {
+                stderr: output.stderr.clone(),
+            };
         }
     }
     BoardError::Exit {
@@ -1157,10 +1179,7 @@ impl VbCli {
         );
         let output = self.run(command)?;
         if output.code != Some(0) {
-            return Err(BoardError::Exit {
-                code: output.code,
-                stderr: output.stderr,
-            });
+            return Err(exit_error(&output));
         }
         assert!(output.stdout.len() <= OUTPUT_BYTES_MAX);
         Ok(output.stdout)
@@ -1714,6 +1733,20 @@ mod tests {
         let timeout = include_str!("../fixtures/board/claim-timeout.stderr.txt");
         let killed = claim_outcome(&output(None, "", timeout));
         assert!(matches!(killed, Err(BoardError::Exit { code: None, .. })));
+    }
+
+    #[test]
+    fn a_board_vb_cannot_reach_is_unreachable_for_every_call() {
+        let unreachable = r#"{"status":"error","reason":"network_error","message":"Couldn't reach the board.","data":{"error":{"code":"unreachable","message":"the board didn't answer: fetch failed","status":502}}}"#;
+        let failed = output(Some(1), "", unreachable);
+        let is_unreachable = |error: Option<BoardError>| matches!(error, Some(BoardError::Unreachable { stderr }) if stderr == unreachable);
+        assert!(is_unreachable(claim_outcome(&failed).err()));
+        assert!(is_unreachable(lease_outcome(TaskId(2), &failed).err()));
+        let done = Command::Complete {
+            id: TaskId(2),
+            result: "done",
+        };
+        assert!(is_unreachable(write_outcome(&done, &failed).err()));
     }
 
     #[test]
