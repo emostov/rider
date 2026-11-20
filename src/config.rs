@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cli::{PROMPTS, PROMPTS_DIR};
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
 use crate::roles::{AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RoleSpec};
 use crate::run_task::{ATTEMPTS_DEFAULT, ATTEMPTS_MAX};
@@ -21,6 +22,8 @@ pub const ATTEMPT_MINUTES_MAX: u64 = ATTEMPT_MILLIS_MAX / 60_000;
 const _: () =
     assert!(ATTEMPT_MINUTES_MAX > 0 && ATTEMPT_MINUTES_MAX * 60_000 <= ATTEMPT_MILLIS_MAX);
 const PROMPT_SUFFIX: &str = ".md";
+const MODEL_NAME_LEN_MAX: usize = 32;
+const MODEL_LEN_MAX: usize = 128;
 const SLOT_DIGITS_MAX: usize = 2;
 const POOL_SLOTS_NEW_ROLE: u8 = 2;
 const MISSING: &str = "is missing for a role that is not built in";
@@ -323,6 +326,10 @@ fn is_name(text: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+fn text_fits(text: &str, len_max: usize) -> bool {
+    !text.trim().is_empty() && text.len() <= len_max && !text.contains(char::is_control)
+}
+
 // The runtime role from a merged shape; every field must be set and valid.
 fn role_spec(
     path: &Path,
@@ -344,7 +351,8 @@ fn role_spec(
         HarnessName::Tact => Harness::Tact,
     };
     let model = role.model.clone().ok_or_else(|| missing("model"))?;
-    if model.is_empty() || model.starts_with('-') || model.contains(char::is_whitespace) {
+    let spaced = model.contains(char::is_whitespace);
+    if spaced || !text_fits(&model, MODEL_LEN_MAX) || model.starts_with('-') {
         return Err(error("model", format!("{model:?} is not a model name")));
     }
     let title = role.title.clone().ok_or_else(|| missing("title"))?;
@@ -353,8 +361,9 @@ fn role_spec(
     }
     let model_name = role.model_name.clone();
     let model_name = model_name.ok_or_else(|| missing("model_name"))?;
-    if model_name.trim().is_empty() {
-        return Err(error("model_name", "must not be empty".to_string()));
+    if !text_fits(&model_name, MODEL_NAME_LEN_MAX) {
+        let problem = format!("must be 1 to {MODEL_NAME_LEN_MAX} bytes, no control characters");
+        return Err(error("model_name", problem));
     }
     let model_slug = role.model_slug.clone();
     let model_slug = model_slug.ok_or_else(|| missing("model_slug"))?;
@@ -411,25 +420,33 @@ fn slot_counts(label: &str, set: Option<u8>, agents: u8) -> Result<(u8, u8), Str
     Ok((slots, pool_slots))
 }
 
-// A built-in prompt's file name, or the absolute path of the user's own prompt file.
+// A built-in prompt's file name, or the absolute path of the user's own prompt file, which
+// must not be one of the built-in files Rider rewrites under the prompts directory.
 fn prompt_file(home: &Path, prompt: &str) -> Result<String, String> {
     let built_in = format!("{prompt}{PROMPT_SUFFIX}");
     if ROLES.iter().any(|spec| spec.prompt_file == built_in) {
         return Ok(built_in);
     }
-    if !prompt.contains('/') {
+    let path = home.join(prompt);
+    let Some(found) = path.canonicalize().ok().filter(|found| found.is_file()) else {
         let names: Vec<&str> = ROLES
             .iter()
             .filter_map(|spec| spec.prompt_file.strip_suffix(PROMPT_SUFFIX))
             .collect();
         return Err(format!(
-            "{prompt:?} is neither a built-in prompt ({}) nor a path",
+            "{} is not a file, and {prompt:?} is not a built-in prompt ({})",
+            path.display(),
             names.join(", ")
         ));
+    };
+    let prompts = home.join(PROMPTS_DIR);
+    let prompts = prompts.canonicalize().unwrap_or(prompts);
+    if let Some((name, _)) = PROMPTS.iter().find(|(name, _)| found == prompts.join(name)) {
+        return Err(format!(
+            "{} is the built-in prompt {name} that Rider rewrites; copy it to another path",
+            path.display()
+        ));
     }
-    let path = home.join(prompt);
-    let found = path.canonicalize().ok().filter(|found| found.is_file());
-    let found = found.ok_or_else(|| format!("{} is not a file", path.display()))?;
     let found = found.to_str().map(str::to_string);
     let found = found.ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
     assert!(Path::new(&found).is_absolute());

@@ -447,6 +447,85 @@ fn an_unknown_field_in_rider_toml_stops_the_daemon_naming_the_field() {
 }
 
 #[test]
+fn a_user_prompt_at_a_built_in_prompts_path_is_refused_naming_the_path() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompts = world.home.join("prompts");
+    fs::create_dir_all(&prompts).expect("create the prompts directory");
+    fs::write(prompts.join("review.md"), "My own review prompt.\n").expect("write a prompt");
+    given_a_rider_toml(&world, "[roles.review]\nprompt = \"prompts/review.md\"\n");
+
+    let output = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("roles.review.prompt"), "{output:?}");
+    assert!(output.stderr.contains("prompts/review.md"), "{output:?}");
+    let kept = fs::read_to_string(prompts.join("review.md")).expect("read the prompt");
+    assert_eq!(kept, "My own review prompt.\n");
+}
+
+#[test]
+fn a_prompt_file_named_directly_under_the_rider_home_is_accepted() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    fs::write(world.home.join("docs.md"), "You write docs.\n").expect("write a prompt");
+    given_a_rider_toml(&world, "[roles.light]\nprompt = \"docs.md\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert!(output.stdout.contains("prompt = \"docs.md\""), "{output:?}");
+}
+
+#[test]
+fn a_model_name_with_a_newline_is_refused_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nmodel_name = \"Sonnet\\n5.5\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("roles.light.model_name"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_model_name_longer_than_its_limit_is_refused_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let long = "M".repeat(200);
+    given_a_rider_toml(&world, &format!("[roles.light]\nmodel_name = \"{long}\"\n"));
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("roles.light.model_name"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_model_with_a_control_character_is_refused_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodel = \"gpt\\u0000sol\"\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(output.stderr.contains("roles.review.model"), "{output:?}");
+}
+
+#[test]
 fn rider_config_without_a_file_prints_the_built_in_table() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
@@ -763,6 +842,31 @@ fn a_session_recorded_for_another_repository_is_not_resumed() {
     );
     let run = &agent_runs_for(&world, &fix)[0];
     assert!(run.dir.ends_with(format!("other-repo/{fix}")), "{run:?}");
+}
+
+#[test]
+fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(
+        &world,
+        "[roles.implement]\nharness = \"codex\"\nmodel = \"gpt-test-implement\"\n",
+    );
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, true),
+    );
+
+    let (states, exit) = when_the_pool_runs_until_settled(&mut world, &[&built, &fix]);
+
+    assert_eq!(states, vec!["completed".to_string(); 2]);
+    assert_eq!(exit, Some(0));
+    let runs = agent_runs_for(&world, &fix);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].harness, "codex");
+    assert_eq!(agent_model(&world, &fix, 0), "gpt-test-implement");
 }
 
 /// A fix of task `onto` that waits for `after`, resuming `onto`'s session when `resume`.

@@ -431,7 +431,12 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
             brief.role.label
         ));
     }
-    assert!(brief.role.harness == Harness::Claude);
+    if brief.role.harness != Harness::Claude {
+        return Err(format!(
+            "role {} runs {:?}, and only Claude resumes a session",
+            brief.role.label, brief.role.harness
+        ));
+    }
     let onto = brief.onto.ok_or("the task has no `onto` label")?;
     let path = session_path(home, onto);
     let mut text = String::new();

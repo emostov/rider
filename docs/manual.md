@@ -127,7 +127,11 @@ configuration, built-in plus file, in the file's own form, so you can start a fi
 A role in the file overrides a built-in role field by field, or adds a new role (at most 16
 roles in all). A new role sets every field but `needs_of`, `builds` and `slots`. `prompt` is a built-in
 prompt name (`implement`, `review`, `polish`, `security`, `qa`) or a path to your own prompt
-file, relative to `$RIDER_HOME` or absolute. `needs_of` makes a task of the role name the task
+file: any relative path, such as `docs.md` or `prompts/docs.md`, is resolved against
+`$RIDER_HOME`, and an absolute path is used as it is. A path to one of the built-in files Rider
+rewrites in `$RIDER_HOME/prompts`, such as `prompts/review.md`, is refused; copy the file to
+another name instead. `model` is at most 128 bytes with no spaces or control characters, and
+`model_name` at most 32 bytes with no control characters. `needs_of` makes a task of the role name the task
 it checks in an `of` label; it defaults to `true` for a role that does not commit and must be
 `true` for one. `slots` caps how many agents of the role run at once; unset, only
 `limits.agents` does in `rider daemon`, and `rider pool` keeps its built-in slot counts.
@@ -180,7 +184,7 @@ file is read once; restart to apply a change.
 | `from` | lead, required when `base` and `onto` are absent | the agreed base branch to cut from |
 | `onto` | lead | id of a task whose existing branch this task works on directly |
 | `of` | lead, required for `review`, `security`, and `qa` | id of the task under review |
-| `resume` | lead | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
+| `resume` | lead | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session; a role configured to run Codex starts fresh |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |

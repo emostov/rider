@@ -47,7 +47,8 @@ pub const PROMPTS: [(&str, &str); 6] = [
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
-const PROMPTS_DIR: &str = "prompts";
+/// The directory under the Rider home that holds the built-in worker prompts.
+pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
 const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
