@@ -396,7 +396,7 @@ mod tests {
             panic!("the pool never releases task {}", id.0)
         }
 
-        fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError> {
+        fn list_open(&self, subtree: &str) -> Result<crate::board::Listing, BoardError> {
             panic!("the pool never lists {subtree}")
         }
     }

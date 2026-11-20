@@ -12,6 +12,9 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use serde_json::{Map, Value};
 
+use crate::core::TASKS_MAX;
+use crate::feed::Cursor;
+
 /// A task's ID on the board. The board prints IDs as decimal strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskId(pub u64);
@@ -67,10 +70,10 @@ const GLOBAL_ARGS_LEN: usize = 5;
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the tasks one task waits for.
 pub const NEEDS_MAX: usize = 64;
-/// Upper bound on the open tasks one listing returns; a subtree with more is an error.
+/// The open tasks one page of a listing asks `vb` for; `vb` takes at most 500.
 pub const TASKS_PAGE_MAX: usize = 200;
-/// The page `vb` is asked for: one more than the bound, so a subtree over it is seen.
-const TASKS_PAGE_ASKED: usize = TASKS_PAGE_MAX + 1;
+/// Upper bound on the pages one listing reads; a subtree with more is an error.
+pub const LISTING_PAGES_MAX: usize = 16;
 /// The reasons a fenced write gives when its claim is over or was never held.
 const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
 /// The length of a time as the board prints it: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
@@ -103,6 +106,23 @@ pub struct TaskView {
     pub claim: Option<Claim>,
 }
 
+/// One page of a listing and the cursor the board printed with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPage {
+    pub tasks: Vec<TaskView>,
+    pub cursor: Cursor,
+}
+
+/// A subtree's open tasks: the first `TASKS_MAX` in the board's order, and a cursor from
+/// before the first page, so a feed started there replays any change made while paging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub tasks: Vec<TaskView>,
+    pub cursor: Cursor,
+    /// The open tasks past `TASKS_MAX`, which the listing does not return.
+    pub left_out: usize,
+}
+
 #[derive(Debug)]
 pub enum BoardError {
     Spawn(String),
@@ -115,7 +135,7 @@ pub enum BoardError {
     TooManyLabels,
     /// A task waits for more than `NEEDS_MAX` tasks.
     TooManyNeeds,
-    /// A subtree holds more than `TASKS_PAGE_MAX` open tasks.
+    /// A subtree's open tasks fill more than `LISTING_PAGES_MAX` pages.
     TooManyTasks,
     /// The board refused a write on task `id` because this profile's claim on it is over.
     ClaimLost {
@@ -162,7 +182,8 @@ impl fmt::Display for BoardError {
             BoardError::TooManyLabels => write!(f, "the task has more than {LABELS_MAX} labels"),
             BoardError::TooManyNeeds => write!(f, "the task waits for more than {NEEDS_MAX} tasks"),
             BoardError::TooManyTasks => {
-                write!(f, "more than {TASKS_PAGE_MAX} open tasks in one listing")
+                let tasks = TASKS_PAGE_MAX * LISTING_PAGES_MAX;
+                write!(f, "more than {tasks} open tasks in one listing")
             }
             BoardError::ClaimLost { id } => write!(f, "the claim on task {} was lost", id.0),
             BoardError::OutputTooLarge => {
@@ -221,7 +242,7 @@ pub trait Board {
     /// Hands task `id` back, so it is ready again. A claim that is over is `ClaimLost`.
     fn release(&self, id: TaskId) -> Result<(), BoardError>;
     /// The open tasks in `subtree`, a channel prefix ending in `/`, and every channel below it.
-    fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError>;
+    fn list_open(&self, subtree: &str) -> Result<Listing, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -251,8 +272,12 @@ enum Command<'a> {
     Release {
         id: TaskId,
     },
+    Cursor {
+        subtree: &'a str,
+    },
     List {
         subtree: &'a str,
+        after: Option<Cursor>,
     },
     Label {
         id: TaskId,
@@ -395,9 +420,13 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             )
         }
         Command::Release { id } => (to_strings(&["tasks", "release", &id.0.to_string()]), None),
-        Command::List { subtree } => {
-            let limit = TASKS_PAGE_ASKED.to_string();
-            let words = to_strings(&["tasks", subtree, "--state", "open", "--limit", &limit]);
+        Command::Cursor { subtree } => (to_strings(&["read", subtree, "--limit", "1"]), None),
+        Command::List { subtree, after } => {
+            let limit = TASKS_PAGE_MAX.to_string();
+            let mut words = to_strings(&["tasks", subtree, "--state", "open", "--limit", &limit]);
+            if let Some(after) = after {
+                words.extend(to_strings(&["--after", &after.0.to_string()]));
+            }
             (words, None)
         }
         Command::Label { id, key, value } => {
@@ -471,6 +500,7 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
         Command::ClaimId { .. } => ("tasks claim", 0),
         Command::Renew { .. } => ("tasks renew", 0),
         Command::Release { .. } => ("tasks release", 0),
+        Command::Cursor { .. } => ("read", 0),
         Command::List { .. } => ("tasks", 0),
         Command::Label { .. } => ("label", 0),
         Command::Reply { .. } => ("reply", 0),
@@ -495,6 +525,7 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
         | Command::Claim { .. }
         | Command::ClaimId { .. }
         | Command::Renew { .. }
+        | Command::Cursor { .. }
         | Command::List { .. } => None,
         Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
@@ -776,14 +807,18 @@ pub fn parse_lease(json: &str) -> Result<TaskView, BoardError> {
     Ok(view)
 }
 
-/// The tasks from the output of `vb tasks <subtree> --json`: `{tasks: [{message, ...}], cursor}`.
-pub fn parse_task_list(json: &str) -> Result<Vec<TaskView>, BoardError> {
+/// One page of `vb tasks <subtree> --json`: `{tasks: [{message, ...}], cursor}`.
+pub fn parse_task_list(json: &str) -> Result<TaskPage, BoardError> {
     let object = parse_object(json)?;
     let tasks = object.get("tasks").and_then(Value::as_array);
     let tasks = tasks.ok_or_else(|| BoardError::Parse("no tasks array".into()))?;
     if tasks.len() > TASKS_PAGE_MAX {
-        return Err(BoardError::TooManyTasks);
+        return Err(BoardError::Parse(format!(
+            "a page of {} tasks, over the {TASKS_PAGE_MAX} asked for",
+            tasks.len()
+        )));
     }
+    let cursor = parse_cursor(&object)?;
     let mut views: Vec<TaskView> = Vec::with_capacity(tasks.len());
     for entry in tasks.iter().take(TASKS_PAGE_MAX) {
         let message = entry.get("message").and_then(Value::as_object);
@@ -791,7 +826,18 @@ pub fn parse_task_list(json: &str) -> Result<Vec<TaskView>, BoardError> {
         views.push(parse_message(message)?);
     }
     assert_eq!(views.len(), tasks.len(), "no task was dropped");
-    Ok(views)
+    Ok(TaskPage {
+        tasks: views,
+        cursor,
+    })
+}
+
+/// The `cursor` a read or a listing printed, a decimal string.
+fn parse_cursor(object: &Map<String, Value>) -> Result<Cursor, BoardError> {
+    let cursor = object.get("cursor").and_then(Value::as_str);
+    let cursor = cursor.ok_or_else(|| BoardError::Parse("no string cursor".into()))?;
+    let cursor = Cursor(parse_id_text(cursor)?.0);
+    Ok(cursor)
 }
 
 /// The `reason` of a failed run, from the JSON it printed: `{status: "error", reason, message}`.
@@ -1122,19 +1168,29 @@ impl VbCli {
         let output = self.run(command)?;
         write_outcome(command, &output)
     }
-}
 
-impl Board for VbCli {
-    fn read_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
-        assert!(!self.url.is_empty() && !self.profile.is_empty());
-        let output = self.run(&Command::Read { id })?;
+    /// The stdout of a read that exited 0.
+    fn read(&self, command: &Command) -> Result<String, BoardError> {
+        assert!(
+            expected_write(command).is_none(),
+            "a write reports an outcome"
+        );
+        let output = self.run(command)?;
         if output.code != Some(0) {
             return Err(BoardError::Exit {
                 code: output.code,
                 stderr: output.stderr,
             });
         }
-        let view = parse_task_view(&output.stdout)?;
+        assert!(output.stdout.len() <= OUTPUT_BYTES_MAX);
+        Ok(output.stdout)
+    }
+}
+
+impl Board for VbCli {
+    fn read_task(&self, id: TaskId) -> Result<TaskView, BoardError> {
+        assert!(!self.url.is_empty() && !self.profile.is_empty());
+        let view = parse_task_view(&self.read(&Command::Read { id })?)?;
         if view.id != id {
             return Err(BoardError::Parse(format!(
                 "asked for {id:?}, read {:?}",
@@ -1231,7 +1287,7 @@ impl Board for VbCli {
         self.write(&Command::Release { id })
     }
 
-    fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError> {
+    fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
         assert!(
             subtree.ends_with('/'),
             "a subtree is a channel prefix ending in /"
@@ -1240,16 +1296,48 @@ impl Board for VbCli {
             !subtree.starts_with('-'),
             "a subtree is never read as an option"
         );
-        let output = self.run(&Command::List { subtree })?;
-        if output.code != Some(0) {
-            return Err(BoardError::Exit {
-                code: output.code,
-                stderr: output.stderr,
-            });
+        let cursor = parse_cursor(&parse_object(&self.read(&Command::Cursor { subtree })?)?)?;
+        let mut tasks: Vec<TaskView> = Vec::new();
+        let mut left_out: usize = 0;
+        let mut after: Option<Cursor> = None;
+        for _ in 0..LISTING_PAGES_MAX {
+            let page = parse_task_list(&self.read(&Command::List { subtree, after })?)?;
+            let full = page.tasks.len() == TASKS_PAGE_MAX;
+            let first = page.tasks.first().map(|task| task.id.0);
+            if first
+                .zip(after)
+                .is_some_and(|(first, after)| first <= after.0)
+            {
+                return Err(BoardError::Parse(format!(
+                    "a page after {} starts at task {}",
+                    after.map_or(0, |after| after.0),
+                    first.unwrap_or(0)
+                )));
+            }
+            // A full page's cursor is its last task's id, where the next page starts; any
+            // other page's cursor is the board's event cursor as of the listing.
+            let last = page.tasks.last().map(|task| task.id.0);
+            if full && last != Some(page.cursor.0) {
+                return Err(BoardError::Parse(format!(
+                    "a full page's cursor {} is not its last task",
+                    page.cursor.0
+                )));
+            }
+            let room = TASKS_MAX.saturating_sub(tasks.len());
+            let over = page.tasks.len().saturating_sub(room);
+            left_out = left_out.checked_add(over).ok_or(BoardError::TooManyTasks)?;
+            tasks.extend(page.tasks.into_iter().take(room));
+            assert!(tasks.len() <= TASKS_MAX);
+            if !full {
+                return Ok(Listing {
+                    tasks,
+                    cursor,
+                    left_out,
+                });
+            }
+            after = Some(page.cursor);
         }
-        let views = parse_task_list(&output.stdout)?;
-        assert!(views.len() <= TASKS_PAGE_MAX);
-        Ok(views)
+        Err(BoardError::TooManyTasks)
     }
 }
 
@@ -1259,7 +1347,8 @@ pub mod testing {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
-    use super::{Board, BoardError, TaskId, TaskState, TaskView, check_message};
+    use super::{Board, BoardError, Listing, TaskId, TaskState, TaskView, check_message};
+    use crate::feed::Cursor;
 
     /// Upper bound on the calls one fake board records.
     pub const CALLS_MAX: usize = 1024;
@@ -1375,12 +1464,16 @@ pub mod testing {
             self.record(format!("release {}", id.0))
         }
 
-        fn list_open(&self, subtree: &str) -> Result<Vec<TaskView>, BoardError> {
+        fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
             self.record(format!("list_open {subtree}"))?;
             let closed = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
             let tasks = self.tasks.borrow();
             let open = tasks.iter().filter(|task| !closed.contains(&task.state));
-            Ok(open.cloned().collect())
+            Ok(Listing {
+                tasks: open.cloned().collect(),
+                cursor: Cursor(0),
+                left_out: 0,
+            })
         }
     }
 }
@@ -1806,20 +1899,91 @@ mod tests {
         let mut b = recorded(4, "task b", &waiting, TaskState::Waiting);
         b.needs = vec![TaskId(2)];
         b.epoch = 0;
-        assert_eq!(parse_task_list(list).unwrap(), vec![a, b]);
+        let page = TaskPage {
+            tasks: vec![a, b],
+            cursor: Cursor(8),
+        };
+        assert_eq!(parse_task_list(list).unwrap(), page);
+    }
+
+    /// A stand-in vb in a fresh directory, running `body`.
+    fn stand_in(name: &str, body: &str) -> (VbCli, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rider-board-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let vb = dir.join("vb");
+        fs::write(&vb, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&vb, fs::Permissions::from_mode(0o755)).unwrap();
+        let board = VbCli {
+            vb,
+            url: "http://127.0.0.1:1".into(),
+            profile: "tester".into(),
+        };
+        (board, dir)
+    }
+
+    /// A stand-in vb that reads the recorded cursor `6` and lists open tasks `1..=count` in
+    /// pages, as the board does: a full page's cursor is its last id, a short page's is the
+    /// event cursor `9999`.
+    fn listing_of(name: &str, count: usize) -> (VbCli, PathBuf) {
+        let task = concat!(
+            r#"{"message":{"id":"%d","text":"t","labels":{},"#,
+            r#""task":{"state":"ready","epoch":0,"needs":[],"claim":null}}}"#
+        );
+        let read = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/board/read-cursor.json"
+        );
+        let body = format!(
+            r#"[ "$1" = read ] && exec cat '{read}'
+after=0
+while [ $# -gt 0 ]; do [ "$1" = --after ] && after=$2; shift; done
+last=$((after + {TASKS_PAGE_MAX}))
+[ $last -gt {count} ] && last={count}
+printf '{{"tasks":['
+id=$((after + 1)); sep=
+while [ $id -le $last ]; do printf "$sep"; printf '{task}' $id; sep=,; id=$((id + 1)); done
+cursor=9999
+[ $((last - after)) -eq {TASKS_PAGE_MAX} ] && cursor=$last
+printf '],"cursor":"%s"}}\n' $cursor
+"#
+        );
+        stand_in(name, &body)
     }
 
     #[test]
-    fn a_listing_over_the_page_bound_is_too_many_tasks() {
-        let task = r#"{"message":{"id":"7","text":"t","labels":{},"task":{"state":"ready",
-            "epoch":0,"needs":[],"claim":null}}}"#;
-        let page = |count: usize| format!(r#"{{"tasks":[{}]}}"#, vec![task; count].join(","));
-        assert_eq!(
-            parse_task_list(&page(TASKS_PAGE_MAX)).unwrap().len(),
-            TASKS_PAGE_MAX
+    fn a_listing_returns_the_board_cursor() {
+        let (board, dir) = listing_of("list-cursor", 3);
+        let listing = board.list_open("work/");
+        fs::remove_dir_all(dir).unwrap();
+        let listing = listing.unwrap();
+        let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!((listing.cursor, listing.left_out), (Cursor(6), 0));
+    }
+
+    #[test]
+    fn a_listing_pages_up_to_the_tracked_tasks_and_counts_the_rest() {
+        let count = TASKS_MAX + 201;
+        let (board, dir) = listing_of("list-pages", count);
+        let listing = board.list_open("work/");
+        fs::remove_dir_all(dir).unwrap();
+        let listing = listing.unwrap();
+        let ids: Vec<u64> = listing.tasks.iter().map(|task| task.id.0).collect();
+        let tracked: Vec<u64> = (1..=TASKS_MAX as u64).collect();
+        assert_eq!(ids, tracked);
+        assert_eq!((listing.cursor, listing.left_out), (Cursor(6), 201));
+    }
+
+    #[test]
+    fn a_listing_past_the_page_bound_is_too_many_tasks() {
+        let (board, dir) = listing_of("list-bound", TASKS_PAGE_MAX * LISTING_PAGES_MAX + 1);
+        let listing = board.list_open("work/");
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            matches!(listing, Err(BoardError::TooManyTasks)),
+            "{listing:?}"
         );
-        let over = parse_task_list(&page(TASKS_PAGE_MAX + 1));
-        assert!(matches!(over, Err(BoardError::TooManyTasks)), "{over:?}");
     }
 
     #[test]
@@ -1894,10 +2058,16 @@ mod tests {
             &["tasks", "renew", "2", "--lease", "1h"],
         );
         expect(Command::Release { id }, &["tasks", "release", "2"]);
-        let list = Command::List { subtree: "work/" };
+        let cursor = Command::Cursor { subtree: "work/" };
+        expect(cursor, &["read", "work/", "--limit", "1"]);
+        let list = Command::List {
+            subtree: "work/",
+            after: Some(Cursor(9)),
+        };
+        let limit = ["--limit", "200", "--after", "9"];
         expect(
             list,
-            &["tasks", "work/", "--state", "open", "--limit", "201"],
+            &[&["tasks", "work/", "--state", "open"][..], &limit].concat(),
         );
     }
 
