@@ -2,10 +2,10 @@
 
 Rider is written in TigerStyle and tested thoroughly enough that it can be rewritten with confidence. When a rule here conflicts with a habit from another codebase, this file wins.
 
-- Before every commit: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
+- Before every commit: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`; the lead's small mechanical edit runs only fast checks, with the full checks in CI before the PR is marked ready.
 - Commit `Cargo.lock`. Commit messages are one sentence and name no tool or assistant.
 - Rider is developed with Rider. Changes to this repository are planned by the lead as tasks on the board channel `work/rider` and carried out by `rider pool rider`, so every change exercises the tool. Work done any other way is the exception and says why.
-- When something goes wrong while building or using Rider, file a GitHub issue (`gh issue create`, label `from-review` or `from-use`) written as a brief a stranger could act on: what happens, the fix wanted, the paths owned, and the command that proves it. The lead plans fixes from the open issues.
+- The board is where work is discussed. Findings, problems and deferred work found while building or using Rider go on the board (a finding record, a reply in the task's thread, or the project's deferred-work thread), not to the project's tracker. The tracker (GitHub issues or Linear, whichever the project uses) is for work that must outlive the board: only when a run ends does the lead, or a person, file one issue there for each item still open, written as a brief a stranger could act on: what happens, the fix wanted, the paths owned, the command that proves it.
 - Design: `docs/superpowers/specs/2026-11-19-rider-design.md`. Observed behaviour of Board and of each agent CLI: `docs/board-observed.md`, `docs/harness-observed.md`.
 
 ## TigerStyle

@@ -259,6 +259,7 @@ fn parse_from(value: &str) -> Result<String, BriefError> {
 mod tests {
     use super::*;
     use crate::board::TaskState;
+    use crate::feed::Cursor;
     use crate::roles::ROLES;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -305,6 +306,10 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            needs: Vec::new(),
+            epoch: 0,
+            claim: None,
+            version: Cursor(0),
         }
     }
 
