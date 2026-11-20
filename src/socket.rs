@@ -4,11 +4,11 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,6 +23,9 @@ use crate::core::{
 
 /// The socket's file name under the Rider home.
 pub const SOCKET_FILE: &str = "rider.sock";
+/// The directory under the Rider home the socket is bound in before it is moved into place.
+const BIND_DIR: &str = ".bind";
+const BIND_FILE: &str = "s";
 /// The protocol version a request names in `v`.
 pub const VERSION: u64 = 1;
 /// Upper bound on one request line; a longer one is refused and the connection closed.
@@ -48,6 +51,8 @@ const LOG_POLL_MILLIS: u64 = 100;
 const LOG_POLLS_MAX: u64 = u64::MAX;
 /// Upper bound on writer threads kept for joining at close; finished ones are dropped first.
 const WRITERS_MAX: usize = 4 * CLIENTS_MAX;
+/// How long one send to a client may block before the client is dropped.
+const WRITE_MILLIS_MAX: u64 = 10_000;
 
 /// Hands a socket event to the core; false once the core has gone.
 pub type Sink = Arc<dyn Fn(Event) -> bool + Send + Sync>;
@@ -67,9 +72,13 @@ struct WireRequest {
     follow: Option<bool>,
 }
 
-struct Outgoing {
-    id: u64,
-    reply: Reply,
+enum Outgoing {
+    Reply {
+        id: u64,
+        reply: Reply,
+    },
+    /// A whole error line refusing a request.
+    Refusal(String),
 }
 
 struct Slot {
@@ -77,6 +86,8 @@ struct Slot {
     /// The id of the request being answered, while one is.
     request: Option<u64>,
     lines: SyncSender<Outgoing>,
+    /// Set once the client fell behind: the writer sends this line next and stops.
+    lagged: Arc<OnceLock<String>>,
     stream: UnixStream,
 }
 
@@ -84,6 +95,8 @@ struct Slot {
 struct Clients {
     slots: Vec<Slot>,
     writers: Vec<JoinHandle<()>>,
+    /// One token per connection, held by its reader and writer while either runs.
+    live: Vec<Arc<()>>,
     next: u64,
     closed: bool,
 }
@@ -100,8 +113,12 @@ fn lock(clients: &Mutex<Clients>) -> MutexGuard<'_, Clients> {
 }
 
 /// Binds `path` with mode 0600, replacing a socket left there, and serves it on its own threads.
+/// No connection can be made before the mode is in effect.
 pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
     assert!(path.is_absolute() && logs.is_absolute());
+    let Some(home) = path.parent() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no directory"));
+    };
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
         Ok(_) => {
@@ -113,8 +130,25 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    // Bound inside a directory only the owner can enter, the socket takes connections only
+    // once it is 0600 and renamed into place, whatever the umask. The bound path is short,
+    // since a socket's path is limited to about 100 bytes.
+    let private = home.join(BIND_DIR);
+    let bound = private.join(BIND_FILE);
+    assert!(bound.starts_with(home) && bound != path);
+    // A daemon that died while binding leaves the directory behind.
+    for removed in [fs::remove_file(&bound), fs::remove_dir(&private)] {
+        match removed {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Ok(()) | Err(_) => {}
+        }
+    }
+    fs::DirBuilder::new().mode(0o700).create(&private)?;
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(&bound)?;
+    fs::set_permissions(&bound, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&bound, path)?;
+    fs::remove_dir(&private)?;
     let clients = Arc::new(Mutex::new(Clients::default()));
     let shared = Arc::clone(&clients);
     thread::Builder::new()
@@ -129,48 +163,67 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
 
 fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, sink: &Sink) {
     for _ in 0..ACCEPTS_MAX {
-        let Ok(mut stream) = listener.accept().map(|(stream, _)| stream) else {
+        let Ok(stream) = listener.accept().map(|(stream, _)| stream) else {
             continue;
         };
         let mut guard = lock(clients);
         if guard.closed {
             return;
         }
-        if guard.slots.len() >= CLIENTS_MAX {
+        guard.live.retain(|token| Arc::strong_count(token) > 1);
+        assert!(guard.slots.len() <= guard.live.len());
+        if guard.live.len() >= CLIENTS_MAX {
             drop(guard);
             let line = error_line(None, "busy", "too many clients are connected");
-            let _ = stream.write_all(line.as_bytes());
+            let _ = stream.set_nonblocking(true);
+            let _ = (&stream).write_all(line.as_bytes());
             continue;
         }
-        let (Ok(reader), Ok(writer)) = (stream.try_clone(), stream.try_clone()) else {
+        let timeout = Some(Duration::from_millis(WRITE_MILLIS_MAX));
+        let (Ok(()), Ok(reader), Ok(writer)) = (
+            stream.set_write_timeout(timeout),
+            stream.try_clone(),
+            stream.try_clone(),
+        ) else {
             continue;
         };
         guard.next = guard.next.saturating_add(1);
         let id = ClientId(guard.next);
         let (lines, queued) = sync_channel::<Outgoing>(CLIENT_BACKLOG_MAX);
-        let logs = logs.to_path_buf();
+        let lagged = Arc::new(OnceLock::new());
+        let token = Arc::new(());
+        let (logs, held_lagged, held_token) =
+            (logs.to_path_buf(), Arc::clone(&lagged), Arc::clone(&token));
         let spawned = thread::Builder::new()
             .name("client-writer".into())
-            .spawn(move || write_replies(writer, &queued, &logs));
+            .spawn(move || {
+                write_replies(writer, &queued, &held_lagged, &logs);
+                drop(held_token);
+            });
         let Ok(handle) = spawned else { continue };
         guard.writers.retain(|writer| !writer.is_finished());
         if guard.writers.len() < WRITERS_MAX {
             guard.writers.push(handle);
         }
+        guard.live.push(Arc::clone(&token));
         guard.slots.push(Slot {
             id,
             request: None,
             lines,
+            lagged,
             stream,
         });
-        assert!(guard.slots.len() <= CLIENTS_MAX);
+        assert!(guard.slots.len() <= guard.live.len() && guard.live.len() <= CLIENTS_MAX);
         drop(guard);
         let (held, sink) = (Arc::clone(clients), Arc::clone(sink));
         let spawned = thread::Builder::new()
             .name("client-reader".into())
-            .spawn(move || read_requests(reader, id, &held, &sink));
+            .spawn(move || {
+                read_requests(reader, id, &held, &sink);
+                drop(token);
+            });
         if spawned.is_err() {
-            lock(clients).slots.retain(|slot| slot.id != id);
+            remove(&mut lock(clients), id);
         }
     }
 }
@@ -215,17 +268,41 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
             Err((request_id, message)) => refuse(clients, id, request_id, &message),
         }
     }
-    lock(clients).slots.retain(|slot| slot.id != id);
+    remove(&mut lock(clients), id);
     let _ = sink(Event::ClientGone(id));
 }
 
-fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, message: &str) {
-    let guard = lock(clients);
-    if let Some(slot) = guard.slots.iter().find(|slot| slot.id == id) {
-        let line = error_line(request, "bad_request", message);
-        // A client too slow to take its refusal is dropped by the next reply instead.
-        let _ = (&slot.stream).write_all(line.as_bytes());
+// Drops the client's slot and shuts its socket down, so its writer ends even when blocked.
+fn remove(guard: &mut Clients, id: ClientId) {
+    if let Some(index) = guard.slots.iter().position(|slot| slot.id == id) {
+        hang_up(&guard.slots.remove(index).stream);
     }
+    assert!(guard.slots.iter().all(|slot| slot.id != id));
+}
+
+fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, message: &str) {
+    let mut guard = lock(clients);
+    if let Some(index) = guard.slots.iter().position(|slot| slot.id == id) {
+        let line = error_line(request, "bad_request", message);
+        queue(&mut guard, index, Outgoing::Refusal(line), request);
+    }
+}
+
+// Queues `outgoing` for the client in slot `index` without blocking; a client whose backlog
+// is full is dropped, and its writer sends the `lagged` error after the line it is on.
+fn queue(guard: &mut Clients, index: usize, outgoing: Outgoing, request: Option<u64>) {
+    let slot = &guard.slots[index];
+    match slot.lines.try_send(outgoing) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            let line = error_line(request, "lagged", "the client read too slowly");
+            let set = slot.lagged.set(line);
+            assert!(set.is_ok(), "a slot is dropped the first time it lags");
+            guard.slots.remove(index);
+        }
+        Err(TrySendError::Disconnected(_)) => hang_up(&guard.slots.remove(index).stream),
+    }
+    assert!(guard.slots.len() <= CLIENTS_MAX);
 }
 
 /// The request in `bytes`, or the request id, if readable, and why it is refused.
@@ -260,7 +337,8 @@ fn parse_request(bytes: &[u8]) -> Result<(u64, Request), (Option<u64>, String)> 
 }
 
 impl Socket {
-    /// Queues `reply` for `client`; a client whose backlog is full is dropped as `lagged`.
+    /// Queues `reply` for `client` without blocking; a client whose backlog is full is
+    /// dropped as `lagged`.
     pub fn reply(&self, client: ClientId, reply: Reply) {
         let mut guard = lock(&self.clients);
         let Some(index) = guard.slots.iter().position(|slot| slot.id == client) else {
@@ -276,18 +354,7 @@ impl Socket {
         if last {
             slot.request = None;
         }
-        match slot.lines.try_send(Outgoing { id, reply }) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                let slot = guard.slots.remove(index);
-                let line = error_line(Some(id), "lagged", "the client read too slowly");
-                // The writer is stuck on this client, so the refusal may not get through.
-                let _ = slot.stream.set_nonblocking(true);
-                let _ = (&slot.stream).write_all(line.as_bytes());
-                let _ = slot.stream.shutdown(Shutdown::Both);
-            }
-        }
-        assert!(guard.slots.len() <= CLIENTS_MAX);
+        queue(&mut guard, index, Outgoing::Reply { id, reply }, Some(id));
     }
 
     /// Stops accepting, lets queued lines reach their clients for a bounded time, and removes
@@ -316,23 +383,46 @@ impl Socket {
     }
 }
 
-fn write_replies(mut stream: UnixStream, queued: &Receiver<Outgoing>, logs: &Path) {
+fn write_replies(
+    mut stream: UnixStream,
+    queued: &Receiver<Outgoing>,
+    lagged: &OnceLock<String>,
+    logs: &Path,
+) {
     for _ in 0..STREAM_LINES_MAX {
+        if lagged.get().is_some() {
+            break;
+        }
         let Ok(outgoing) = queued.recv() else { break };
-        let written = match outgoing.reply {
-            Reply::Log { task, follow } => {
-                stream_log(&mut stream, outgoing.id, task, follow, queued, logs)
-            }
-            reply => {
-                let line = reply_line(outgoing.id, &reply, logs);
+        let written = match outgoing {
+            Outgoing::Reply {
+                id,
+                reply: Reply::Log { task, follow },
+            } => stream_log(&mut stream, id, task, follow, queued, logs),
+            Outgoing::Reply { id, reply } => {
+                let line = reply_line(id, &reply, logs);
                 stream.write_all(line.as_bytes()).is_ok()
             }
+            Outgoing::Refusal(line) => stream.write_all(line.as_bytes()).is_ok(),
         };
         if !written {
             break;
         }
     }
+    // Every line before it went whole, so the `lagged` error does too, unless the send
+    // times out.
+    if let Some(line) = lagged.get() {
+        let _ = stream.write_all(line.as_bytes());
+    }
+    hang_up(&stream);
+}
+
+// Shuts both directions down, ending any read or send blocked on the socket.
+fn hang_up(stream: &UnixStream) {
+    // macOS refuses `Shutdown::Both` with ENOTCONN once the peer has shut its side, so each
+    // direction is shut on its own.
     let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.shutdown(Shutdown::Read);
 }
 
 /// The newest of the task's attempt logs (`*.jsonl`) under `logs`, if it has any.
@@ -394,9 +484,12 @@ fn stream_log(
         }
         if !ended {
             match queued.recv_timeout(Duration::from_millis(LOG_POLL_MILLIS)) {
-                Ok(Outgoing {
+                Ok(Outgoing::Reply {
                     reply: Reply::End, ..
                 }) => ended = true,
+                Ok(Outgoing::Refusal(line)) if stream.write_all(line.as_bytes()).is_err() => {
+                    return false;
+                }
                 Ok(_) | Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return false,
             }
@@ -657,5 +750,196 @@ fn refusal(reply: &Value) -> ClientError {
     match (field("code"), field("message")) {
         (Some(code), Some(message)) => ClientError::Refused { code, message },
         _ => ClientError::Malformed(reply.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::Shutdown;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Receiver, sync_channel};
+    use std::thread;
+    use std::time::Duration;
+
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    use super::{CLIENT_BACKLOG_MAX, SOCKET_FILE, Socket, listen};
+    use crate::board::{TaskId, TaskState};
+    use crate::core::{
+        BoardHealth, CLIENTS_MAX, ClientId, Event, Reply, StatusView, Stopping, TaskRow, Untracked,
+    };
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn serve() -> (TempDir, PathBuf, Socket, Receiver<Event>) {
+        let dir = TempDir::new_in("/tmp").unwrap();
+        let path = dir.path().join(SOCKET_FILE);
+        let (events, received) = sync_channel(2 * CLIENT_BACKLOG_MAX);
+        let sink = Arc::new(move |event| events.send(event).is_ok());
+        let socket = listen(&path, dir.path().to_path_buf(), sink).unwrap();
+        (dir, path, socket, received)
+    }
+
+    fn status(tasks: u64, branch: usize) -> Reply {
+        let row = |id| TaskRow {
+            id: TaskId(id),
+            project: Some("demo".into()),
+            state: TaskState::Ready,
+            role: Some("implement".into()),
+            profile: None,
+            age_millis: None,
+            branch: Some("x".repeat(branch)),
+        };
+        Reply::Status(StatusView {
+            board: BoardHealth::Up,
+            stopping: Stopping::No,
+            running: 0,
+            limit: 32,
+            untracked: Untracked::Exactly(0),
+            tasks: (0..tasks).map(row).collect(),
+        })
+    }
+
+    /// Sends a status request and returns the client the core is told of, or `None` if it
+    /// is told the client went.
+    fn request(stream: &mut UnixStream, events: &Receiver<Event>) -> Option<ClientId> {
+        stream
+            .write_all(b"{\"v\":1,\"id\":1,\"cmd\":\"status\"}\n")
+            .ok()?;
+        match events.recv_timeout(WAIT).unwrap() {
+            Event::Client { client, .. } => Some(client),
+            Event::ClientGone(_) => None,
+            event => panic!("expected a request, got {event:?}"),
+        }
+    }
+
+    fn read_line(stream: &UnixStream) -> Value {
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn a_client_flooding_bad_requests_without_reading_never_holds_up_a_reply_to_another() {
+        let (_dir, path, socket, events) = serve();
+        let mut healthy = UnixStream::connect(&path).unwrap();
+        let healthy_id = request(&mut healthy, &events).unwrap();
+        let mut flooder = UnixStream::connect(&path).unwrap();
+        flooder
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let _ = flooder.write_all(&b"{}\n".repeat(10_000));
+
+        let socket = Arc::new(socket);
+        let (done, finished) = sync_channel(1);
+        let replier = {
+            let socket = Arc::clone(&socket);
+            thread::spawn(move || {
+                socket.reply(healthy_id, Reply::Agents(Vec::new()));
+                done.send(()).unwrap();
+            })
+        };
+        let replied = finished.recv_timeout(Duration::from_secs(2));
+        drop(flooder);
+        replier.join().unwrap();
+
+        assert_eq!(replied, Ok(()), "the reply waited on the flooding client");
+        let expected = serde_json::json!({"id": 1, "ok": true, "data": []});
+        assert_eq!(read_line(&healthy), expected);
+        socket.close();
+    }
+
+    #[test]
+    fn a_client_that_half_closes_gets_no_more_of_a_reply_it_stopped_reading() {
+        let (_dir, path, socket, events) = serve();
+        let mut client = UnixStream::connect(&path).unwrap();
+        let id = request(&mut client, &events).unwrap();
+        socket.reply(id, status(256, 4096));
+
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        assert_eq!(events.recv_timeout(WAIT).unwrap(), Event::ClientGone(id));
+        let mut data = Vec::new();
+        client.read_to_end(&mut data).unwrap();
+        assert!(
+            !data.ends_with(b"\n"),
+            "the writer kept sending to a client that went: {} bytes",
+            data.len()
+        );
+        socket.close();
+    }
+
+    #[test]
+    fn a_lagging_client_holds_its_seat_until_it_has_read_whole_lines_ending_in_lagged() {
+        let (_dir, path, socket, events) = serve();
+        let mut slow = UnixStream::connect(&path).unwrap();
+        let mut replies = 0;
+        for _ in 0..CLIENT_BACKLOG_MAX + 8 {
+            let Some(id) = request(&mut slow, &events) else {
+                break;
+            };
+            socket.reply(id, status(16, 1024));
+            replies += 1;
+        }
+        assert!(replies > CLIENT_BACKLOG_MAX, "{replies} replies");
+
+        let others: Vec<UnixStream> = (1..CLIENTS_MAX)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let refused = UnixStream::connect(&path).unwrap();
+        assert_eq!(read_line(&refused)["error"]["code"], "busy");
+
+        slow.set_read_timeout(Some(WAIT)).unwrap();
+        let mut data = String::new();
+        slow.read_to_string(&mut data).unwrap();
+        assert!(data.ends_with('\n'), "a line was cut short");
+        let lines: Vec<Value> = (data.lines())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.last().unwrap()["error"]["code"], "lagged");
+        drop(others);
+        socket.close();
+    }
+
+    #[test]
+    fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
+        let dir = TempDir::new_in("/tmp").unwrap();
+        let path = dir.path().join(SOCKET_FILE);
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (done, path) = (Arc::clone(&done), path.clone());
+            thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    let Ok(metadata) = fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    let mode = metadata.permissions().mode() & 0o777;
+                    if metadata.file_type().is_socket() && mode != 0o600 {
+                        seen.push(mode);
+                    }
+                }
+                seen
+            })
+        };
+
+        for _ in 0..300 {
+            let socket = listen(&path, dir.path().to_path_buf(), Arc::new(|_| true)).unwrap();
+            socket.close();
+        }
+        done.store(true, Ordering::SeqCst);
+
+        assert_eq!(watcher.join().unwrap(), Vec::<u32>::new());
+        let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(left.len(), 0, "{left:?}");
     }
 }
