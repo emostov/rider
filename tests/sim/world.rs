@@ -148,6 +148,8 @@ pub struct World {
     pub trace: Vec<String>,
     /// The phases runs were in when the core was restarted, by name.
     pub restarted_in: BTreeSet<String>,
+    /// The phases runs were in when a board outage began, by name.
+    pub down_in: BTreeSet<String>,
     /// How many times the core was restarted.
     generation: u64,
     /// The replies the core sent `OWNER` during its current request.
@@ -195,6 +197,7 @@ impl World {
             exited: false,
             trace: Vec::new(),
             restarted_in: BTreeSet::new(),
+            down_in: BTreeSet::new(),
             generation: 0,
             replies: Vec::new(),
         }
@@ -299,7 +302,7 @@ impl World {
             80..=87 => self.create_task(),
             88..=89 => self.lose_claim(),
             90..=91 => self.crash_agent(),
-            92 => self.down_until = Timestamp(self.now.0 + self.rng.u64(1..10) * MINUTE),
+            92 => self.board_outage(),
             93 => self.lose_feed(),
             94..=95 => self.unblock(),
             96 => self.cancel_task(),
@@ -314,6 +317,16 @@ impl World {
             _ => return self.advance(),
         }
         Ok(())
+    }
+
+    /// Every board call fails for one to nine minutes from now.
+    fn board_outage(&mut self) {
+        for run in self.core.runs() {
+            self.down_in.insert(phase_name(run.phase));
+        }
+        self.down_until = Timestamp(self.now.0 + self.rng.u64(1..10) * MINUTE);
+        self.trace
+            .push(format!("board down until {:?}", self.down_until));
     }
 
     /// Asks the core, as the owner, to kill a task's agent or to follow its log, sometimes for
@@ -388,9 +401,7 @@ impl World {
     /// cursor the old one handled.
     fn restart(&mut self) -> Result<(), String> {
         for run in self.core.runs() {
-            let phase = format!("{:?}", run.phase);
-            let name = phase.split('(').next().unwrap_or_default().to_string();
-            self.restarted_in.insert(name);
+            self.restarted_in.insert(phase_name(run.phase));
         }
         let saved = self.core.cursor();
         self.core = State::new(self.config.clone(), self.now);
@@ -1079,7 +1090,8 @@ impl World {
     }
 
     fn check_actions(&mut self, actions: &[Action]) -> Result<(), String> {
-        let blocked = self.core.board() != BoardHealth::Up || self.core.stopping() != Stopping::No;
+        let down = self.core.board() != BoardHealth::Up;
+        let blocked = down || self.core.stopping() != Stopping::No;
         for action in actions {
             let (run, write) = match action {
                 Action::Claim { run, task, profile } => {
@@ -1103,6 +1115,9 @@ impl World {
                 }
                 Action::Renew { run, .. } => (*run, true),
                 Action::Release { run, profile, .. } => {
+                    if down {
+                        return Err(format!("{action:?} while the board is down"));
+                    }
                     let claimed = self.log.entry(*run).or_default().profile.as_ref();
                     if claimed != Some(profile) {
                         return Err(format!("{action:?} is not as the claim's {claimed:?}"));
@@ -1114,6 +1129,9 @@ impl World {
                 } => {
                     if self.stopped_now {
                         return Err(format!("stop-now: {action:?} counts an attempt"));
+                    }
+                    if down {
+                        return Err(format!("{action:?} while the board is down"));
                     }
                     let log = self.log.entry(*run).or_default();
                     log.settles += 1;
@@ -1246,6 +1264,11 @@ impl World {
         }
         Ok(())
     }
+}
+
+fn phase_name(phase: Phase) -> String {
+    let phase = format!("{phase:?}");
+    phase.split('(').next().unwrap_or_default().to_string()
 }
 
 fn is_closed(state: TaskState) -> bool {

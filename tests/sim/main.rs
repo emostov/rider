@@ -13,7 +13,8 @@ use world::World;
 const SEEDS: u64 = 64;
 /// Further seeds every run covers once each.
 const MORE_SEEDS: u64 = 2000;
-/// The phases a run can be in, by name; every one sees a restart in some seed.
+/// The phases a run can be in, by name; every one sees a restart and a board outage in some
+/// seed.
 const PHASES: [&str; 7] = [
     "Claiming",
     "Preparing",
@@ -42,24 +43,27 @@ fn more_seeds_hold_every_invariant() {
         return;
     }
     let mut restarted_in = BTreeSet::new();
+    let mut down_in = BTreeSet::new();
     for seed in SEEDS..SEEDS + MORE_SEEDS {
-        let (trace, phases) = run_seed(seed);
-        assert!(!trace.is_empty());
-        restarted_in.extend(phases);
+        let world = run_seed(seed);
+        assert!(!world.trace.is_empty());
+        restarted_in.extend(world.restarted_in);
+        down_in.extend(world.down_in);
     }
     let expected: BTreeSet<String> = PHASES.iter().map(|phase| phase.to_string()).collect();
     assert_eq!(restarted_in, expected, "the phases a restart came in");
+    assert_eq!(down_in, expected, "the phases a board outage came in");
 }
 
 fn run(seed: u64) -> Vec<String> {
-    run_seed(seed).0
+    run_seed(seed).trace
 }
 
-/// The seed's trace, and the phases its runs were in when the core restarted.
-fn run_seed(seed: u64) -> (Vec<String>, BTreeSet<String>) {
+/// The world after the seed has run.
+fn run_seed(seed: u64) -> World {
     let mut world = World::new(seed);
     match world.run() {
-        Ok(()) => (world.trace, world.restarted_in),
+        Ok(()) => world,
         Err(failure) => {
             let start = world.trace.len().saturating_sub(TRACE_SHOWN);
             for line in &world.trace[start..] {
