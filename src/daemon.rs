@@ -30,8 +30,8 @@ use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
-    Attempt, Env, Judgement, Prepared, RunError, judge_attempt, launch_agent, prepare_attempt,
-    settle_attempt,
+    Attempt, Env, Judgement, Prepared, RunError, board_identity, judge_attempt, launch_agent,
+    prepare_attempt, settle_attempt,
 };
 use crate::settle::Verdict;
 
@@ -400,6 +400,14 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         stop_now: AtomicBool::new(false),
         log,
     });
+    // Read before any claim, so no attempt spends its lease on it; a failure here is retried
+    // by the first attempt.
+    let identity = board_identity(&shared.paths.board_url, &shared.board(DAEMON_PROFILE));
+    if let Err(error) = identity {
+        shared
+            .log
+            .write(&format!("could not read the board's identity: {error}"));
+    }
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
     start_signals(shared.events.clone())?;

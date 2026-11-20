@@ -293,7 +293,7 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
 }
 
 /// The identity of the board at `url`, read from it once per process and then remembered.
-fn board_identity(url: &str, board: &dyn Board) -> Result<BoardIdentity, BoardError> {
+pub fn board_identity(url: &str, board: &dyn Board) -> Result<BoardIdentity, BoardError> {
     assert!(!url.is_empty());
     // Held across the read, so the slots of one pool post at most one marker between them.
     let mut known = BOARD_IDENTITY
