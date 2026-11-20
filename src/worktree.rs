@@ -444,6 +444,7 @@ mod tests {
     use super::*;
     use crate::board::testing::FakeBoard;
     use crate::board::{TaskState, TaskView};
+    use crate::feed::Cursor;
     use crate::git::testing::{Fixture, git, git_succeeds};
     use crate::roles::role_from_label;
     use std::fs;
@@ -457,6 +458,10 @@ mod tests {
             text: "Earlier work.".to_string(),
             state: TaskState::Completed,
             labels: labels.into_iter().collect(),
+            needs: Vec::new(),
+            epoch: 1,
+            claim: None,
+            version: Cursor(0),
         }
     }
 
