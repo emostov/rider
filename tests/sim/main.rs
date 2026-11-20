@@ -7,8 +7,10 @@ mod world;
 
 use world::World;
 
-/// The seeds every run covers.
+/// The fixed seeds every run covers, each replayed.
 const SEEDS: u64 = 64;
+/// Further seeds every run covers once each.
+const MORE_SEEDS: u64 = 2000;
 /// How many of the last steps a failure prints.
 const TRACE_SHOWN: usize = 40;
 
@@ -19,6 +21,16 @@ fn seeds() -> Vec<u64> {
             Err(_) => panic!("SIM_SEED must be a number, got {text:?}"),
         },
         Err(_) => (0..SEEDS).collect(),
+    }
+}
+
+#[test]
+fn more_seeds_hold_every_invariant() {
+    if std::env::var("SIM_SEED").is_ok() {
+        return;
+    }
+    for seed in SEEDS..SEEDS + MORE_SEEDS {
+        assert!(!run(seed).is_empty());
     }
 }
 

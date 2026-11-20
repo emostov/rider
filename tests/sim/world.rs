@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use rider::board::{TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
     ACTIONS_MAX, Action, BoardHealth, Call, Config, Event, Phase, RunId, Settlement, State,
-    StopReason, Stopping, step,
+    StopReason, Stopping, Untracked, step,
 };
 use rider::feed::{BoardEvent, Cursor, EventKind};
 use rider::roles::ROLES;
@@ -38,7 +38,11 @@ struct FakeTask {
 
 struct Agent {
     run: RunId,
+    /// The id of the `Spawn` the agent's exit answers.
+    spawn: u64,
     exit_at: Timestamp,
+    /// The agent ignores every stop and exits only at `exit_at`.
+    stubborn: bool,
 }
 
 /// What the checker remembers about one run.
@@ -66,16 +70,20 @@ pub struct World {
     tasks: Vec<FakeTask>,
     feed: VecDeque<BoardEvent>,
     cursor: u64,
-    /// Results not yet delivered, each with the outstanding action it answers.
-    results: Vec<(Event, Option<RunId>, &'static str)>,
+    /// Results not yet delivered, each with the id of the outstanding action it answers.
+    /// A result is not delivered before its time.
+    results: Vec<(Event, u64, Timestamp)>,
     agents: Vec<Agent>,
     down_until: Timestamp,
     /// Actions not yet answered, by run (`None` for a listing or a feed restart).
-    outstanding: Vec<(Option<RunId>, &'static str)>,
+    outstanding: Vec<(u64, Option<RunId>, &'static str)>,
+    next_action: u64,
     log: HashMap<RunId, RunLog>,
     settled_epochs: HashSet<(u64, u64)>,
     /// Open tasks as the delivered feed events and snapshots told the core.
     told_open: BTreeSet<u64>,
+    /// Runs whose agent has been spawned.
+    spawned: HashSet<RunId>,
     /// Whether the core had been told to stop now before the current step.
     stopped_now: bool,
     signals: u8,
@@ -102,9 +110,11 @@ impl World {
             agents: Vec::new(),
             down_until: now,
             outstanding: Vec::new(),
+            next_action: 0,
             log: HashMap::new(),
             settled_epochs: HashSet::new(),
             told_open: BTreeSet::new(),
+            spawned: HashSet::new(),
             stopped_now: false,
             signals: 0,
             exited: false,
@@ -142,15 +152,30 @@ impl World {
                 self.outstanding
             ));
         }
-        Ok(())
+        let now = self.now;
+        let held = self
+            .tasks
+            .iter()
+            .find(|task| task.holder.is_some() && task.lease_until > now);
+        match held {
+            Some(task) => Err(format!(
+                "task {} is still claimed by {:?} until {:?} after the core exited at {now:?}",
+                task.id.0, task.holder, task.lease_until
+            )),
+            None => Ok(()),
+        }
     }
 
     fn turn(&mut self, faults: bool) -> Result<(), String> {
         let choice = self.rng.u32(0..100);
-        if choice < 40 && !self.results.is_empty() {
-            let index = self.rng.usize(0..self.results.len());
-            let (event, run, kind) = self.results.swap_remove(index);
-            self.answer(run, kind)?;
+        let now = self.now;
+        let ready: Vec<usize> = (0..self.results.len())
+            .filter(|index| self.results[*index].2 <= now)
+            .collect();
+        if choice < 40 && !ready.is_empty() {
+            let index = ready[self.rng.usize(0..ready.len())];
+            let (event, id, _) = self.results.swap_remove(index);
+            self.answer(id, &event)?;
             return self.deliver(event);
         }
         if choice < 60
@@ -168,10 +193,11 @@ impl World {
             92 => self.down_until = Timestamp(self.now.0 + self.rng.u64(1..10) * MINUTE),
             93 => {
                 self.feed.clear();
-                self.outstanding.push((None, "feed"));
-                self.reply(None, "feed", Event::FeedLost);
+                let id = self.expect(None, "feed");
+                self.reply(id, Event::FeedLost);
             }
             94..=95 => self.unblock(),
+            96 => self.cancel_task(),
             _ => return self.advance(),
         }
         Ok(())
@@ -199,7 +225,7 @@ impl World {
             .partition(|agent| agent.exit_at <= now);
         self.agents = running;
         for agent in done {
-            self.reply(Some(agent.run), "spawn", Event::AgentExited(agent.run));
+            self.reply(agent.spawn, Event::AgentExited(agent.run));
         }
         self.deliver(Event::Tick(now))
     }
@@ -243,7 +269,7 @@ impl World {
         if !self.agents.is_empty() {
             let index = self.rng.usize(0..self.agents.len());
             let agent = self.agents.swap_remove(index);
-            self.reply(Some(agent.run), "spawn", Event::AgentExited(agent.run));
+            self.reply(agent.spawn, Event::AgentExited(agent.run));
         }
     }
 
@@ -255,6 +281,19 @@ impl World {
         if let Some(index) = index {
             self.tasks[index].state = TaskState::Ready;
             self.publish(index, EventKind::TaskUnblocked);
+        }
+    }
+
+    /// The owner cancels an open task, whoever holds it.
+    fn cancel_task(&mut self) {
+        let open: Vec<usize> = (0..self.tasks.len())
+            .filter(|index| !is_closed(self.tasks[*index].state))
+            .collect();
+        if !open.is_empty() {
+            let index = open[self.rng.usize(0..open.len())];
+            self.tasks[index].holder = None;
+            self.tasks[index].state = TaskState::Canceled;
+            self.publish(index, EventKind::TaskCanceled);
         }
     }
 
@@ -291,26 +330,25 @@ impl World {
         Ok(())
     }
 
-    fn reply(&mut self, run: Option<RunId>, kind: &'static str, event: Event) {
-        self.results.push((event, run, kind));
+    /// Records one emitted action instance; its one result must name the returned id.
+    fn expect(&mut self, run: Option<RunId>, kind: &'static str) -> u64 {
+        self.next_action += 1;
+        self.outstanding.push((self.next_action, run, kind));
+        self.next_action
     }
 
-    fn answer(&mut self, run: Option<RunId>, kind: &'static str) -> Result<(), String> {
-        if kind == "spawn" {
-            self.outstanding.retain(|entry| *entry != (run, "stop"));
-        }
-        match self
-            .outstanding
-            .iter()
-            .position(|entry| *entry == (run, kind))
-        {
+    fn reply(&mut self, id: u64, event: Event) {
+        self.results.push((event, id, self.now));
+    }
+
+    fn answer(&mut self, id: u64, event: &Event) -> Result<(), String> {
+        match self.outstanding.iter().position(|entry| entry.0 == id) {
             Some(index) => {
                 self.outstanding.swap_remove(index);
                 Ok(())
             }
             None => Err(format!(
-                "a {kind} result for {run:?} answers no outstanding action: {:?}",
-                self.outstanding
+                "invariant 10: {event:?} answers action {id}, which is not outstanding"
             )),
         }
     }
@@ -318,7 +356,7 @@ impl World {
     fn note_result(&mut self, event: &Event) {
         let (run, entry) = match event {
             Event::Claimed { run, .. } => (*run, "claimed"),
-            Event::Prepared(run) => (*run, "prepared"),
+            Event::Prepared { run, .. } => (*run, "prepared"),
             Event::PrepareBlocked { run, .. } => (*run, "blocked"),
             Event::Judged { run, .. } => (*run, "judged"),
             Event::ClaimLost(run) => (*run, "lost"),
@@ -375,35 +413,42 @@ impl World {
         match action {
             Action::Claim { run, task, .. } => self.claim(run, task),
             Action::Prepare { run, task } => {
-                self.outstanding.push((Some(run), "prepare"));
-                if self.rng.u32(0..3) == 0 {
-                    self.learn_branch(task);
-                }
+                let id = self.expect(Some(run), "prepare");
+                let branch = self.learn_branch(task);
                 let event = match self.rng.u32(0..10) {
                     0 => Event::PrepareBlocked {
                         run,
                         kind: "invalid_brief".to_string(),
                         reason: "base is not a need".to_string(),
                     },
-                    _ => Event::Prepared(run),
+                    _ => Event::Prepared { run, branch },
                 };
-                self.reply(Some(run), "prepare", event);
+                self.reply(id, event);
             }
             Action::Spawn { run, .. } => {
-                self.outstanding.push((Some(run), "spawn"));
+                let spawn = self.expect(Some(run), "spawn");
+                self.spawned.insert(run);
                 let exit_at = Timestamp(self.now.0 + self.rng.u64(MINUTE..70 * MINUTE));
-                self.agents.push(Agent { run, exit_at });
+                let stubborn = self.rng.u32(0..6) == 0;
+                self.agents.push(Agent {
+                    run,
+                    spawn,
+                    exit_at,
+                    stubborn,
+                });
             }
             Action::StopAgent { run, .. } => {
-                self.outstanding.push((Some(run), "stop"));
-                if let Some(index) = self.agents.iter().position(|agent| agent.run == run) {
-                    self.agents.swap_remove(index);
-                    self.reply(Some(run), "spawn", Event::AgentExited(run));
+                let id = self.expect(Some(run), "stop");
+                self.reply(id, Event::StopDone(run));
+                let found = self.agents.iter().position(|agent| agent.run == run);
+                if let Some(index) = found.filter(|index| !self.agents[*index].stubborn) {
+                    let agent = self.agents.swap_remove(index);
+                    self.reply(agent.spawn, Event::AgentExited(run));
                 }
             }
             Action::Renew { run, task } => self.renew(run, task),
             Action::Judge { run, .. } => {
-                self.outstanding.push((Some(run), "judge"));
+                let id = self.expect(Some(run), "judge");
                 let verdict = match self.rng.u32(0..3) {
                     0 => Verdict::Complete {
                         result: "done".to_string(),
@@ -413,7 +458,7 @@ impl World {
                     },
                     _ => Verdict::LeaveBlocked,
                 };
-                self.reply(Some(run), "judge", Event::Judged { run, verdict });
+                self.reply(id, Event::Judged { run, verdict });
             }
             Action::Settle {
                 run,
@@ -424,30 +469,29 @@ impl World {
             Action::Release { run, task, epoch } => self.close(run, task, epoch, None)?,
             Action::ListTasks => self.list(),
             Action::RestartFeed(cursor) => {
-                self.outstanding.push((None, "feed"));
-                self.reply(None, "feed", Event::FeedResumed(cursor));
+                let id = self.expect(None, "feed");
+                self.reply(id, Event::FeedResumed(cursor));
             }
             Action::Exit(_) => self.exited = true,
         }
         Ok(())
     }
 
-    /// Preparing finds the task's branch, as Rider does for a task with none.
-    fn learn_branch(&mut self, task: TaskId) {
-        let Some(index) = self.tasks.iter().position(|fake| fake.id == task) else {
-            return;
-        };
-        if self.tasks[index]
-            .labels
-            .iter()
-            .any(|(name, _)| name == "branch")
-        {
-            return;
+    /// The task's branch as preparation finds it; for a task with none it sometimes picks one.
+    fn learn_branch(&mut self, task: TaskId) -> Option<String> {
+        let index = self.tasks.iter().position(|fake| fake.id == task)?;
+        let labels = &self.tasks[index].labels;
+        if let Some((_, branch)) = labels.iter().find(|(name, _)| name == "branch") {
+            return Some(branch.clone());
+        }
+        if self.rng.u32(0..3) != 0 {
+            return None;
         }
         let branch = BRANCHES[self.rng.usize(0..BRANCHES.len())];
         let labels = &mut self.tasks[index].labels;
         labels.push(("branch".to_string(), branch.to_string()));
         self.publish(index, EventKind::LabelsChanged);
+        Some(branch.to_string())
     }
 
     fn holds(&self, run: RunId, task: TaskId) -> Option<usize> {
@@ -457,9 +501,9 @@ impl World {
     }
 
     fn claim(&mut self, run: RunId, task: TaskId) {
-        self.outstanding.push((Some(run), "claim"));
+        let id = self.expect(Some(run), "claim");
         if self.board_fails() {
-            self.reply(Some(run), "claim", Event::BoardFailed(Call::Claim(run)));
+            self.reply(id, Event::BoardFailed(Call::Claim(run)));
             return;
         }
         let index = self.tasks.iter().position(|fake| fake.id == task);
@@ -476,25 +520,30 @@ impl World {
                 fake.lease_until = until;
                 let epoch = fake.epoch;
                 self.publish(index, EventKind::TaskClaimed);
-                self.reply(Some(run), "claim", Event::Claimed { run, epoch, until });
+                // Sometimes the grant is answered only after the core has given the claim up.
+                let late = self.rng.u32(0..15) == 0;
+                let at = Timestamp(self.now.0 + self.config.claim_millis_max + MINUTE);
+                let at = if late { at } else { self.now };
+                self.results
+                    .push((Event::Claimed { run, epoch, until }, id, at));
             }
-            _ => self.reply(Some(run), "claim", Event::ClaimRefused(run)),
+            _ => self.reply(id, Event::ClaimRefused(run)),
         }
     }
 
     fn renew(&mut self, run: RunId, task: TaskId) {
-        self.outstanding.push((Some(run), "renew"));
+        let id = self.expect(Some(run), "renew");
         if self.board_fails() {
-            self.reply(Some(run), "renew", Event::BoardFailed(Call::Renew(run)));
+            self.reply(id, Event::BoardFailed(Call::Renew(run)));
             return;
         }
         match self.holds(run, task) {
             Some(index) => {
                 let until = Timestamp(self.now.0 + self.config.lease_millis);
                 self.tasks[index].lease_until = until;
-                self.reply(Some(run), "renew", Event::Renewed { run, until });
+                self.reply(id, Event::Renewed { run, until });
             }
-            None => self.reply(Some(run), "renew", Event::ClaimLost(run)),
+            None => self.reply(id, Event::ClaimLost(run)),
         }
     }
 
@@ -510,18 +559,18 @@ impl World {
         } else {
             "release"
         };
-        self.outstanding.push((Some(run), kind));
+        let id = self.expect(Some(run), kind);
         if self.board_fails() {
             let call = if settlement.is_some() {
                 Call::Settle(run)
             } else {
                 Call::Release(run)
             };
-            self.reply(Some(run), kind, Event::BoardFailed(call));
+            self.reply(id, Event::BoardFailed(call));
             return Ok(());
         }
         let Some(index) = self.holds(run, task) else {
-            self.reply(Some(run), kind, Event::ClaimLost(run));
+            self.reply(id, Event::ClaimLost(run));
             return Ok(());
         };
         if !self.settled_epochs.insert((task.0, epoch)) {
@@ -543,14 +592,14 @@ impl World {
         self.tasks[index].holder = None;
         self.tasks[index].state = state;
         self.publish(index, event_kind);
-        self.reply(Some(run), kind, Event::Settled(run));
+        self.reply(id, Event::Settled(run));
         Ok(())
     }
 
     fn list(&mut self) {
-        self.outstanding.push((None, "list"));
+        let id = self.expect(None, "list");
         if self.board_fails() {
-            self.reply(None, "list", Event::BoardFailed(Call::ListTasks));
+            self.reply(id, Event::BoardFailed(Call::ListTasks));
             return;
         }
         let tasks = self
@@ -567,7 +616,7 @@ impl World {
             })
             .collect();
         let cursor = Cursor(self.cursor);
-        self.reply(None, "list", Event::Snapshot { tasks, cursor });
+        self.reply(id, Event::Snapshot { tasks, cursor });
     }
 
     fn check(&mut self, actions: &[Action]) -> Result<(), String> {
@@ -591,8 +640,8 @@ impl World {
                 self.log.entry(run.id).or_default().time_limited = true;
             }
             let now = self.core.now();
-            let covered = self.outstanding.contains(&(Some(run.id), "renew"))
-                || self.outstanding.contains(&(Some(run.id), "stop"))
+            let covered = (self.outstanding.iter())
+                .any(|entry| entry.1 == Some(run.id) && matches!(entry.2, "renew" | "stop"))
                 || actions.iter().any(|action| {
                     matches!(action, Action::Renew { run: id, .. }
                         | Action::StopAgent { run: id, .. } if *id == run.id)
@@ -602,20 +651,26 @@ impl World {
                     "invariant 3: {run:?} runs on a lapsed lease at {now:?}"
                 ));
             }
+            // A lost agent has ended its phase: the run waits only for the agent's exit.
             let limit = run.phase_start.0 + self.config.phase_millis_max(run.phase);
-            if now.0 >= limit {
+            if now.0 >= limit && !run.agent_lost {
                 return Err(format!(
                     "invariant 10: {run:?} is past its phase's time limit"
                 ));
             }
         }
-        let told = self.core.tasks().len() + self.core.untracked();
-        if !self.core.exited() && told != self.told_open.len() {
+        self.check_agents_known()?;
+        self.check_branches()?;
+        let tracked = self.core.tasks().len();
+        let untracked = self.core.untracked();
+        let open = self.told_open.len();
+        let counted = match untracked {
+            Untracked::Exactly(count) => tracked + count == open,
+            Untracked::AtLeast(count) => tracked + count <= open,
+        };
+        if !self.core.exited() && !counted {
             return Err(format!(
-                "invariant 8: {} tracked and {} untracked, but {} open tasks were told",
-                self.core.tasks().len(),
-                self.core.untracked(),
-                self.told_open.len()
+                "invariant 8: {tracked} tracked and {untracked:?}, but {open} open tasks were told"
             ));
         }
         if actions.len() > ACTIONS_MAX
@@ -631,11 +686,10 @@ impl World {
         let blocked = self.core.board() != BoardHealth::Up || self.core.stopping() != Stopping::No;
         for action in actions {
             let (run, write) = match action {
-                Action::Claim { run, task, .. } => {
+                Action::Claim { run, .. } => {
                     if blocked {
                         return Err(format!("invariant 9: {action:?} while down or stopping"));
                     }
-                    self.check_branch_free(*run, *task)?;
                     (*run, true)
                 }
                 Action::Renew { run, .. } | Action::Release { run, .. } => (*run, true),
@@ -677,27 +731,52 @@ impl World {
         Ok(())
     }
 
-    /// Invariant 2 for branches: a claim never shares a branch the core knows another run is on.
-    fn check_branch_free(&self, run: RunId, task: TaskId) -> Result<(), String> {
-        let branch_of = |id: TaskId| {
-            let found = self.core.tasks().iter().find(|tracked| tracked.id == id);
-            found.and_then(|tracked| tracked.branch.as_deref())
+    /// A run whose agent still runs is never treated as if the agent had exited.
+    fn check_agents_known(&self) -> Result<(), String> {
+        for agent in &self.agents {
+            let run = self.core.runs().iter().find(|run| run.id == agent.run);
+            if !run.is_some_and(|run| run.agent_alive) {
+                return Err(format!(
+                    "{:?}'s agent still runs, but the core has {run:?}",
+                    agent.run
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Invariant 2 on branches: no two runs reserve one, and no two spawned runs work on one.
+    fn check_branches(&self) -> Result<(), String> {
+        let runs = self.core.runs();
+        for (index, run) in runs.iter().enumerate() {
+            let other = (runs[index + 1..].iter())
+                .find(|other| run.branch.is_some() && other.branch == run.branch);
+            if let Some(other) = other {
+                return Err(format!(
+                    "invariant 2: {run:?} and {other:?} reserve one branch"
+                ));
+            }
+        }
+        let branch_of = |task: TaskId| {
+            let fake = self.tasks.iter().find(|fake| fake.id == task)?;
+            let found = fake.labels.iter().find(|(name, _)| name == "branch");
+            found.map(|(_, value)| value.as_str())
         };
-        let Some(branch) = branch_of(task) else {
-            return Ok(());
-        };
-        let other = self
+        let spawned: Vec<_> = self
             .core
             .runs()
             .iter()
-            .find(|other| other.id != run && branch_of(other.task) == Some(branch));
-        match other {
-            Some(other) => Err(format!(
-                "invariant 2: claim of task {} on {branch} while {other:?} is on it",
-                task.0
-            )),
-            None => Ok(()),
+            .filter(|run| self.spawned.contains(&run.id))
+            .filter_map(|run| Some((run, branch_of(run.task)?)))
+            .collect();
+        for (index, (run, branch)) in spawned.iter().enumerate() {
+            if let Some((other, _)) = spawned[index + 1..].iter().find(|(_, b)| b == branch) {
+                return Err(format!(
+                    "invariant 2: {run:?} and {other:?} both on {branch}"
+                ));
+            }
         }
+        Ok(())
     }
 }
 

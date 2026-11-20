@@ -10,7 +10,7 @@ pub const TASKS_MAX: usize = 256;
 /// Upper bound on the roles in the table the core is given.
 pub const ROLES_MAX: usize = 16;
 /// Upper bound on the actions one step emits: a few per run, plus a few of its own.
-pub const ACTIONS_MAX: usize = 4 * AGENTS_MAX as usize + 8;
+pub const ACTIONS_MAX: usize = 6 * AGENTS_MAX as usize + 8;
 /// How long a claim holds its task, in milliseconds.
 pub const LEASE_MILLIS: u64 = 3600 * 1000;
 /// How long one attempt may run, in milliseconds.
@@ -31,6 +31,10 @@ pub const PREPARE_MILLIS_MAX: u64 = 10 * 60 * 1000;
 pub const JUDGE_MILLIS_MAX: u64 = 10 * 60 * 1000;
 /// How long a stopped agent may take to exit, in milliseconds.
 pub const STOP_MILLIS_MAX: u64 = 2 * 60 * 1000;
+/// How many times a stop is sent before the agent counts as lost.
+pub const STOP_TRIES_MAX: u8 = 3;
+/// Upper bound on claims whose answer came after their run was given up.
+pub const PENDING_CLAIMS_MAX: usize = AGENTS_MAX as usize;
 /// Upper bound on the distinct untracked tasks the core counts.
 pub const UNTRACKED_MAX: usize = 4 * TASKS_MAX;
 /// How many feed restarts in a row are allowed before the board counts as down.
@@ -182,6 +186,33 @@ pub struct Run {
     pub retry_at: Timestamp,
     /// The agent process exists and has not been seen to exit.
     pub agent_alive: bool,
+    /// The branch this run reserves, from its claim or its preparation until it is removed.
+    pub branch: Option<String>,
+    /// How many stops were sent to the agent in this phase.
+    pub stop_tries: u8,
+    /// Every stop went unanswered: the run, its slot and its claim stay until the agent exits.
+    pub agent_lost: bool,
+}
+
+/// A claim given up while unanswered: if the board granted it, the grant is released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingClaim {
+    pub run: RunId,
+    pub task: TaskId,
+    /// When the claim was sent; past one lease any grant has lapsed.
+    pub since: Timestamp,
+    /// The granted epoch, once a late `Claimed` arrived.
+    pub epoch: Option<u64>,
+    pub releasing: bool,
+    pub retry_at: Timestamp,
+}
+
+/// How many open tasks the core saw but does not track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Untracked {
+    Exactly(usize),
+    /// More were seen than `UNTRACKED_MAX` lets the core tell apart.
+    AtLeast(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,13 +254,19 @@ pub enum Event {
         until: Timestamp,
     },
     ClaimRefused(RunId),
-    Prepared(RunId),
+    /// The worktree is ready; `branch` is the branch preparation found, if any.
+    Prepared {
+        run: RunId,
+        branch: Option<String>,
+    },
     PrepareBlocked {
         run: RunId,
         kind: String,
         reason: String,
     },
     AgentExited(RunId),
+    /// A `StopAgent` was carried out; the agent's exit is reported separately.
+    StopDone(RunId),
     Judged {
         run: RunId,
         verdict: Verdict,
@@ -298,7 +335,9 @@ pub struct State {
     config: Config,
     tasks: Vec<Task>,
     untracked: Vec<TaskId>,
+    untracked_overflow: bool,
     runs: Vec<Run>,
+    pending_claims: Vec<PendingClaim>,
     next_run: u64,
     board: BoardHealth,
     stopping: Stopping,
@@ -318,7 +357,9 @@ impl State {
             config,
             tasks: Vec::new(),
             untracked: Vec::new(),
+            untracked_overflow: false,
             runs: Vec::new(),
+            pending_claims: Vec::new(),
             next_run: 1,
             board: BoardHealth::Up,
             stopping: Stopping::No,
@@ -340,11 +381,20 @@ impl State {
         &self.tasks
     }
     /// Tasks seen but not tracked because `tasks_max` was reached.
-    pub fn untracked(&self) -> usize {
-        self.untracked.len()
+    pub fn untracked(&self) -> Untracked {
+        let count = self.untracked.len();
+        assert!(count <= UNTRACKED_MAX);
+        if self.untracked_overflow {
+            Untracked::AtLeast(count)
+        } else {
+            Untracked::Exactly(count)
+        }
     }
     pub fn runs(&self) -> &[Run] {
         &self.runs
+    }
+    pub fn pending_claims(&self) -> &[PendingClaim] {
+        &self.pending_claims
     }
     pub fn board(&self) -> BoardHealth {
         self.board
@@ -414,17 +464,19 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         Event::Signal => signal(state, actions),
         Event::Claimed { run, epoch, until } => on_claimed(state, run, epoch, until, actions),
         Event::ClaimRefused(run) => {
+            state.pending_claims.retain(|pending| pending.run != run);
             if let Some(index) = run_in(state, run, Phase::Claiming) {
                 remove_run(state, index);
             }
         }
-        Event::Prepared(run) => on_prepared(state, run, actions),
+        Event::Prepared { run, branch } => on_prepared(state, run, branch, actions),
         Event::PrepareBlocked { run, kind, reason } => {
             if let Some(index) = run_in(state, run, Phase::Preparing) {
                 begin_settle(state, index, Settlement::Block { kind, reason }, actions);
             }
         }
         Event::AgentExited(run) => on_agent_exited(state, run, actions),
+        Event::StopDone(_) => {}
         Event::Judged { run, verdict } => {
             if let Some(index) = run_in(state, run, Phase::Judging) {
                 begin_settle(state, index, Settlement::Verdict(verdict), actions);
@@ -439,12 +491,16 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             }
         }
         Event::ClaimLost(run) => {
+            state.pending_claims.retain(|pending| pending.run != run);
             if let Some(index) = state.run_index(run) {
                 abandon(state, index, actions);
             }
         }
         Event::Settled(run) => {
             state.board = BoardHealth::Up;
+            state
+                .pending_claims
+                .retain(|pending| pending.run != run || !pending.releasing);
             if let Some(index) = state.run_index(run)
                 && state.runs[index].settling
             {
@@ -509,13 +565,42 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         }
         None => note_untracked(state, feed.task),
     }
+    reserve_branches(state);
     assert!(state.untracked.len() <= UNTRACKED_MAX);
 }
 
-/// Past `UNTRACKED_MAX` the count stays at its bound until the next snapshot.
+/// A run whose branch was unknown reserves it once its task's branch is learned and free.
+fn reserve_branches(state: &mut State) {
+    for index in 0..state.runs.len() {
+        if state.runs[index].branch.is_some() {
+            continue;
+        }
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.id == state.runs[index].task);
+        let Some(branch) = task.and_then(|task| task.branch.clone()) else {
+            continue;
+        };
+        if !state
+            .runs
+            .iter()
+            .any(|run| run.branch.as_ref() == Some(&branch))
+        {
+            state.runs[index].branch = Some(branch);
+        }
+    }
+    assert!(state.runs.len() <= usize::from(state.config.agents_max));
+}
+
+/// Past `UNTRACKED_MAX` the count is a lower bound until the next snapshot.
 fn note_untracked(state: &mut State, task: TaskId) {
-    if !state.untracked.contains(&task) && state.untracked.len() < UNTRACKED_MAX {
-        state.untracked.push(task);
+    if !state.untracked.contains(&task) {
+        if state.untracked.len() < UNTRACKED_MAX {
+            state.untracked.push(task);
+        } else {
+            state.untracked_overflow = true;
+        }
     }
     assert!(state.untracked.len() <= UNTRACKED_MAX);
 }
@@ -523,7 +608,8 @@ fn note_untracked(state: &mut State, task: TaskId) {
 fn reconcile(state: &mut State, views: &[TaskView]) {
     state.tasks.clear();
     state.untracked.clear();
-    // Tasks with a run go first, so a run's branch stays known whatever the overflow.
+    state.untracked_overflow = false;
+    // Tasks with a run go first, so a run's task stays known whatever the overflow.
     for with_run in [true, false] {
         for view in views {
             let has_run = state.runs.iter().any(|run| run.task == view.id);
@@ -542,6 +628,7 @@ fn reconcile(state: &mut State, views: &[TaskView]) {
             });
         }
     }
+    reserve_branches(state);
     assert!(state.tasks.len() <= state.config.tasks_max);
     assert!(state.tasks.len() <= views.len());
 }
@@ -575,6 +662,18 @@ fn mark_down(state: &mut State) {
 
 fn board_failed(state: &mut State, call: Call) {
     mark_down(state);
+    let now = state.now;
+    let pause = state.config.settle_pause_millis;
+    for pending in state.pending_claims.iter_mut() {
+        if call == Call::Release(pending.run) && pending.releasing {
+            pending.releasing = false;
+            pending.retry_at = Timestamp(now.0.saturating_add(pause));
+        }
+    }
+    // A claim that failed outright was not granted by this call.
+    state
+        .pending_claims
+        .retain(|pending| call != Call::Claim(pending.run));
     let run = match call {
         Call::ListTasks => {
             state.listing = false;
@@ -585,8 +684,6 @@ fn board_failed(state: &mut State, call: Call) {
     let Some(index) = state.run_index(run) else {
         return;
     };
-    let now = state.now;
-    let pause = state.config.settle_pause_millis;
     let tries_max = state.config.settle_tries_max;
     let entry = &mut state.runs[index];
     match call {
@@ -631,10 +728,15 @@ fn on_claimed(
     actions: &mut Vec<Action>,
 ) {
     state.board = BoardHealth::Up;
+    let now = state.now;
+    if let Some(pending) = state.pending_claims.iter_mut().find(|p| p.run == run) {
+        pending.epoch = Some(epoch);
+        pending.retry_at = now;
+        return;
+    }
     let Some(index) = run_in(state, run, Phase::Claiming) else {
         return;
     };
-    let now = state.now;
     let entry = &mut state.runs[index];
     entry.epoch = epoch;
     entry.lease_until = until;
@@ -647,10 +749,22 @@ fn on_claimed(
     actions.push(Action::Prepare { run, task });
 }
 
-fn on_prepared(state: &mut State, run: RunId, actions: &mut Vec<Action>) {
+fn on_prepared(state: &mut State, run: RunId, branch: Option<String>, actions: &mut Vec<Action>) {
     let Some(index) = run_in(state, run, Phase::Preparing) else {
         return;
     };
+    if state.runs[index].branch.is_none() {
+        state.runs[index].branch = branch;
+    }
+    let mine = state.runs[index].branch.as_deref();
+    let taken = mine.is_some()
+        && (state.runs.iter()).any(|other| other.id != run && other.branch.as_deref() == mine);
+    if taken {
+        // The branch belongs to the run that reserved it first; this one gives the task back.
+        state.runs[index].branch = None;
+        begin_settle(state, index, Settlement::Release, actions);
+        return;
+    }
     if state.stopping == Stopping::Now {
         begin_settle(state, index, Settlement::Release, actions);
         return;
@@ -672,6 +786,7 @@ fn on_agent_exited(state: &mut State, run: RunId, actions: &mut Vec<Action>) {
     let now = state.now;
     let entry = &mut state.runs[index];
     entry.agent_alive = false;
+    entry.agent_lost = false;
     match entry.phase {
         Phase::Running => {
             set_phase(entry, Phase::Judging, now);
@@ -744,10 +859,13 @@ fn abandon(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         return;
     }
     let already_stopping = matches!(entry.phase, Phase::Stopping(_) | Phase::Abandoning);
+    let started = entry.phase_start;
     set_phase(entry, Phase::Abandoning, now);
-    if !already_stopping {
-        let (run, task) = (entry.id, entry.task);
-        actions.push(Action::StopAgent { run, task });
+    if already_stopping {
+        // The stop already sent keeps its deadline.
+        entry.phase_start = started;
+    } else {
+        send_stop(entry, actions);
     }
 }
 
@@ -757,11 +875,21 @@ fn stop_now(state: &mut State, actions: &mut Vec<Action>) {
     for entry in state.runs.iter_mut() {
         if entry.phase == Phase::Running {
             set_phase(entry, Phase::Stopping(StopReason::StopNow), now);
-            let (run, task) = (entry.id, entry.task);
-            actions.push(Action::StopAgent { run, task });
+            send_stop(entry, actions);
         }
     }
     assert!(state.runs.iter().all(|run| run.phase != Phase::Running));
+}
+
+fn send_stop(entry: &mut Run, actions: &mut Vec<Action>) {
+    assert!(entry.agent_alive);
+    assert!(matches!(
+        entry.phase,
+        Phase::Stopping(_) | Phase::Abandoning
+    ));
+    entry.stop_tries = 1;
+    let (run, task) = (entry.id, entry.task);
+    actions.push(Action::StopAgent { run, task });
 }
 
 fn holds_claim(phase: Phase) -> bool {
@@ -818,7 +946,29 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
             try_settle(state, index, actions);
         }
     }
+    release_pending(state, actions);
     assert!(actions.len() <= ACTIONS_MAX);
+}
+
+/// Releases late grants of given-up claims, and forgets those whose grant has lapsed.
+fn release_pending(state: &mut State, actions: &mut Vec<Action>) {
+    let now = state.now;
+    let lease = state.config.lease_millis;
+    let up = state.board == BoardHealth::Up;
+    state
+        .pending_claims
+        .retain(|pending| now.0 < pending.since.0.saturating_add(lease));
+    for pending in state.pending_claims.iter_mut() {
+        let Some(epoch) = pending.epoch else {
+            continue;
+        };
+        if up && !pending.releasing && now >= pending.retry_at {
+            pending.releasing = true;
+            let (run, task) = (pending.run, pending.task);
+            actions.push(Action::Release { run, task, epoch });
+        }
+    }
+    assert!(state.pending_claims.len() <= PENDING_CLAIMS_MAX);
 }
 
 fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
@@ -826,7 +976,13 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         return;
     }
     let agents_max = usize::from(state.config.agents_max);
-    while state.runs.len() < agents_max {
+    loop {
+        let claiming = state.runs.iter().filter(|run| run.phase == Phase::Claiming);
+        // Every claim in flight must fit among the pending claims if it is given up.
+        let unanswered = state.pending_claims.len() + claiming.count();
+        if state.runs.len() >= agents_max || unanswered >= PENDING_CLAIMS_MAX {
+            break;
+        }
         let Some((task, role, slot)) = next_claimable(state) else {
             break;
         };
@@ -834,6 +990,7 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         state.next_run = state.next_run.saturating_add(1);
         let profile = state.profile(role, slot);
         let now = state.now;
+        let branch = state.tasks[task].branch.clone();
         let task = state.tasks[task].id;
         state.runs.push(Run {
             id,
@@ -851,6 +1008,9 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
             settling: false,
             retry_at: now,
             agent_alive: false,
+            branch,
+            stop_tries: 0,
+            agent_lost: false,
         });
         actions.push(Action::Claim {
             run: id,
@@ -868,10 +1028,10 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
         let Some(role) = task.role else {
             continue;
         };
-        let taken = state.runs.iter().any(|run| {
-            run.task == task.id
-                || (task.branch.is_some() && branch_of(state, run.task) == task.branch.as_deref())
-        });
+        let taken = state
+            .runs
+            .iter()
+            .any(|run| run.task == task.id || (task.branch.is_some() && run.branch == task.branch));
         if task.state != TaskState::Ready || taken {
             continue;
         }
@@ -893,20 +1053,13 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     best
 }
 
-/// The branch of a tracked task; the task, not its run, holds it.
-fn branch_of(state: &State, task: TaskId) -> Option<&str> {
-    let found = state.tasks.iter().find(|entry| entry.id == task)?;
-    assert_eq!(found.id, task);
-    found.branch.as_deref()
-}
-
 fn expire_phases(state: &mut State, actions: &mut Vec<Action>) {
     let now = state.now;
     let mut index = 0;
     while index < state.runs.len() {
         let entry = &state.runs[index];
         let limit = state.config.phase_millis_max(entry.phase);
-        let due = now.0 >= entry.phase_start.0.saturating_add(limit);
+        let due = !entry.agent_lost && now.0 >= entry.phase_start.0.saturating_add(limit);
         let before = state.runs.len();
         if due {
             phase_expired(state, index, actions);
@@ -923,24 +1076,42 @@ fn phase_expired(state: &mut State, index: usize, actions: &mut Vec<Action>) {
     let entry = &mut state.runs[index];
     let (run, task) = (entry.id, entry.task);
     match entry.phase {
-        // Whether the board granted it is unknown; an unrenewed claim lapses within the lease.
-        Phase::Claiming => remove_run(state, index),
+        // Whether the board granted it is unknown; a late grant is released.
+        Phase::Claiming => {
+            assert!(state.pending_claims.len() < PENDING_CLAIMS_MAX);
+            let since = entry.phase_start;
+            state.pending_claims.push(PendingClaim {
+                run,
+                task,
+                since,
+                epoch: None,
+                releasing: false,
+                retry_at: now,
+            });
+            remove_run(state, index);
+        }
         Phase::Preparing | Phase::Judging => {
             begin_settle(state, index, Settlement::Release, actions);
         }
         Phase::Running => {
             set_phase(entry, Phase::Stopping(StopReason::TimeLimit), now);
-            actions.push(Action::StopAgent { run, task });
+            send_stop(entry, actions);
         }
         // The closing write is abandoned and the lease lapses, as when its tries run out.
         Phase::Settling => remove_run(state, index),
-        // An agent that outlives its stop is treated as gone.
-        Phase::Stopping(_) | Phase::Abandoning => on_agent_exited(state, run, actions),
+        // Only an observed exit ends the agent; past the tries it is lost, not gone.
+        Phase::Stopping(_) | Phase::Abandoning if entry.stop_tries < STOP_TRIES_MAX => {
+            entry.stop_tries = entry.stop_tries.saturating_add(1);
+            entry.phase_start = now;
+            actions.push(Action::StopAgent { run, task });
+        }
+        Phase::Stopping(_) | Phase::Abandoning => entry.agent_lost = true,
     }
 }
 
 fn finish_stopping(state: &mut State, actions: &mut Vec<Action>) {
-    if state.stopping == Stopping::No || !state.runs.is_empty() || state.exited {
+    let busy = !state.runs.is_empty() || !state.pending_claims.is_empty();
+    if state.stopping == Stopping::No || busy || state.exited {
         return;
     }
     state.exited = true;
