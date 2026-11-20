@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 pub enum Harness {
     Claude,
     Codex,
-    Tact,
 }
 
 /// One role an agent can take on a task.
