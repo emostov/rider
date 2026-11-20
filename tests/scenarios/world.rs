@@ -1,0 +1,521 @@
+//! The world a scenario runs in: a board, a rider home, a repository, and fake agents.
+
+use std::fs;
+use std::io::{Error as IoError, Read, Write, stderr};
+use std::net::TcpListener;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::fake_agent;
+
+/// The project every scenario's pool runs; its tasks go in the channel `work/<PROJECT>`.
+pub const PROJECT: &str = "demo";
+/// The profile the tests write tasks as.
+pub const LEAD: &str = "lead-fable-5-2";
+/// The base branch of the scratch repository.
+pub const MAIN: &str = "main";
+
+const COMMAND_SECONDS_MAX: u64 = 30;
+const OUTPUT_BYTES_MAX: u64 = 4 << 20;
+const BOARD_START_SECONDS_MAX: u64 = 30;
+const POLL_MILLIS: u64 = 100;
+const REAP_SECONDS_MAX: u64 = 5;
+const EVENTS_MAX: usize = 3;
+const AGENT_PIDS_MAX: usize = 256;
+const PROCESSES_MAX: usize = 65_536;
+const DROP_FAILURES_MAX: usize = 4;
+const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+const INSTALL_HINT: &str = "install Node 22 and the Board CLI: \
+                            npm install --prefix ~/.rider/node @vercel/board";
+
+static WORLDS: AtomicU32 = AtomicU32::new(0);
+
+/// A board, a rider home, and a repository, all removed and stopped when it drops.
+pub struct World {
+    pub root: PathBuf,
+    pub home: PathBuf,
+    pub repo: PathBuf,
+    pub url: String,
+    /// The fake `claude` and `codex` scripts, first on the pool's `PATH`.
+    pub agents: PathBuf,
+    /// Holds `node`, so the Board CLI runs without the rest of the caller's `PATH`.
+    pub tools: PathBuf,
+    pub vb: PathBuf,
+    pub(crate) board: Option<Child>,
+    pub(crate) pool: Option<Pool>,
+    owns_root: bool,
+}
+
+/// A running `rider pool` and the standard input that stops it.
+pub struct Pool {
+    pub(crate) child: Child,
+    pub(crate) stdin: Option<ChildStdin>,
+}
+
+/// What a finished command printed and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let found = std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file());
+    assert!(found.as_ref().is_none_or(|found| found.ends_with(name)));
+    found
+}
+
+/// The installed `vb` and `node`, or `None` after saying on standard error which is missing.
+pub fn find_tools() -> Option<(PathBuf, PathBuf)> {
+    let vb = find_on_path("vb").or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let installed = PathBuf::from(home).join(".rider/node/node_modules/.bin/vb");
+        installed.is_file().then_some(installed)
+    });
+    let node = find_on_path("node");
+    match (vb, node) {
+        (Some(vb), Some(node)) => Some((vb, node)),
+        (vb, _) => {
+            let missing = if vb.is_none() {
+                "vb (the Board CLI)"
+            } else {
+                "node"
+            };
+            // `eprintln!` is captured by the test runner; a skip must be seen.
+            let line = format!("skipping scenario: {missing} not found; {INSTALL_HINT}\n");
+            let _ = stderr().write_all(line.as_bytes());
+            None
+        }
+    }
+}
+
+/// Writes an executable file.
+pub fn write_executable(path: &Path, text: &str) {
+    fs::write(path, text).expect("write an executable");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make it executable");
+    assert!(path.is_file());
+}
+
+impl World {
+    /// Lays out the directories and starts nothing; `None` when `vb` or `node` is missing.
+    pub fn new() -> Option<World> {
+        let (installed_vb, node) = find_tools()?;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().expect("read the bound port").port();
+        assert!(port != 0 && port != 4100, "never the live board's port");
+        let url = format!("http://127.0.0.1:{port}/api/board");
+        let n = WORLDS.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!("rider-scenario-{}-{n}-{nanos}", std::process::id());
+        let temp = std::env::temp_dir().canonicalize();
+        let root = temp.expect("resolve the temporary directory").join(name);
+        assert!(root.is_absolute());
+        // Built before the root exists so a failure from its creation on unwinds through Drop.
+        let mut world = World {
+            repo: root.join("repo"),
+            vb: root.join("rider-home/node/node_modules/.bin/vb"),
+            home: root.join("rider-home"),
+            agents: root.join("agents"),
+            tools: root.join("tools"),
+            root,
+            url,
+            board: None,
+            pool: None,
+            owns_root: false,
+        };
+        if let Err(error) = fs::create_dir(&world.root) {
+            panic!("create the scenario's directory: {error}");
+        }
+        world.owns_root = true;
+        let vb_dir = world.vb.parent().expect("vb has a directory");
+        for dir in [
+            vb_dir,
+            &world.agents,
+            &world.tools,
+            &world.root.join("user-home"),
+        ] {
+            fs::create_dir_all(dir).expect("create a scenario directory");
+        }
+        symlink(&installed_vb, &world.vb).expect("link the Board CLI");
+        symlink(&node, world.tools.join("node")).expect("link node");
+        fake_agent::install(&world.root, &world.agents);
+        assert!(world.vb.starts_with(&world.home));
+        Some(world)
+    }
+
+    /// The `PATH` every child gets: fake agents first, then the Board CLI, node, the system.
+    pub fn child_path(&self) -> String {
+        let vb_dir = self.vb.parent().expect("vb has a directory");
+        let path = format!(
+            "{}:{}:{}:{SYSTEM_PATH}",
+            self.agents.display(),
+            vb_dir.display(),
+            self.tools.display()
+        );
+        assert!(path.starts_with(self.agents.to_str().expect("UTF-8 path")));
+        path
+    }
+
+    /// A command with none of the caller's environment, only the world's.
+    pub fn command(&self, program: &Path) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .env("PATH", self.child_path())
+            .env("HOME", self.root.join("user-home"))
+            .env("RIDER_HOME", &self.home)
+            .env("BOARD_URL", &self.url)
+            .env(fake_agent::WORLD_VAR, &self.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// Starts `vb serve` on the world's port and waits until it answers.
+    pub fn start_board(&mut self) {
+        assert!(self.board.is_none(), "the board is started once");
+        let port = self
+            .url
+            .split(':')
+            .nth(2)
+            .and_then(|rest| rest.split('/').next());
+        let port = port.expect("the URL holds a port").to_string();
+        let log = fs::File::create(self.root.join("board.log")).expect("create the board log");
+        let err = log.try_clone().expect("share the board log");
+        let child = self
+            .command(&self.vb)
+            .args([
+                "serve",
+                "--port",
+                &port,
+                "--no-open",
+                "--no-inspect",
+                "--dir",
+            ])
+            .arg(self.root.join("board"))
+            .stdout(log)
+            .stderr(err)
+            .process_group(0)
+            .spawn()
+            .expect("start vb serve");
+        self.board = Some(child);
+        let deadline = Instant::now() + Duration::from_secs(BOARD_START_SECONDS_MAX);
+        while Instant::now() < deadline {
+            if self.vb_as(LEAD, &["whoami", "--json"], None).code == Some(0) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(POLL_MILLIS));
+        }
+        panic!("the board did not answer within {BOARD_START_SECONDS_MAX} seconds");
+    }
+
+    /// Runs `vb <args> --url <world> --as <profile>`, with `input` on standard input.
+    pub fn vb_as(&self, profile: &str, args: &[&str], input: Option<&str>) -> Output {
+        assert!(
+            !args.is_empty() && !args.contains(&"--"),
+            "text goes on standard input"
+        );
+        let mut command = self.command(&self.vb);
+        command
+            .args(args)
+            .args(["--url", &self.url, "--as", profile]);
+        run_bounded(command, input)
+    }
+
+    /// Runs `vb` as the lead and returns its standard output, panicking when it fails.
+    pub fn vb_lead(&self, args: &[&str], input: Option<&str>) -> String {
+        let output = self.vb_as(LEAD, args, input);
+        assert_eq!(output.code, Some(0), "vb {args:?} failed: {output:?}");
+        output.stdout
+    }
+
+    /// Runs `git <args>` in `dir` with the world's environment.
+    pub fn git(&self, dir: &Path, args: &[&str]) -> Output {
+        assert!(dir.is_absolute() && !args.is_empty());
+        let mut command = self.command(Path::new("git"));
+        command.arg("-C").arg(dir).args(args);
+        run_bounded(command, None)
+    }
+
+    /// Runs `git <args>` in the scratch repository and returns its trimmed standard output.
+    pub fn git_ok(&self, args: &[&str]) -> String {
+        let output = self.git(&self.repo, args);
+        assert_eq!(output.code, Some(0), "git {args:?} failed: {output:?}");
+        output.stdout.trim_end().to_string()
+    }
+}
+
+/// Why a bounded command produced no `Output`.
+#[derive(Debug)]
+pub enum RunError {
+    Spawn(IoError),
+    Wait(IoError),
+    /// Writing the command's standard input failed.
+    Input(IoError),
+    /// Reading the command's standard output or error failed.
+    Read(IoError),
+    /// The command printed more than `OUTPUT_BYTES_MAX` bytes on one stream.
+    OutputTooLong,
+    /// The command, or a descendant holding its input or output, outlived `COMMAND_SECONDS_MAX`.
+    TimedOut,
+    /// The command was still running `REAP_SECONDS_MAX` after it was killed.
+    Unkilled,
+}
+
+enum Event {
+    Stdout(String),
+    Stderr(String),
+    Written,
+    Failed(RunError),
+}
+
+fn read_all(stream: impl Read, send: SyncSender<Event>, wrap: fn(String) -> Event) {
+    let mut bytes = Vec::new();
+    let read = stream.take(OUTPUT_BYTES_MAX + 1).read_to_end(&mut bytes);
+    let event = match read {
+        Err(error) => Event::Failed(RunError::Read(error)),
+        Ok(_) if u64::try_from(bytes.len()).map_or(true, |n| n > OUTPUT_BYTES_MAX) => {
+            Event::Failed(RunError::OutputTooLong)
+        }
+        Ok(_) => wrap(String::from_utf8_lossy(&bytes).into_owned()),
+    };
+    // The receiver is gone only once the command has already been judged.
+    let _ = send.send(event);
+}
+
+/// Runs `command` to its end within `COMMAND_SECONDS_MAX`, panicking when it cannot.
+pub fn run_bounded(command: Command, input: Option<&str>) -> Output {
+    let shown = format!("{command:?}");
+    let why = match run_within(command, input) {
+        Ok(output) => return output,
+        Err(RunError::Spawn(error)) => format!("could not start: {error}"),
+        Err(RunError::Wait(error)) => format!("could not be polled: {error}"),
+        Err(RunError::Input(error)) => format!("could not be given its input: {error}"),
+        Err(RunError::Read(error)) => format!("could not be read: {error}"),
+        Err(RunError::OutputTooLong) => format!("printed over {OUTPUT_BYTES_MAX} bytes"),
+        Err(RunError::TimedOut) => format!("outlived {COMMAND_SECONDS_MAX} seconds"),
+        Err(RunError::Unkilled) => format!("outlived its kill by {REAP_SECONDS_MAX} seconds"),
+    };
+    panic!("{shown} {why}");
+}
+
+/// Runs `command` in its own process group, feeding `input` and reading both outputs, and
+/// kills it and its group when the whole exchange fails or outlives `COMMAND_SECONDS_MAX`.
+pub fn run_within(mut command: Command, input: Option<&str>) -> Result<Output, RunError> {
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let deadline = Instant::now() + Duration::from_secs(COMMAND_SECONDS_MAX);
+    let mut child = command.spawn().map_err(RunError::Spawn)?;
+    let (send, receive) = sync_channel(EVENTS_MAX);
+    let mut events = 0;
+    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+        let (text, send) = (text.to_string(), send.clone());
+        thread::spawn(move || {
+            let event = match stdin.write_all(text.as_bytes()) {
+                Ok(()) => Event::Written,
+                Err(error) => Event::Failed(RunError::Input(error)),
+            };
+            drop(stdin);
+            let _ = send.send(event);
+        });
+        events += 1;
+    }
+    if let Some(stdout) = child.stdout.take() {
+        let send = send.clone();
+        thread::spawn(move || read_all(stdout, send, Event::Stdout));
+        events += 1;
+    }
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || read_all(stderr, send, Event::Stderr));
+        events += 1;
+    }
+    assert!(events <= EVENTS_MAX);
+    let finished = finish_within(&mut child, &receive, events, deadline);
+    match finished {
+        Ok(output) => Ok(output),
+        Err(_) if !reap(&mut child) => Err(RunError::Unkilled),
+        Err(error) => Err(error),
+    }
+}
+
+fn finish_within(
+    child: &mut Child,
+    receive: &Receiver<Event>,
+    mut events: usize,
+    deadline: Instant,
+) -> Result<Output, RunError> {
+    let step = Duration::from_millis(POLL_MILLIS / 10);
+    let mut output = Output {
+        code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait().map_err(RunError::Wait)?;
+        }
+        if let (Some(status), 0) = (status, events) {
+            output.code = status.code();
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(RunError::TimedOut);
+        }
+        if events == 0 {
+            thread::sleep(step.min(left));
+            continue;
+        }
+        let event = match receive.recv_timeout(step.min(left)) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => panic!("a command's I/O thread vanished"),
+        };
+        match event {
+            Event::Stdout(text) => output.stdout = text,
+            Event::Stderr(text) => output.stderr = text,
+            Event::Written => {}
+            Event::Failed(error) => return Err(error),
+        }
+        events -= 1;
+    }
+    let within = |text: &str| u64::try_from(text.len()).is_ok_and(|n| n <= OUTPUT_BYTES_MAX);
+    assert!(within(&output.stdout) && within(&output.stderr));
+    Ok(output)
+}
+
+fn kill(pid: u32, group: bool) {
+    assert!(pid > 1, "never signal init or every process");
+    let target = if group {
+        format!("-{pid}")
+    } else {
+        pid.to_string()
+    };
+    // The target may already be gone; whoever needs it dead checks that afterwards.
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", "--", &target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Kills `child` and its process group; whether it was reaped within `REAP_SECONDS_MAX`.
+fn reap(child: &mut Child) -> bool {
+    kill(child.id(), true);
+    // A child that left its group is missed by the group signal.
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => thread::sleep(Duration::from_millis(POLL_MILLIS / 10)),
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// The pids of processes running this world's fake agents, found by their scripts' literal
+/// paths as whole words of their command lines.
+fn agent_pids(world: &World) -> Result<Vec<u32>, String> {
+    let scripts = ["claude", "codex"].map(|name| world.agents.join(name).display().to_string());
+    let mut command = Command::new("/bin/ps");
+    command
+        .args(["-A", "-ww", "-o", "pid=,command="])
+        .stdin(Stdio::null());
+    let output = run_within(command, None).map_err(|error| format!("ps failed: {error:?}"))?;
+    if output.code != Some(0) {
+        return Err(format!("ps exited {:?}: {}", output.code, output.stderr));
+    }
+    let mut pids = Vec::new();
+    for (index, line) in output.stdout.lines().enumerate() {
+        if index >= PROCESSES_MAX {
+            return Err(format!("ps listed over {PROCESSES_MAX} processes"));
+        }
+        let line = line.trim_start();
+        let (pid, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let pid: u32 = pid
+            .parse()
+            .map_err(|_| format!("unrecognised ps line {line:?}"))?;
+        let runs_agent = scripts.iter().any(|script| {
+            rest.match_indices(script.as_str()).any(|(at, _)| {
+                let after = &rest[at..][script.len()..];
+                (at == 0 || rest[..at].ends_with(' '))
+                    && (after.is_empty() || after.starts_with(' '))
+            })
+        });
+        if runs_agent && pid > 1 {
+            if pids.len() == AGENT_PIDS_MAX {
+                return Err(format!("over {AGENT_PIDS_MAX} fake agents are running"));
+            }
+            pids.push(pid);
+        }
+    }
+    assert!(pids.len() <= AGENT_PIDS_MAX);
+    Ok(pids)
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        let mut failures: Vec<String> = Vec::with_capacity(DROP_FAILURES_MAX);
+        if let Some(mut pool) = self.pool.take()
+            && !reap(&mut pool.child)
+        {
+            failures.push("the pool outlived its kill".to_string());
+        }
+        // After the pool is dead no new agent can start, so one sweep finds them all.
+        for pid in fake_agent::running_pids(&self.root) {
+            kill(pid, true);
+        }
+        match agent_pids(self) {
+            Ok(pids) => {
+                for pid in pids {
+                    kill(pid, true);
+                    kill(pid, false);
+                }
+            }
+            Err(why) => failures.push(why),
+        }
+        if let Some(mut board) = self.board.take()
+            && !reap(&mut board)
+        {
+            failures.push("the board outlived its kill".to_string());
+        }
+        let temp = std::env::temp_dir().canonicalize();
+        if self.owns_root
+            && temp.is_ok_and(|temp| self.root.starts_with(temp))
+            && let Err(error) = fs::remove_dir_all(&self.root)
+        {
+            failures.push(format!("removing {}: {error}", self.root.display()));
+        }
+        assert!(failures.len() <= DROP_FAILURES_MAX);
+        if failures.is_empty() {
+            return;
+        }
+        let why = format!("the scenario world was not cleaned up: {failures:?}\n");
+        if thread::panicking() {
+            let _ = stderr().write_all(why.as_bytes());
+        } else {
+            panic!("{why}");
+        }
+    }
+}
