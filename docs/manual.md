@@ -268,6 +268,13 @@ These come from the first end-to-end run (see `docs/milestone-0-run.md`).
 - **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
   `vb label`, then `vb tasks unblock <id> --as lead-fable-5-2`.
 - **A Codex log starts with "Reading additional input from stdin...".** This is harmless.
+- **Many `node ... vb` processes are left running.** A Board CLI process whose parent exited
+  and whose board stopped answering keeps running. `rider reap` lists them (pid, age,
+  command); `rider reap --yes` stops them with SIGTERM, then SIGKILL after a few seconds.
+  `--url <board>`, repeatable, limits both to processes on those boards. It never touches
+  another user's processes, one whose parent is alive, one on `BOARD_URL`, a `vb serve`, or
+  one whose board URL names a host rather than an IP address.
+  `rider daemon` writes the same list to `daemon.log` when it starts.
 
 ## More
 

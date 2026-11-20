@@ -978,6 +978,139 @@ fn claude_options(session: Option<&str>) -> Vec<String> {
 }
 
 #[test]
+fn reap_lists_and_stops_only_an_orphaned_vb_whose_board_is_gone() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let live = given_another_board(&world, "live-board");
+    let mut gone = given_another_board(&world, "gone-board");
+    let mut orphans = Orphans::default();
+    let own = world.url.clone();
+    let on_world = given_an_orphaned_vb_tail(&world, &mut orphans, &own);
+    let on_live = given_an_orphaned_vb_tail(&world, &mut orphans, &live.url);
+    let on_gone = given_an_orphaned_vb_tail(&world, &mut orphans, &gone.url);
+    gone.stop();
+
+    let ours = [
+        "reap", "--url", &own, "--url", &live.url, "--url", &gone.url,
+    ];
+    let listed = when_rider_runs(&world, &ours);
+
+    assert_eq!(listed.code, Some(0), "{listed:?}");
+    let shown = format!(
+        "pid {on_gone} age <age> vb tail --url {} --as rider-daemon",
+        gone.url
+    );
+    assert_eq!(line_for_pid(&listed.stdout, on_gone), Some(shown));
+    assert_eq!(line_for_pid(&listed.stdout, on_live), None);
+    assert_eq!(line_for_pid(&listed.stdout, on_world), None);
+    assert!(
+        listed
+            .stdout
+            .contains("leaked vb processes; rider reap --yes stops them")
+    );
+    assert!(is_alive(on_gone), "listing stops nothing");
+
+    given_a_running_daemon(&mut world);
+    let logged = format!("leaked pid {on_gone} age ");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let log = || fs::read_to_string(world.home.join("daemon.log")).unwrap_or_default();
+    while !log().contains(&logged) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon logged no leak:\n{}",
+            log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(is_alive(on_gone), "the daemon stops nothing");
+
+    let stopped = when_rider_runs(&world, &[&ours[..], &["--yes"]].concat());
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    let line = format!("stopped pid {on_gone} with SIGTERM");
+    assert!(stopped.stdout.lines().any(|l| l == line), "{stopped:?}");
+    assert!(when_the_process_ends_within(on_gone, 5));
+    assert!(is_alive(on_live) && is_alive(on_world));
+    let board = world.board.as_mut().expect("the world's board runs");
+    assert_eq!(board.try_wait().expect("poll the board"), None);
+}
+
+#[test]
+fn reap_spares_a_vb_whose_last_url_is_the_configured_board() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let dead = an_unused_url();
+    let mut orphans = Orphans::default();
+    let args = [
+        "tail",
+        "--url",
+        &dead,
+        "--url",
+        &world.url,
+        "--as",
+        "rider-daemon",
+    ];
+    let pid = given_an_orphaned_vb(&world, &mut orphans, &args);
+
+    let listed = when_rider_runs(&world, &["reap", "--url", &dead, "--url", &world.url]);
+
+    assert_eq!(listed.code, Some(0), "{listed:?}");
+    assert_eq!(line_for_pid(&listed.stdout, pid), None, "{listed:?}");
+    assert!(is_alive(pid));
+}
+
+#[test]
+fn reap_never_selects_a_board_server() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let dead = an_unused_url();
+    let served = an_unused_url();
+    let port = served
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches("/api/board");
+    let dir = world.root.join("orphaned-serve");
+    let dir = dir.to_str().expect("the world's root is UTF-8");
+    let mut orphans = Orphans::default();
+    let args = [
+        "serve",
+        "--port",
+        port,
+        "--no-open",
+        "--no-inspect",
+        "--dir",
+        dir,
+        "--url",
+        &dead,
+    ];
+    let pid = given_an_orphaned_vb(&world, &mut orphans, &args);
+
+    let listed = when_rider_runs(&world, &["reap", "--url", &dead]);
+
+    assert_eq!(listed.code, Some(0), "{listed:?}");
+    assert_eq!(line_for_pid(&listed.stdout, pid), None, "{listed:?}");
+}
+
+#[test]
+fn reap_does_not_resolve_a_hostname_and_spares_its_vb() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let named = "http://rider-reap-scenario.invalid:1/api/board";
+    let mut orphans = Orphans::default();
+    let pid = given_an_orphaned_vb_tail(&world, &mut orphans, named);
+
+    let listed = when_rider_runs(&world, &["reap", "--url", named]);
+
+    assert_eq!(listed.code, Some(0), "{listed:?}");
+    assert_eq!(line_for_pid(&listed.stdout, pid), None, "{listed:?}");
+}
+
+#[test]
 fn a_panicking_world_kills_its_wrapped_vb_and_spares_a_process_that_names_its_path() {
     let Some(mut world) = World::new() else {
         return;

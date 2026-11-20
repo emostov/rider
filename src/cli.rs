@@ -22,6 +22,7 @@ use crate::harness::{self, CommandLine, Exit, HarnessError, LOG_BYTES_MAX};
 use crate::pool::{
     Effects, Event, Gate, PAUSE_STEP_MILLIS, Slot, SlotEnd, event_line, slot_loop, slots,
 };
+use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, PROFILE_LEN_MAX, RoleSpec};
 use crate::run_task::{Env, Ran, RunError, run_task};
 use crate::settle::Verdict;
@@ -33,8 +34,10 @@ const ENVIRONMENT: &str = r#"environment:
 
 /// The longest project name.
 pub const PROJECT_LEN_MAX: usize = 64;
-/// Upper bound on the arguments rider looks at, after the program name.
-pub const ARGS_MAX: usize = 16;
+/// Upper bound on the boards one `rider reap` names.
+pub const REAP_URLS_MAX: usize = 8;
+/// Upper bound on the arguments rider looks at, after the program name: the longest command.
+pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
 /// Upper bound on what `rider pool` reads from standard input before it stops.
 pub const STDIN_BYTES_MAX: u64 = 1024 * 1024;
 /// Every role's prompt file and the files they read, once each, built into the binary.
@@ -110,6 +113,17 @@ pub enum Command {
         #[arg(value_name = "ID", value_parser = parse_task_id)]
         id: TaskId,
     },
+    /// List orphaned vb processes whose board no longer answers.
+    ///
+    /// Only those on the given boards if any; --yes stops them.
+    Reap {
+        /// A board whose vb processes to consider; repeat for more.
+        #[arg(long = "url", value_name = "BOARD", value_parser = parse_url)]
+        urls: Vec<String>,
+        /// Stop the listed processes.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// An argument value rider does not accept.
@@ -117,6 +131,7 @@ pub enum Command {
 pub enum UsageError {
     BadProject(String),
     BadTaskId(String),
+    EmptyUrl,
 }
 
 impl fmt::Display for UsageError {
@@ -133,11 +148,20 @@ impl fmt::Display for UsageError {
                     "{text:?} is not a task id: use its number, such as 42 or #42"
                 )
             }
+            UsageError::EmptyUrl => write!(f, "a board URL is empty"),
         }
     }
 }
 
 impl std::error::Error for UsageError {}
+
+fn parse_url(text: &str) -> Result<String, UsageError> {
+    if text.is_empty() {
+        return Err(UsageError::EmptyUrl);
+    }
+    assert!(!text.is_empty());
+    Ok(text.to_string())
+}
 
 fn parse_task_id(text: &str) -> Result<TaskId, UsageError> {
     let bad = || UsageError::BadTaskId(text.to_string());
@@ -306,6 +330,8 @@ pub enum CliError {
     Run(RunError),
     SlotsFailed(usize),
     Daemon(DaemonError),
+    Reap(ReapError),
+    TooManyUrls,
     ConfigFile(ConfigFileError),
     TableInstalled,
 }
@@ -330,6 +356,8 @@ impl fmt::Display for CliError {
                 write!(f, "the task is no longer claimed; it is {state:?}")
             }
             CliError::Daemon(error) => write!(f, "{error}"),
+            CliError::Reap(error) => write!(f, "{error}"),
+            CliError::TooManyUrls => write!(f, "name at most {REAP_URLS_MAX} boards"),
             CliError::ConfigFile(error) => write!(f, "{error}"),
             CliError::TableInstalled => write!(f, "the role table was already installed"),
             CliError::SlotsFailed(count) => {
@@ -374,7 +402,44 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Pool { project } => pool(project, config),
         Command::Config => print_config(config),
         Command::RunTask { id } => run_one(*id, config),
+        Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
     }
+}
+
+fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliError> {
+    if urls.len() > REAP_URLS_MAX {
+        return Err(CliError::TooManyUrls);
+    }
+    let leaks = reap::find_leaks_on(&config.board_url, urls).map_err(CliError::Reap)?;
+    for leak in &leaks {
+        say(&reap::leak_line(leak));
+    }
+    let count = leaks.len();
+    if !yes {
+        say(&format!(
+            "{count} leaked vb processes; rider reap --yes stops them"
+        ));
+        return Ok(0);
+    }
+    let ends = reap::stop(&leaks);
+    assert_eq!(ends.len(), count);
+    let mut failed = 0_usize;
+    for (leak, end) in leaks.iter().zip(&ends) {
+        match end {
+            Ok(Stopped::Gone) => say(&format!("pid {} had already ended", leak.pid)),
+            Ok(Stopped::Term) => say(&format!("stopped pid {} with SIGTERM", leak.pid)),
+            Ok(Stopped::Kill) => say(&format!("stopped pid {} with SIGKILL", leak.pid)),
+            Err(error) => {
+                failed += 1;
+                say(&format!("could not stop pid {}: {error}", leak.pid));
+            }
+        }
+    }
+    say(&format!(
+        "stopped {} of {count} leaked vb processes",
+        count - failed
+    ));
+    Ok(u8::from(failed > 0))
 }
 
 // Reads rider.toml and makes its role table the process's; returns the table and limits.
