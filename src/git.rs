@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, Stdio};
+use std::process::{Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,8 @@ const GIT_DEADLINE: Duration = Duration::from_secs(300);
 const POLL_MILLIS: u64 = 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
 const POLLS_MAX: u64 = GIT_DEADLINE.as_secs() * 1000 / POLL_MILLIS + 1;
+const READERS_JOIN_WAIT: Duration = Duration::from_secs(2);
+const READERS_JOIN_POLLS_MAX: u64 = READERS_JOIN_WAIT.as_secs() * 1000 / POLL_MILLIS + 1;
 const WORKTREE_FIELDS_MAX: usize = 8;
 const ARGS_MAX: usize = 12;
 const COMMIT_HEX_LENS: [usize; 2] = [40, 64];
@@ -53,7 +55,7 @@ pub enum GitError {
     OutputTooLarge {
         args: String,
     },
-    /// `git` did not exit and close its output within `GIT_DEADLINE`.
+    /// `git` did not exit and close its output within its deadline.
     TimedOut {
         args: String,
         seconds: u64,
@@ -178,37 +180,107 @@ fn finish_reader(reader: Reader) -> Result<Vec<u8>, GitError> {
     joined.map_err(|_| GitError::Io("a reader thread panicked".to_string()))?
 }
 
-/// Reads both streams of `child` until it exits and they close, or until `GIT_DEADLINE`.
-fn collect(child: &mut dyn ChildWrapper, args: &str) -> Result<Output, GitError> {
-    let deadline = Instant::now() + GIT_DEADLINE;
+/// Starts a reader on each of `child`'s output streams: stdout first, then stderr.
+fn start_readers(child: &mut dyn ChildWrapper, args: &str) -> Result<[Reader; 2], GitError> {
+    assert!(!args.is_empty());
     let missing = |name: &str| GitError::Spawn(format!("git {args}: no {name}"));
     let stdout = child.stdout().take().ok_or_else(|| missing("stdout"))?;
     let stderr = child.stderr().take().ok_or_else(|| missing("stderr"))?;
-    let reader = start_reader(stdout, args)?;
-    let errors = start_reader(stderr, args)?;
-    let mut status = None;
+    let readers = [start_reader(stdout, args)?, start_reader(stderr, args)?];
+    assert!(child.stdout().is_none() && child.stderr().is_none());
+    Ok(readers)
+}
+
+// `try_wait` reaps the leader, so it is called only once both streams have closed. On every
+// error the leader is therefore unreaped, and its id still names its process group.
+fn poll(
+    child: &mut dyn ChildWrapper,
+    readers: &mut [Option<Reader>; 2],
+    bytes: &mut [Vec<u8>; 2],
+    deadline: Instant,
+) -> Result<Option<ExitStatus>, GitError> {
     for _ in 0..POLLS_MAX {
-        if status.is_none() {
-            let polled = child.try_wait();
-            status = polled.map_err(|error| GitError::Io(format!("waiting for git: {error}")))?;
+        for (slot, out) in readers.iter_mut().zip(bytes.iter_mut()) {
+            if let Some(reader) = slot.take_if(|reader| reader.is_finished()) {
+                *out = finish_reader(reader)?;
+            }
         }
-        if status.is_some() && reader.is_finished() && errors.is_finished() {
-            break;
+        if readers.iter().all(Option::is_none) {
+            let polled = child.try_wait();
+            let status =
+                polled.map_err(|error| GitError::Io(format!("waiting for git: {error}")))?;
+            if status.is_some() {
+                assert!(bytes.iter().all(|out| out.len() <= OUTPUT_BYTES_MAX));
+                return Ok(status);
+            }
         }
         if Instant::now() >= deadline {
             break;
         }
         thread::sleep(POLL_INTERVAL);
     }
-    let Some(status) = status.filter(|_| reader.is_finished() && errors.is_finished()) else {
-        let args = args.to_string();
-        let seconds = GIT_DEADLINE.as_secs();
-        return Err(GitError::TimedOut { args, seconds });
+    Ok(None)
+}
+
+/// Kills `child`'s whole group, which may outlive its leader, then joins the readers that
+/// close within `READERS_JOIN_WAIT`.
+fn end(
+    child: &mut dyn ChildWrapper,
+    readers: [Option<Reader>; 2],
+    args: &str,
+) -> Result<(), GitError> {
+    assert!(!args.is_empty());
+    let killed = board::kill_group(child);
+    let deadline = Instant::now() + READERS_JOIN_WAIT;
+    let mut open = readers;
+    for _ in 0..READERS_JOIN_POLLS_MAX {
+        for slot in &mut open {
+            if let Some(reader) = slot.take_if(|reader| reader.is_finished()) {
+                // The call has already failed, so what the killed group printed is not wanted.
+                let _ = reader.join();
+            }
+        }
+        if open.iter().all(Option::is_none) || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    // A reader still open here is held by a process that left the group; it is detached.
+    killed.map_err(|error| GitError::Io(format!("ending git {args}: {error}")))
+}
+
+/// Reads both streams of `child` until it exits and they close, or until `limit` passes.
+/// Unless it ends that way, the whole process group is killed.
+fn collect(child: &mut dyn ChildWrapper, args: &str, limit: Duration) -> Result<Output, GitError> {
+    assert!(!args.is_empty());
+    assert!(limit <= GIT_DEADLINE, "the poll bound covers the deadline");
+    let deadline = Instant::now() + limit;
+    let mut readers = [None, None];
+    let mut bytes = [Vec::new(), Vec::new()];
+    let polled = match start_readers(child, args) {
+        Ok(started) => {
+            readers = started.map(Some);
+            poll(child, &mut readers, &mut bytes, deadline)
+        }
+        Err(error) => Err(error),
     };
+    let status = match polled {
+        Ok(Some(status)) => status,
+        unfinished => {
+            end(child, readers, args)?;
+            let seconds = limit.as_secs();
+            let timed_out = GitError::TimedOut {
+                args: args.to_string(),
+                seconds,
+            };
+            return Err(unfinished.err().unwrap_or(timed_out));
+        }
+    };
+    let [stdout, stderr] = bytes;
     let output = Output {
         code: status.code(),
-        stdout: finish_reader(reader)?,
-        stderr: finish_reader(errors)?,
+        stdout,
+        stderr,
     };
     assert!(output.stdout.len() <= OUTPUT_BYTES_MAX);
     assert!(output.stderr.len() <= OUTPUT_BYTES_MAX);
@@ -231,26 +303,20 @@ fn command(dir: &Path, args: &[&OsStr]) -> Process {
     command
 }
 
-/// Runs `process` in its own process group, killing the group unless it ends in time.
-fn spawn_and_collect(process: Process, line: &str) -> Result<Output, GitError> {
+/// Runs `process` in its own process group, killing the group unless it ends within `limit`.
+fn spawn_and_collect(process: Process, line: &str, limit: Duration) -> Result<Output, GitError> {
     assert!(!line.is_empty());
     let spawned = CommandWrap::from(process)
         .wrap(ProcessGroup::leader())
         .spawn();
     let mut child = spawned.map_err(|error| GitError::Spawn(format!("git {line}: {error}")))?;
-    let output = collect(child.as_mut(), line);
-    // A child already reaped needs no kill; one still running must not outlive the call.
-    if output.is_err() && !matches!(child.try_wait(), Ok(Some(_))) {
-        let killed = board::kill_group(child.as_mut());
-        killed.map_err(|error| GitError::Io(format!("ending git {line}: {error}")))?;
-    }
-    output
+    collect(child.as_mut(), line, limit)
 }
 
 fn run(dir: &Path, args: &[&OsStr]) -> Result<Output, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
     let line = shown(args);
-    spawn_and_collect(command(dir, args), &line)
+    spawn_and_collect(command(dir, args), &line, GIT_DEADLINE)
 }
 
 fn exit_error(args: &[&OsStr], output: &Output) -> GitError {
@@ -638,7 +704,7 @@ pub mod testing {
         let mut process = command(dir, &args);
         process.env_remove("GIT_CONFIG_COUNT");
         process.env_remove("GIT_CONFIG_PARAMETERS");
-        spawn_and_collect(process, &shown(&args)).unwrap()
+        spawn_and_collect(process, &shown(&args), super::GIT_DEADLINE).unwrap()
     }
 
     /// Runs `git -C <dir> <args>`, asserts it succeeded, and returns its trimmed stdout.
@@ -909,5 +975,88 @@ worktree /v\0HEAD 0123\0branch refs/heads/rider/2-y\0\0";
         fs::create_dir_all(&other).unwrap();
         init_repo(&other);
         assert!(is_clean(&other).unwrap());
+    }
+
+    fn is_gone(pid: i32) -> bool {
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        for _ in 0..1000 {
+            if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn a_hook_left_holding_output_is_killed_at_the_deadline() {
+        let fixture = Fixture::new("git-hook");
+        let hooks = fixture.root.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let pid_file = fixture.root.join("sleeper.pid");
+        let hook = format!(
+            "#!/bin/sh\nsleep 60 &\necho $! > '{}'\n",
+            pid_file.display()
+        );
+        let hook_path = hooks.join("post-checkout");
+        fs::write(&hook_path, hook).unwrap();
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&hook_path, executable).unwrap();
+        git(
+            &fixture.repo,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        let linked = fixture.root.join("linked");
+        let args = [OsStr::new("worktree"), OsStr::new("add"), OsStr::new("-q")];
+        let args = [
+            args[0],
+            args[1],
+            args[2],
+            OsStr::new("--"),
+            linked.as_os_str(),
+        ];
+        let limit = Duration::from_secs(5);
+        let started = Instant::now();
+        let result = spawn_and_collect(command(&fixture.repo, &args), &shown(&args), limit);
+        let elapsed = started.elapsed();
+        let error = result.err();
+        assert!(
+            matches!(error, Some(GitError::TimedOut { seconds: 5, .. })),
+            "{error:?}"
+        );
+        assert!(elapsed < limit * 3, "returned after {elapsed:?}");
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            is_gone(pid),
+            "the hook's background sleep {pid} outlived the call"
+        );
+    }
+
+    #[test]
+    fn output_past_the_bound_fails_without_waiting_for_the_deadline() {
+        let fixture = Fixture::new("git-overflow");
+        let mut process = Process::new("sh");
+        let script = format!("head -c {} /dev/zero; exec sleep 60", OUTPUT_BYTES_MAX + 1);
+        process.arg("-c").arg(script).current_dir(&fixture.root);
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let result = spawn_and_collect(process, "overflow", Duration::from_secs(60));
+        let elapsed = started.elapsed();
+        let error = result.err();
+        assert!(
+            matches!(&error, Some(GitError::OutputTooLarge { args }) if args == "overflow"),
+            "{error:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "returned after {elapsed:?}"
+        );
     }
 }
