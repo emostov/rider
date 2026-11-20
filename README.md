@@ -10,12 +10,12 @@ a model picked for the job.
 
 ## How it works
 
-**The lead** is a Claude Code session on Fable 5.2. It plans the work, answers
+**The lead** is your coding-agent session, guided by the `ride-swarm` skill. It plans the work, answers
 the workers' questions, checks their results, and keeps you updated. It never
 writes code itself. Questions only you can answer wait in the `decisions`
 channel while the rest of the work goes on.
 
-**The swarm** runs up to four agents at once:
+**The swarm** runs as many agents at once as the task graph allows, up to 32:
 
 | Role        | Model           | Job                                         |
 | ----------- | --------------- | ------------------------------------------- |
@@ -26,84 +26,42 @@ channel while the rest of the work goes on.
 | `security`  | Mythos 5.2      | Reviews the finished stack                  |
 | `qa`        | Opus 5.5        | Optional: uses another task's work like a person would |
 
-Every implementing task is reviewed by a different model than the one that
-built it. A task is done only when its agent exited cleanly, its worktree is
-clean, and its branch has new commits.
-
-Each task's branch is cut from the task it builds on, so the result can become
-one pull request or a stack.
-
 ## Getting started
 
-Clone this repository, open your agent in it, and paste:
+Paste this into your coding agent:
 
 ```
-Set up Rider from this checkout by following docs/manual.md: check the
-prerequisites, install the Board CLI and its skill, run `cargo install --path .`,
-start the board with `rider serve` in the background, and register the two
-schemas in skills/ride-swarm/schemas/. Then tell me the commands to start the worker pool and the
-lead in my own terminals. Do not start any agents yourself.
+Install Rider: clone https://github.com/emostov/rider if you don't have it yet, then run
+`cargo install --locked --path <that clone>`, which installs the `rider` binary. Then run
+`npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
 ```
 
-To install by hand instead, you need Rust, Node 22, `jq`, and the `claude` and
-`codex` CLIs, each signed in:
-
-```bash
-npm install --prefix ~/.rider/node @vercel/board
-npx skills add vercel/board --skill board -g
-cargo install --path .
-```
-
-Then register the schemas (see the [manual](./docs/manual.md)) and start three
-terminals:
-
-```bash
-rider serve              # the board
-rider pool demo          # the swarm, for project "demo"
-cd lead && claude        # the lead
-```
-
-Tell the lead what you want:
-
-```
-You are the lead for project `demo`. The repository is /abs/path/to/repo, base
-branch `main`. Goal: <what you want built, and how you will know it is done>.
-Plan it with a review of each implementing task, a polish pass, and one
-security review of the stack. I have agreed the goal and the channel
-`work/demo`; decide everything else yourself. Workers are already running.
-```
-
-Watch the swarm in the board's inspector at <http://127.0.0.1:4100>.
-
-## Using the skills
-
-Install the `ride-swarm` skill, then talk to Claude Code:
-
-```bash
-npx skills add emostov/rider --skill ride-swarm -g
-```
-
-Say "ride a swarm to ..." to start work and "check my swarm" for status. The
-`ship-swarm` skill, in `skills/`, carries a finished stack through pull requests. The
-first time, it asks how you like its loops to run (a review packet before the PR, comments,
-CI, review threads) and saves the answers in `~/.rider/ship.toml`.
-
-## Safety
-
-- **Agents run unsandboxed, with permission prompts skipped.** They can read
-  and change anything your user can. Only point Rider at repositories you are
-  prepared to have changed.
-- **Nothing leaves your machine.** Rider never pushes, opens a pull request, or
-  merges. Work stays on local branches named `rider/<task id>-<slug>`.
+Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
+pull request, it asks how you like its loops to run (a review packet first, comments, CI,
+review threads) and saves the answers in `~/.rider/ship.toml`.
 
 ## Status
 
-Rider is early. Next up is a daemon: `rider up` to start everything,
-`rider chat` to talk to the lead, `rider status` to see the swarm, and recovery
-after a crash.
+Rider is early and still developing basic features.
 
 ## Docs
 
 The [manual](./docs/manual.md) covers prerequisites, roles, labels, watching
 and stopping the swarm, where files live, and troubleshooting.
 The [release guide](./docs/releasing.md) covers tagging and publishing.
+
+## How it's built
+
+- **A deterministic simulator.** The daemon's decisions are one pure function,
+  `step(state, event) -> actions`, with no I/O. A seeded simulator (`tests/sim/`) drives it
+  through thousands of runs with a fake board, agents and clock, injecting crashes, lost
+  claims, board outages and clock jumps, and checks the design's invariants after every
+  step. A failing seed replays exactly: `SIM_SEED=<n> cargo test --test sim`.
+- **Elements of TigerStyle.** At least two assertions per function, every loop and
+  collection bounded by a named constant, no recursion, no `unsafe`, no async runtime:
+  threads, bounded channels and back pressure. See [AGENTS.md](./AGENTS.md).
+- **Black-box scenario tests.** `tests/scenarios/` runs the real `rider` binary against a
+  real board in a scratch directory, with fake agents, so behaviour is pinned from the
+  outside and the code can be rewritten with confidence.
+- **Built by its own swarm.** Rider's changes are planned on the board and carried out by
+  Rider's own agents, each reviewed by a different model than the one that wrote it.
