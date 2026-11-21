@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
 use crate::roles::{
-    AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RepoRoles, RoleSpec,
+    AGENTS_MAX, BUILDERS_DEFAULT, Harness, LEAD_PREFIX, LEAD_PROFILE, PROFILE_LEN_MAX, ROLES,
+    RepoRoles, RoleSpec,
 };
 use crate::run_task::{ATTEMPTS_DEFAULT, ATTEMPTS_MAX};
 
@@ -453,6 +454,14 @@ fn role_spec(
     let missing = |name: &str| error(name, MISSING.to_string());
     if !is_name(label) {
         let problem = "must be lowercase letters, digits and '-', starting with a letter";
+        return Err(field_error(
+            path,
+            format!("{prefix}roles.{label}"),
+            problem.into(),
+        ));
+    }
+    if label == LEAD_PROFILE || label.starts_with(LEAD_PREFIX) {
+        let problem = "is reserved for the lead's board profile";
         return Err(field_error(
             path,
             format!("{prefix}roles.{label}"),

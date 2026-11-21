@@ -28,7 +28,7 @@ use crate::feed::{
 use crate::harness::LOG_BYTES_MAX;
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::reap::{self, ReapError, Stopped};
-use crate::roles::{self, RoleSpec};
+use crate::roles::{self, LEAD_PREFIX, LEAD_PROFILE, RoleSpec};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
@@ -75,8 +75,6 @@ const CHANNEL_NOT_FOUND: &str = "channel_not_found";
 const QUEUE_PROFILE: &str = "rider-queue";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
-const LEAD_PROFILE: &str = "lead";
-const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
 /// How long the feed must stay quiet after an event before the wait reports it.

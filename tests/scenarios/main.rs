@@ -867,6 +867,36 @@ fn a_repository_table_giving_implement_a_skill_puts_it_in_only_that_repositorys_
 }
 
 #[test]
+fn rider_config_refuses_a_role_named_lead_or_beginning_lead_dash() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompt = world.root.join("lead-prompt.md");
+    fs::write(&prompt, "You lead.\n").expect("write a prompt");
+    for label in ["lead", "lead-two"] {
+        let toml = format!(
+            r#"[roles.{label}]
+harness = "claude"
+model = "m"
+title = "Lead"
+model_name = "M"
+model_slug = "x"
+prompt = "{}"
+commits = true
+"#,
+            prompt.display()
+        );
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{output:?}");
+        let problem = format!("roles.{label} is reserved for the lead's board profile");
+        assert!(output.stderr.contains(&problem), "{output:?}");
+    }
+}
+
+#[test]
 fn an_unknown_key_in_a_repository_role_table_stops_the_daemon_naming_it() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
