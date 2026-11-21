@@ -43,8 +43,8 @@ pub enum Behaviour {
     /// As `codex review` whose review delegate never started: prints Codex's interruption
     /// message and exits 0.
     ReviewInterrupted,
-    /// As `codex review` stopped by the provider's content filter: prints `CONTENT_FILTER_ERROR`
-    /// on stderr and exits 1.
+    /// As Codex stopped by the provider's content filter, exiting 1: `codex exec` prints the
+    /// recorded `CONTENT_FILTER_EVENTS`, and `codex review` prints `CONTENT_FILTER_ERROR` on stderr.
     ContentFilterStop,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
@@ -171,9 +171,12 @@ impl Behaviour {
 /// What Codex's interruption message for a review that never started begins with.
 pub const REVIEW_INTERRUPTED: &str =
     "Review was interrupted. Please re-run /review and wait for it to complete.";
-/// The error a `ContentFilterStop` agent prints on stderr.
-pub const CONTENT_FILTER_ERROR: &str =
-    "ERROR: This content was flagged for possible cybersecurity risk.";
+/// The error a `ContentFilterStop` agent prints on stderr as `codex review`.
+pub const CONTENT_FILTER_ERROR: &str = "ERROR: This content was flagged for possible cybersecurity risk. If this seems wrong, try \
+     rephrasing your request.";
+/// The events a `ContentFilterStop` agent prints as `codex exec`, recorded from a real run.
+const CONTENT_FILTER_EVENTS: &str =
+    include_str!("../../fixtures/harness/codex-content-filter.jsonl");
 
 /// The question a blocking agent asks.
 pub const BLOCK_QUESTION: &str = "The fake agent needs an answer.";
@@ -296,7 +299,14 @@ case "$behaviour" in
   exit-non-zero) exit {fail} ;;
   review-nothing) exit 0 ;;
   review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
-  content-filter-stop) echo "{CONTENT_FILTER_ERROR}" >&2; exit 1 ;;
+  content-filter-stop)
+    if [ "$harness" = codex ]; then
+      cat <<'EVENTS'
+{CONTENT_FILTER_EVENTS}EVENTS
+    else
+      echo "{CONTENT_FILTER_ERROR}" >&2
+    fi
+    exit 1 ;;
   wander-branch) git switch -q -c elsewhere && commit || exit 1 ;;
   detach) git checkout -q --detach && commit || exit 1 ;;
   commit-then-fail) commit; exit {fail} ;;

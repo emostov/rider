@@ -1258,6 +1258,7 @@ impl World {
             .map(|fake| ListedTask {
                 view: TaskView {
                     id: fake.id,
+                    channel: "work/sim".to_string(),
                     text: String::new(),
                     state: fake.state,
                     labels: fake.labels.clone(),

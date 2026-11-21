@@ -74,6 +74,11 @@ pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
 const SCHEMAS_LISTED_MAX: usize = 1024;
 /// The number of global arguments: `--json --url <url> --as <profile>`.
 const GLOBAL_ARGS_LEN: usize = 5;
+/// The most labels and needs `create_task` writes, so its arguments stay within `ARGS_MAX`.
+pub const CREATE_LABELS_MAX: usize = 4;
+pub const CREATE_NEEDS_MAX: usize = 1;
+const _: () =
+    assert!(6 + 2 * CREATE_LABELS_MAX + 1 + CREATE_NEEDS_MAX + GLOBAL_ARGS_LEN + 2 <= ARGS_MAX);
 /// The longest decimal ID that fits a `u64`.
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the tasks one task waits for.
@@ -118,6 +123,7 @@ pub struct Claim {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskView {
     pub id: TaskId,
+    pub channel: String,
     pub text: String,
     pub state: TaskState,
     /// At most `LABELS_MAX` entries.
@@ -298,6 +304,16 @@ pub trait Board {
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
     fn schema_ids(&self) -> Result<Vec<String>, BoardError>;
     fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError>;
+    /// Creates a task in `channel` that waits for `needs`, or returns the one an earlier call
+    /// with the same `key` created.
+    fn create_task(
+        &self,
+        channel: &str,
+        text: &str,
+        labels: &[(&str, &str)],
+        needs: &[TaskId],
+        key: &str,
+    ) -> Result<TaskId, BoardError>;
 }
 
 pub fn register_schemas(board: &dyn Board) -> Result<Vec<&'static str>, BoardError> {
@@ -387,6 +403,13 @@ enum Command<'a> {
     CreateSchema {
         id: &'a str,
         json: &'a str,
+    },
+    Create {
+        channel: &'a str,
+        text: &'a str,
+        labels: &'a [(&'a str, &'a str)],
+        needs: &'a [TaskId],
+        key: &'a str,
     },
 }
 
@@ -533,6 +556,25 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
         Command::CreateSchema { id, .. } => {
             (to_strings(&["schemas", "create", id, "--file", "-"]), None)
         }
+        // The task's text goes on stdin; `-` tells `vb` to read it there.
+        Command::Create {
+            channel,
+            labels,
+            needs,
+            key,
+            ..
+        } => {
+            let mut words = to_strings(&["tasks", "create", channel, "-"]);
+            for (name, value) in labels {
+                words.extend(["--label".to_string(), format!("{name}={value}")]);
+            }
+            if !needs.is_empty() {
+                words.push("--needs".to_string());
+                words.extend(needs.iter().map(|need| need.0.to_string()));
+            }
+            words.extend(to_strings(&["--idempotency-key", key]));
+            (words, None)
+        }
     };
     assert!(
         VERBS.contains(&words[0].as_str()),
@@ -569,13 +611,14 @@ fn command_stdin<'a>(command: &Command<'a>) -> Option<&'a str> {
     let stdin = match *command {
         Command::Reply { text, .. } => Some(text),
         Command::CreateSchema { json, .. } => Some(json),
+        Command::Create { text, .. } => Some(text),
         _ => None,
     };
     assert!(
         stdin.is_none()
             || matches!(
                 command,
-                Command::Reply { .. } | Command::CreateSchema { .. }
+                Command::Reply { .. } | Command::CreateSchema { .. } | Command::Create { .. }
             )
     );
     stdin
@@ -601,6 +644,7 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
         Command::Block { .. } => ("tasks block", 0),
         Command::Schemas => ("schemas list", 0),
         Command::CreateSchema { .. } => ("schemas create", 0),
+        Command::Create { .. } => ("tasks create", 0),
     };
     assert!(
         wait_seconds <= WAIT_SECONDS_MAX,
@@ -623,7 +667,8 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
         | Command::PostRoot { .. }
         | Command::List { .. }
         | Command::Schemas
-        | Command::CreateSchema { .. } => None,
+        | Command::CreateSchema { .. }
+        | Command::Create { .. } => None,
         Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
         Command::Reply { id, .. } | Command::Post { id, .. } => Some(("posted", id)),
@@ -699,6 +744,7 @@ struct WireTask {
 #[derive(Deserialize)]
 struct WireMessage {
     id: String,
+    channel: String,
     text: String,
     labels: BTreeMap<String, String>,
     task: WireTask,
@@ -758,7 +804,6 @@ struct WireListed {
 /// A listed task's message: a task's message and the channel it is in.
 #[derive(Deserialize)]
 struct WireListedMessage {
-    channel: String,
     #[serde(flatten)]
     message: WireMessage,
 }
@@ -933,11 +978,15 @@ fn holder_from_wire(holder: WireHolder) -> Result<Claim, BoardError> {
 fn view_from_wire(message: WireMessage) -> Result<TaskView, BoardError> {
     let WireMessage {
         id,
+        channel,
         text,
         labels,
         task,
         version,
     } = message;
+    if channel.is_empty() {
+        return Err(BoardError::Parse("a task in an empty channel".into()));
+    }
     if labels.len() > LABELS_MAX {
         return Err(BoardError::TooManyLabels);
     }
@@ -956,6 +1005,7 @@ fn view_from_wire(message: WireMessage) -> Result<TaskView, BoardError> {
         task.needs.iter().map(|need| parse_id_text(need)).collect();
     let view = TaskView {
         id: parse_id_text(&id)?,
+        channel,
         text,
         state,
         labels: labels.into_iter().collect(),
@@ -1047,13 +1097,8 @@ pub fn parse_task_list(json: &str) -> Result<TaskPage, BoardError> {
     let cursor = Cursor(parse_id_text(&listing.cursor)?.0);
     let tasks: Result<Vec<ListedTask>, BoardError> = (listing.tasks.into_iter())
         .map(|listed| {
-            let WireListedMessage { channel, message } = listed.message;
-            if channel.is_empty() {
-                return Err(BoardError::Parse(
-                    "a listed task in an empty channel".into(),
-                ));
-            }
-            let view = view_from_wire(message)?;
+            let view = view_from_wire(listed.message.message)?;
+            let channel = view.channel.clone();
             Ok(ListedTask { view, channel })
         })
         .collect();
@@ -1600,6 +1645,28 @@ impl Board for VbCli {
         assert!(!json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
         self.read(&Command::CreateSchema { id, json }).map(drop)
     }
+
+    fn create_task(
+        &self,
+        channel: &str,
+        text: &str,
+        labels: &[(&str, &str)],
+        needs: &[TaskId],
+        key: &str,
+    ) -> Result<TaskId, BoardError> {
+        assert!(!channel.is_empty() && !channel.starts_with('-'));
+        assert!(!key.is_empty() && !key.starts_with('-'));
+        assert!(labels.len() <= CREATE_LABELS_MAX && needs.len() <= CREATE_NEEDS_MAX);
+        let command = Command::Create {
+            channel,
+            text,
+            labels,
+            needs,
+            key,
+        };
+        let (_, id) = parse_write(&self.read(&command)?)?;
+        Ok(id)
+    }
 }
 
 impl VbCli {
@@ -1809,6 +1876,18 @@ pub mod testing {
 
         fn create_schema(&self, id: &str, _: &str) -> Result<(), BoardError> {
             self.record(format!("create_schema {id}"))
+        }
+
+        fn create_task(
+            &self,
+            channel: &str,
+            _: &str,
+            _: &[(&str, &str)],
+            _: &[TaskId],
+            key: &str,
+        ) -> Result<TaskId, BoardError> {
+            self.record(format!("create_task {channel} {key}"))?;
+            Err(BoardError::Parse("the fake board creates no tasks".into()))
         }
 
         fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {

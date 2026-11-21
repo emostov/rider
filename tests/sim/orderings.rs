@@ -176,6 +176,7 @@ fn listed(
     ListedTask {
         view: TaskView {
             id,
+            channel: "work/sim".to_string(),
             text: String::new(),
             state,
             labels,

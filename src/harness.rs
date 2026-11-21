@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -44,6 +44,9 @@ const LINE_BYTES_MAX: usize = 4 * 1024 * 1024;
 const LINES_MAX: u64 = LOG_BYTES_MAX + 1;
 const SKIP_READS_MAX: u64 = LOG_BYTES_MAX / LINE_BYTES_MAX as u64 + 2;
 const REVIEW_INTERRUPTED: &str = "Review was interrupted.";
+// Codex's content-filter error has no code: its message's first sentence names it.
+const CONTENT_FILTER: &str = "This content was flagged for possible cybersecurity risk.";
+const STDERR_TAIL_BYTES: u64 = 64 * 1024;
 const POISONED: &str = "the log lock was poisoned";
 
 const _: () = {
@@ -697,13 +700,18 @@ enum CodexEvent {
     #[serde(rename = "item.completed")]
     ItemCompleted { item: Option<Field<CodexItem>> },
     #[serde(rename = "turn.failed")]
-    TurnFailed,
+    TurnFailed { error: Option<Field<CodexError>> },
     #[serde(rename = "turn.completed")]
     TurnCompleted,
     #[serde(rename = "error")]
     Error,
     #[serde(other)]
     Other,
+}
+
+#[derive(Deserialize)]
+struct CodexError {
+    message: Option<Field<String>>,
 }
 
 #[derive(Deserialize)]
@@ -829,6 +837,44 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
     before
 }
 
+/// Whether the provider's content filter ended the run at `log`: for Codex, its last turn event
+/// is a `turn.failed` whose error is the filter's; for `codex review`, its stderr transcript
+/// ends with that error.
+pub fn stopped_by_content_filter(harness: &Harness, log: &Path) -> bool {
+    let stopped = match harness {
+        Harness::Claude => false,
+        Harness::Codex => {
+            let mut stopped = false;
+            let _ = scan(log, |event| match event {
+                CodexEvent::TurnFailed { error } => {
+                    let message = valid(error).and_then(|error| valid(error.message));
+                    stopped = message.is_some_and(|text| text.starts_with(CONTENT_FILTER));
+                }
+                CodexEvent::TurnCompleted => stopped = false,
+                CodexEvent::ItemCompleted { .. } | CodexEvent::Error | CodexEvent::Other => {}
+            });
+            stopped
+        }
+        Harness::CodexReview => {
+            let stderr = stderr_log(log);
+            let Ok(mut file) = File::open(&stderr) else {
+                return false;
+            };
+            let len = file.metadata().map_or(0, |metadata| metadata.len());
+            let mut tail = Vec::new();
+            let read = file
+                .seek(SeekFrom::Start(len.saturating_sub(STDERR_TAIL_BYTES)))
+                .and_then(|_| file.take(STDERR_TAIL_BYTES).read_to_end(&mut tail));
+            let text = String::from_utf8_lossy(&tail);
+            let last = text.lines().rev().find(|line| !line.trim().is_empty());
+            let error = last.and_then(|line| line.trim().strip_prefix("ERROR: "));
+            read.is_ok() && error.is_some_and(|text| text.starts_with(CONTENT_FILTER))
+        }
+    };
+    assert!(!stopped || *harness != Harness::Claude);
+    stopped
+}
+
 /// Whether the stream at `log` records a failed run; false when the log is unreadable.
 pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut last_result_failed = false;
@@ -839,7 +885,7 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
         // `item.type == "error"` inside `item.completed` is a harmless warning, and a
         // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
         Harness::Codex => scan(log, |event| match event {
-            CodexEvent::TurnFailed | CodexEvent::Error => last_turn_failed = true,
+            CodexEvent::TurnFailed { .. } | CodexEvent::Error => last_turn_failed = true,
             CodexEvent::TurnCompleted => last_turn_failed = false,
             CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
         }),

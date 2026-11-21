@@ -54,6 +54,11 @@ pub const IDENTITY_READS_MAX: u32 = 5;
 const IDENTITY_PAUSE_MILLIS: u64 = 1_000;
 const SUMMARY_CHARS_MAX: usize = TAIL_REPLY_CHARS_MAX / 6;
 const ATTEMPT_LABEL: &str = "attempt";
+// A review the content filter stopped names its rerun in `rerun`; the rerun names it in
+// `rerun_of`.
+const RERUN_LABEL: &str = "rerun";
+const RERUN_OF_LABEL: &str = "rerun_of";
+const RERUN_ROLE: &str = "security";
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
@@ -1226,7 +1231,52 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     if board.reply(id, &format!("{header}\n{tail}")).is_err() {
         let _ = board.reply(id, &header);
     }
+    let role = attempt.brief.role;
+    let filtered = harness::stopped_by_content_filter(&role.harness, attempt.log());
+    if filtered && role.needs_of && role.label != RERUN_ROLE {
+        rerun_on_mythos(id, board, attempt);
+    }
     Ok(())
+}
+
+// The rerun keeps the brief's text as it is: the filter is never worked around.
+fn rerun_on_mythos(id: TaskId, board: &dyn Board, attempt: &Attempt) {
+    assert!(attempt.brief.role.needs_of);
+    assert!(attempt.brief.role.label != RERUN_ROLE);
+    let view = match board.read_task(id) {
+        Ok(view) => view,
+        Err(error) => {
+            let note = format!("Rider could not rerun this review on Mythos: {error}.");
+            let _ = board.reply(id, &one_line(&note));
+            return;
+        }
+    };
+    if label(&view, RERUN_LABEL).is_some() {
+        return;
+    }
+    let (Some(of), Some(repo)) = (attempt.brief.of, label(&view, "repo")) else {
+        return;
+    };
+    let (needs, of, own) = ([of], of.0.to_string(), id.0.to_string());
+    let labels = [
+        ("role", RERUN_ROLE),
+        ("repo", repo),
+        ("of", of.as_str()),
+        (RERUN_OF_LABEL, own.as_str()),
+    ];
+    let key = format!("rider-rerun-{own}");
+    let note = match board.create_task(&view.channel, &view.text, &labels, &needs, &key) {
+        Ok(rerun) => {
+            let _ = board.set_label(id, RERUN_LABEL, &rerun.0.to_string());
+            format!(
+                "The provider's content filter stopped this review, so it is rerun once on \
+                 Mythos as security task #{}, with the same brief.",
+                rerun.0
+            )
+        }
+        Err(error) => format!("Rider could not rerun this review on Mythos: {error}."),
+    };
+    let _ = board.reply(id, &one_line(&note));
 }
 
 // The window past its first byte, which is the one before the window, read only for its `\n`.

@@ -132,6 +132,80 @@ fn a_native_review_stopped_by_the_content_filter_fails_showing_codexs_error() {
     );
 }
 
+#[test]
+fn a_review_stopped_by_the_content_filter_is_rerun_once_on_mythos_with_the_same_brief() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let brief = "Review the work of the sandbox: git diff main...HEAD.";
+    let review = NewTask::new(brief)
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::ContentFilterStop]);
+    let native = when_the_lead_creates(&world, &a_native_review_of(&world, &built));
+    given_the_agent_will(&world, &native, &[Behaviour::ContentFilterStop]);
+
+    let tasks = [built.as_str(), review.as_str(), native.as_str()];
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &tasks);
+    world.vb_lead(&["tasks", "reopen", &review], None);
+    let (again, _) = when_the_daemon_runs_until_settled(&mut world, &[&review]);
+
+    assert_eq!(states, vec!["completed", "failed", "failed"]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(again, vec!["failed"]);
+    let reruns = reruns_on_the_board(&world);
+    assert_eq!(reruns.len(), 2, "{reruns:?}");
+    for (failed, text) in [
+        (&review, brief),
+        (&native, "Review the work: git diff main...HEAD."),
+    ] {
+        let rerun = reruns_of(&reruns, failed);
+        let read: serde_json::Value = serde_json::from_str(&task_text(&world, &rerun)).unwrap();
+        assert_eq!(read["message"]["text"], json!(text));
+        assert_eq!(read["message"]["task"]["needs"], json!([built]));
+        let labels = task_labels(&world, &rerun);
+        let expected = [
+            ("of", built.as_str()),
+            ("repo", world.repo_label()),
+            ("rerun_of", failed.as_str()),
+            ("role", "security"),
+        ];
+        let wanted: Vec<(String, String)> = (expected.iter())
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let got: Vec<(String, String)> = (labels.into_iter())
+            .filter(|(key, _)| expected.iter().any(|(wanted, _)| wanted == key))
+            .collect();
+        assert_eq!(got, wanted);
+        assert_eq!(task_label(&world, failed, "rerun"), Some(rerun.clone()));
+        let replies = replies_text(&world, failed);
+        let note = format!("rerun once on Mythos as security task #{rerun}");
+        assert_eq!(replies.matches(&note).count(), 1, "{replies}");
+    }
+}
+
+fn reruns_on_the_board(world: &World) -> Vec<(String, String)> {
+    let all = tasks_in_state(world, "all");
+    let labelled = all.into_iter().filter_map(|id| {
+        let of = task_label(world, &id, "rerun_of")?;
+        Some((id, of))
+    });
+    labelled.collect()
+}
+
+fn reruns_of(reruns: &[(String, String)], failed: &str) -> String {
+    let mut found = reruns.iter().filter(|(_, of)| of == failed);
+    let (rerun, _) = found
+        .next()
+        .unwrap_or_else(|| panic!("no rerun of #{failed}"));
+    assert_eq!(found.next(), None, "a second rerun of #{failed}");
+    rerun.clone()
+}
+
 fn replies_text(world: &World, id: &str) -> String {
     let replies = task_replies(world, id);
     let texts: Vec<String> = replies.iter().map(|reply| reply.to_string()).collect();
