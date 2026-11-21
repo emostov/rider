@@ -60,8 +60,9 @@ pub enum BriefError {
     RestackWithoutOnto,
     /// The `base` task, which the task does not need.
     BaseNotNeeded(TaskId),
-    /// The `of` task, which the task does not need.
-    OfNotNeeded(TaskId),
+    OfSelf,
+    OfCanceled(TaskId),
+    OfCycle(TaskId),
     /// An unfinished task on the branch of the `onto` task that the task does not need.
     OntoNotNeeded {
         unfinished: TaskId,
@@ -143,10 +144,19 @@ impl fmt::Display for BriefError {
                  from its `base` task's branch only once that task is done.",
                 base.0
             ),
-            BriefError::OfNotNeeded(of) => write!(
+            BriefError::OfSelf => write!(
                 f,
-                "Add task #{} to this task's needs, or change the `of` label: a task checks \
-                 the work of its `of` task only once that task is done.",
+                "Change the `of` label to another task: a task cannot check its own work."
+            ),
+            BriefError::OfCanceled(of) => write!(
+                f,
+                "Change the `of` label: task #{} was canceled, so it is never done.",
+                of.0
+            ),
+            BriefError::OfCycle(of) => write!(
+                f,
+                "Change the `of` label of this task or of task #{}: the `of` labels form a \
+                 cycle, so none of these tasks is ever done first.",
                 of.0
             ),
             BriefError::OntoNotNeeded { unfinished, onto } => write!(
@@ -188,11 +198,11 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     if role.needs_of && of.is_none() {
         return Err(BriefError::ReviewWithoutOf);
     }
+    if of == Some(view.id) {
+        return Err(BriefError::OfSelf);
+    }
     if let Some(base) = base.filter(|base| !view.needs.contains(base)) {
         return Err(BriefError::BaseNotNeeded(base));
-    }
-    if let Some(of) = of.filter(|of| role.needs_of && !view.needs.contains(of)) {
-        return Err(BriefError::OfNotNeeded(of));
     }
     let from = label(view, "from").map(parse_from).transpose()?;
     let resume = match label(view, "resume") {
@@ -226,6 +236,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     assert!(brief.base.is_none_or(|base| view.needs.contains(&base)));
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
     assert!(!brief.role.needs_of || brief.of.is_some());
+    assert!(brief.of != Some(brief.id));
     assert!(brief.role.commits_expected || brief.role.needs_of);
     Ok(brief)
 }

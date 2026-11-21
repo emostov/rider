@@ -1086,6 +1086,7 @@ fn prepare(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
                 extra: Extra::Attempt(Arc::new(attempt)),
             }
         }
+        Ok(Prepared::WaitingFor(of)) => Input::plain(Event::PrepareWaiting { run, of }),
         Ok(Prepared::Blocked { kind, reason }) => Input::plain(Event::PrepareBlocked {
             run,
             kind: kind.to_string(),

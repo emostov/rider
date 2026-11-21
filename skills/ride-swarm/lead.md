@@ -108,8 +108,11 @@ that names a local branch. It also checks the order of work:
   finished.
 - An `onto` task must `need` every unfinished task on that branch, unless that task waits
   for it, so two workers never change one branch.
-- A `review`, `security`, or `qa` task must `need` its `of` task, so it never reviews
-  unfinished work.
+- A task with an `of` label waits until its `of` task is done, as if that task were in its
+  `needs`, so it never reviews unfinished work; there is no need to repeat it in `needs`.
+  It keeps waiting while the `of` task is failed, and runs once that task is reopened and
+  done. An `of` label naming the task itself, a cycle of `of` labels, or an `of` task that
+  was canceled blocks the task as `invalid_brief`.
 
 Only a task's own `branch` label that names a branch other than the one its worktree is on
 blocks as `rider_error`. A branch checked out in another task's worktree blocks as
