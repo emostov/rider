@@ -8,7 +8,9 @@ mod brief_settle;
     reason = "behaviours and readers for the scenarios still to come"
 )]
 mod fake_agent;
+mod harness_cli;
 mod run_task;
+mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
 mod worktree_git;

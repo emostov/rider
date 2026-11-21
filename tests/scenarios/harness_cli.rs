@@ -1,0 +1,270 @@
+use std::ffi::OsString;
+use std::fs;
+use std::os::unix::ffi::OsStringExt;
+use std::path::Path;
+use std::process::Command;
+
+use crate::fake_agent::{BLOCK_QUESTION, Behaviour};
+use crate::steps::*;
+use crate::world::{World, run_bounded, write_executable};
+
+type EnvCase = (
+    Vec<(&'static str, OsString)>,
+    &'static [&'static str],
+    &'static str,
+);
+
+const BAD_ID: &str = "is not a task id: use its number, such as 42 or #42";
+
+fn rider(world: &World) -> Command {
+    world.command(Path::new(env!("CARGO_BIN_EXE_rider")))
+}
+
+fn given_a_fake_vb_in(home: &Path, record: &Path, code: u8) {
+    let bin = home.join("node/node_modules/.bin");
+    fs::create_dir_all(&bin).expect("create the fake vb's directory");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit {code}\n",
+        record.display()
+    );
+    write_executable(&bin.join("vb"), &script);
+}
+
+#[test]
+fn rider_help_in_each_spelling_prints_the_commands_and_exits_zero() {
+    let Some(world) = World::new() else {
+        return;
+    };
+
+    for help in ["--help", "-h", "help"] {
+        let output = when_rider_runs(&world, &[help]);
+
+        assert_eq!(output.code, Some(0), "{help}: {output:?}");
+        assert!(output.stdout.contains("Usage: rider"), "{help}: {output:?}");
+        assert!(output.stdout.contains("daemon"), "{help}: {output:?}");
+    }
+}
+
+#[test]
+fn rider_with_a_missing_extra_or_removed_argument_exits_two_saying_which() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let cases: [(&[&str], &str); 7] = [
+        (&[], "Usage: rider"),
+        (
+            &["kill"],
+            "the following required arguments were not provided",
+        ),
+        (
+            &["logs"],
+            "the following required arguments were not provided",
+        ),
+        (&["serve", "now"], "unexpected argument 'now'"),
+        (&["kill", "1", "2"], "unexpected argument '2'"),
+        (&["start"], "unrecognized subcommand 'start'"),
+        (&["pool", "rider"], "unrecognized subcommand 'pool'"),
+    ];
+
+    for (args, says) in cases {
+        let output = when_rider_runs(&world, args);
+
+        assert_eq!(output.code, Some(2), "{args:?}: {output:?}");
+        assert!(output.stderr.contains(says), "{args:?}: {output:?}");
+    }
+}
+
+#[test]
+fn rider_kill_of_an_id_that_is_not_decimal_exits_two_and_a_number_or_hash_number_is_taken() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let bad = [
+        "",
+        "#",
+        "-1",
+        "+1",
+        "1.0",
+        "0x1",
+        "##1",
+        "18446744073709551616",
+        "12a",
+    ];
+
+    for id in bad {
+        let output = when_rider_runs(&world, &["kill", "--", id]);
+
+        assert_eq!(output.code, Some(2), "{id:?}: {output:?}");
+        assert!(
+            output.stderr.contains(&format!("{id:?} {BAD_ID}")),
+            "{output:?}"
+        );
+    }
+    for id in ["42", "#7", "18446744073709551615"] {
+        let output = when_rider_runs(&world, &["kill", id]);
+
+        assert_eq!(output.code, Some(1), "no daemon answers {id:?}: {output:?}");
+        assert!(!output.stderr.contains(BAD_ID), "{id:?}: {output:?}");
+    }
+}
+
+#[test]
+fn rider_refuses_a_missing_relative_empty_non_unicode_or_colon_home_naming_the_variable() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let bad = || OsString::from_vec(vec![0x2f, 0xff]);
+    let cases: [EnvCase; 5] = [
+        (
+            vec![],
+            &["RIDER_HOME", "HOME"],
+            "neither RIDER_HOME nor HOME is set",
+        ),
+        (
+            vec![("RIDER_HOME", "rider".into())],
+            &[],
+            r#"RIDER_HOME must be an absolute path, not "rider""#,
+        ),
+        (
+            vec![("BOARD_URL", "".into())],
+            &[],
+            "BOARD_URL is set but empty",
+        ),
+        (
+            vec![("RIDER_HOME", bad())],
+            &[],
+            "RIDER_HOME is not valid UTF-8",
+        ),
+        (
+            vec![("RIDER_HOME", "/srv/a:b".into())],
+            &[],
+            r#"rider's home "/srv/a:b" must not contain ':'"#,
+        ),
+    ];
+
+    for (set, unset, says) in cases {
+        let mut command = rider(&world);
+        command.envs(set.iter().map(|(name, value)| (name, value)));
+        for name in unset {
+            command.env_remove(name);
+        }
+        command.arg("config");
+        let output = run_bounded(command, None);
+
+        assert_eq!(output.code, Some(1), "{says}: {output:?}");
+        assert_eq!(output.stderr, format!("rider: {says}\n"));
+    }
+    let mut command = rider(&world);
+    command.env("HOME", bad()).arg("config");
+    let output = run_bounded(command, None);
+    assert_eq!(
+        output.code,
+        Some(0),
+        "RIDER_HOME wins over a bad HOME: {output:?}"
+    );
+}
+
+#[test]
+fn rider_serve_runs_vb_on_the_homes_board_in_the_foreground_and_exits_with_its_code() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let user_home = world.root.join("serving-user");
+    let home = user_home.join(".rider");
+    let record = world.root.join("vb-args");
+    given_a_fake_vb_in(&home, &record, 3);
+
+    let mut command = rider(&world);
+    command
+        .env_remove("RIDER_HOME")
+        .env("HOME", &user_home)
+        .arg("serve");
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(3), "{output:?}");
+    let board = home.join("board");
+    assert!(board.is_dir());
+    let args = fs::read_to_string(&record).expect("read the fake vb's arguments");
+    assert_eq!(
+        args,
+        format!("serve\n--dir\n{}\n--no-open\n", board.display())
+    );
+    assert!(!home.join("prompts").exists(), "serve copies no prompts");
+}
+
+#[test]
+fn the_daemon_writes_every_built_in_prompt_over_what_is_in_the_homes_prompts() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompts = world.home.join("prompts");
+    fs::create_dir_all(&prompts).expect("create the prompts directory");
+    fs::write(prompts.join("review.md"), "stale").expect("write a stale prompt");
+
+    given_a_running_daemon(&mut world);
+
+    let expected = [
+        ("implement.md", include_str!("../../prompts/implement.md")),
+        ("review.md", include_str!("../../prompts/review.md")),
+        ("security.md", include_str!("../../prompts/security.md")),
+        ("slop-rules.md", include_str!("../../prompts/slop-rules.md")),
+        ("qa.md", include_str!("../../prompts/qa.md")),
+    ];
+    for (name, text) in expected {
+        let found = fs::read_to_string(prompts.join(name)).expect("read a written prompt");
+        assert_eq!(found, text, "{name}");
+    }
+}
+
+#[test]
+fn rider_without_board_url_reaches_the_local_board_on_port_4100() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("default-url-home");
+    let record = world.root.join("vb-args");
+    given_a_fake_vb_in(&home, &record, 1);
+
+    let mut command = rider(&world);
+    command
+        .env_remove("BOARD_URL")
+        .env("RIDER_HOME", &home)
+        .args(["wait", "rider", "--timeout", "1"]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(
+        output.code,
+        Some(1),
+        "the fake vb fails the read: {output:?}"
+    );
+    let args = fs::read_to_string(&record).expect("read the fake vb's arguments");
+    let url = args.lines().skip_while(|arg| *arg != "--url").nth(1);
+    assert_eq!(url, Some("http://127.0.0.1:4100/api/board"), "{args}");
+}
+
+#[test]
+fn an_agent_whose_inherited_path_lacks_the_board_cli_still_runs_rider_homes_vb() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let vb_dir = world
+        .vb
+        .parent()
+        .expect("vb has a directory")
+        .display()
+        .to_string();
+    let path = world.child_path().replace(&format!(":{vb_dir}:"), ":");
+    assert!(!path.contains(&vb_dir), "{path}");
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Block]);
+
+    given_a_running_daemon_with(&mut world, &[("PATH", &path)]);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["blocked"]);
+    let block = task_block(&world, &task);
+    assert_eq!(
+        block,
+        Some(("needs_input".to_string(), BLOCK_QUESTION.to_string()))
+    );
+}
