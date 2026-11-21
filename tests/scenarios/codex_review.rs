@@ -76,6 +76,8 @@ fn a_native_review_whose_codex_review_exits_non_zero_fails() {
 
     assert_eq!(states, vec!["completed", "failed"]);
     assert_eq!(exit, Some(0));
+    assert_eq!(task_label(&world, &review, "rerun"), None);
+    assert_eq!(reruns_on_the_board(&world), Vec::new());
     assert_eq!(agent_runs_for(&world, &review)[0].harness, "codex-review");
     assert_eq!(
         task_records(&world, &review, "rider-result"),
@@ -130,6 +132,248 @@ fn a_native_review_stopped_by_the_content_filter_fails_showing_codexs_error() {
         replies.contains(fake_agent::CONTENT_FILTER_ERROR),
         "{replies}"
     );
+}
+
+#[test]
+fn a_review_stopped_by_the_content_filter_is_rerun_once_on_mythos_with_a_handoff() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    let brief = "Review the work of the sandbox: git diff main...HEAD.\n";
+    let review = NewTask::new(brief)
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built);
+    let review = when_the_lead_creates(&world, &review);
+    let amendment = "Only review src/.";
+    world.vb_lead(&["reply", &review, "-"], Some(amendment));
+    world.vb_lead(&["label", &review, "role=review"], None);
+    given_the_agent_will(&world, &review, &[Behaviour::ContentFilterStop]);
+    let native = when_the_lead_creates(&world, &a_native_review_of(&world, &built));
+    given_the_agent_will(&world, &native, &[Behaviour::ContentFilterStop]);
+    let qa = NewTask::new("Test the reviewed work.")
+        .label("repo", world.repo_label())
+        .label("of", &review)
+        .needs(&review)
+        .role("qa");
+    let qa = when_the_lead_creates(&world, &qa);
+    given_the_agent_will(&world, "default", &[Behaviour::CommitNothing]);
+
+    let tasks = [
+        built.as_str(),
+        review.as_str(),
+        native.as_str(),
+        qa.as_str(),
+    ];
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &tasks);
+    world.vb_lead(&["tasks", "reopen", &review], None);
+    let (again, _) = when_the_daemon_runs_until_settled(&mut world, &[&review]);
+
+    assert_eq!(
+        states,
+        vec!["completed", "failed", "failed", "completed"],
+        "{:?}",
+        task_block(&world, &qa)
+    );
+    assert_eq!(exit, Some(0));
+    assert_eq!(again, vec!["failed"]);
+    let reruns = reruns_on_the_board(&world);
+    assert_eq!(reruns.len(), 2, "{reruns:?}");
+    let reply_id = |id: &str, text: &str| -> String {
+        let replies = task_replies(&world, id);
+        let found = replies.iter().find(|reply| reply["text"] == json!(text));
+        let found = found.unwrap_or_else(|| panic!("no reply {text:?} in #{id}"));
+        found["id"].as_str().expect("a reply id").to_string()
+    };
+    let amended = format!(
+        "{}\n\n## Amendments from the thread of task #{review}, the latest winning\n\nReply \
+         #{}:\n{amendment}\n",
+        brief.trim_end(),
+        reply_id(&review, amendment)
+    );
+    let native_brief = "Review the work: git diff main...HEAD.";
+    for (failed, text) in [(&review, amended.as_str()), (&native, native_brief)] {
+        let rerun = reruns_of(&reruns, failed);
+        let read: serde_json::Value = serde_json::from_str(&task_text(&world, &rerun)).unwrap();
+        assert_eq!(read["message"]["text"], json!(text));
+        assert_eq!(read["message"]["task"]["needs"], json!([built]));
+        let labels = task_labels(&world, &rerun);
+        let expected = [
+            ("of", built.as_str()),
+            ("repo", world.repo_label()),
+            ("rerun_of", failed.as_str()),
+            ("role", "security"),
+        ];
+        let wanted: Vec<(String, String)> = (expected.iter())
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let got: Vec<(String, String)> = (labels.into_iter())
+            .filter(|(key, _)| expected.iter().any(|(wanted, _)| wanted == key))
+            .collect();
+        assert_eq!(got, wanted);
+        assert_eq!(task_label(&world, failed, "rerun"), Some(rerun.clone()));
+        let replies = replies_text(&world, failed);
+        let note = format!("rerun once on Mythos as security task #{rerun}");
+        assert_eq!(replies.matches(&note).count(), 1, "{replies}");
+        let handoff = reply_texts(&world, &rerun);
+        let plan = format!(
+            "- #{} by {}: {}",
+            reply_id(failed, fake_agent::CONTENT_FILTER_PLAN),
+            reply_profile(&world, failed, fake_agent::CONTENT_FILTER_PLAN),
+            fake_agent::CONTENT_FILTER_PLAN
+        );
+        assert!(
+            handoff.contains("verify and extend it rather than repeat it"),
+            "{handoff}"
+        );
+        assert!(handoff.contains(&plan), "{handoff}");
+    }
+    let handoff = reply_texts(&world, &reruns_of(&reruns, &review));
+    for line in [
+        "- said: I’ll review the PR and report findings in the task thread.",
+        "- ran `/bin/zsh -lc 'git status --porcelain'`, exit 0: ",
+        "/bin/echo sandbox-ready'`, exit 0: sandbox-ready",
+    ] {
+        assert!(handoff.contains(line), "{line} in {handoff}");
+    }
+    let review_rerun = reruns_of(&reruns, &review);
+    assert_eq!(task_label(&world, &qa, "of"), Some(review_rerun.clone()));
+    let read: serde_json::Value = serde_json::from_str(&task_text(&world, &qa)).unwrap();
+    assert_eq!(read["message"]["task"]["needs"], json!([review_rerun]));
+}
+
+#[test]
+fn a_long_handoff_is_cut_to_fit_the_board_and_the_rerun_still_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    let review = NewTask::new("Review the work: git diff main...HEAD.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built);
+    let review = when_the_lead_creates(&world, &review);
+    let profile = "a-worker-with-a-long-profile-xyz";
+    let long = format!("\u{1b}]0;owned\u{7}\u{202e}{}", "w".repeat(300));
+    for _ in 0..16 {
+        let output = world.vb_as(profile, &["reply", &review, "-"], Some(&long));
+        assert_eq!(output.code, Some(0), "{output:?}");
+    }
+    world.vb_lead(&["label", &review, "role=review"], None);
+    given_the_agent_will(&world, &review, &[Behaviour::ContentFilterStopLong]);
+    given_the_agent_will(&world, "default", &[Behaviour::CommitNothing]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "failed"]);
+    assert_eq!(exit, Some(0));
+    let reruns = reruns_on_the_board(&world);
+    let rerun = reruns_of(&reruns, &review);
+    assert_eq!(
+        task_label(&world, &rerun, "role"),
+        Some("security".to_string())
+    );
+    let handoff = reply_texts(&world, &rerun);
+    let handoff = handoff.split("```json").next().unwrap_or_default();
+    assert!(
+        handoff.starts_with("Handoff from the Codex run"),
+        "{handoff}"
+    );
+    assert!(
+        handoff.chars().count() <= 9_000,
+        "{}",
+        handoff.chars().count()
+    );
+    let controls: Vec<char> = (handoff.chars())
+        .filter(|c| (c.is_control() && *c != '\n') || ('\u{202a}'..='\u{202e}').contains(c))
+        .collect();
+    assert_eq!(controls, Vec::<char>::new());
+    assert!(
+        handoff
+            .trim_end()
+            .ends_with("- was running `last-command` when it stopped"),
+        "{handoff}"
+    );
+    assert!(handoff.contains(&format!("by {profile}: ")), "{handoff}");
+}
+
+#[test]
+fn a_reply_from_the_stopped_reviews_worker_is_not_delivered_to_the_rerun() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    let review = NewTask::new("Review the work: git diff main...HEAD.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::ContentFilterStop]);
+    let rerun_plan = [Behaviour::HoldThenNothing, Behaviour::ReportDecision];
+    given_the_agent_will(&world, "default", &rerun_plan);
+    given_a_running_daemon(&mut world);
+    let states = when_the_tasks_settle(&world, &[&built, &review]);
+    let rerun = (0..RERUN_POLLS)
+        .find_map(|_| {
+            let label = task_label(&world, &review, "rerun");
+            if label.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            label
+        })
+        .unwrap_or_else(|| panic!("no rerun of #{review}"));
+    when_the_agent_has_started(&world, &rerun);
+
+    let worker = reply_profile(&world, &review, fake_agent::CONTENT_FILTER_PLAN);
+    let note = world.vb_as(&worker, &["reply", &rerun, "-"], Some("Decision red."));
+    assert_eq!(note.code, Some(0), "{note:?}");
+    world.release_agent(&rerun);
+    let settled = when_the_tasks_settle(&world, &[&rerun]);
+
+    assert_eq!(states, vec!["completed", "failed"]);
+    assert_eq!(settled, vec!["completed"]);
+    assert_eq!(agent_runs_for(&world, &rerun).len(), 1);
+}
+
+const RERUN_POLLS: u32 = 150;
+
+fn reply_profile(world: &World, id: &str, text: &str) -> String {
+    let replies = task_replies(world, id);
+    let found = replies.iter().find(|reply| reply["text"] == json!(text));
+    let found = found.unwrap_or_else(|| panic!("no reply {text:?} in #{id}"));
+    found["by"]["profile"]
+        .as_str()
+        .expect("a profile")
+        .to_string()
+}
+
+fn reply_texts(world: &World, id: &str) -> String {
+    let replies = task_replies(world, id);
+    let texts = replies.iter().filter_map(|reply| reply["text"].as_str());
+    texts.collect::<Vec<_>>().join("\n")
+}
+
+fn reruns_on_the_board(world: &World) -> Vec<(String, String)> {
+    let all = tasks_in_state(world, "all");
+    let labelled = all.into_iter().filter_map(|id| {
+        let of = task_label(world, &id, "rerun_of")?;
+        Some((id, of))
+    });
+    labelled.collect()
+}
+
+fn reruns_of(reruns: &[(String, String)], failed: &str) -> String {
+    let mut found = reruns.iter().filter(|(_, of)| of == failed);
+    let (rerun, _) = found
+        .next()
+        .unwrap_or_else(|| panic!("no rerun of #{failed}"));
+    assert_eq!(found.next(), None, "a second rerun of #{failed}");
+    rerun.clone()
 }
 
 fn replies_text(world: &World, id: &str) -> String {

@@ -52,6 +52,24 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   `turn.failed`, or a top-level `error` after which no `turn.completed` comes (Codex gave up), fails.
   Fixture: `codex-reconnect.jsonl`, cut from a real review run, with the provider
   URL and `cf-ray` id redacted.
+- A provider's content filter ends a turn for good (2026-11-20, codex-cli 0.170.0, a `review`
+  run of sandboxing code on `gpt-6.1-sol`): a top-level `error` event, then
+  `{"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity
+  risk. If this seems wrong, try rephrasing your request. ..."}}`, then exit 1. `error` holds only
+  `message`; there is no code, so Rider recognises the stop by the message's first sentence, and
+  only on the last turn event being `turn.failed`. `codex review` prints the same message on
+  stderr. Rider reruns such a review once as a Mythos `security` task with the same brief.
+  `codex review` prints its `tokens used` footer after the error as it shuts down, so Rider
+  looks for the error among the last lines of stderr, not only the last one.
+  Fixture: `codex-content-filter.jsonl`: the run's real events around its last commands, with
+  the first message, and one command whose text held a local path, reworded. The rerun gets a
+  handoff reply built from these `command_execution` items (`command`, `exit_code`,
+  `aggregated_output`) and `agent_message` texts.
+  Known limits: the `codex review` transcript also holds command output, so a reviewed file
+  that prints the filter's `ERROR:` line near the end of a run that then fails can cause one
+  extra rerun (read-only, at most one per task). The handoff carries the last 160 characters
+  of each command's output, as the failure reply's log tail already does, so a secret a review
+  printed can reach the rerun's thread too.
 
 ## Codex review
 

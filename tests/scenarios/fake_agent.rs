@@ -44,9 +44,12 @@ pub enum Behaviour {
     /// As `codex review` whose review delegate never started: prints Codex's interruption
     /// message and exits 0.
     ReviewInterrupted,
-    /// As `codex review` stopped by the provider's content filter: prints `CONTENT_FILTER_ERROR`
-    /// on stderr and exits 1.
+    /// As Codex stopped by the provider's content filter, exiting 1: `codex exec` prints the
+    /// recorded `CONTENT_FILTER_EVENTS`, and `codex review` prints `CONTENT_FILTER_ERROR` on stderr.
     ContentFilterStop,
+    /// Like `ContentFilterStop` as `codex exec`, after 24 long commands whose output starts with
+    /// an escape sequence, and while `last-command` runs.
+    ContentFilterStopLong,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
     /// Like `Hold`, but ignores SIGTERM.
@@ -184,6 +187,7 @@ impl Behaviour {
             Behaviour::ReviewNothing => "review-nothing",
             Behaviour::ReviewInterrupted => "review-interrupted",
             Behaviour::ContentFilterStop => "content-filter-stop",
+            Behaviour::ContentFilterStopLong => "content-filter-stop-long",
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::HoldTalking => "hold-talking",
@@ -232,9 +236,11 @@ impl Behaviour {
 /// What Codex's interruption message for a review that never started begins with.
 pub const REVIEW_INTERRUPTED: &str =
     "Review was interrupted. Please re-run /review and wait for it to complete.";
-/// The error a `ContentFilterStop` agent prints on stderr.
-pub const CONTENT_FILTER_ERROR: &str =
-    "ERROR: This content was flagged for possible cybersecurity risk.";
+pub const CONTENT_FILTER_PLAN: &str = "Plan: check the sandbox profile first.";
+pub const CONTENT_FILTER_ERROR: &str = "ERROR: This content was flagged for possible cybersecurity risk. If this seems wrong, try \
+     rephrasing your request.";
+const CONTENT_FILTER_EVENTS: &str =
+    include_str!("../../fixtures/harness/codex-content-filter.jsonl");
 
 /// The question a blocking agent asks.
 pub const BLOCK_QUESTION: &str = "The fake agent needs an answer.";
@@ -321,6 +327,7 @@ harness=$(basename "$0")
 runs="$world/{RUNS_FILE}"
 attempt=$( (grep "^start $task " "$runs" 2>/dev/null || true) | wc -l | tr -d ' ')
 plan="$world/{BEHAVIOURS_DIR}/$task"
+[ -f "$plan" ] || plan="$world/{BEHAVIOURS_DIR}/default"
 behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=$(tail -n 1 "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
@@ -389,7 +396,31 @@ case "$behaviour" in
   exit-non-zero) exit {fail} ;;
   review-nothing) exit 0 ;;
   review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
-  content-filter-stop) echo "{CONTENT_FILTER_ERROR}" >&2; exit 1 ;;
+  content-filter-stop)
+    vb reply "$task" -- "{CONTENT_FILTER_PLAN}" > /dev/null || exit 2
+    if [ "$harness" = codex ]; then
+      cat <<'EVENTS'
+{CONTENT_FILTER_EVENTS}EVENTS
+    else
+      printf 'exec\n/bin/zsh -lc ls\n succeeded in 5ms:\nsrc\n' >&2
+      printf '%s\ntokens used\n4,080\n' "{CONTENT_FILTER_ERROR}" >&2
+    fi
+    exit 1 ;;
+  content-filter-stop-long)
+    pad=$(printf '%160s' '' | tr ' ' c)
+    out=$(printf '%160s' '' | tr ' ' o)
+    i=0
+    while [ $i -lt 24 ]; do
+      item='"id":"item_'$i'","type":"command_execution","command":"cmd'$i' '$pad'"'
+      item="$item"',"aggregated_output":"\u001b[2J'$out'","exit_code":0,"status":"completed"'
+      echo '{{"type":"item.completed","item":{{'"$item"'}}}}'
+      i=$((i + 1))
+    done
+    item='"id":"item_99","type":"command_execution","command":"last-command","status":"in_progress"'
+    echo '{{"type":"item.started","item":{{'"$item"'}}}}'
+    cat <<'EVENTS' | tail -n 2
+{CONTENT_FILTER_EVENTS}EVENTS
+    exit 1 ;;
   wander-branch) git switch -q -c elsewhere && commit || exit 1 ;;
   detach) git checkout -q --detach && commit || exit 1 ;;
   commit-then-fail) commit; exit {fail} ;;

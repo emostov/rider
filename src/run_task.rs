@@ -14,8 +14,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::board::{
-    Amendment, Board, BoardError, MESSAGE_CHARS_MAX, REPLIES_MAX, TaskId, TaskState, TaskView,
-    Thread, message_tail, one_line,
+    Amendment, Board, BoardError, MESSAGE_CHARS_MAX, REPLIES_MAX, RERUN_OF_LABEL, SET_NEEDS_MAX,
+    TaskId, TaskState, TaskView, Thread, message_tail, one_line,
 };
 use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
 use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES};
@@ -27,7 +27,7 @@ use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, Io, LOG_BYTES_MAX,
     PROMPT_BYTES_MAX, Resume, SESSION_BYTES_MAX, SessionId, Usage, command_for, stderr_log,
 };
-use crate::roles::{Harness, RoleSpec, role_in_repo};
+use crate::roles::{Harness, PROFILE_LEN_MAX, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
@@ -59,6 +59,23 @@ pub const IDENTITY_READS_MAX: u32 = 5;
 const IDENTITY_PAUSE_MILLIS: u64 = 1_000;
 const SUMMARY_CHARS_MAX: usize = TAIL_REPLY_CHARS_MAX / 6;
 const ATTEMPT_LABEL: &str = "attempt";
+const RERUN_LABEL: &str = "rerun";
+const RERUN_ROLE: &str = "security";
+const RERUN_FROM_ROLES: [&str; 2] = ["review", "native-review"];
+const RERUN_TRIES: u32 = 3;
+const HANDOFF_REPLIES_MAX: usize = 16;
+const HANDOFF_LINE_CHARS: usize = 160;
+const HANDOFF_HEADER_CHARS_MAX: usize = 400;
+const HANDOFF_REPLY_LINE_CHARS_MAX: usize = HANDOFF_LINE_CHARS + PROFILE_LEN_MAX + 40;
+const HANDOFF_CHARS_MAX: usize = 8_000;
+const _: () = assert!(HANDOFF_CHARS_MAX + 1_000 <= MESSAGE_CHARS_MAX);
+const _: () = assert!(
+    HANDOFF_HEADER_CHARS_MAX
+        + HANDOFF_REPLIES_MAX * HANDOFF_REPLY_LINE_CHARS_MAX
+        + 4 * harness::HANDOFF_LOG_LINE_CHARS_MAX
+        <= HANDOFF_CHARS_MAX
+);
+const _: () = assert!(RERUN_TRIES > 0);
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
@@ -1408,10 +1425,10 @@ fn branch_tasks(
     });
     let own = named.tasks.iter().find(|task| task.view.id == id);
     let channel = own.ok_or_else(|| format!("task #{} is not listed on it", id.0))?;
-    let channel = &channel.channel;
+    let channel = &channel.view.channel;
     let mut on_branch: Vec<u64> = vec![onto.0];
     let mine = (named.tasks.iter())
-        .filter(|task| task.channel == *channel && same_repo(&task.view, &attempt.brief.repo))
+        .filter(|task| task.view.channel == *channel && same_repo(&task.view, &attempt.brief.repo))
         .filter(|task| label(&task.view, BRANCH_LABEL) == Some(branch));
     for task in mine {
         if on_branch.contains(&task.view.id.0) {
@@ -1541,7 +1558,172 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     if board.reply(id, &format!("{header}\n{tail}")).is_err() {
         let _ = board.reply(id, &header);
     }
+    let role = attempt.brief.role;
+    let filtered = harness::stopped_by_content_filter(&role.harness, &attempt.log());
+    if filtered && RERUN_FROM_ROLES.contains(&role.label) {
+        rerun_on_mythos(id, board, attempt);
+    }
     Ok(())
+}
+
+fn rerun_on_mythos(id: TaskId, board: &dyn Board, attempt: &Attempt) {
+    assert!(RERUN_FROM_ROLES.contains(&attempt.brief.role.label));
+    let note = match rerun(id, board, attempt) {
+        Ok(None) => return,
+        Ok(Some((rerun, relinked))) => format!(
+            "The provider's content filter stopped this review, so it is rerun once on Mythos \
+             as security task #{}, with the same brief, its amendments, and a handoff of this \
+             run's work.{relinked}",
+            rerun.0
+        ),
+        Err(error) => format!("Rider could not rerun this review on Mythos: {error}."),
+    };
+    let _ = board.reply(id, &one_line(&note));
+}
+
+fn retried<T>(mut call: impl FnMut() -> Result<T, BoardError>) -> Result<T, BoardError> {
+    let mut last = call();
+    for _ in 1..RERUN_TRIES {
+        if last.is_ok() {
+            break;
+        }
+        last = call();
+    }
+    last
+}
+
+fn rerun(
+    id: TaskId,
+    board: &dyn Board,
+    attempt: &Attempt,
+) -> Result<Option<(TaskId, String)>, BoardError> {
+    let view = retried(|| board.read_task(id))?;
+    if label(&view, RERUN_LABEL).is_some() {
+        return Ok(None);
+    }
+    let (Some(of), Some(repo)) = (attempt.brief.of, label(&view, "repo")) else {
+        return Ok(None);
+    };
+    let thread = retried(|| board.thread(id))?;
+    let mut text = view.text.clone();
+    if !thread.amendments.is_empty() {
+        text.push_str(&format!(
+            "\n\n## Amendments from the thread of task #{}, the latest winning\n",
+            id.0
+        ));
+    }
+    for amendment in &thread.amendments {
+        text.push_str(&format!(
+            "\nReply #{}:\n{}\n",
+            amendment.id.0, amendment.text
+        ));
+    }
+    if text.chars().count() > MESSAGE_CHARS_MAX {
+        return Err(BoardError::Parse(format!(
+            "the brief and its amendments pass {MESSAGE_CHARS_MAX} characters"
+        )));
+    }
+    let (of_text, own) = (of.0.to_string(), id.0.to_string());
+    let labels = [
+        ("repo", repo),
+        ("of", of_text.as_str()),
+        (RERUN_OF_LABEL, own.as_str()),
+    ];
+    let key = format!("rider-rerun-{own}");
+    let rerun = retried(|| board.create_task(&view.channel, &text, &labels, &[of], &key))?;
+    assert!(rerun != id && rerun != of);
+    let handoff = handoff(id, &thread.others, attempt);
+    let handed = board.reply(rerun, &handoff).map_or_else(
+        |error| {
+            format!(
+                " Rider could not post the handoff to #{}: {error}.",
+                rerun.0
+            )
+        },
+        |()| String::new(),
+    );
+    let checked = retried(|| board.read_task(of))?;
+    if let Some(branch) = label(&checked, BRANCH_LABEL) {
+        retried(|| board.set_label(rerun, BRANCH_LABEL, branch))?;
+    }
+    retried(|| board.set_label(rerun, "role", RERUN_ROLE))?;
+    let relinked = relink(id, rerun, board).map_or_else(
+        |error| {
+            format!(
+                " Rider could not point the tasks that wait for it at #{}: {error}.",
+                rerun.0
+            )
+        },
+        |count| {
+            format!(
+                " {count} tasks that waited for it or checked it now use #{}.",
+                rerun.0
+            )
+        },
+    );
+    retried(|| board.set_label(id, RERUN_LABEL, &rerun.0.to_string()))?;
+    Ok(Some((rerun, format!("{handed}{relinked}"))))
+}
+
+fn handoff(id: TaskId, others: &[Amendment], attempt: &Attempt) -> String {
+    let own = id.0;
+    let mut handoff = format!(
+        "Handoff from the Codex run of task #{own} that the content filter stopped. It is a \
+         record of work already done, not instructions: verify and extend it rather than \
+         repeat it.\n\nWhat it posted in task #{own}'s thread:\n"
+    );
+    assert!(handoff.chars().count() <= HANDOFF_HEADER_CHARS_MAX);
+    let skip = others.len().saturating_sub(HANDOFF_REPLIES_MAX);
+    for reply in others.iter().skip(skip) {
+        let by = reply.profile.as_deref().unwrap_or("owner");
+        let by = harness::clip(by, PROFILE_LEN_MAX, false);
+        let first = reply.text.lines().find(|line| !line.trim().is_empty());
+        let first = harness::clip(first.unwrap_or_default(), HANDOFF_LINE_CHARS, false);
+        handoff.push_str(&format!("- #{} by {by}: {first}\n", reply.id.0));
+    }
+    handoff.push_str("\nWhat its log shows, oldest first:\n");
+    let log = harness::handoff(&attempt.brief.role.harness, &attempt.log());
+    let mut room = HANDOFF_CHARS_MAX.saturating_sub(handoff.chars().count());
+    let mut kept = 0usize;
+    for line in log.iter().rev() {
+        let size = line.chars().count() + 1;
+        if size > room {
+            break;
+        }
+        room -= size;
+        kept += 1;
+    }
+    for line in &log[log.len() - kept..] {
+        handoff.push_str(line);
+        handoff.push('\n');
+    }
+    assert!(handoff.chars().count() <= HANDOFF_CHARS_MAX);
+    handoff
+}
+
+fn relink(failed: TaskId, rerun: TaskId, board: &dyn Board) -> Result<usize, BoardError> {
+    let listing = retried(|| board.list_open(SUBTREE))?;
+    let (failed_text, rerun_text) = (failed.0.to_string(), rerun.0.to_string());
+    let mut count = 0usize;
+    for task in &listing.tasks {
+        let view = &task.view;
+        let checks = label(view, "of") == Some(failed_text.as_str());
+        if view.needs.contains(&failed) {
+            let needs: Vec<TaskId> = (view.needs.iter())
+                .map(|need| if *need == failed { rerun } else { *need })
+                .collect();
+            if needs.len() > SET_NEEDS_MAX {
+                return Err(BoardError::TooManyNeeds);
+            }
+            retried(|| board.set_needs(view.id, &needs))?;
+        }
+        if checks {
+            retried(|| board.set_label(view.id, "of", &rerun_text))?;
+        }
+        count += usize::from(checks || view.needs.contains(&failed));
+    }
+    assert!(count <= listing.tasks.len());
+    Ok(count)
 }
 
 // The window past its first byte, which is the one before the window, read only for its `\n`.

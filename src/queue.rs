@@ -430,7 +430,7 @@ fn entries(tasks: &[ListedTask]) -> Vec<Entry<'_>> {
     let mut entries: Vec<Entry> = (tasks.iter())
         .map(|task| Entry {
             task,
-            item: if task.channel == QUEUE_CHANNEL {
+            item: if task.view.channel == QUEUE_CHANNEL {
                 parse_pr_item(task)
             } else {
                 decision(task)
@@ -439,11 +439,11 @@ fn entries(tasks: &[ListedTask]) -> Vec<Entry<'_>> {
         .collect();
     for entry in &mut entries {
         let task = entry.task;
-        let Some(pr) = label(task, "pr").filter(|_| task.channel == QUEUE_CHANNEL) else {
+        let Some(pr) = label(task, "pr").filter(|_| task.view.channel == QUEUE_CHANNEL) else {
             continue;
         };
         let first = (tasks.iter())
-            .filter(|other| other.channel == QUEUE_CHANNEL && other.view.id.0 < task.view.id.0)
+            .filter(|other| other.view.channel == QUEUE_CHANNEL && other.view.id.0 < task.view.id.0)
             .filter(|other| label(other, "pr") == Some(pr))
             .map(|other| other.view.id)
             .min_by_key(|id| id.0);
@@ -617,7 +617,7 @@ fn row(entry: &Entry, item: &Item, place: Place, now: u64) -> String {
         .map_or("-".to_string(), |since| age(now.saturating_sub(since)));
     let link = match &item.pr {
         Some(pr) => format!("{PR_URL}{}/pull/{}", pr.repo, pr.number),
-        None => format!("{} #{}", entry.task.channel, entry.task.view.id.0),
+        None => format!("{} #{}", entry.task.view.channel, entry.task.view.id.0),
     };
     assert!(rank.len() <= RANK_WIDTH && age.len() <= 3 && state.len() <= STATE_WIDTH);
     let line = format!(
@@ -667,7 +667,7 @@ fn entry_json(entry: &Entry, place: Place, invalid: Option<&str>) -> Value {
     assert!(labels.len() == entry.task.view.labels.len());
     json!({
         "id": entry.task.view.id.0,
-        "channel": entry.task.channel,
+        "channel": entry.task.view.channel,
         "rank": rank,
         "labels": labels,
         "needs": needs,

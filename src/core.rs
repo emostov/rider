@@ -1308,7 +1308,8 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
     let mut listed_untracked: usize = 0;
     // Tasks with a run go first, so a run's task stays known whatever the overflow.
     for with_run in [true, false] {
-        for ListedTask { view, channel } in tasks {
+        for ListedTask { view } in tasks {
+            let channel = &view.channel;
             let has_run = state.runs.iter().any(|run| run.task == view.id);
             let newer = state.tasks.iter().any(|task| task.id == view.id)
                 || (state.closed.iter()).any(|(id, at)| *id == view.id && *at >= view.version)

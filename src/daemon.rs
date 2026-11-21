@@ -1425,6 +1425,21 @@ impl Board for Guarded<'_> {
     fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError> {
         self.board.create_schema(id, json)
     }
+    fn set_needs(&self, id: TaskId, needs: &[TaskId]) -> Result<(), BoardError> {
+        self.gate(false)?;
+        self.board.set_needs(id, needs)
+    }
+    fn create_task(
+        &self,
+        channel: &str,
+        text: &str,
+        labels: &[(&str, &str)],
+        needs: &[TaskId],
+        key: &str,
+    ) -> Result<TaskId, BoardError> {
+        self.gate(false)?;
+        self.board.create_task(channel, text, labels, needs, key)
+    }
 }
 
 fn release(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {

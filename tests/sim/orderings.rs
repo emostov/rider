@@ -177,6 +177,7 @@ fn listed(
     ListedTask {
         view: TaskView {
             id,
+            channel: "work/sim".to_string(),
             text: String::new(),
             state,
             labels,
@@ -188,7 +189,6 @@ fn listed(
             }),
             version: Cursor(1),
         },
-        channel: "work/sim".to_string(),
     }
 }
 
