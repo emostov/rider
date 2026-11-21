@@ -4,12 +4,12 @@ use rider::harness::{
     CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId, command_for,
     last_message, run, run_on_clock, session_id, stream_reports_failure,
 };
-use rider::roles::{Harness, role_from_label};
+use rider::roles::{AGENTS_MAX, Harness, role_from_label};
 use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::{Builder, TempDir};
@@ -37,6 +37,12 @@ impl Scratch {
     }
 }
 
+static READER_BUDGET: RwLock<()> = RwLock::new(());
+
+fn sharing_the_reader_budget() -> RwLockReadGuard<'static, ()> {
+    READER_BUDGET.read().unwrap_or_else(PoisonError::into_inner)
+}
+
 const PROMPT: &str = "Do the task.";
 const LINE_BYTES_MAX: usize = 4 * 1024 * 1024;
 
@@ -55,6 +61,7 @@ fn fake(args: &[&str]) -> CommandLine {
 
 #[test]
 fn exit_code_is_reported() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("exit");
     let log = scratch.root.join("logs").join("deep").join("agent.log");
     let mut cmd = fake(&["2", "5", "0", "3"]);
@@ -77,6 +84,7 @@ fn exit_code_is_reported() {
 
 #[test]
 fn log_stops_growing_at_the_cap() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("cap");
     let log = scratch.root.join("agent.log");
     let exit = run(
@@ -93,6 +101,7 @@ fn log_stops_growing_at_the_cap() {
 
 #[test]
 fn a_hung_agent_is_killed_at_the_limit() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("hung");
     let log = scratch.root.join("agent.log");
     let start = Instant::now();
@@ -105,6 +114,7 @@ fn a_hung_agent_is_killed_at_the_limit() {
 
 #[test]
 fn an_agent_that_ignores_sigterm_is_killed_after_the_grace() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("stubborn");
     let log = scratch.root.join("agent.log");
     let start = Instant::now();
@@ -117,6 +127,7 @@ fn an_agent_that_ignores_sigterm_is_killed_after_the_grace() {
 
 #[test]
 fn a_leftover_process_holding_the_pipe_does_not_stall_rider() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("orphan");
     let log = scratch.root.join("agent.log");
     let start = Instant::now();
@@ -129,6 +140,7 @@ fn a_leftover_process_holding_the_pipe_does_not_stall_rider() {
 
 #[test]
 fn a_process_that_left_the_group_does_not_stall_rider() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("escape");
     let log = scratch.root.join("agent.log");
     let start = Instant::now();
@@ -144,6 +156,7 @@ fn a_process_that_left_the_group_does_not_stall_rider() {
 
 #[test]
 fn a_signal_rider_did_not_send_is_reported() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("signal");
     let log = scratch.root.join("agent.log");
     let cmd = fake(&["0", "0", "30", "0", "kill-self"]);
@@ -153,6 +166,7 @@ fn a_signal_rider_did_not_send_is_reported() {
 
 #[test]
 fn a_missing_program_is_a_spawn_error() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("missing");
     let log = scratch.root.join("agent.log");
     let mut cmd = fake(&[]);
@@ -334,7 +348,8 @@ fn a_codex_turn_is_judged_by_how_it_ended() {
 
 #[test]
 fn reader_slots_are_returned_after_each_run() {
-    const RUNS: usize = 4 * 2 * rider::roles::AGENTS_MAX as usize / 2 + 1;
+    let _sharing = sharing_the_reader_budget();
+    const RUNS: usize = 4 * 2 * AGENTS_MAX as usize / 2 + 1;
     let scratch = Scratch::new("slots");
     let log = scratch.root.join("agent.log");
     for _ in 0..RUNS {
@@ -345,6 +360,7 @@ fn reader_slots_are_returned_after_each_run() {
 
 #[test]
 fn a_log_write_that_hangs_does_not_stop_the_time_limit() {
+    let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("fifo");
     let log = scratch.root.join("agent.log");
     let made = Command::new("mkfifo")
@@ -383,6 +399,7 @@ fn run_with_wall_clock(name: &str, shift: fn(SystemTime) -> SystemTime) -> (Exit
         let now = SystemTime::now();
         if read.replace(true) { shift(now) } else { now }
     };
+    let _sharing = sharing_the_reader_budget();
     let start = Instant::now();
     let cmd = fake(&["1", "10", "20", "0"]);
     let exit = run_on_clock(&cmd, &scratch.root, &log, 2, 4096, &wall_clock);
@@ -402,4 +419,59 @@ fn a_wall_clock_set_back_counts_no_time_and_the_attempt_ends_at_its_limit() {
     assert_eq!(exit, Exit::TimedOut);
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+#[test]
+fn a_run_past_the_reader_budget_is_refused_and_the_holders_finish() {
+    const HOLDERS_MAX: usize = 4 * 2 * AGENTS_MAX as usize / 2 + 1;
+    const POLLS_MAX: u32 = 1000;
+    let _alone = READER_BUDGET
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("budget");
+    let release = scratch.root.join("release");
+    let hold = format!(
+        r#"echo started > "$0"; n=0
+until [ -e '{}' ] || [ "$n" -gt 600 ]; do n=$((n + 1)); sleep 0.05; done"#,
+        release.display()
+    );
+    let mut holders = Vec::new();
+    let mut refused = None;
+    for index in 0..HOLDERS_MAX {
+        let started = scratch.root.join(format!("started-{index}"));
+        let cmd = CommandLine {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                hold.clone(),
+                started.display().to_string(),
+            ],
+            env: Vec::new(),
+        };
+        let (root, log) = (
+            scratch.root.clone(),
+            scratch.root.join(format!("{index}.log")),
+        );
+        let holder = thread::spawn(move || run(&cmd, &root, &log, 60, 4096));
+        let mut polls = 0;
+        while !started.exists() && !holder.is_finished() && polls < POLLS_MAX {
+            polls += 1;
+            thread::sleep(Duration::from_millis(10));
+        }
+        if holder.is_finished() {
+            refused = Some(holder.join());
+            break;
+        }
+        holders.push(holder);
+    }
+    fs::write(&release, "").unwrap();
+    for holder in holders {
+        assert_eq!(holder.join().unwrap().unwrap(), Exit::Code(0));
+    }
+    let refused = refused.expect("a run past the budget finishes at once");
+    let refused = refused.expect("a run past the budget returns, not panics");
+    assert!(
+        matches!(refused, Err(HarnessError::ReadersExhausted)),
+        "{refused:?}"
+    );
 }
