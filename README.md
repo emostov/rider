@@ -18,7 +18,8 @@ Rider runs one agent per task, each in its own git worktree, with a model picked
   role in `rider.toml`; `rider config` prints the values in effect.
 - **A role for each job.** `implement` (Opus) and `light` (Sonnet) write code. `review` runs
   `codex exec` and `native-review` runs Codex's built-in `codex review`. `security` runs on
-  Mythos, and `qa` tests the result. Each role sets its harness, model, prompt and slots.
+  Mythos, and `qa` tests the result. Roles are configurable: change any role's harness,
+  model, prompt and slots, or add roles of your own, under `[roles.<name>]` in `rider.toml`.
 - **Reviews at the end of each PR.** The lead runs a `review` and a `native-review` of the
   whole diff in parallel, then one fix task for their blocking findings. A Mythos `security`
   review of the whole PR comes last.
