@@ -3,9 +3,9 @@
 
 use rider::board::{Claim, ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
-    Action, CLIENTS_MAX, Call, ClientId, Config, ErrorCode, Event, LEASE_MILLIS, Phase, Reply,
-    Request, RunId, SETTLE_PAUSE_MILLIS, SETTLE_TRIES_MAX, STOP_MILLIS_MAX, Settlement, State,
-    StopReason, TASKS_MAX, UNTRACKED_MAX, Untracked, step,
+    Action, CLIENTS_MAX, Call, ClientId, Config, ErrorCode, Event, LEASE_MILLIS,
+    PREPARE_MILLIS_MAX, Phase, Reply, Request, RunId, SETTLE_PAUSE_MILLIS, SETTLE_TRIES_MAX,
+    STOP_MILLIS_MAX, Settlement, State, StopReason, TASKS_MAX, UNTRACKED_MAX, Untracked, step,
 };
 use rider::daemon::EVENT_QUEUE_MAX;
 use rider::feed::{BoardEvent, Cursor, EventKind};
@@ -466,7 +466,6 @@ fn an_agent_finishing_during_an_outage_is_settled_when_the_board_returns() {
 }
 
 #[test]
-#[ignore = "known gap: a resumed claim whose renewal fails is not resumed again"]
 fn a_failed_startup_renewal_is_retried_when_the_board_returns() {
     let task = TaskId(1);
     let mut script = Script::bare();
@@ -484,9 +483,80 @@ fn a_failed_startup_renewal_is_retried_when_the_board_returns() {
     script.step(Event::BoardFailed(Call::Claim(run)));
     script.tick_after(60 * SECOND);
     let back = script.snapshot(vec![task_listed()]);
-    let resumed =
-        (back.iter()).any(|action| matches!(action, Action::Resume { task: t, .. } if *t == task));
-    assert!(resumed, "the board returned, and the core sent {back:?}");
+    let again = match back.as_slice() {
+        [Action::Resume { run, task: t, .. }, Action::ListTasks] if *t == task => *run,
+        other => panic!("the board returned, and the core sent {other:?}"),
+    };
+    assert_eq!(
+        script.claimed(again),
+        vec![Action::Prepare { run: again, task }]
+    );
+    let later = script.snapshot(vec![task_listed()]);
+    assert_eq!(later, vec![]);
+}
+
+#[test]
+fn a_startup_renewal_failing_after_a_retry_snapshot_is_retried_again() {
+    let (first, second) = (TaskId(1), TaskId(2));
+    let mut script = Script::bare();
+    assert_eq!(script.step(Event::Tick(START)), vec![Action::ListTasks]);
+    let config = Config::from_roles(&ROLES);
+    let role = &config.roles[0];
+    let labels = vec![("role".to_string(), role.label.clone())];
+    let held = |task: TaskId, slot: u8| {
+        let holder = format!("{HOLDER}{}-{slot}-{}", role.label, role.model_slug);
+        listed(task, TaskState::Claimed, labels.clone(), Some(holder))
+    };
+    let both = || vec![held(first, 1), held(second, 2)];
+    let resumes = |actions: &[Action]| -> Vec<(TaskId, RunId)> {
+        let resumed = actions.iter().filter_map(|action| match action {
+            Action::Resume { run, task, .. } => Some((*task, *run)),
+            _ => None,
+        });
+        resumed.collect()
+    };
+    let start = resumes(&script.snapshot(both()));
+    let [(_, run_a), (_, run_b)] = start.as_slice() else {
+        panic!("two held claims at start-up were answered {start:?}");
+    };
+    let (run_a, run_b) = (*run_a, *run_b);
+    script.step(Event::BoardFailed(Call::Claim(run_a)));
+    script.tick_after(10 * SECOND);
+    let retried = resumes(&script.snapshot(both()));
+    let [(task, retry_a)] = retried.as_slice() else {
+        panic!("the board returned, and the core resumed {retried:?}");
+    };
+    assert_eq!(*task, first);
+    let retry_a = *retry_a;
+    script.step(Event::BoardFailed(Call::Claim(run_b)));
+    script.claimed(retry_a);
+    script.tick_after(10 * SECOND);
+    let last = resumes(&script.snapshot(both()));
+    assert_eq!(
+        last.iter().map(|(task, _)| *task).collect::<Vec<_>>(),
+        vec![second]
+    );
+}
+
+#[test]
+fn a_prepare_retry_due_at_the_phase_deadline_is_not_sent() {
+    let task = TaskId(1);
+    let mut script = Script::new();
+    let run = script.ready(task);
+    assert_eq!(script.claimed(run), vec![Action::Prepare { run, task }]);
+    script.tick_after(PREPARE_MILLIS_MAX - SETTLE_PAUSE_MILLIS);
+    script.step(Event::BoardFailed(Call::Prepare(run)));
+    script.snapshot(vec![listed(
+        task,
+        TaskState::Claimed,
+        role_labels(),
+        Some(format!("{HOLDER}{}", profile(&script, run))),
+    )]);
+    let due = script.tick_after(SETTLE_PAUSE_MILLIS);
+    let prepares = due
+        .iter()
+        .filter(|action| matches!(action, Action::Prepare { .. }));
+    assert_eq!(prepares.count(), 0, "at the deadline the core sent {due:?}");
 }
 
 /// A run of `built` on a branch has sent its closing write when its renewal finds the claim

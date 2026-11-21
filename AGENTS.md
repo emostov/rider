@@ -50,7 +50,7 @@ Rider is written in TigerStyle and tested thoroughly enough that it can be rewri
 
 - Every child process gets a closed standard input, unless text is being fed to it, and has its output read through a named byte bound.
 - Text handed to another CLI goes after a final `--` or through standard input, never as a bare argument that could be read as an option.
-- Rider runs against real repositories. Never reset, clean, force, push, merge, or delete a branch. A worktree is removed only when it is safe to: no modified or untracked files, on its expected branch, no operation in progress. Git-ignored build output does not stop a removal.
+- Rider runs against real repositories. Never reset, clean, force, push, merge, or delete a branch. The one exception is `rider pr <task>`, which only the lead runs: it pushes a completed task's branch without force and opens its draft PR. A worktree is removed only when it is safe to: no modified or untracked files, on its expected branch, no operation in progress. Git-ignored build output does not stop a removal.
 - Clear inherited `GIT_*` repository variables on every git child.
 
 ## Comments
