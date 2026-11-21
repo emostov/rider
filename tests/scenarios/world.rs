@@ -241,7 +241,7 @@ impl World {
         panic!("the board did not answer within {BOARD_START_SECONDS_MAX} seconds");
     }
 
-    fn stop_board(&mut self) {
+    pub fn stop_board(&mut self) {
         let mut board = self.board.take().expect("the board was started");
         assert!(reap(&mut board), "the board outlived its kill");
     }
