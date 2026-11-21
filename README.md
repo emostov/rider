@@ -56,7 +56,9 @@ for Claude Code or `~/.codex/skills` for Codex.
 ## Quickstart
 
 The `ride-swarm` skill needs Rust, Node 22, `jq`, and both `claude` and `codex` on `PATH`,
-each signed in. It stops and names any that is missing.
+each signed in. It stops and names any of those that is missing. It installs what it can
+and tells you: `rider` with `cargo install --git`, and the Board CLI with an unpinned
+`npm install @vercel/board` under `<rider home>/node`.
 
 Open a coding-agent session in a terminal you keep open and say `ride a swarm to <goal>`.
 The lead starts the daemon with `rider up`, plans the goal into tasks on the board, and
