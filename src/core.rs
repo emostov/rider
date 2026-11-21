@@ -1853,6 +1853,13 @@ fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action
     assert!(branches_unique(&state.runs));
 }
 
+fn onto_of_run(state: &State, run: &Run) -> Option<TaskId> {
+    let task = state.tasks.iter().find(|task| task.id == run.task);
+    let onto = task.and_then(|task| task.onto);
+    assert!(onto != Some(run.task));
+    onto
+}
+
 /// The oldest claimable task, its role, and the lowest free slot of that role; a task of a
 /// building role is claimable only while fewer than `builders_max` building runs exist.
 fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
@@ -1874,6 +1881,7 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
                 || (task.branch.is_some() && run.branch == task.branch)
                 || task.onto == Some(run.task)
                 || (task.onto.is_some() && closing(run) && run.branch.is_some())
+                || (task.onto.is_some() && onto_of_run(state, run) == task.onto)
         });
         if task.state != TaskState::Ready || taken {
             continue;

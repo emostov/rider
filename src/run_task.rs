@@ -530,9 +530,9 @@ pub fn judge_attempt(
         && attempt.fresh_log.get().is_some()
     {
         let note = format!(
-            "{:?} could not resume session {} before doing any work, so the attempt ran \
+            "{} could not resume session {} before doing any work, so the attempt ran \
              again starting fresh.",
-            attempt.brief.role.harness,
+            harness_name(attempt.brief.role.harness),
             fresh.session.as_str()
         );
         // The note only informs; losing it must not stop the attempt.
@@ -764,8 +764,9 @@ fn prepare(
     let session = brief.resume.then(|| resume_session(&brief, &env.home));
     let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
         (Ok(_), Some(onto)) => format!(
-            "Resuming the {:?} session of task #{}.",
-            brief.role.harness, onto.0
+            "Resuming the {} session of task #{}.",
+            harness_name(brief.role.harness),
+            onto.0
         ),
         (Ok(_), None) => panic!("a session is only resumed from an `onto` task"),
         (Err(why), _) => format!("Starting a fresh session despite `resume=1`: {why}."),
@@ -857,7 +858,8 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     let (session, repo) = text.split_once('\n').ok_or_else(malformed)?;
     let repo = repo.strip_suffix('\n').filter(|repo| !repo.is_empty());
     let repo = Path::new(repo.ok_or_else(malformed)?);
-    let (harness, session) = session.split_once(' ').ok_or_else(malformed)?;
+    // Sessions recorded before the harness word was written are Claude's.
+    let (harness, session) = session.split_once(' ').unwrap_or(("claude", session));
     let harness = match harness {
         "claude" => Harness::Claude,
         "codex" => Harness::Codex,
@@ -866,8 +868,18 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     let session = SessionId::parse(session).ok_or_else(malformed)?;
     if harness != brief.role.harness {
         return Err(format!(
-            "task #{}'s session was recorded by {harness:?}, and role {} runs {:?}",
-            onto.0, brief.role.label, brief.role.harness
+            "task #{}'s session was recorded by {}, and role {} runs {}",
+            onto.0,
+            harness_name(harness),
+            brief.role.label,
+            harness_name(brief.role.harness)
+        ));
+    }
+    if harness == Harness::Codex && brief.role.label != "review" {
+        return Err(format!(
+            "Codex continues a session in place, so only a review resumes one, and role {} \
+             is not review",
+            brief.role.label
         ));
     }
     if repo != brief.repo {
@@ -880,6 +892,14 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);
     Ok(session)
+}
+
+fn harness_name(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Claude => "Claude",
+        Harness::Codex => "Codex",
+        Harness::CodexReview => "Codex review",
+    }
 }
 
 fn session_path(home: &Path, id: TaskId) -> PathBuf {

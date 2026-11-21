@@ -28,6 +28,8 @@ pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
 const ARGS_MAX: usize = 16;
+const CODEX_REFUSAL_BYTES_MAX: usize = 64 * 1024;
+const CODEX_NO_ROLLOUT: &str = "no rollout found for thread id";
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
@@ -828,12 +830,19 @@ pub fn session_id(harness: Harness, log: &Path) -> Option<SessionId> {
 /// names a session the harness cannot open; false when the log is unreadable.
 pub fn ended_before_any_turn(harness: Harness, log: &Path) -> bool {
     if harness == Harness::Codex {
-        // A refused `codex exec resume` prints only an error to stderr: no thread starts.
+        // A refused `codex exec resume` prints only this error to stderr: no thread starts.
         let mut started = false;
         let read = scan(log, |event| {
             started |= matches!(event, CodexEvent::ThreadStarted { .. });
         });
-        return read && !started;
+        let mut head = String::new();
+        let text = File::open(log).and_then(|file| {
+            let bound = u64::try_from(CODEX_REFUSAL_BYTES_MAX).unwrap_or(u64::MAX);
+            file.take(bound).read_to_string(&mut head)
+        });
+        let refused = text.is_ok() && head.contains(CODEX_NO_ROLLOUT);
+        assert!(head.len() <= CODEX_REFUSAL_BYTES_MAX);
+        return read && !started && refused;
     }
     let mut results = 0u64;
     let mut refused = false;

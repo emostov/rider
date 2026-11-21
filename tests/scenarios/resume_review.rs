@@ -1,3 +1,6 @@
+use std::thread;
+use std::time::Duration;
+
 use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
@@ -111,6 +114,70 @@ fn a_follow_up_review_whose_session_codex_refuses_starts_fresh_in_the_same_attem
          again starting fresh."
     );
     assert!(replies(&world, &follow_up).contains(&note), "{note}");
+}
+
+#[test]
+fn a_follow_up_review_whose_codex_fails_for_another_reason_is_not_rerun_fresh() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let first = when_the_lead_creates(&world, &a_review(&world, "Review the work.", &built));
+    let follow_up = a_review(&world, "Check the requests were addressed.", &built)
+        .label("onto", &first)
+        .label("resume", "1")
+        .needs(&first);
+    let follow_up = when_the_lead_creates(&world, &follow_up);
+    given_the_agent_will(&world, &first, &[Behaviour::CommitNothing]);
+    given_the_agent_will(&world, &follow_up, &[Behaviour::FailBeforeThread]);
+
+    let tasks = [built.as_str(), first.as_str(), follow_up.as_str()];
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &tasks);
+
+    assert_eq!(states, vec!["completed", "completed", "failed"]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_runs_for(&world, &follow_up).len(), 1);
+    let session = fake_agent::session(&first, 0);
+    assert_eq!(resumed_session(&world, &follow_up, 0), Some(session));
+    let blamed = replies(&world, &follow_up);
+    assert!(
+        !blamed
+            .iter()
+            .any(|reply| reply.contains("could not resume")),
+        "{blamed:?}"
+    );
+}
+
+#[test]
+fn two_follow_up_reviews_onto_one_review_never_resume_its_session_at_once() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let first = when_the_lead_creates(&world, &a_review(&world, "Review the work.", &built));
+    let follow_up = |text: &str| {
+        let task = a_review(&world, text, &built)
+            .label("onto", &first)
+            .label("resume", "1")
+            .needs(&first);
+        when_the_lead_creates(&world, &task)
+    };
+    let one = follow_up("Check the first request.");
+    let two = follow_up("Check the second request.");
+    given_the_agent_will(&world, &first, &[Behaviour::CommitNothing]);
+    given_the_agent_will(&world, &one, &[Behaviour::HoldThenNothing]);
+    given_the_agent_will(&world, &two, &[Behaviour::HoldThenNothing]);
+    given_a_running_daemon(&mut world);
+
+    when_the_agent_has_started(&world, &one);
+    thread::sleep(Duration::from_secs(3));
+
+    assert_eq!(agent_runs_for(&world, &two), vec![]);
+    world.release_agent(&one);
+    when_the_agent_has_started(&world, &two);
+    world.release_agent(&two);
+    let states = when_the_tasks_settle(&world, &[&one, &two]);
+    assert_eq!(states, vec!["completed".to_string(); 2]);
 }
 
 #[test]

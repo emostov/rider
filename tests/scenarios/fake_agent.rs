@@ -31,6 +31,9 @@ pub enum Behaviour {
     Commit,
     /// Reports success having committed nothing.
     CommitNothing,
+    /// As a Codex that fails before its thread starts for a reason other than the session,
+    /// such as an expired login: prints an error to stderr and exits 1.
+    FailBeforeThread,
     /// Records its worktree's `HEAD` commit and branch, then acts like `CommitNothing`.
     RecordHead,
     /// Writes `uncommitted-<task>.txt` without committing it and reports success.
@@ -134,6 +137,7 @@ impl Behaviour {
         match self {
             Behaviour::Commit => "commit",
             Behaviour::CommitNothing => "commit-nothing",
+            Behaviour::FailBeforeThread => "fail-before-thread",
             Behaviour::RecordHead => "record-head",
             Behaviour::LeaveUncommitted => "leave-uncommitted",
             Behaviour::Block => "block",
@@ -308,6 +312,9 @@ commit() {{
 case "$behaviour" in
   commit) commit || exit 1 ;;
   commit-nothing) ;;
+  fail-before-thread)
+    echo "Error: not logged in" >&2
+    exit 1 ;;
   record-head)
     head="$world/{HEADS_DIR}/$task-$attempt"
     git rev-parse HEAD > "$head" && (git symbolic-ref -q HEAD || true) >> "$head" || exit 1 ;;
