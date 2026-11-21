@@ -80,6 +80,10 @@ pub enum Behaviour {
     BadBytes,
     /// Prints 40 lines of 250 four-byte characters each, then exits `FAIL_EXIT_CODE`.
     WideLines,
+    /// Commits like `Commit` and reports `dashed_summary(task)`, as JSON-escaped text.
+    CommitDashedSummary,
+    /// Prints `TALK_LINES` lines of `talk_line(n)` and exits `FAIL_EXIT_CODE`.
+    FailTalkingLong,
     /// Kills itself with SIGKILL.
     ExitOnSignal,
     /// Commits like `Commit`, then reports a failed result and exits 0.
@@ -96,6 +100,19 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+}
+
+pub const TALK_LINES: usize = 300;
+pub const TALK_LINE_PAD: usize = 250;
+pub const SUMMARY_WORDS: usize = 200;
+
+pub fn talk_line(n: usize) -> String {
+    format!("-é{n} {}", "x".repeat(TALK_LINE_PAD))
+}
+
+pub fn dashed_summary(task: &str) -> String {
+    let words: String = (0..SUMMARY_WORDS).map(|n| format!(" é{n}")).collect();
+    format!("-first  line\n\t-task {task}{words}")
 }
 
 impl Behaviour {
@@ -126,6 +143,8 @@ impl Behaviour {
             Behaviour::LongLine => "long-line",
             Behaviour::BadBytes => "bad-bytes",
             Behaviour::WideLines => "wide-lines",
+            Behaviour::CommitDashedSummary => "commit-dashed-summary",
+            Behaviour::FailTalkingLong => "fail-talking-long",
             Behaviour::ExitOnSignal => "exit-on-signal",
             Behaviour::CommitReportingFailure => "commit-reporting-failure",
             Behaviour::CommitSilently => "commit-silently",
@@ -184,6 +203,7 @@ fn script() -> String {
     let fail = FAIL_EXIT_CODE;
     let slow = SLOW_SECONDS;
     let long = LONG_LINE_BYTES;
+    let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -267,6 +287,16 @@ case "$behaviour" in
   wide-lines)
     l=$(i=0; while [ $i -lt 250 ]; do printf '\360\237\230\200'; i=$((i + 1)); done)
     i=0; while [ $i -lt 40 ]; do printf '%s\n' "$l"; i=$((i + 1)); done; exit {fail} ;;
+  commit-dashed-summary)
+    commit || exit 1
+    summary='-first  line\\n\\t-task '"$task"
+    n=0
+    while [ $n -lt {words} ]; do summary="$summary é$n"; n=$((n + 1)); done ;;
+  fail-talking-long)
+    pad=$(printf '%{pad}s' '' | tr " " x)
+    n=0
+    while [ $n -lt {lines} ]; do printf -- '-é%s %s\n' $n "$pad"; n=$((n + 1)); done
+    exit {fail} ;;
   refuse-resume|refuse-resume-slowly|refuse-resume-then-hold)
     [ "$behaviour" = refuse-resume-slowly ] && sleep {slow}
     if [ -n "$resumed" ]; then

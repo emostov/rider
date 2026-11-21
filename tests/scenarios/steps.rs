@@ -513,6 +513,20 @@ pub fn given_a_running_daemon(world: &mut World) {
 
 /// Given a running `rider daemon` with `env` added to the world's environment.
 pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
+    when_the_daemon_is_started(world, env);
+    let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
+    while !world.daemon_log().contains(DAEMON_STARTED) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not start within {DAEMON_START_SECONDS_MAX} seconds:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When `rider daemon` is spawned with `env` added, not waiting for it to start following.
+pub fn when_the_daemon_is_started(world: &mut World, env: &[(&str, &str)]) {
     assert!(world.daemon.is_none(), "one daemon per world");
     let log =
         fs::File::create(world.root.join("daemon-output.log")).expect("create the daemon output");
@@ -527,15 +541,7 @@ pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
         .spawn()
         .expect("start rider daemon");
     world.daemon = Some(Daemon { child });
-    let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
-    while !world.daemon_log().contains(DAEMON_STARTED) {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon did not start within {DAEMON_START_SECONDS_MAX} seconds:\n{}",
-            world.daemon_log()
-        );
-        thread::sleep(Duration::from_millis(POLL_MILLIS));
-    }
+    assert!(world.daemon.is_some());
 }
 
 /// When the daemon is sent SIGTERM.
