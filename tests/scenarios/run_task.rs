@@ -474,13 +474,62 @@ fn a_failed_attempt_whose_log_reply_cannot_be_posted_still_counts_its_attempt() 
     };
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_the_agent_will(&world, &task, &[Behaviour::ExitNonZero]);
-    given_vb_fails_every(&world, &[r#""reply "*"#]);
+    given_vb_fails_the_first_reply(&world);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
 
     assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
     assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let log = world.home.join("logs").join(&task).join("1.jsonl");
+    let header = format!("The whole log: {}", log.display());
+    let replies = task_replies(&world, &task);
+    let texts: Vec<&str> = replies.iter().filter_map(|r| r["text"].as_str()).collect();
+    assert_eq!(texts, vec![header.as_str()]);
+}
+
+#[test]
+fn a_completed_task_whose_record_and_its_reply_both_fail_still_releases_its_worktree() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_vb_fails_every(&world, &[r#""post "[0-9]*"#, r#""reply "*"#]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    then_the_worktree_is_removed(&world, &task);
+    assert_eq!(
+        task_records(&world, &task, "rider-result"),
+        Vec::<Value>::new()
+    );
     assert_eq!(task_replies(&world, &task), Vec::<Value>::new());
+}
+
+#[test]
+fn a_failed_attempt_writes_no_attempt_label_or_log_reply_before_its_fail_lands() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::ExitNonZero]);
+    let (marker, release) = (world.root.join("failing"), world.root.join("release"));
+    given_vb_waits_for(&world, "fail", &marker, &release);
+    given_a_running_daemon(&mut world);
+    when_the_file_exists(&world, &marker);
+
+    let (label, replies) = (
+        task_label(&world, &task, "attempt"),
+        task_replies(&world, &task),
+    );
+    std::fs::write(&release, "").expect("release the held fail");
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["failed"]);
+    assert_eq!((label, replies), (None, Vec::<Value>::new()));
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
 }
 
 #[test]
@@ -769,8 +818,13 @@ fn a_task_canceled_before_rider_first_reads_it_gets_no_writes_and_no_agent() {
 
     world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
     let (replies, labels) = (task_replies(&world, &task), task_labels(&world, &task));
+    assert!(when_rider_status_shows_within(&world, "1 of 32 running", 1));
     std::fs::write(&release, "").expect("release the held read");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        when_rider_status_shows_within(&world, "0 of 32 running", SETTLE_SECONDS_MAX),
+        "the run never ended:\n{}",
+        world.daemon_log()
+    );
     when_the_daemon_is_sent_sigterm(&world);
 
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));

@@ -1276,6 +1276,24 @@ pub fn when_the_process_is_sent(pid: u32, signal: &str) {
     assert!(status.success(), "kill {signal} {pid}");
 }
 
+/// Given the first `vb reply` fails and every later one runs.
+pub fn given_vb_fails_the_first_reply(world: &World) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = reply ] && mkdir '{}/first-reply' 2>/dev/null; then
+  echo 'injected reply failure' >&2
+  exit 1
+fi
+exec '{}' "$@"
+"#,
+        world.root.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
 /// Given every `vb` call whose arguments match one of the shell `patterns` fails.
 pub fn given_vb_fails_every(world: &World, patterns: &[&str]) {
     assert!(!patterns.is_empty());
