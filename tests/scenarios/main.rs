@@ -263,6 +263,12 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
         .chain(["--disable", "plugins", "--disable", "apps", "-C", &dir]);
     let expected: Vec<String> = options.map(String::from).collect();
     assert_eq!(fake_agent::options(&world.root, &review, 0), expected);
+    let count = fake_agent::arg_count(&world.root, &review, 0);
+    assert_eq!(
+        count,
+        expected.len() + 2,
+        "one prompt argument follows `--`"
+    );
     assert_eq!(task_label(&world, &review, "branch"), None);
     assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
     then_the_worktree_is_removed(&world, &review);

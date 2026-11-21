@@ -165,7 +165,7 @@ fn each_failed_attempt_is_failed_with_the_reason_its_evidence_shows() {
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     let implement = [
-        Behaviour::ExitNonZero,
+        Behaviour::ComplainThenExitNonZero,
         Behaviour::ExitOnSignal,
         Behaviour::CommitReportingFailure,
         Behaviour::LeaveBranch,
@@ -217,6 +217,9 @@ fn each_failed_attempt_is_failed_with_the_reason_its_evidence_shows() {
     for (id, reason) in ids.iter().zip(&reasons) {
         then_the_task_failed_with(&world, id, reason);
     }
+    let log = world.home.join("logs").join(&ids[0]).join("1.jsonl");
+    let log = std::fs::read_to_string(&log).expect("read the failed attempt's log");
+    assert!(log.contains(fake_agent::STDERR_LINE), "{log}");
     let block = Some(("needs_input".to_string(), BLOCK_QUESTION.to_string()));
     assert_eq!(task_block(&world, &ids[4]), block);
     then_the_task_failed_with(&world, &ids[5], "review changed the checkout");

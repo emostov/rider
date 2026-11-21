@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::fake_agent::Behaviour;
+use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
 
@@ -83,6 +83,8 @@ fn each_roles_agent_gets_a_short_prompt_with_its_rules_and_no_way_to_settle_its_
         "Without\n  `restack=1`, never rebase",
     ];
     let implement = agent_prompt(&world, &built, 0);
+    let options = fake_agent::options(&world.root, &built, 0).len();
+    assert_eq!(fake_agent::arg_count(&world.root, &built, 0), options + 2);
     then_the_prompt_has(&implement, "implement", &restack);
     assert!(implement.contains(&format!("\n\n{}\n\n# Task ", SLOP_RULES.trim_end())));
     let ancestor = r#"git merge-base --is-ancestor "$start" HEAD"#;

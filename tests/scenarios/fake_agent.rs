@@ -20,6 +20,8 @@ const LEFTOVERS_DIR: &str = "agent-leftovers";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
+/// The line a `ComplainThenExitNonZero` agent prints on stderr.
+pub const STDERR_LINE: &str = "fake agent complains on stderr";
 /// How long the one line a `LongLine` agent prints is, in bytes.
 pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
@@ -125,6 +127,8 @@ pub enum Behaviour {
     CommitLeavingEscapee,
     /// Commits and reports like `Commit`, then prints `FLOOD_BYTES` bytes and exits 0.
     CommitFlooding,
+    /// Prints `STDERR_LINE` on stderr and exits `FAIL_EXIT_CODE`.
+    ComplainThenExitNonZero,
     ReportDecision,
     HoldAttempt,
     MergePr,
@@ -188,6 +192,7 @@ impl Behaviour {
             Behaviour::CommitLeavingOrphan => "commit-leaving-orphan",
             Behaviour::CommitLeavingEscapee => "commit-leaving-escapee",
             Behaviour::CommitFlooding => "commit-flooding",
+            Behaviour::ComplainThenExitNonZero => "complain-then-exit-non-zero",
             Behaviour::ReportDecision => "report-decision",
             Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
@@ -272,6 +277,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+echo "$#" > "$world/{ARGS_DIR}/$task-$attempt.argc"
 [ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
@@ -330,6 +336,7 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  complain-then-exit-non-zero) echo "{STDERR_LINE}" >&2; exit {fail} ;;
   review-nothing) exit 0 ;;
   review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
   content-filter-stop) echo "{CONTENT_FILTER_ERROR}" >&2; exit 1 ;;
@@ -469,6 +476,13 @@ pub fn leftover(world: &Path, task: &str) -> u32 {
 pub fn stdin(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.stdin"));
     fs::read_to_string(&path).expect("read an agent's standard input")
+}
+
+/// How many arguments attempt `attempt` of `task` was started with.
+pub fn arg_count(world: &Path, task: &str, attempt: u32) -> usize {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.argc"));
+    let text = fs::read_to_string(&path).expect("read an agent's argument count");
+    text.trim().parse().expect("an argument count")
 }
 
 /// The arguments attempt `attempt` of `task` was started with, one per line.
