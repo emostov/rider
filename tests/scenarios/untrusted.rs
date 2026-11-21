@@ -209,3 +209,68 @@ fn an_untrusted_task_with_a_branch_label_is_an_invalid_brief() {
         Some(("invalid_brief".to_string(), reason.to_string()))
     );
 }
+
+#[test]
+fn an_untrusted_codex_review_turns_off_the_servers_of_the_config_it_loads_under_home() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let review = an_untrusted_task(&world, "Review the pull request.", "native-review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
+    given_the_users_codex_config_declares_mcp_servers(&world, &["alpha"]);
+    let daemon_codex_home = world.root.join("daemon-codex-home");
+    fs::create_dir_all(&daemon_codex_home).expect("create the daemon's Codex home");
+    let daemon_codex_home = daemon_codex_home
+        .to_str()
+        .expect("a UTF-8 path")
+        .to_string();
+    given_a_running_daemon_with(&mut world, &[("CODEX_HOME", &daemon_codex_home)]);
+
+    let states = when_the_tasks_settle(&world, &[&review]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(states, vec!["completed"]);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let args = fake_agent::args(&world.root, &review, 0);
+    assert!(
+        args.starts_with("review\n-c\nmcp_servers.alpha.enabled=false\n"),
+        "{args}"
+    );
+}
+
+#[test]
+fn a_mythos_rerun_of_an_untrusted_review_stays_untrusted() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    let review = an_untrusted_task(&world, "Review the pull request.", "review")
+        .label("of", &built)
+        .needs(&built);
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::ContentFilterStop]);
+    given_the_agent_will(&world, "default", &[Behaviour::CommitNothing]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "failed"]);
+    assert_eq!(exit, Some(0));
+    let all = tasks_in_state(&world, "all");
+    let reruns: Vec<String> = (all.into_iter())
+        .filter(|id| task_label(&world, id, "rerun_of").as_deref() == Some(review.as_str()))
+        .collect();
+    assert_eq!(reruns.len(), 1, "{reruns:?}");
+    let rerun = &reruns[0];
+    assert_eq!(
+        task_label(&world, rerun, "untrusted"),
+        Some("1".to_string())
+    );
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[rerun]);
+    assert_eq!(states, vec!["completed"]);
+    let runs = agent_runs_for(&world, rerun);
+    assert_eq!(runs.len(), 1);
+    let scratch = world.home.join("untrusted").join(rerun).join("work");
+    assert_eq!(runs[0].dir, scratch);
+}

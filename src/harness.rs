@@ -208,13 +208,18 @@ pub enum Resume<'a> {
 /// The `-c` settings that turn off every MCP server the user's Codex configuration and the
 /// worktree's project configuration declare; none for Claude, which takes an empty strict MCP
 /// configuration instead.
-pub fn codex_mcp_overrides(harness: &Harness, dir: &Path) -> Result<Vec<String>, HarnessError> {
+pub fn codex_mcp_overrides(
+    harness: &Harness,
+    dir: &Path,
+    untrusted: bool,
+) -> Result<Vec<String>, HarnessError> {
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
+    assert!(!UNTRUSTED_ENV_ALLOWED.contains(&"CODEX_HOME"));
     if *harness == Harness::Claude {
         return Ok(Vec::new());
     }
     // Codex takes an empty `CODEX_HOME` as unset.
-    let home = env::var_os("CODEX_HOME").filter(|home| !home.is_empty());
+    let home = env::var_os("CODEX_HOME").filter(|home| !home.is_empty() && !untrusted);
     let home = match home.map(PathBuf::from) {
         Some(home) if !home.is_absolute() => {
             let why = "CODEX_HOME is not an absolute path".to_string();

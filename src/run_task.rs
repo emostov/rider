@@ -414,7 +414,9 @@ impl Attempt {
             Harness::Codex | Harness::CodexReview => None,
         };
         let dir = &self.checkout.dir;
-        let servers = harness::codex_mcp_overrides(&self.brief.role.harness, dir).ok()?;
+        let servers =
+            harness::codex_mcp_overrides(&self.brief.role.harness, dir, self.brief.untrusted)
+                .ok()?;
         let (cmd, how) = match &session {
             Some(session) => {
                 let resume = Some(Resume::InPlace(session));
@@ -936,7 +938,8 @@ fn prepare(
         );
         Block::new("rider_error", reason)
     };
-    let servers = harness::codex_mcp_overrides(&brief.role.harness, &dir).map_err(cannot)?;
+    let servers =
+        harness::codex_mcp_overrides(&brief.role.harness, &dir, brief.untrusted).map_err(cannot)?;
     let command = |resume: Option<&SessionId>| {
         let cmd = command_for(
             brief.role,
@@ -1781,6 +1784,7 @@ fn rerun(
         ("repo", repo),
         ("of", of_text.as_str()),
         (RERUN_OF_LABEL, own.as_str()),
+        ("untrusted", if attempt.brief.untrusted { "1" } else { "0" }),
     ];
     let key = format!("rider-rerun-{own}");
     let rerun = retried(|| board.create_task(&view.channel, &text, &labels, &[of], &key))?;
