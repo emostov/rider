@@ -155,5 +155,5 @@ fn only_a_session_id_claude_could_not_misread_is_kept_for_a_later_resume() {
         kept,
         format!("20de60af-1a54-4519-8f52-8623adc5d76e\n{repo}\n")
     );
-    assert_eq!(task_logs(&world, &ids[1]), vec!["1.jsonl"]);
+    assert_eq!(task_logs(&world, &ids[1]), vec!["1.jsonl", "result.json"]);
 }
