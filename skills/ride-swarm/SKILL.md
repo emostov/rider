@@ -10,7 +10,7 @@ daemon runs one agent per ready task in its own git worktree, and a lead plans t
 into tasks. When the user rides a swarm from this session, **this session is the lead**.
 
 `<skill>` is the directory that contains this SKILL.md. It holds `lead.md`, the lead's
-instructions, and `schemas/`. The board is reached with `vb`, which needs:
+instructions, and `schemas/`, which Rider registers on the board itself. The board is reached with `vb`, which needs:
 
 ```sh
 export BOARD_URL=http://127.0.0.1:4100/api/board PATH="$HOME/.rider/node/node_modules/.bin:$PATH"
@@ -48,7 +48,10 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 
 1. **Install what is missing.** Check each with `command -v`; install only what is absent,
    and tell the user what you installed.
-   - `rider`: `cargo install --locked --git https://github.com/emostov/rider swarm-rider`
+   - `rider`: `cargo install --locked --git https://github.com/emostov/rider swarm-rider`, then
+     `rider skills install --into <this agent's skills directory>` (`~/.claude/skills` for
+     Claude Code, `~/.codex/skills` for Codex), which installs these skills from the binary
+     and keeps them updated with it.
    - `vb` (the Board CLI): `npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board`
    - `claude`, `codex`, `jq`, Node 22, and Rust cannot be installed for the user: name the
      missing ones and stop. `claude` and `codex` must be signed in.
@@ -59,13 +62,10 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    (`git -C <repo> merge --no-ff <branch>` on a clean checkout, `git merge --abort` and a
    restack task on conflict, never push), or the user merges when asked in `decisions`.
 3. **Board.** If it is down, start `rider serve` as a background command and check again.
-   `vb schemas list` must list `rider-result@2` and `rider-finding@1`;
-   register a missing one with `vb schemas create rider-result@2 --file
-   <skill>/schemas/rider-result@2.json` (`rider-finding@1` from `rider-finding.json`).
 4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
    run `rider up`, which starts it in the background, and check `rider status` again.
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
-   `lead-fable-5-2`. Answer the user before anything else.
+   `lead`. Answer the user before anything else.
 
 To send a finished branch for the owner's review, open its PR, and get CI green, follow the
 `ship-swarm` skill. Its loops follow the owner's settings in `<rider home>/ship.toml`.

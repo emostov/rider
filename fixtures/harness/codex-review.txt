@@ -1,0 +1,6 @@
+The new function returns the wrong number of items for ordinary valid inputs.
+
+Review comment:
+
+- [P1] Start the slice at `len(xs) - n` — /tmp/repo/lib.py:6-6
+  For `0 <= n < len(xs)`, `last` returns one extra item. When `n == len(xs)`, the slice starts at `-1` and returns only the last item: `last([1, 2, 3], 3)` returns `[3]` instead of `[1, 2, 3]`.
