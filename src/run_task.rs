@@ -15,7 +15,7 @@ use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
 use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
-use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES_PROMPT};
+use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES};
 use crate::core::TASKS_MAX;
 use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
@@ -748,15 +748,10 @@ fn log_path(home: &Path, id: TaskId, attempt: u16) -> PathBuf {
 }
 
 fn role_prompt(prompt_file: &str) -> Result<String, Block> {
-    let built_in = |name: &str| {
-        let found = PROMPTS.iter().find(|(found, _)| *found == name);
-        found.map(|(_, text)| text.trim_end())
-    };
-    match built_in(prompt_file) {
+    let built_in = PROMPTS.iter().find(|(name, _)| *name == prompt_file);
+    match built_in.map(|(_, text)| text.trim_end()) {
         Some(text) if prompt_file == IMPLEMENT_PROMPT => {
-            let rules = built_in(SLOP_RULES_PROMPT);
-            assert!(rules.is_some(), "the slop rules are built in");
-            Ok(format!("{text}\n\n{}", rules.unwrap_or_default()))
+            Ok(format!("{text}\n\n{}", SLOP_RULES.trim_end()))
         }
         Some(text) => Ok(text.to_string()),
         None => read_prompt_file(Path::new(prompt_file)),

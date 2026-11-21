@@ -37,15 +37,14 @@ const ENVIRONMENT: &str = r#"environment:
 pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
-/// The built-in prompt that carries the slop rules after its own text.
 pub const IMPLEMENT_PROMPT: &str = "implement.md";
-pub const SLOP_RULES_PROMPT: &str = "slop-rules.md";
+pub const SLOP_RULES: &str = include_str!("../prompts/slop-rules.md");
 /// Every role's prompt and the slop rules, once each, built into the binary.
 pub const PROMPTS: [(&str, &str); 5] = [
     (IMPLEMENT_PROMPT, include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
     ("security.md", include_str!("../prompts/security.md")),
-    (SLOP_RULES_PROMPT, include_str!("../prompts/slop-rules.md")),
+    ("slop-rules.md", SLOP_RULES),
     ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";

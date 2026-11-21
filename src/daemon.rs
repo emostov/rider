@@ -167,7 +167,6 @@ pub enum DaemonError {
     NotAFile(PathBuf),
     /// The board's identity could not be read at start-up.
     Identity(IdentityUnknown),
-    /// Rider's schemas could not be registered on the board at start-up.
     Schemas(BoardError),
 }
 

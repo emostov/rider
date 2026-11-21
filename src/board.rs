@@ -67,7 +67,6 @@ const CLAIM_LEASE: &str = "1h";
 const CLAIM_EMPTY_REASONS: [&str; 2] = ["timeout", "nothing_ready"];
 /// The first word of every command `vb` is run with.
 const VERBS: [&str; 6] = ["read", "tasks", "label", "reply", "post", "schemas"];
-/// Rider's own schemas, as `name@version` and JSON Schema, built into the binary.
 pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
     (
         "rider-result@2",
@@ -78,7 +77,6 @@ pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
         include_str!("../skills/ride-swarm/schemas/rider-finding.json"),
     ),
 ];
-/// Upper bound on the schemas one `vb schemas list` may name, built-in ones included.
 const SCHEMAS_LISTED_MAX: usize = 1024;
 /// The number of global arguments: `--json --url <url> --as <profile>`.
 const GLOBAL_ARGS_LEN: usize = 5;
@@ -304,14 +302,10 @@ pub trait Board {
     ) -> Result<Listing, BoardError>;
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
-    /// The `name@version` of every schema the board knows, built-in ones included.
     fn schema_ids(&self) -> Result<Vec<String>, BoardError>;
-    /// Registers schema `id` with the JSON Schema `json`.
     fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError>;
 }
 
-/// Registers each of Rider's schemas the board lacks, leaving a registered one alone, and
-/// returns the ids it registered.
 pub fn register_schemas(board: &dyn Board) -> Result<Vec<&'static str>, BoardError> {
     let known = board.schema_ids()?;
     let mut registered = Vec::with_capacity(RIDER_SCHEMAS.len());
@@ -806,7 +800,6 @@ struct WireMessageRef {
     re: Option<String>,
 }
 
-/// `vb schemas list`: only each schema's `name@version` is used.
 #[derive(Deserialize)]
 struct WireSchemas {
     schemas: Vec<WireSchema>,
