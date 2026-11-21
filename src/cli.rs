@@ -561,11 +561,15 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
-    if let Ok(mut client) = Client::connect(&config.home) {
-        let data = client.send("status", &[]).map_err(CliError::Client)?;
-        println!("rider: the daemon is already running");
-        println!("{}", status_line(&data));
-        return Ok(0);
+    match Client::connect(&config.home) {
+        Ok(mut client) => {
+            let data = client.send("status", &[]).map_err(CliError::Client)?;
+            println!("rider: the daemon is already running");
+            println!("{}", status_line(&data));
+            return Ok(0);
+        }
+        Err(error @ ClientError::PathTooLong(_)) => return Err(CliError::Client(error)),
+        Err(_) => {}
     }
     fs::create_dir_all(&config.home).map_err(|error| CliError::Io {
         action: "create",

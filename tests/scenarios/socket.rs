@@ -4,12 +4,14 @@ use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
 
@@ -27,6 +29,9 @@ const DAEMON_STARTS: usize = 20;
 const WATCH_POLLS_MAX: u64 = u64::MAX;
 const SEAT_PROBES_MAX: usize = 1000;
 const SEAT_PROBE_MILLIS: u64 = 50;
+const DAEMON_IDLE_SECONDS: u64 = 5;
+const REQUEST_BYTES_MAX: usize = 64 * 1024;
+const LONG_HOME_BYTES: usize = 100;
 
 #[test]
 fn a_client_flooding_bad_requests_without_reading_never_holds_up_rider_status() {
@@ -157,6 +162,93 @@ fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
         Vec::<&str>::new(),
         "left behind by a daemon that stopped"
     );
+}
+
+#[test]
+fn an_oversized_request_gets_its_bad_request_reply_before_the_connection_ends() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    let mut client = given_a_client_on_the_socket(&world);
+
+    client
+        .write_all(&vec![b'x'; REQUEST_BYTES_MAX + 1])
+        .expect("send the oversized request");
+    let data = then_the_client_reads_to_its_end(&client);
+
+    let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+    let first: Value = serde_json::from_str(text.lines().next().unwrap_or_default())
+        .unwrap_or_else(|_| panic!("no reply line before the end: {text:?}"));
+    assert_eq!(first["error"]["code"], json!("bad_request"), "{first}");
+}
+
+#[test]
+fn idle_connections_in_every_seat_are_closed_so_rider_status_answers() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::HoldTalking]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+    let mut follow = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    follow.args(["logs", "-f", &task]).stdout(Stdio::piped());
+    let mut follower = follow.spawn().expect("start rider logs -f");
+    let lines = crate::lines_of(follower.stdout.take().expect("rider logs -f output"));
+    let first = lines.recv_timeout(Duration::from_secs(READ_SECONDS_MAX));
+    let idle: Vec<UnixStream> = (1..CLIENTS_MAX)
+        .map(|_| given_a_client_on_the_socket(&world))
+        .collect();
+
+    thread::sleep(Duration::from_secs(DAEMON_IDLE_SECONDS + 2));
+    let status = when_rider_runs(&world, &["status"]);
+    let following = follower.try_wait().expect("poll rider logs -f");
+    world.release_agent(&task);
+    let rest: Vec<String> = lines.iter().collect();
+    let followed = follower.wait().expect("wait for rider logs -f");
+    drop(idle);
+
+    assert_eq!(status.code, Some(0), "{status:?}");
+    assert!(status.stdout.contains("board up"), "{status:?}");
+    assert_eq!(first, Ok(fake_agent::hold_line(&task)));
+    assert_eq!(following, None, "rider logs -f ended while it followed");
+    assert_eq!(followed.code(), Some(0));
+    let summary = fake_agent::summary(&task, 0);
+    assert!(rest.iter().any(|line| line.contains(&summary)), "{rest:?}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_home_too_long_for_a_socket_address_fails_naming_the_limit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let parent = world
+        .home
+        .parent()
+        .expect("the home has a parent")
+        .to_path_buf();
+    let used = parent.as_os_str().len() + 1;
+    assert!(
+        used < LONG_HOME_BYTES,
+        "the temporary directory is too long"
+    );
+    world.home = parent.join("h".repeat(LONG_HOME_BYTES - used));
+    assert_eq!(world.home.as_os_str().len(), LONG_HOME_BYTES);
+
+    let up = when_rider_runs(&world, &["up"]);
+    let status = when_rider_runs(&world, &["status"]);
+
+    assert_eq!(up.code, Some(1), "{up:?}");
+    assert!(up.stderr.contains("byte limit for a socket path"), "{up:?}");
+    assert!(
+        status.stderr.contains("byte limit for a socket path"),
+        "{status:?}"
+    );
+    assert!(!world.home.join("rider.sock").exists());
+    assert!(!world.home.join("daemon.log").exists());
 }
 
 struct StopOnDrop<'a>(&'a AtomicBool);

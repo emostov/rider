@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -71,6 +71,13 @@ const DRAIN_BYTES_MAX: usize = 1024 * 1024;
 const DRAIN_CHUNK_BYTES: usize = 16 * 1024;
 /// Upper bound on the time spent dropping a client's input before its socket closes.
 const DRAIN_MILLIS_MAX: u64 = 2000;
+const IDLE_MILLIS_MAX: u64 = 5000;
+// A socket address holds at most 108 bytes of path on Linux and 104 on macOS and the BSDs,
+// a closing NUL included.
+#[cfg(target_os = "linux")]
+const SOCKET_PATH_BYTES_MAX: usize = 107;
+#[cfg(not(target_os = "linux"))]
+const SOCKET_PATH_BYTES_MAX: usize = 103;
 
 /// Hands a socket event to the core; false once the core has gone.
 pub type Sink = Arc<dyn Fn(Event) -> bool + Send + Sync>;
@@ -137,6 +144,10 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
     let Some(home) = path.parent() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no directory"));
     };
+    if path.as_os_str().len() > SOCKET_PATH_BYTES_MAX {
+        let message = ClientError::PathTooLong(path.to_path_buf()).to_string();
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+    }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
         Ok(_) => {
@@ -253,11 +264,24 @@ fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, s
 // Reads requests until the client goes, then tells the core.
 fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sink: &Sink) {
     let mut reader = BufReader::new(stream);
+    let mut bytes = Vec::new();
+    let idle = Some(Duration::from_millis(IDLE_MILLIS_MAX));
     for _ in 0..REQUESTS_MAX {
-        let mut bytes = Vec::new();
-        let limit = u64::try_from(REQUEST_BYTES_MAX).unwrap_or(u64::MAX);
-        let read = (&mut reader).take(limit + 1).read_until(b'\n', &mut bytes);
+        assert!(bytes.len() <= REQUEST_BYTES_MAX);
+        let room = u64::try_from(REQUEST_BYTES_MAX + 1 - bytes.len()).unwrap_or(u64::MAX);
+        if reader.get_ref().set_read_timeout(idle).is_err() {
+            break;
+        }
+        let read = (&mut reader).take(room).read_until(b'\n', &mut bytes);
         match read {
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                let guard = lock(clients);
+                let slot = guard.slots.iter().find(|slot| slot.id == id);
+                if slot.is_some_and(|slot| slot.request.is_some()) {
+                    continue;
+                }
+                break;
+            }
             Ok(0) | Err(_) => break,
             Ok(_) if bytes.len() > REQUEST_BYTES_MAX => {
                 let message = format!("a request is at most {REQUEST_BYTES_MAX} bytes");
@@ -267,7 +291,7 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
             }
             Ok(_) => {}
         }
-        match parse_request(&bytes) {
+        match parse_request(&std::mem::take(&mut bytes)) {
             Ok((request_id, request)) => {
                 let mut guard = lock(clients);
                 let Some(slot) = guard.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -716,6 +740,7 @@ pub enum ClientError {
     },
     /// The connection closed before the reply ended.
     Closed,
+    PathTooLong(PathBuf),
 }
 
 impl fmt::Display for ClientError {
@@ -732,6 +757,13 @@ impl fmt::Display for ClientError {
             ClientError::Malformed(line) => write!(f, "the daemon answered {line:?}"),
             ClientError::Refused { code, message } => write!(f, "{code}: {message}"),
             ClientError::Closed => write!(f, "the daemon closed the connection"),
+            ClientError::PathTooLong(path) => write!(
+                f,
+                "{} is {} bytes, over the {SOCKET_PATH_BYTES_MAX} byte limit for a socket path; \
+                 set RIDER_HOME to a shorter path",
+                path.display(),
+                path.as_os_str().len()
+            ),
         }
     }
 }
@@ -745,6 +777,9 @@ impl Client {
     /// Connects to the socket under `home`.
     pub fn connect(home: &Path) -> Result<Client, ClientError> {
         let path = home.join(SOCKET_FILE);
+        if path.as_os_str().len() > SOCKET_PATH_BYTES_MAX {
+            return Err(ClientError::PathTooLong(path));
+        }
         let stream = UnixStream::connect(&path).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                 ClientError::NotRunning(path.clone())
