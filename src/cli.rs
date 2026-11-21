@@ -1125,35 +1125,3 @@ fn io_error(action: &'static str, path: &Path, error: &io::Error) -> CliError {
         message: error.to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_defaults_to_home_and_the_local_board() {
-        let vars = Vars {
-            home: Some("/Users/someone".into()),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(vars),
-            Ok(Config {
-                home: PathBuf::from("/Users/someone/.rider"),
-                board_url: "http://127.0.0.1:4100/api/board".to_string(),
-            })
-        );
-        let vars = Vars {
-            rider_home: Some("/srv/rider".into()),
-            board_url: Some("http://127.0.0.1:5000/api/board".into()),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(vars),
-            Ok(Config {
-                home: PathBuf::from("/srv/rider"),
-                board_url: "http://127.0.0.1:5000/api/board".to_string(),
-            })
-        );
-    }
-}

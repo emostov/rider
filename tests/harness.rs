@@ -2,12 +2,16 @@
 
 use rider::harness::{
     CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId, command_for,
-    last_message, run, session_id, stream_reports_failure,
+    last_message, run, run_on_clock, session_id, stream_reports_failure,
 };
 use rider::roles::{Harness, role_from_label};
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 use tempfile::{Builder, TempDir};
 
 /// A fresh directory under the system temp dir, removed when dropped.
@@ -330,4 +334,65 @@ fn reader_slots_are_returned_after_each_run() {
         let exit = run(&fake(&["0", "0", "0", "0"]), &scratch.root, &log, 10, 4096);
         assert_eq!(exit.unwrap(), Exit::Code(0));
     }
+}
+
+#[test]
+fn a_log_write_that_hangs_does_not_stop_the_time_limit() {
+    let scratch = Scratch::new("fifo");
+    let log = scratch.root.join("agent.log");
+    let made = Command::new("mkfifo")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .status();
+    assert_eq!(made.map(|status| status.success()).ok(), Some(true));
+    let (release, released) = mpsc::sync_channel::<()>(0);
+    let fifo = log.clone();
+    let unread = thread::spawn(move || {
+        let reader = fs::File::open(fifo).unwrap();
+        let _ = released.recv();
+        drop(reader);
+    });
+    let (sent, finished) = mpsc::sync_channel(1);
+    let cmd = fake(&["1024", "4096", "60", "0"]);
+    let root = scratch.root.clone();
+    thread::spawn(move || {
+        let start = Instant::now();
+        let exit = run(&cmd, &root, &log, 1, 1 << 24);
+        let _ = sent.send((exit, start.elapsed()));
+    });
+    let outcome = finished.recv_timeout(Duration::from_secs(20));
+    drop(release);
+    unread.join().unwrap();
+    let (exit, elapsed) = outcome.expect("run returns while its log write hangs");
+    assert_eq!(exit.unwrap(), Exit::TimedOut);
+    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+}
+
+fn run_with_wall_clock(name: &str, shift: fn(SystemTime) -> SystemTime) -> (Exit, Duration) {
+    let scratch = Scratch::new(name);
+    let log = scratch.root.join("agent.log");
+    let read = Cell::new(false);
+    let wall_clock = || {
+        let now = SystemTime::now();
+        if read.replace(true) { shift(now) } else { now }
+    };
+    let start = Instant::now();
+    let cmd = fake(&["1", "10", "20", "0"]);
+    let exit = run_on_clock(&cmd, &scratch.root, &log, 2, 4096, &wall_clock);
+    (exit.unwrap(), start.elapsed())
+}
+
+#[test]
+fn a_machine_that_slept_past_the_limit_ends_the_attempt_at_once() {
+    let (exit, elapsed) = run_with_wall_clock("slept", |now| now + Duration::from_secs(3600));
+    assert_eq!(exit, Exit::TimedOut);
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn a_wall_clock_set_back_counts_no_time_and_the_attempt_ends_at_its_limit() {
+    let (exit, elapsed) = run_with_wall_clock("back", |now| now - Duration::from_secs(3600));
+    assert_eq!(exit, Exit::TimedOut);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }

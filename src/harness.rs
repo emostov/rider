@@ -392,10 +392,11 @@ fn supervise(
     child: &mut dyn ChildWrapper,
     shared: &Shared,
     seconds_max: u64,
+    wall_clock: &dyn Fn() -> SystemTime,
 ) -> Result<(ExitStatus, bool), HarnessError> {
     assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
     assert!(child.id() > 1, "the group of a child rider started");
-    let start = (Instant::now(), SystemTime::now());
+    let start = (Instant::now(), wall_clock());
     let limit = Duration::from_secs(seconds_max);
     let grace = Duration::from_secs(KILL_GRACE_SECONDS);
     let mut term_sent: Option<(Instant, SystemTime)> = None;
@@ -414,7 +415,7 @@ fn supervise(
             let _ = kill_and_reap(child);
             return Err(HarnessError::Log(message));
         }
-        let now = (Instant::now(), SystemTime::now());
+        let now = (Instant::now(), wall_clock());
         let since = |then: (Instant, SystemTime)| {
             let monotonic = now.0.saturating_duration_since(then.0);
             (monotonic, now.1.duration_since(then.1))
@@ -502,6 +503,17 @@ pub fn run(
     seconds_max: u64,
     log_bytes_max: u64,
 ) -> Result<Exit, HarnessError> {
+    run_on_clock(cmd, dir, log, seconds_max, log_bytes_max, &SystemTime::now)
+}
+
+pub fn run_on_clock(
+    cmd: &CommandLine,
+    dir: &Path,
+    log: &Path,
+    seconds_max: u64,
+    log_bytes_max: u64,
+    wall_clock: &dyn Fn() -> SystemTime,
+) -> Result<Exit, HarnessError> {
     assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
     assert!(log_bytes_max <= LOG_BYTES_MAX);
     assert!(cmd.args.len() <= ARGS_MAX && cmd.env.len() <= ENV_MAX);
@@ -523,7 +535,7 @@ pub fn run(
         return Err(error);
     }
     drop(done);
-    let outcome = supervise(child.as_mut(), &shared, seconds_max);
+    let outcome = supervise(child.as_mut(), &shared, seconds_max, wall_clock);
     // The leader is reaped; leftover members of its group would hold the pipes open.
     let _ = child.start_kill();
     let drained = drain(&finished);
@@ -749,53 +761,4 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     assert!(!last_result_failed || *harness == Harness::Claude);
     assert!(!last_turn_failed || *harness == Harness::Codex);
     last_result_failed || last_turn_failed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn scratch_file(name: &str, text: &str) -> PathBuf {
-        let unique = format!("rider-harness-unit-{name}-{}", std::process::id());
-        let path = std::env::temp_dir().join(unique);
-        fs::write(&path, text).unwrap();
-        path
-    }
-
-    #[test]
-    fn either_clock_can_end_an_attempt() {
-        let limit = Duration::from_secs(60);
-        let (under, over) = (Duration::from_secs(59), Duration::from_secs(61));
-        let backwards = SystemTime::UNIX_EPOCH.duration_since(SystemTime::now());
-        assert!(backwards.is_err());
-        assert!(!timed_out(under, Ok(under), limit));
-        assert!(timed_out(limit, Ok(under), limit));
-        assert!(timed_out(over, Ok(under), limit));
-        assert!(timed_out(under, Ok(limit), limit), "the machine slept");
-        assert!(timed_out(under, Ok(Duration::from_secs(3600)), limit));
-        assert!(
-            !timed_out(under, backwards.clone(), limit),
-            "the clock went back"
-        );
-        assert!(timed_out(over, backwards, limit));
-    }
-
-    #[test]
-    fn checking_for_a_log_error_never_waits_on_a_write() {
-        let path = scratch_file("lock", "");
-        let shared = open_log(&path, 16).unwrap();
-        let held = shared.file.lock().unwrap();
-        let (tx, rx) = mpsc::channel();
-        let probe = Arc::clone(&shared);
-        thread::spawn(move || {
-            probe.fail("disk full".to_string());
-            tx.send(probe.error()).unwrap();
-        });
-        let answer = rx.recv_timeout(Duration::from_secs(1));
-        drop(held);
-        assert_eq!(answer, Ok(Some("disk full".to_string())));
-        assert_eq!(shared.close(), Some("disk full".to_string()));
-        fs::remove_file(&path).unwrap();
-    }
 }

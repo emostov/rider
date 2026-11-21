@@ -214,3 +214,29 @@ fn the_daemon_writes_every_built_in_prompt_over_what_is_in_the_homes_prompts() {
         assert_eq!(found, text, "{name}");
     }
 }
+
+#[test]
+fn rider_without_board_url_reaches_the_local_board_on_port_4100() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("default-url-home");
+    let record = world.root.join("vb-args");
+    given_a_fake_vb_in(&home, &record, 1);
+
+    let mut command = rider(&world);
+    command
+        .env_remove("BOARD_URL")
+        .env("RIDER_HOME", &home)
+        .args(["wait", "rider", "--timeout", "1"]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(
+        output.code,
+        Some(1),
+        "the fake vb fails the read: {output:?}"
+    );
+    let args = fs::read_to_string(&record).expect("read the fake vb's arguments");
+    let url = args.lines().skip_while(|arg| *arg != "--url").nth(1);
+    assert_eq!(url, Some("http://127.0.0.1:4100/api/board"), "{args}");
+}
