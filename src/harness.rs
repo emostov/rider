@@ -1,7 +1,7 @@
 //! Launches one agent, records its output to a size-capped log, stops it at a time limit, and
 //! reads its final message back from the recorded stream.
 
-use crate::board::one_line;
+use crate::board::{message_tail, one_line};
 use crate::git;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
@@ -693,16 +693,47 @@ enum ClaudeEvent {
     #[serde(rename = "result")]
     Result {
         result: Option<Field<String>>,
+        errors: Option<Field<Vec<String>>>,
         subtype: Option<Field<String>>,
         is_error: Option<Field<bool>>,
         num_turns: Option<Field<u64>>,
     },
     #[serde(rename = "assistant")]
-    Assistant,
+    Assistant {
+        message: Option<Field<ClaudeMessage>>,
+    },
     #[serde(rename = "user")]
-    User,
+    User {
+        message: Option<Field<ClaudeMessage>>,
+    },
     #[serde(other)]
     Other,
+}
+
+#[derive(Deserialize)]
+struct ClaudeMessage {
+    content: Option<Field<Vec<Field<ClaudeBlock>>>>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeBlock {
+    #[serde(rename = "type")]
+    kind: Option<Field<String>>,
+    text: Option<Field<String>>,
+    is_error: Option<Field<bool>>,
+    content: Option<Field<ToolContent>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolContent {
+    Text(String),
+    Blocks(Vec<Field<ClaudeText>>),
+}
+
+#[derive(Deserialize)]
+struct ClaudeText {
+    text: Option<Field<String>>,
 }
 
 #[derive(Deserialize)]
@@ -722,7 +753,7 @@ enum CodexEvent {
     #[serde(rename = "turn.completed")]
     TurnCompleted,
     #[serde(rename = "error")]
-    Error,
+    Error { message: Option<Field<String>> },
     #[serde(other)]
     Other,
 }
@@ -850,7 +881,7 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
             results = results.saturating_add(1);
             refused = valid(is_error) == Some(true) && valid(num_turns) == Some(0);
         }
-        ClaudeEvent::Assistant | ClaudeEvent::User => turned = true,
+        ClaudeEvent::Assistant { .. } | ClaudeEvent::User { .. } => turned = true,
         ClaudeEvent::Other => {}
     });
     let before = read && results == 1 && refused && !turned;
@@ -871,7 +902,7 @@ pub fn stopped_by_content_filter(harness: &Harness, log: &Path) -> bool {
                 CodexEvent::TurnCompleted => stopped = false,
                 CodexEvent::ItemStarted { .. }
                 | CodexEvent::ItemCompleted { .. }
-                | CodexEvent::Error
+                | CodexEvent::Error { .. }
                 | CodexEvent::Other => {}
             });
             stopped
@@ -988,7 +1019,7 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
         // `item.type == "error"` inside `item.completed` is a harmless warning, and a
         // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
         Harness::Codex => scan(log, |event| match event {
-            CodexEvent::TurnFailed { .. } | CodexEvent::Error => last_turn_failed = true,
+            CodexEvent::TurnFailed { .. } | CodexEvent::Error { .. } => last_turn_failed = true,
             CodexEvent::TurnCompleted => last_turn_failed = false,
             CodexEvent::ItemStarted { .. }
             | CodexEvent::ItemCompleted { .. }
@@ -1016,4 +1047,183 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     assert!(!last_turn_failed || *harness == Harness::Codex);
     assert!(!last_review_failed || *harness == Harness::CodexReview);
     last_result_failed || last_turn_failed || last_review_failed
+}
+
+pub fn failure_account(harness: &Harness, log: &Path, tail: &str) -> Option<String> {
+    let mut account = Account::default();
+    let _ = match harness {
+        Harness::Claude => scan(log, |event| account.claude(event)),
+        Harness::Codex => scan(log, |event| account.codex(event)),
+        Harness::CodexReview => return None,
+    };
+    let mut text = String::new();
+    if !account.messages.is_empty() {
+        text.push_str("The agent's last messages:");
+        account
+            .messages
+            .iter()
+            .for_each(|message| quote(&mut text, message));
+    }
+    let ends = [
+        ("Its last failed tool call: ", &account.tool),
+        ("Its run ended in error: ", &account.error),
+    ];
+    for (lead, end) in ends {
+        if let Some(end) = end {
+            text.push_str(if text.is_empty() { "" } else { "\n" });
+            text.push_str(lead);
+            text.push_str(&end.replace('\n', " "));
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let plain = tail.lines().filter(|line| {
+        !line.trim().is_empty() && serde_json::from_str::<IgnoredAny>(line).is_err()
+    });
+    let plain: Vec<&str> = plain.collect();
+    let plain = &plain[plain.len().saturating_sub(ACCOUNT_PLAIN_LINES_MAX)..];
+    if !plain.is_empty() {
+        text.push_str("\nThe log's last lines that are not events:");
+        let plain = plain
+            .iter()
+            .filter_map(|line| piece(Some(line.to_string())));
+        plain.for_each(|line| quote(&mut text, &line));
+    }
+    assert!(account.messages.len() <= ACCOUNT_MESSAGES_MAX);
+    assert!(!text.is_empty());
+    Some(text)
+}
+
+fn quote(text: &mut String, piece: &str) {
+    assert!(!piece.is_empty());
+    for line in piece.lines() {
+        text.push_str("\n> ");
+        text.push_str(line.trim_end());
+    }
+    assert!(text.ends_with(piece.lines().last().unwrap_or_default().trim_end()));
+}
+
+const ACCOUNT_PLAIN_LINES_MAX: usize = 5;
+const ACCOUNT_MESSAGES_MAX: usize = 3;
+const ACCOUNT_PIECE_CHARS_MAX: usize = 2_000;
+
+#[derive(Default)]
+struct Account {
+    messages: Vec<String>,
+    tool: Option<String>,
+    error: Option<String>,
+}
+
+impl Account {
+    fn said(&mut self, text: Option<String>) {
+        let Some(text) = piece(text) else {
+            return;
+        };
+        if self.messages.len() == ACCOUNT_MESSAGES_MAX {
+            self.messages.remove(0);
+        }
+        self.messages.push(text);
+        assert!(self.messages.len() <= ACCOUNT_MESSAGES_MAX);
+    }
+
+    fn claude(&mut self, event: ClaudeEvent) {
+        assert!(self.messages.len() <= ACCOUNT_MESSAGES_MAX);
+        match event {
+            ClaudeEvent::Assistant { message } => {
+                for block in blocks(message) {
+                    if valid(block.kind).as_deref() == Some("text") {
+                        self.said(valid(block.text));
+                    }
+                }
+            }
+            ClaudeEvent::User { message } => {
+                for block in blocks(message) {
+                    if valid(block.is_error) != Some(true) {
+                        continue;
+                    }
+                    let text = match valid(block.content) {
+                        Some(ToolContent::Text(text)) => Some(text),
+                        Some(ToolContent::Blocks(inner)) => {
+                            let texts = inner.into_iter().filter_map(|b| valid(Some(b)));
+                            let texts: Vec<String> = texts.filter_map(|b| valid(b.text)).collect();
+                            Some(texts.join("\n"))
+                        }
+                        None => None,
+                    };
+                    self.tool = piece(text).or_else(|| Some("(no text)".to_string()));
+                }
+            }
+            ClaudeEvent::Result {
+                result,
+                errors,
+                subtype,
+                is_error,
+                ..
+            } => {
+                let failed =
+                    valid(is_error) == Some(true) || valid(subtype).as_deref() != Some("success");
+                let errors = valid(errors).and_then(|errors| errors.into_iter().last());
+                let text = piece(valid(result)).or_else(|| piece(errors));
+                self.error = failed.then_some(text).flatten();
+            }
+            ClaudeEvent::Other => {}
+        }
+    }
+
+    fn codex(&mut self, event: CodexEvent) {
+        assert!(self.messages.len() <= ACCOUNT_MESSAGES_MAX);
+        match event {
+            CodexEvent::ItemCompleted { item } => {
+                let Some(item) = valid(item) else {
+                    return;
+                };
+                match valid(item.kind).as_deref() {
+                    Some("agent_message") => self.said(valid(item.text)),
+                    Some("command_execution") => {
+                        let code = valid(item.exit_code).filter(|code| *code != 0);
+                        let command = piece(valid(item.command));
+                        if let (Some(code), Some(command)) = (code, command) {
+                            self.tool = Some(format!("`{command}` exited {code}"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CodexEvent::TurnFailed { error } => {
+                let message = valid(error).and_then(|error| valid(error.message));
+                self.error = piece(message).or_else(|| Some("(no message)".to_string()));
+            }
+            CodexEvent::Error { message } => self.error = piece(valid(message)),
+            CodexEvent::TurnCompleted => self.error = None,
+            CodexEvent::ItemStarted { .. } | CodexEvent::Other => {}
+        }
+    }
+}
+
+fn blocks(message: Option<Field<ClaudeMessage>>) -> impl Iterator<Item = ClaudeBlock> {
+    let content = valid(message).and_then(|message| valid(message.content));
+    content
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|b| valid(Some(b)))
+}
+
+fn piece(text: Option<String>) -> Option<String> {
+    let text: String = text?.chars().map(shown).collect();
+    let text = message_tail(text.trim(), ACCOUNT_PIECE_CHARS_MAX).trim();
+    assert!(text.chars().count() <= ACCOUNT_PIECE_CHARS_MAX);
+    assert!(!text.contains(|c: char| c != '\n' && shown(c) != c));
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+// Terminals act on control characters, and bidi overrides reorder the text a reader sees.
+fn shown(c: char) -> char {
+    let bidi =
+        matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    if c != '\n' && (c.is_control() || bidi) {
+        ' '
+    } else {
+        c
+    }
 }

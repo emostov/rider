@@ -80,11 +80,14 @@ const _: () = assert!(RERUN_TRIES > 0);
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
 const RESULT_SCHEMA: &str = "rider-result@2";
+const OF_CHAIN_MAX: usize = 16;
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the Claude session id of its latest completed attempt on one line,
 // then the repository it ran in.
 const SESSION_FILE: &str = "session";
+const RESULT_FILE: &str = "result.json";
+pub const RESULT_FILE_BYTES_MAX: u64 = 64 * 1024;
 const SESSION_FILE_BYTES_MAX: usize = 4096;
 const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const DELIVERY_NOTE: &str = "These replies were posted in your task's thread while you worked. \
@@ -120,6 +123,7 @@ pub enum RunError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ran {
     Settled(Verdict),
+    WaitingFor(TaskId),
     /// The task was relabeled after its claim: no agent launched and it is still claimed.
     RoleChanged {
         claimed: &'static str,
@@ -171,6 +175,15 @@ struct ResultRecord<'a> {
     summary: &'a str,
 }
 
+#[derive(Serialize)]
+struct Settlement<'a> {
+    repo: &'a str,
+    branch: Option<&'a str>,
+    head: &'a str,
+    summary: &'a str,
+    base: Option<&'a str>,
+}
+
 struct Evidence {
     clean: bool,
     on_branch: bool,
@@ -194,6 +207,10 @@ pub fn run_task(
             board.block(id, &reason, kind)?;
             return Ok(Ran::Settled(Verdict::LeaveBlocked));
         }
+        Prepared::WaitingFor(of) => {
+            board.release(id)?;
+            return Ok(Ran::WaitingFor(of));
+        }
     };
     let found = attempt.role().label;
     if let Some(claimed) = claimed.filter(|claimed| claimed.label != found) {
@@ -203,7 +220,7 @@ pub fn run_task(
         });
     }
     let launched = attempt.launch(board, launch);
-    let judgement = judge_attempt(id, board, &attempt, launched)?;
+    let judgement = judge_attempt(id, board, &attempt, &launched)?;
     settle_attempt(id, env, board, &attempt, &judgement)?;
     Ok(Ran::Settled(judgement.verdict))
 }
@@ -419,6 +436,7 @@ impl Attempt {
 /// What preparing an attempt came to: an attempt to run, or a block to write instead.
 pub enum Prepared {
     Ready(Box<Attempt>),
+    WaitingFor(TaskId),
     Blocked { kind: &'static str, reason: String },
 }
 
@@ -456,19 +474,25 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
         Ok(validated) => validated,
         Err(block) => return Ok(block.prepared()),
     };
+    if let Some(of) = brief.of.filter(|of| !view.needs.contains(of))
+        && let Some(prepared) = of_not_done(id, of, board)?
+    {
+        return Ok(prepared);
+    }
     if let Some(error) = unneeded_on_branch(&brief, &view, board)? {
         return Ok(Block::new("invalid_brief", error.to_string()).prepared());
     }
     let identity = board_identity(&env.board_url, board)?;
     let attempt = match prepare(brief, failed, start, env, board, &identity) {
         Ok(attempt) => attempt,
-        Err(block) => return Ok(block.prepared()),
+        Err(Unprepared::Blocked(block)) => return Ok(block.prepared()),
+        Err(Unprepared::CallFailed(error)) => return Err(RunError::Board(error)),
     };
     if let Some(branch) = &attempt.checkout.branch {
         if let Some(block) = label_branch(id, board, &view, branch)? {
             return Ok(block.prepared());
         }
-        if !attempt.retry && start_label.is_none() {
+        if start_label.is_none() && (attempt.failed == 0 || !attempt.retry) {
             board.set_label(id, START_LABEL, &attempt.checkout.start_head)?;
         }
     }
@@ -539,7 +563,7 @@ pub fn judge_attempt(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<Judgement, RunError> {
     if let Some(fresh) = attempt.fallback.as_ref()
         && attempt.fresh_log.get().is_some()
@@ -630,6 +654,40 @@ pub fn launch_agent(
     harness::run(cmd, dir, log, seconds_max, LOG_BYTES_MAX)
 }
 
+fn of_not_done(id: TaskId, of: TaskId, board: &dyn Board) -> Result<Option<Prepared>, RunError> {
+    assert!(
+        id != of,
+        "parse_brief rejects an `of` label naming the task itself"
+    );
+    let mut next = of;
+    for _ in 0..OF_CHAIN_MAX {
+        let view = board.read_task(next)?;
+        match view.state {
+            TaskState::Completed if next == of => return Ok(None),
+            TaskState::Canceled if next == of => {
+                let reason = BriefError::OfCanceled(of).to_string();
+                return Ok(Some(Block::new("invalid_brief", reason).prepared()));
+            }
+            TaskState::Completed | TaskState::Canceled => break,
+            TaskState::Waiting
+            | TaskState::Ready
+            | TaskState::Claimed
+            | TaskState::Blocked
+            | TaskState::Failed => {}
+        }
+        match parse_id_label(&view, "of").ok().flatten() {
+            Some(after) if after == id => {
+                let reason = BriefError::OfCycle(of).to_string();
+                return Ok(Some(Block::new("invalid_brief", reason).prepared()));
+            }
+            Some(after) if after != next => next = after,
+            Some(_) | None => break,
+        }
+    }
+    assert!(next != id);
+    Ok(Some(Prepared::WaitingFor(of)))
+}
+
 fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
     assert!(attempts > 0 && attempts <= ATTEMPTS_MAX);
     let invalid = |reason: String| Block::new("invalid_brief", reason);
@@ -678,10 +736,10 @@ fn unneeded_on_branch(
         .tasks
         .iter()
         .map(|listed| &listed.view)
-        .filter(|task| task.id != view.id && in_repo(task, &brief.repo))
+        .filter(|task| task.id != view.id)
         .collect();
     let mut targets: Vec<TaskId> = vec![onto];
-    for task in &open {
+    for task in open.iter().filter(|task| in_repo(task, &brief.repo)) {
         let target = label(task, BRANCH_LABEL)
             .is_none()
             .then(|| parse_id_label(task, "onto").ok().flatten())
@@ -712,8 +770,9 @@ fn unneeded_on_branch(
         let inherited = works_onto
             .and_then(branch_of)
             .and_then(|(_, b)| b.as_deref());
-        own.or(inherited) == Some(branch.as_str())
-            || own.is_none() && works_onto.is_some_and(|id| members.contains(&id))
+        in_repo(task, &brief.repo)
+            && (own.or(inherited) == Some(branch.as_str())
+                || own.is_none() && works_onto.is_some_and(|id| members.contains(&id)))
     });
     let after = closure(&open, view.id, |task, members| {
         task.needs.iter().any(|need| members.contains(need))
@@ -769,7 +828,7 @@ fn prepare(
     env: &Env,
     board: &dyn Board,
     identity: &BoardIdentity,
-) -> Result<Attempt, Block> {
+) -> Result<Attempt, Unprepared> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
     let dir = worktree::dir_for(&brief, &env.home);
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
@@ -807,8 +866,13 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = worktree::prepare(&brief, board, &env.home, identity);
-    let checkout = checkout.map_err(|error| worktree_block(&error))?;
+    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
+        Ok(checkout) => checkout,
+        Err(WorktreeError::Board(error)) if error.call_failed() => {
+            return Err(Unprepared::CallFailed(error));
+        }
+        Err(error) => return Err(worktree_block(&error).into()),
+    };
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
     assert!(log.is_absolute());
@@ -831,6 +895,17 @@ fn prepare(
         fresh_log: OnceLock::new(),
         stopped: AtomicBool::new(false),
     })
+}
+
+enum Unprepared {
+    Blocked(Block),
+    CallFailed(BoardError),
+}
+
+impl From<Block> for Unprepared {
+    fn from(block: Block) -> Unprepared {
+        Unprepared::Blocked(block)
+    }
 }
 
 fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
@@ -885,6 +960,13 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);
     Ok(session)
+}
+
+pub fn result_path(home: &Path, id: TaskId) -> PathBuf {
+    assert!(home.is_absolute());
+    let path = home.join(LOGS_DIR).join(id.0.to_string()).join(RESULT_FILE);
+    assert!(path.starts_with(home));
+    path
 }
 
 fn session_path(home: &Path, id: TaskId) -> PathBuf {
@@ -1094,7 +1176,7 @@ fn inspect(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<(Verdict, Option<Work>), RunError> {
     let fail = |reason: String| (Verdict::Fail { reason }, None);
     let state_after = board.read_task(id)?.state;
@@ -1105,7 +1187,7 @@ fn inspect(
         other => return Err(RunError::LostClaim(other)),
     }
     let exit = match launched {
-        Ok(exit) => exit,
+        Ok(exit) => *exit,
         Err(error) => return Ok(fail(error.to_string())),
     };
     let evidence = match evidence(attempt) {
@@ -1241,6 +1323,26 @@ fn complete(
         let _ = board.reply(id, &one_line(&note));
     }
     // The record and the note below only inform; losing them must not undo finished work.
+    let settlement = attempt.brief.repo.to_str().map(|repo| Settlement {
+        repo,
+        branch: record.branch,
+        head: record.head,
+        summary: record.summary,
+        base: attempt.checkout.base.as_deref(),
+    });
+    let path = result_path(&env.home, id);
+    let written = match settlement.map(|settlement| serde_json::to_string(&settlement)) {
+        Some(Ok(json)) => fs::write(&path, json).map_err(|error| error.to_string()),
+        Some(Err(error)) => Err(error.to_string()),
+        None => Err("the repository path is not UTF-8".to_string()),
+    };
+    if let Err(error) = written {
+        let note = format!(
+            "Rider could not record the result in {}: {error}.",
+            path.display()
+        );
+        let _ = board.reply(id, &one_line(&note));
+    }
     if let Ok(record) = serde_json::to_string(&record)
         && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
     {
@@ -1387,9 +1489,11 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
     // `codex review` prints errors, such as a provider's content-filter stop, only on stderr.
     let (header, tail) = match attempt.brief.role.harness {
-        Harness::Claude | Harness::Codex => {
+        harness @ (Harness::Claude | Harness::Codex) => {
             let log = attempt.log();
-            (format!("The whole log: {}", log.display()), log_tail(&log))
+            let tail = log_tail(&log);
+            let tail = harness::failure_account(&harness, &log, &tail).unwrap_or(tail);
+            (format!("The whole log: {}", log.display()), tail)
         }
         Harness::CodexReview => {
             let stderr = stderr_log(&attempt.log());

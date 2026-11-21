@@ -10,6 +10,7 @@ mod codex_review;
 )]
 mod fake_agent;
 mod harness_cli;
+mod pr;
 mod queue;
 mod queue_unclaimed;
 mod review_pr;
@@ -1952,35 +1953,113 @@ fn an_onto_task_that_does_not_need_an_unfinished_task_on_its_branch_is_blocked()
 }
 
 #[test]
-fn a_review_that_does_not_need_the_task_it_checks_is_blocked() {
+fn a_review_that_does_not_need_the_task_it_checks_waits_for_it_and_runs_on_its_work() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Hold]);
     let review = NewTask::new("Review the work.")
         .label("repo", world.repo_label())
         .label("of", &built)
         .role("review");
     let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &built);
 
-    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+    world.release_agent(&built);
+    let states = when_the_tasks_settle(&world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let branch = then_the_branch_has_the_agents_commit(&world, &built, 0);
+    let head = branch_head(&world, &branch);
+    assert_eq!(fake_agent::head(&world.root, &review, 0), (head, None));
+    assert_eq!(agent_runs_for(&world, &review).len(), 1);
+}
+
+#[test]
+fn a_review_of_a_failed_task_it_does_not_need_waits_until_that_task_is_reopened_and_done() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = an_implement_task(&world, "Add the work.").label("attempt", "2");
+    let built = when_the_lead_creates(&world, &built);
+    given_the_agent_will(&world, &built, &[Behaviour::ExitNonZero, Behaviour::Commit]);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["failed"]);
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+
+    world.vb_lead(&["label", &built, "attempt=0"], None);
+    world.vb_lead(&["tasks", "reopen", &built], None);
+    let states = when_the_tasks_settle(&world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let branch = then_the_branch_has_the_agents_commit(&world, &built, 1);
+    let head = branch_head(&world, &branch);
+    assert_eq!(fake_agent::head(&world.root, &review, 0), (head, None));
+}
+
+fn a_review(world: &World) -> String {
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .role("review");
+    when_the_lead_creates(world, &review)
+}
+
+#[test]
+fn a_task_whose_of_label_names_itself_is_blocked() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let review = a_review(&world);
+    world.vb_lead(&["label", &review, &format!("of={review}")], None);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&review]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = "Change the `of` label to another task: a task cannot check its own work.";
+    assert_eq!(
+        task_block(&world, &review),
+        Some(("invalid_brief".to_string(), reason.to_string()))
+    );
+}
+
+#[test]
+fn tasks_whose_of_labels_form_a_cycle_are_blocked() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let first = a_review(&world);
+    let second = a_review(&world);
+    world.vb_lead(&["label", &first, &format!("of={second}")], None);
+    world.vb_lead(&["label", &second, &format!("of={first}")], None);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&first, &second]);
 
     assert_eq!(
         (states, exit),
-        (
-            vec!["completed".to_string(), "blocked".to_string()],
-            Some(0)
+        (["blocked", "blocked"].map(String::from).to_vec(), Some(0))
+    );
+    let reason = |of: &str| {
+        format!(
+            "Change the `of` label of this task or of task #{of}: the `of` labels form a \
+             cycle, so none of these tasks is ever done first."
         )
-    );
-    let reason = format!(
-        "Add task #{built} to this task's needs, or change the `of` label: a task checks \
-         the work of its `of` task only once that task is done."
-    );
-    assert_eq!(
-        task_block(&world, &review),
-        Some(("invalid_brief".to_string(), reason))
-    );
-    assert_eq!(agent_runs_for(&world, &review), vec![]);
+    };
+    let blocked = |reason: String| Some(("invalid_brief".to_string(), reason));
+    assert_eq!(task_block(&world, &first), blocked(reason(&second)));
+    assert_eq!(task_block(&world, &second), blocked(reason(&first)));
+    assert_eq!(agent_runs(&world), vec![]);
 }
 
 #[test]
@@ -2070,6 +2149,104 @@ fn an_onto_task_that_does_not_need_an_unfinished_task_onto_a_completed_fix_is_bl
         Some(("invalid_brief".to_string(), reason))
     );
     assert_eq!(agent_runs_for(&world, &racing), vec![]);
+}
+
+#[test]
+fn an_agent_that_finishes_while_the_board_is_down_completes_once_the_board_is_back() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    world.stop_board();
+    world.release_agent(&task);
+    let deadline = Instant::now() + Duration::from_secs(fake_agent::HOLD_SECONDS_MAX);
+    while !fake_agent::running_pids(&world.root).is_empty() {
+        assert!(Instant::now() < deadline, "the released agent did not exit");
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_secs(3));
+    world.start_board();
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+    let exit = then_the_daemon_exits(&mut world);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert_eq!(task_label(&world, &task, "attempt"), None);
+    then_the_branch_has_the_agents_commit(&world, &task, 0);
+}
+
+#[test]
+fn a_base_read_that_cannot_reach_the_board_is_retried_and_the_task_completes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let base = when_the_lead_creates(&world, &an_implement_task(&world, "Add the base work."));
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&base]);
+    assert_eq!(states, vec!["completed"]);
+    given_vb_cannot_reach_the_board_once(&world, "read", &base, "");
+    let stacked = NewTask::new("Add the stacked work.")
+        .label("repo", world.repo_label())
+        .label("base", &base)
+        .needs(&base)
+        .role("implement");
+    let stacked = when_the_lead_creates(&world, &stacked);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&stacked]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert_eq!(task_block(&world, &stacked), None);
+    assert!(world.root.join(format!("unreachable-read-{base}")).exists());
+}
+
+#[test]
+fn a_start_label_write_that_cannot_reach_the_board_is_retried_before_the_agent_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_vb_cannot_reach_the_board_once(&world, "label", &task, "start=");
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert!(
+        world
+            .root
+            .join(format!("unreachable-label-{task}"))
+            .exists()
+    );
+    let main = world.git_ok(&["rev-parse", MAIN]);
+    assert_eq!(task_label(&world, &task, "start"), Some(main));
+}
+
+#[test]
+fn an_onto_task_runs_when_a_task_on_its_branch_waits_for_it_through_a_task_of_no_repository() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let first = a_fix(&world, "Fix the work.", &built, &built, false);
+    let first = when_the_lead_creates(&world, &first);
+    let gate = NewTask::new("Finish a prerequisite.").needs(&first);
+    let gate = when_the_lead_creates(&world, &gate);
+    let later = a_fix(&world, "Fix the work again.", &built, &gate, false);
+    let later = when_the_lead_creates(&world, &later);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &first]);
+
+    assert_eq!(
+        (states, exit),
+        (
+            vec!["completed".to_string(), "completed".to_string()],
+            Some(0)
+        )
+    );
+    assert_eq!(task_block(&world, &first), None);
+    assert_eq!(task_state(&world, &later), "waiting");
 }
 
 #[test]
@@ -2222,7 +2399,7 @@ fn rider_down_drains_the_running_agent_claims_nothing_new_and_the_daemon_exits()
         );
         let later = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
         assert_eq!(
-            when_the_task_leaves_ready_within(&world, &later, 3),
+            when_the_task_leaves_ready_within(&world, &later, 7),
             "ready"
         );
         world.release_agent(&running);
@@ -2622,9 +2799,6 @@ fn an_onto_task_completes_after_a_crash_left_a_later_fix_holding_the_branch() {
         return;
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
-    given_a_running_daemon(&mut world);
-    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
     let first = when_the_lead_creates(
         &world,
         &a_fix(&world, "Fix the work.", &built, &built, false),
@@ -2633,10 +2807,13 @@ fn an_onto_task_completes_after_a_crash_left_a_later_fix_holding_the_branch() {
         &world,
         &a_fix(&world, "Fix it again.", &built, &first, false),
     );
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
     given_the_agent_will(&world, &first, &[Behaviour::Commit]);
     given_the_agent_will(&world, &second, &[Behaviour::Commit]);
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
     given_vb_waits_for_the_result_post(&world, &first, &posted, &release);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
     when_the_file_exists(&world, &posted);
     when_the_daemon_crashes(&mut world);
     fs::write(&release, "").expect("release the held post");
