@@ -21,6 +21,7 @@ const FLOOD_LINES: usize = 10_000;
 const FLOOD_WRITE_MILLIS: u64 = 500;
 const LAG_REQUESTS_MAX: u64 = 1 << 16;
 const LAG_STALL_SECONDS: u64 = 3;
+const LAG_ATTEMPTS_MAX: usize = 8;
 const READ_SECONDS_MAX: u64 = 30;
 const READS_MAX: usize = 1 << 20;
 const LOG_LINES: usize = 8 * 1024;
@@ -107,9 +108,8 @@ fn a_lagging_client_holds_its_seat_until_it_has_read_whole_lines_ending_in_lagge
         return;
     };
     given_a_running_daemon(&mut world);
-    let mut slow = given_a_client_on_the_socket(&world);
 
-    let sent = when_the_client_asks_for_status_without_reading(&mut slow);
+    let (slow, sent) = given_a_client_lagging_with_lines_unsent(&world);
     let others: Vec<UnixStream> = (1..CLIENTS_MAX)
         .map(|_| given_a_client_on_the_socket(&world))
         .collect();
@@ -395,7 +395,25 @@ fn when_the_client_floods_bad_requests_without_reading(client: &mut UnixStream) 
     let _ = client.write_all(&b"{}\n".repeat(FLOOD_LINES));
 }
 
-fn when_the_client_asks_for_status_without_reading(client: &mut UnixStream) -> u64 {
+enum Flood {
+    Stalled(u64),
+    HungUp,
+}
+
+// A client whose lines all fit in the socket buffers is hung up on once they are queued, so
+// its seat frees before it reads; only a flood that stalls leaves the daemon a line unsent.
+fn given_a_client_lagging_with_lines_unsent(world: &World) -> (UnixStream, u64) {
+    for _ in 0..LAG_ATTEMPTS_MAX {
+        let mut client = given_a_client_on_the_socket(world);
+        match when_the_client_asks_for_status_without_reading(&mut client) {
+            Flood::Stalled(sent) => return (client, sent),
+            Flood::HungUp => {}
+        }
+    }
+    panic!("the daemon hung up on all {LAG_ATTEMPTS_MAX} lagging clients before they read");
+}
+
+fn when_the_client_asks_for_status_without_reading(client: &mut UnixStream) -> Flood {
     client
         .set_write_timeout(Some(Duration::from_secs(LAG_STALL_SECONDS)))
         .expect("set a write timeout");
@@ -403,16 +421,16 @@ fn when_the_client_asks_for_status_without_reading(client: &mut UnixStream) -> u
         let request = format!("{}\n", json!({"v": 1, "id": id, "cmd": "status"}));
         match client.write_all(request.as_bytes()) {
             Ok(()) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Flood::Stalled(id - 1);
+            }
             Err(error)
                 if matches!(
                     error.kind(),
-                    ErrorKind::WouldBlock
-                        | ErrorKind::TimedOut
-                        | ErrorKind::ConnectionReset
-                        | ErrorKind::BrokenPipe
+                    ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
                 ) =>
             {
-                return id - 1;
+                return Flood::HungUp;
             }
             Err(error) => panic!("sending request {id} failed: {error}"),
         }

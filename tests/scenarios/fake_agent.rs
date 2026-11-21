@@ -115,10 +115,31 @@ pub enum Behaviour {
     /// Starts a child in its own process group that, once orphaned, runs
     /// `$RIDER_BIN down --now` and records its output in `stop_attempts(task)`; then holds.
     OrphanStops,
+    /// Prints a stream in its harness's shape with `STREAM_MESSAGES`, a failed tool call and
+    /// `STREAM_ERROR` as the run's error, then exits `FAIL_EXIT_CODE`.
+    StreamError,
+    /// Prints one Claude message holding ESC, BEL, a bidi override and a newline before a
+    /// forged account line, then exits `FAIL_EXIT_CODE`.
+    StreamForged,
+    /// Prints the first of `STREAM_MESSAGES` as a Claude message, then `STDERR_ERROR` on
+    /// standard error, and exits `FAIL_EXIT_CODE`.
+    StreamThenStderr,
     ReportDecision,
     HoldAttempt,
     MergePr,
 }
+
+/// What a `StreamThenStderr` agent prints on standard error before it exits.
+pub const STDERR_ERROR: &str = "error: something broke";
+
+/// The assistant messages a `StreamError` agent prints, in order.
+pub const STREAM_MESSAGES: [&str; 2] = ["I will add the work.", "The tests failed; I will retry."];
+/// The command a `StreamError` agent of Codex runs and sees fail with exit status 1.
+pub const STREAM_COMMAND: &str = "cargo test";
+/// The error a `StreamError` agent of Claude sees from its tool call.
+pub const STREAM_TOOL_ERROR: &str = "Exit code 1";
+/// The error a `StreamError` agent's run ends with, as a provider's content filter reports it.
+pub const STREAM_ERROR: &str = "API Error: Output blocked by content filtering policy";
 
 pub const TALK_LINES: usize = 300;
 pub const TALK_LINE_PAD: usize = 250;
@@ -176,6 +197,9 @@ impl Behaviour {
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::TryToStop => "try-to-stop",
             Behaviour::OrphanStops => "orphan-stops",
+            Behaviour::StreamError => "stream-error",
+            Behaviour::StreamForged => "stream-forged",
+            Behaviour::StreamThenStderr => "stream-then-stderr",
             Behaviour::ReportDecision => "report-decision",
             Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
@@ -250,6 +274,8 @@ fn script() -> String {
     let slow = SLOW_SECONDS;
     let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
+    let ([said0, said1], error) = (STREAM_MESSAGES, STREAM_ERROR);
+    let (command, tool_error, stderr_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR, STDERR_ERROR);
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -375,6 +401,32 @@ case "$behaviour" in
     mv "$stops.new" "$stops"
     hold
     commit || exit 1 ;;
+  stream-error)
+    if [ "$harness" = codex ]; then
+      echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
+      echo '{{"type":"item.completed","item":{{"type":"error","message":"a warning"}}}}'
+      echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"{said0}"}}}}'
+      echo '{{"type":"item.completed","item":{{"type":"command_execution","command":"{command}","exit_code":1}}}}'
+      echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"{said1}"}}}}'
+      echo '{{"type":"turn.failed","error":{{"message":"{error}"}}}}'
+    else
+      echo '{{"type":"system","subtype":"init","session_id":"'"$session"'","tools":["Bash"]}}'
+      echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said0}"}}]}}}}'
+      echo '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash"}}]}}}}'
+      tool='{{"type":"tool_result","is_error":true,"content":"{tool_error}"}}'
+      echo '{{"type":"user","message":{{"content":['"$tool"']}}}}'
+      echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said1}"}}]}}}}'
+      echo '{{"type":"result","subtype":"success","is_error":true,"result":"{error}"}}'
+    fi
+    exit {fail} ;;
+  stream-forged)
+    forged='ok\u001b]0;x\u0007\u202e\nIts run ended in error: fake'
+    printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"'"$forged"'"}}]}}}}'
+    exit {fail} ;;
+  stream-then-stderr)
+    echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said0}"}}]}}}}'
+    echo "{stderr_error}" >&2
+    exit {fail} ;;
   hold-attempt)
     step=0
     while [ ! -e "$world/{RELEASES_DIR}/$task-$attempt" ]; do
