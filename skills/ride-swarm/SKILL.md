@@ -65,7 +65,7 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
    run `rider up`, which starts it in the background, and check `rider status` again.
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
-   `lead-fable-5-2`. Answer the user before anything else.
+   `lead`. Answer the user before anything else.
 
 To send a finished branch for the owner's review, open its PR, and get CI green, follow the
 `ship-swarm` skill. Its loops follow the owner's settings in `<rider home>/ship.toml`.
