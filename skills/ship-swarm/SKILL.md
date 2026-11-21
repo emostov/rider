@@ -16,7 +16,7 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
 
 - Act only when the owner asks, and only on the branch or stack they name. The ask does not
   carry over to another branch or PR.
-- Never merge (`gh pr merge` included) and never push to the base branch.
+- Merge a PR (`gh pr merge --merge`, never deleting its branch) only when its CI is green on the head and its review is done, and promptly then; cut the next work from main, and never stack more than two PRs. Never push to the base branch.
 - A feature branch the swarm created may be rewritten, also after its PR is open: restacks
   and rebases are fine. Push a rewrite with `git push --force-with-lease origin <branch>`
   on that branch only. Never force-push the base branch or a branch the swarm did not
@@ -36,7 +36,8 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
 
 ## Pinging the owner
 
-The owner should hear from you when they must act, and not for every poll. Classify each
+The owner should hear from you only on decisions, PRs and failures, not for every poll or
+settled task. Classify each
 event, then send it on `notify.channel` (`"push"` uses the harness's push notification
 tool; without one, fall back to the session):
 
@@ -116,7 +117,9 @@ still live can be.
 ## 1. Open the PR
 
 1. Check the branch is settled: no unfinished task is `onto` it or reviews it
-   (`vb tasks work/<project> --state all`), and its reviews report nothing blocking.
+   (`vb tasks work/<project> --state all`), and its reviews report nothing blocking. One
+   review per PR: a single-task PR needs only its holistic review; per-task reviews exist only
+   in a multi-task PR, whose holistic review then reads the diff only.
 2. `git -C <repo> push -u origin <branch>`. If the remote branch exists and the push is
    rejected as non-fast-forward, stop and tell the owner: it may not be the swarm's.
 3. Fill the repository's template (`.github/pull_request_template.md`, or a file in
@@ -133,7 +136,7 @@ still live can be.
    stacks on.
 
 The lead may open a PR as a draft (`gh pr create --draft`) before the work is finished,
-so CI runs while reviews, polish and the security review go on. Push each later fix on the
+so CI runs while reviews and the security review go on. Push each later fix on the
 branch to it. Mark it ready with `gh pr ready <n>` only when the stack's tasks are done and
 CI is green.
 
@@ -173,8 +176,9 @@ All green: step 4. The board wait from `lead.md` runs alongside it.
      failing assertion, a formatting check.
 4. A real failure becomes a fix task, created as `lead.md` describes:
    `role=implement` (or `light` when the log says exactly what to change, as a lint does),
-   `onto=<top>`, `needs` every unfinished task on that branch, and no `review` of its own
-   (read its diff; the PR's holistic review covers it). The brief carries the check's name, the failing log lines, and the local command that
+   `onto=<top>`, `resume=1` when the task it fixes is `implement` or `light`, `needs` every
+   unfinished task on that branch, and no `review` of its own (read its diff; the PR's
+   holistic review covers it). The brief carries the check's name, the failing log lines, and the local command that
    reproduces the check (from the workflow file under `.github/workflows/`).
 5. When the fix task completes, read the result, then push: `git -C <repo> push
    origin <branch>`. `<top>` is now the fix task. Watch again (step 2).

@@ -13,6 +13,4 @@ pub mod run_task;
 pub mod settle;
 pub mod skills;
 pub mod socket;
-#[cfg(test)]
-mod test_support;
 pub mod worktree;

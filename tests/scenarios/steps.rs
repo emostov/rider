@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -511,6 +513,20 @@ pub fn given_a_running_daemon(world: &mut World) {
 
 /// Given a running `rider daemon` with `env` added to the world's environment.
 pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
+    when_the_daemon_is_started(world, env);
+    let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
+    while !world.daemon_log().contains(DAEMON_STARTED) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not start within {DAEMON_START_SECONDS_MAX} seconds:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
+}
+
+/// When `rider daemon` is spawned with `env` added, not waiting for it to start following.
+pub fn when_the_daemon_is_started(world: &mut World, env: &[(&str, &str)]) {
     assert!(world.daemon.is_none(), "one daemon per world");
     let log =
         fs::File::create(world.root.join("daemon-output.log")).expect("create the daemon output");
@@ -525,15 +541,7 @@ pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
         .spawn()
         .expect("start rider daemon");
     world.daemon = Some(Daemon { child });
-    let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
-    while !world.daemon_log().contains(DAEMON_STARTED) {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon did not start within {DAEMON_START_SECONDS_MAX} seconds:\n{}",
-            world.daemon_log()
-        );
-        thread::sleep(Duration::from_millis(POLL_MILLIS));
-    }
+    assert!(world.daemon.is_some());
 }
 
 /// When the daemon is sent SIGTERM.
@@ -782,6 +790,36 @@ esac
 exec '{}' "$@"
 "#,
         marker.display(),
+        release.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given the first `vb read <task>` of each of `tasks` touches `marker-<task>` under the world's
+/// root and then waits, up to `HELD_TENTHS_MAX` tenths of a second, until `release` exists.
+pub fn given_vb_holds_the_first_read_of(world: &World, tasks: &[&str], release: &Path) {
+    assert!(!tasks.is_empty());
+    assert!(
+        tasks
+            .iter()
+            .all(|task| task.bytes().all(|b| b.is_ascii_digit()))
+    );
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let root = world.root.display();
+    let script = format!(
+        r#"#!/bin/sh
+case " {} " in *" $2 "*)
+  if [ "$1" = read ] && mkdir '{root}/held-'"$2" 2>/dev/null; then
+    : > '{root}/marker-'"$2"
+    n=0
+    while [ ! -e '{}' ] && [ $n -lt {HELD_TENTHS_MAX} ]; do sleep 0.1; n=$((n + 1)); done
+  fi;;
+esac
+exec '{}' "$@"
+"#,
+        tasks.join(" "),
         release.display(),
         real.display()
     );
@@ -1054,6 +1092,94 @@ pub fn when_the_group_is_killed(pid: u32) {
     assert!(status.success(), "killing group {pid} failed: {status}");
 }
 
+/// Upper bound on the requests a client that never reads sends before the daemon stops
+/// reading them; past every kernel buffer and the daemon's backlog on Linux and macOS.
+const FLOOD_REQUESTS_MAX: u64 = 1 << 16;
+/// How long a write to the daemon may wait before the daemon is taken to have stopped reading.
+const FLOOD_STALL_SECONDS: u64 = 3;
+/// How long a client that lagged waits for the daemon to end its connection.
+const LAGGED_END_SECONDS_MAX: u64 = 30;
+/// Upper bound on the reads taken to reach the end of a connection.
+const LAGGED_READS_MAX: usize = 1 << 20;
+
+/// A raw connection to the running daemon's socket.
+pub fn given_a_client_on_the_daemon_socket(world: &World) -> UnixStream {
+    UnixStream::connect(world.home.join("rider.sock")).expect("connect to the daemon socket")
+}
+
+/// When the client sends status requests and never reads, until a write waits
+/// `FLOOD_STALL_SECONDS` or is refused because the daemon stopped reading; returns the
+/// requests sent whole.
+pub fn when_the_client_sends_status_requests_without_reading(client: &mut UnixStream) -> u64 {
+    let stall = Duration::from_secs(FLOOD_STALL_SECONDS);
+    client
+        .set_write_timeout(Some(stall))
+        .expect("set a write timeout");
+    for id in 1..=FLOOD_REQUESTS_MAX {
+        let request = format!("{{\"v\":1,\"id\":{id},\"cmd\":\"status\"}}\n");
+        match client.write_all(request.as_bytes()) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                ) =>
+            {
+                return id - 1;
+            }
+            Err(error) => panic!("sending request {id} failed: {error}"),
+        }
+    }
+    panic!("the daemon read all {FLOOD_REQUESTS_MAX} requests from a client that never read");
+}
+
+/// Then the client reads until the daemon ends its connection; returns every line, each
+/// parsed as JSON, failing if a line is cut short or the end is not reached in time.
+pub fn then_the_client_reads_to_the_end(mut client: &UnixStream) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(LAGGED_END_SECONDS_MAX);
+    let mut data = Vec::new();
+    let mut buffer = vec![0; 64 * 1024];
+    for _ in 0..LAGGED_READS_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let bytes = data.len();
+        assert!(!left.is_zero(), "no end of stream in time: {bytes} bytes");
+        // macOS refuses the timeout with EINVAL once the daemon has closed its end; a read
+        // then returns at once, so the error is safe to ignore.
+        let _ = client.set_read_timeout(Some(left));
+        match client.read(&mut buffer) {
+            Ok(0) => {
+                let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+                assert!(text.ends_with('\n'), "a line was cut short: {bytes} bytes");
+                return text.lines().map(parse::<Value>).collect();
+            }
+            Ok(read) => data.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            // Linux resets the connection when the daemon closes it with the client's
+            // requests still unread, which it may do once its bound on reading them is reached.
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {
+                let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+                assert!(
+                    text.ends_with('\n'),
+                    "reset after a cut line: {bytes} bytes, {error}"
+                );
+                let lines: Vec<Value> = text.lines().map(parse::<Value>).collect();
+                let code = lines.last().and_then(|line| line["error"]["code"].as_str());
+                assert_eq!(code, Some("lagged"), "reset before lagged: {error}");
+                return lines;
+            }
+            Err(error) => panic!("reading to the end failed after {bytes} bytes: {error}"),
+        }
+    }
+    panic!("no end of stream within {LAGGED_READS_MAX} reads");
+}
+
 /// How long a scenario waits for `rider wait` to end.
 const WAIT_SECONDS_MAX: u64 = 90;
 /// The exit code of a `rider wait` that timed out.
@@ -1148,4 +1274,113 @@ pub fn when_the_process_is_sent(pid: u32, signal: &str) {
         .status()
         .expect("run kill");
     assert!(status.success(), "kill {signal} {pid}");
+}
+
+/// Given the first `vb reply` fails and every later one runs.
+pub fn given_vb_fails_the_first_reply(world: &World) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = reply ] && mkdir '{}/first-reply' 2>/dev/null; then
+  echo 'injected reply failure' >&2
+  exit 1
+fi
+exec '{}' "$@"
+"#,
+        world.root.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb` call whose arguments match one of the shell `patterns` fails.
+pub fn given_vb_fails_every(world: &World, patterns: &[&str]) {
+    assert!(!patterns.is_empty());
+    assert!(
+        patterns
+            .iter()
+            .all(|pattern| !pattern.is_empty() && !pattern.contains('\''))
+    );
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case "$*" in {}) echo "injected $1 failure" >&2; exit 1;; esac
+exec '{}' "$@"
+"#,
+        patterns.join("|"),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given the lead holds and completes `task` itself, so it never gets a `branch` label.
+pub fn given_the_lead_completes(world: &World, task: &str) {
+    world.vb_lead(&["tasks", "claim", task], None);
+    world.vb_lead(&["tasks", "complete", task, "done by hand"], None);
+    assert_eq!(task_state(world, task), "completed");
+}
+
+/// The names of the log files rider kept for `task`, sorted.
+pub fn task_logs(world: &World, task: &str) -> Vec<String> {
+    let dir = world.home.join("logs").join(task);
+    let entries = fs::read_dir(&dir).expect("read the task's log directory");
+    let mut names: Vec<String> = entries
+        .map(|entry| {
+            entry
+                .expect("a log entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Given the first `times` `vb tasks <verb>` calls each fail, logged as lines in `calls`.
+pub fn given_vb_fails_the_first(world: &World, verb: &str, times: u32, calls: &Path) {
+    assert!(!verb.is_empty() && verb.bytes().all(|b| b.is_ascii_lowercase()));
+    assert!(times > 0);
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = tasks ] && [ "$2" = {verb} ]; then
+  echo {verb} >> '{calls}'
+  if [ "$(wc -l < '{calls}')" -le {times} ]; then
+    echo 'injected {verb} failure' >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"#,
+        calls = calls.display(),
+        real = real.display(),
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb read <task>` by an implement worker after its first fails, printing `words`
+/// words of error text.
+pub fn given_vb_fails_later_reads_of(world: &World, task: &str, words: usize) {
+    assert!(!task.is_empty() && task.bytes().all(|b| b.is_ascii_digit()));
+    assert!(words > 0);
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let root = world.root.display();
+    let text = vec!["injected"; words].join(" ");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" --as implement"*) worker=1;; *) worker=0;; esac
+if [ $worker = 1 ] && [ "$1" = read ] && [ "$2" = {task} ] && ! mkdir '{root}/read-{task}' 2>/dev/null; then
+  echo '{text}' >&2
+  exit 1
+fi
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
 }

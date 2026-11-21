@@ -48,7 +48,7 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 
 1. **Install what is missing.** Check each with `command -v`; install only what is absent,
    and tell the user what you installed.
-   - `rider`: `cargo install --locked --git https://github.com/emostov/rider rider`, then
+   - `rider`: `cargo install --locked --git https://github.com/emostov/rider swarm-rider`, then
      `rider skills install --into <this agent's skills directory>` (`~/.claude/skills` for
      Claude Code, `~/.codex/skills` for Codex), which installs these skills from the binary
      and keeps them updated with it.
