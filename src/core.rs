@@ -13,8 +13,13 @@ pub const ROLES_MAX: usize = 16;
 pub const CLIENTS_MAX: usize = 8;
 /// Upper bound on the actions one step emits: a few per run, a line per ended run for each
 /// client waiting on `down`, an end for each client following a log, plus a few of its own.
-pub const ACTIONS_MAX: usize =
-    6 * AGENTS_MAX as usize + CLIENTS_MAX * (AGENTS_MAX as usize + 1) + 2 * CLIENTS_MAX + 8;
+pub const ACTIONS_MAX: usize = 6 * AGENTS_MAX as usize
+    + CLIENTS_MAX * (AGENTS_MAX as usize + 1)
+    + 2 * CLIENTS_MAX
+    + REFUSALS_MAX
+    + 8;
+/// Upper bound on the tasks of off roles one step refuses.
+pub const REFUSALS_MAX: usize = AGENTS_MAX as usize;
 /// How long a claim holds its task, in milliseconds.
 pub const LEASE_MILLIS: u64 = 3600 * 1000;
 /// How long one attempt may run, in milliseconds.
@@ -71,6 +76,8 @@ pub struct Role {
     pub model_slug: String,
     pub slots: u8,
     pub builds: bool,
+    /// An off role's ready tasks are refused unclaimed, never run.
+    pub enabled: bool,
 }
 
 /// The role table and limits the core runs under.
@@ -105,6 +112,7 @@ impl Config {
                 model_slug: spec.model_slug.to_string(),
                 slots: spec.slots,
                 builds: spec.builds,
+                enabled: spec.enabled,
             })
             .collect();
         Config {
@@ -388,6 +396,8 @@ pub enum Event {
         until: Timestamp,
     },
     ClaimRefused(RunId),
+    /// The board answered a `Refuse`, whether or not the task was blocked.
+    Refused(TaskId),
     /// The worktree is ready; `branch` is the branch preparation found, if any, and `role` the
     /// label of the role the agent would launch as.
     Prepared {
@@ -439,6 +449,12 @@ pub enum Action {
     Claim {
         run: RunId,
         task: TaskId,
+        profile: String,
+    },
+    /// Blocks, as its owner and unclaimed, a ready task whose role is off.
+    Refuse {
+        task: TaskId,
+        role: String,
         profile: String,
     },
     /// Renews, as `profile`, a claim the board shows held by it from before a restart; it is
@@ -750,6 +766,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         }
         Event::Claimed { run, epoch, until } => on_claimed(state, run, epoch, until, actions),
         Event::ClaimRefused(run) => claim_refused(state, run),
+        Event::Refused(_) => {}
         Event::Prepared { run, branch, role } => on_prepared(state, run, branch, &role, actions),
         Event::PrepareBlocked { run, kind, reason } => {
             if let Some(index) = run_in(state, run, Phase::Preparing) {
@@ -1740,6 +1757,7 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
     if state.board() != BoardHealth::Up || state.stopping != Stopping::No {
         return;
     }
+    refuse_off_roles(state, actions);
     let agents_max = usize::from(state.config.agents_max);
     loop {
         let claiming = state.runs.iter().filter(|run| run.phase == Phase::Claiming);
@@ -1757,6 +1775,31 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         actions.push(Action::Claim { run, task, profile });
     }
     assert!(state.runs.len() <= agents_max);
+}
+
+/// Refuses up to `REFUSALS_MAX` ready tasks whose role is off, each once until the next tick.
+fn refuse_off_roles(state: &mut State, actions: &mut Vec<Action>) {
+    let before = actions.len();
+    for index in 0..state.tasks.len() {
+        if actions.len() - before >= REFUSALS_MAX {
+            break;
+        }
+        let task = &state.tasks[index];
+        let off = task.role.filter(|role| !state.config.roles[*role].enabled);
+        let ready = task.state == TaskState::Ready && task.project.is_some();
+        let Some(role) = off.filter(|_| ready && !task.claim_refused) else {
+            continue;
+        };
+        let (task, label) = (task.id, state.config.roles[role].label.clone());
+        let profile = state.profile(role, 1);
+        state.tasks[index].claim_refused = true;
+        actions.push(Action::Refuse {
+            task,
+            role: label,
+            profile,
+        });
+    }
+    assert!(actions.len() - before <= REFUSALS_MAX);
 }
 
 /// A new run claiming `task` as `role`'s `slot`, and the profile it claims as.
@@ -1862,7 +1905,8 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     let mut best: Option<(usize, usize, u8)> = None;
     for (index, task) in state.tasks.iter().enumerate() {
         let role = task.role.filter(|role| {
-            task.project.is_some() && !task.claim_refused && !(builders_full && roles[*role].builds)
+            let builds = builders_full && roles[*role].builds;
+            task.project.is_some() && !task.claim_refused && roles[*role].enabled && !builds
         });
         let Some(role) = role else {
             continue;

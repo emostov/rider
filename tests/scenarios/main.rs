@@ -976,7 +976,7 @@ fn a_task_labelled_with_the_removed_polish_role_is_left_unclaimed_as_an_unknown_
 }
 
 #[test]
-fn a_task_of_a_role_turned_off_in_rider_toml_is_blocked_naming_the_setting_without_an_agent() {
+fn a_task_of_a_role_turned_off_in_rider_toml_is_blocked_unclaimed_naming_the_setting() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -991,6 +991,7 @@ fn a_task_of_a_role_turned_off_in_rider_toml_is_blocked_naming_the_setting_witho
                   `enabled = false` under [roles.light] in rider.toml.";
     let block = Some(("invalid_brief".to_string(), reason.to_string()));
     assert_eq!(task_block(&world, &task), block);
+    assert_eq!(task_epoch(&world, &task), 0);
     assert_eq!(agent_runs(&world), vec![]);
 }
 

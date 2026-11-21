@@ -24,6 +24,7 @@ use crate::board::{
     Board, BoardError, Listing, TaskId, TaskState, TaskView, Thread, Timestamp, VbCli, one_line,
     parse_failure_reason, register_schemas,
 };
+use crate::brief::BriefError;
 use crate::cli::board_serve;
 use crate::config::Limits;
 use crate::core::{
@@ -930,6 +931,11 @@ fn job(
         Action::Resume { run, task, profile } => {
             Box::new(move || resume(&shared, run, task, &profile))
         }
+        Action::Refuse {
+            task,
+            role,
+            profile,
+        } => Box::new(move || refuse(&shared, task, role, &profile)),
         Action::Prepare { run, task } => {
             let profile = find(contexts, run, lost(run, "prepare"))?.profile.clone();
             Box::new(move || prepare(&shared, run, task, &profile))
@@ -1030,6 +1036,21 @@ fn claim(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
         Err(_) => Event::ClaimRefused(run),
     };
     Input::plain(event)
+}
+
+// Blocks, unclaimed, a ready task whose role is off; `vb` lets the task's owner block it.
+fn refuse(shared: &Shared, task: TaskId, role: String, profile: &str) -> Input {
+    assert!(!profile.is_empty() && !role.is_empty());
+    let reason = BriefError::RoleOff(role).to_string();
+    let outcome = match shared.board(profile).block(task, &reason, "invalid_brief") {
+        Ok(()) => "blocked".to_string(),
+        Err(error) => format!("not blocked: {error}"),
+    };
+    shared.log.write(&format!(
+        "refused #{} of a role that is off: {outcome}",
+        task.0
+    ));
+    Input::plain(Event::Refused(task))
 }
 
 // Renews a claim held from before a restart; it is answered as a claim, keeping its epoch.
