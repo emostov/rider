@@ -43,6 +43,10 @@ use crate::harness::{
     ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PrivateOpenError,
     open_private,
 };
+#[cfg(target_os = "macos")]
+use crate::queue_files::PRS_DIR;
+#[cfg(target_os = "macos")]
+use crate::queue_wait::QUEUE_DIR;
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
@@ -1244,15 +1248,18 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let home = shared.paths.home.clone();
     let vb = shared.paths.vb.clone();
     let confine = shared.confine;
+    let repo = attempt.repo().to_path_buf();
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&stop);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
+        let unreadable = |error: GitError| HarnessError::Spawn(error.to_string());
         if confine && cmd.untrusted {
-            args.extend(confinement(&home, &vb, Confined::Untrusted)?);
+            let common = git::common_dir(&repo).map_err(unreadable)?;
+            let dirs = [repo.clone(), common];
+            args.extend(confinement(&home, &vb, Confined::Untrusted(dirs))?);
         } else if confine {
-            let unreadable = |error: GitError| HarnessError::Spawn(error.to_string());
             let common = git::common_dir(dir).map_err(unreadable)?;
             let own = git::git_dir(dir).map_err(unreadable)?;
             let dirs = [dir.to_path_buf(), common, own];
@@ -1296,7 +1303,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
 
 enum Confined {
     DaemonGit,
-    Untrusted,
+    Untrusted([PathBuf; 2]),
     Worktree([PathBuf; 3]),
 }
 
@@ -1305,9 +1312,10 @@ enum Confined {
 #[cfg(target_os = "macos")]
 fn confinement(home: &Path, vb: &Path, confined: Confined) -> Result<Vec<String>, HarnessError> {
     let offline = matches!(confined, Confined::DaemonGit);
-    let repo: &[PathBuf] = match &confined {
-        Confined::Worktree(dirs) => dirs,
-        Confined::DaemonGit | Confined::Untrusted => &[],
+    let (repo, untouchable): (&[PathBuf], &[PathBuf]) = match &confined {
+        Confined::Worktree(dirs) => (dirs, &[]),
+        Confined::Untrusted(dirs) => (&[], dirs),
+        Confined::DaemonGit => (&[], &[]),
     };
     let unusable = |why: String| HarnessError::Spawn(format!("cannot confine: {why}"));
     let resolve = |path: &Path| {
@@ -1329,9 +1337,14 @@ fn confinement(home: &Path, vb: &Path, confined: Confined) -> Result<Vec<String>
         .iter()
         .map(|dir| resolve(dir))
         .collect::<Result<_, _>>()?;
-    let (mut literals, subpaths) = denied_writes(&home, &vb);
+    let (mut literals, mut subpaths) = denied_writes(&home, &vb);
     for dir in repo.iter().skip(1) {
         literals.extend(dir.ancestors().map(Path::to_path_buf));
+    }
+    for dir in untouchable.iter().map(|dir| resolve(dir)) {
+        let dir = dir?;
+        literals.extend(dir.ancestors().skip(1).map(Path::to_path_buf));
+        subpaths.insert(dir);
     }
     let git = match repo.as_slice() {
         [] => String::new(),
@@ -1382,7 +1395,7 @@ fn denied_writes(home: &Path, vb: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf
     let mut subpaths: BTreeSet<PathBuf> = [AGENTS_DIR, LOGS_DIR, NODE_DIR, PROMPTS_DIR]
         .into_iter()
         .chain(HOME_DIRS)
-        .chain([socket::BIND_DIR])
+        .chain([socket::BIND_DIR, PRS_DIR, QUEUE_DIR])
         .map(|name| home.join(name))
         .collect();
     let mut literals: BTreeSet<PathBuf> = BTreeSet::new();

@@ -29,7 +29,8 @@ const COMMENTS_MAX: usize = 4096;
 const SLUG_BYTES_MAX: usize = 64;
 const LABEL_SHOWN_CHARS_MAX: usize = 48;
 const WARNINGS_MAX: usize = 16;
-const REVIEWED_DIR: &str = "queue/reviewed";
+pub const QUEUE_DIR: &str = "queue";
+const REVIEWED_DIR: &str = "reviewed";
 const RECORD_BYTES_MAX: u64 = 64;
 const LOGIN_BYTES_MAX: usize = 64;
 const CALLS_IN_FLIGHT_MAX: usize = 16;
@@ -296,7 +297,10 @@ fn parse_slug(slug: &str) -> Option<&str> {
 
 fn record_path(home: &Path, item: TaskId) -> PathBuf {
     assert!(home.is_absolute());
-    let path = home.join(REVIEWED_DIR).join(item.0.to_string());
+    let path = home
+        .join(QUEUE_DIR)
+        .join(REVIEWED_DIR)
+        .join(item.0.to_string());
     assert!(path.starts_with(home));
     path
 }

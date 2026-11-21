@@ -285,6 +285,7 @@ fn an_untrusted_agent_runs_in_the_sandbox_and_cannot_write_the_daemons_files() {
     let task = an_untrusted_task(&world, "Review the pull request.", "review");
     let task = when_the_lead_creates(&world, &task);
     given_the_agent_will(&world, &task, &[Behaviour::TryWrites]);
+    given_pinned_pr_files_and_a_reviewed_head(&world);
     given_a_running_daemon(&mut world);
 
     let states = when_the_tasks_settle(&world, &[&task]);
@@ -300,6 +301,43 @@ fn an_untrusted_agent_runs_in_the_sandbox_and_cannot_write_the_daemons_files() {
         .map(|name| format!("{name} refused\n"))
         .collect();
     assert_eq!(fake_agent::tried_writes(&world.root, &task, 0), expected);
+    let repo: String = (fake_agent::REPO_WRITES.split(' '))
+        .map(|name| format!("{name} refused\n"))
+        .collect();
+    assert_eq!(fake_agent::tried_repo_writes(&world.root, &task, 0), repo);
     let scratch = world.home.join("untrusted").join(&task).join("work");
     assert_eq!(agent_runs_for(&world, &task)[0].dir, scratch);
+}
+
+#[test]
+fn canceling_a_blocked_untrusted_task_removes_its_scratch_directory() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = an_untrusted_task(&world, "Review the pull request.", "review");
+    let task = when_the_lead_creates(&world, &task);
+    given_the_agent_will(&world, &task, &[Behaviour::Block]);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["blocked"]);
+    assert!(when_rider_status_shows_within(
+        &world,
+        "0 of 32 running",
+        SETTLE_SECONDS_MAX
+    ));
+    let scratch = world.home.join("untrusted").join(&task);
+    assert!(
+        scratch.is_dir(),
+        "the blocked task keeps {}",
+        scratch.display()
+    );
+
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while scratch.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(!scratch.exists(), "{} is left behind", scratch.display());
 }

@@ -1585,3 +1585,16 @@ pub fn given_main_commits_a_codex_project_config(world: &World, text: &str) {
     world.git_ok(&["commit", "-q", "-m", "Add a Codex project config"]);
     assert_eq!(world.git_ok(&["branch", "--show-current"]), MAIN);
 }
+
+/// Given the lead pinned a PR's files and recorded a reviewed head, as `rider queue files` and
+/// `rider queue reviewed` do.
+pub fn given_pinned_pr_files_and_a_reviewed_head(world: &World) {
+    let pinned = world.home.join("prs").join("7-head");
+    let reviewed = world.home.join("queue").join("reviewed");
+    for dir in [&pinned, &reviewed] {
+        fs::create_dir_all(dir).expect("create the queue's directory");
+    }
+    fs::write(pinned.join("patch.diff"), "diff\n").expect("write the pinned diff");
+    fs::write(reviewed.join("7"), format!("{}\n", "a".repeat(40))).expect("write the record");
+    assert!(reviewed.join("7").is_file());
+}

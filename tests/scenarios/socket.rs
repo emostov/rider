@@ -877,6 +877,7 @@ fn an_agent_cannot_write_the_daemons_staging_files_or_its_board_cli_install() {
     };
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_the_agent_will(&world, &task, &[Behaviour::TryWrites]);
+    given_pinned_pr_files_and_a_reviewed_head(&world);
     given_a_running_daemon(&mut world);
 
     let states = when_the_tasks_settle(&world, &[&task]);

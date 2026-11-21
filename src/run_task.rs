@@ -307,6 +307,11 @@ impl Attempt {
         branch
     }
 
+    pub fn repo(&self) -> &Path {
+        assert!(self.brief.repo.is_absolute());
+        &self.brief.repo
+    }
+
     pub fn launch(&self, board: &dyn Board, launch: &Launch) -> Result<Exit, HarnessError> {
         assert!(self.checkout.dir.is_absolute() && self.log.is_absolute());
         assert!(!self.cmd.program.is_empty());
@@ -1537,15 +1542,24 @@ fn complete(
     Ok(())
 }
 
+fn remove_scratch(id: TaskId, home: &Path, board: &dyn Board) {
+    assert!(home.is_absolute());
+    let scratch = home.join(UNTRUSTED_DIR).join(id.0.to_string());
+    assert!(scratch.starts_with(home));
+    match fs::remove_dir_all(&scratch) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            let note = format!("Kept the scratch directory {}: {error}.", scratch.display());
+            let _ = board.reply(id, &one_line(&note));
+        }
+        Ok(()) | Err(_) => {}
+    }
+}
+
 fn release_or_note(id: TaskId, home: &Path, board: &dyn Board, attempt: &Attempt) {
     assert!(home.is_absolute() && attempt.brief.repo.is_absolute());
     assert!(attempt.brief.id == id);
     if attempt.brief.untrusted {
-        let scratch = home.join(UNTRUSTED_DIR).join(id.0.to_string());
-        if let Err(error) = fs::remove_dir_all(&scratch) {
-            let note = format!("Kept the scratch directory {}: {error}.", scratch.display());
-            let _ = board.reply(id, &one_line(&note));
-        }
+        remove_scratch(id, home, board);
         return;
     }
     let checkout = &attempt.checkout;
@@ -1563,6 +1577,10 @@ pub fn release_canceled_idle(id: TaskId, home: &Path, url: &str, board: &dyn Boa
         return;
     };
     if view.state != TaskState::Canceled || view.id != id {
+        return;
+    }
+    if brief.untrusted {
+        remove_scratch(id, home, board);
         return;
     }
     brief.role = role_in_repo(brief.role, &brief.repo);
