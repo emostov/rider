@@ -689,3 +689,23 @@ fn an_agent_cannot_open_an_app_it_wrote_to_leave_its_sandbox() {
     assert_ne!(code, "0", "{output}");
     assert!(!fake_agent::escaped(&world.root, fake_agent::ESCAPE_OPEN));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_cannot_write_its_repositorys_git_config_hooks_or_remotes_but_still_commits() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantGitConfig]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let refused = "config refused\nconfig.worktree refused\nhooks/post-checkout refused\n\
+                   info/attributes refused\nremotes/origin refused\nown refused\n";
+    assert_eq!(
+        fake_agent::git_config_writes(&world.root, &task, 0),
+        refused
+    );
+}

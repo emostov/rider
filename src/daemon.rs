@@ -37,7 +37,7 @@ use crate::core::{
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
-use crate::git;
+use crate::git::{self, GitError};
 use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
@@ -151,6 +151,18 @@ exec "$@""#;
 
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+#[cfg(target_os = "macos")]
+const NODE_MODULES: &str = "node_modules";
+#[cfg(target_os = "macos")]
+const PACKAGE_DEPTH_MAX: usize = 16;
+#[cfg(target_os = "macos")]
+const HOME_DIRS: [&str; 4] = ["board", "wait", "roles", "run"];
+#[cfg(target_os = "macos")]
+const HOME_FILES: [&str; 2] = ["node.lock", "ship.toml"];
+#[cfg(target_os = "macos")]
+const GIT_FILES: [&str; 2] = ["config", "config.worktree"];
+#[cfg(target_os = "macos")]
+const GIT_DIRS: [&str; 3] = ["hooks", "info", "remotes"];
 #[cfg(target_os = "macos")]
 const PROGRAMS: [&str; 5] = ["git", "gh", "node", "npm", "sh"];
 #[cfg(target_os = "macos")]
@@ -1177,7 +1189,10 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
         if confine {
-            args.extend(confinement(&home, &vb, false)?);
+            let unreadable = |error: GitError| HarnessError::Spawn(error.to_string());
+            let common = git::common_dir(dir).map_err(unreadable)?;
+            let own = git::git_dir(dir).map_err(unreadable)?;
+            args.extend(confinement(&home, &vb, &[common, own])?);
         }
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
@@ -1211,7 +1226,8 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
 // macOS still ships the deprecated sandbox-exec. Every process a confined agent starts,
 // detached or in a group of its own, inherits the profile and cannot leave it.
 #[cfg(target_os = "macos")]
-fn confinement(home: &Path, vb: &Path, offline: bool) -> Result<Vec<String>, HarnessError> {
+fn confinement(home: &Path, vb: &Path, repo: &[PathBuf]) -> Result<Vec<String>, HarnessError> {
+    let offline = repo.is_empty();
     let unusable = |why: String| HarnessError::Spawn(format!("cannot confine: {why}"));
     let resolve = |path: &Path| {
         fs::canonicalize(path)
@@ -1228,7 +1244,16 @@ fn confinement(home: &Path, vb: &Path, offline: bool) -> Result<Vec<String>, Har
     };
     let home = resolve(home)?;
     let vb = resolve(vb)?;
-    let (literals, subpaths) = denied_writes(&home, &vb);
+    let repo: Vec<PathBuf> = repo
+        .iter()
+        .map(|dir| resolve(dir))
+        .collect::<Result<_, _>>()?;
+    let (mut literals, mut subpaths) = denied_writes(&home, &vb);
+    for dir in &repo {
+        literals.extend(dir.ancestors().map(Path::to_path_buf));
+        literals.extend(GIT_FILES.map(|name| dir.join(name)));
+        subpaths.extend(GIT_DIRS.map(|name| dir.join(name)));
+    }
     if literals.len() + subpaths.len() > DENIED_MAX {
         return Err(unusable(format!("more than {DENIED_MAX} paths to deny")));
     }
@@ -1268,11 +1293,16 @@ fn denied_writes(home: &Path, vb: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf
     assert!(home.is_absolute() && vb.is_absolute());
     let mut subpaths: BTreeSet<PathBuf> = [AGENTS_DIR, LOGS_DIR, NODE_DIR, PROMPTS_DIR]
         .into_iter()
+        .chain(HOME_DIRS)
         .chain([socket::BIND_DIR])
         .map(|name| home.join(name))
         .collect();
     let mut literals: BTreeSet<PathBuf> = BTreeSet::new();
-    for name in CONTROL_FILES.into_iter().chain([CONFIG_FILE]) {
+    for name in CONTROL_FILES
+        .into_iter()
+        .chain(HOME_FILES)
+        .chain([CONFIG_FILE])
+    {
         literals.insert(home.join(name));
         literals.insert(home.join(format!("{name}{STAGED_SUFFIX}")));
     }
@@ -1289,7 +1319,7 @@ fn denied_writes(home: &Path, vb: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf
     let programs = programs
         .chain(std::env::current_exe())
         .chain([vb.to_path_buf()]);
-    let installs = programs.filter_map(|file| Some(fs::canonicalize(file).ok()?.parent()?.into()));
+    let installs = programs.filter_map(install_dir);
     let resolved = dirs.iter().filter_map(|dir| fs::canonicalize(dir).ok());
     let trusted: Vec<PathBuf> = dirs
         .iter()
@@ -1314,13 +1344,37 @@ fn confine_git(paths: &Paths) -> Result<(), DaemonError> {
     if !program.is_file() {
         return Err(DaemonError::Confine("no git on PATH".to_string()));
     }
-    let sandbox = confinement(&paths.home, &paths.vb, true)
+    let sandbox = confinement(&paths.home, &paths.vb, &[])
         .map_err(|error| DaemonError::Confine(error.to_string()))?;
     assert!(program.is_absolute());
     if !git::confine(program, sandbox) {
         return Err(DaemonError::Confine("git is already confined".to_string()));
     }
     Ok(())
+}
+
+// A program that is a script inside an npm package runs the rest of its package too.
+#[cfg(target_os = "macos")]
+fn install_dir(program: PathBuf) -> Option<PathBuf> {
+    let file = fs::canonicalize(program).ok()?;
+    let named = |dir: Option<&Path>, name: &str| {
+        dir.and_then(Path::file_name)
+            .is_some_and(|found| found == name)
+    };
+    let scoped = |dir: Option<&Path>| {
+        let name = dir
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy());
+        name.is_some_and(|name| name.starts_with('@'))
+    };
+    let package = file.ancestors().take(PACKAGE_DEPTH_MAX).find(|dir| {
+        let parent = dir.parent();
+        (named(parent, NODE_MODULES) && !scoped(Some(dir)))
+            || (scoped(parent) && named(parent.and_then(Path::parent), NODE_MODULES))
+    });
+    let dir = package.or(file.parent())?.to_path_buf();
+    assert!(file.starts_with(&dir) && dir != file);
+    Some(dir)
 }
 
 // sandbox-exec exits 71, printing `sandbox_apply: Operation not permitted`, when the process
@@ -1351,9 +1405,9 @@ fn confines_agents(log: &Log) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn confinement(home: &Path, vb: &Path, offline: bool) -> Result<Vec<String>, HarnessError> {
+fn confinement(home: &Path, vb: &Path, repo: &[PathBuf]) -> Result<Vec<String>, HarnessError> {
     assert!(home.is_absolute() && !vb.as_os_str().is_empty());
-    let _ = offline;
+    assert!(repo.iter().all(|dir| dir.is_absolute()));
     Ok(Vec::new())
 }
 

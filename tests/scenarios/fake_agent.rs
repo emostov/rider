@@ -27,7 +27,8 @@ pub const ESCAPE_EQUALS: &str = "escape-equals";
 pub const ESCAPE_NESTED: &str = "escape-nested";
 pub const ESCAPE_PROMISOR: &str = "escape-promisor";
 pub const ESCAPE_OPEN: &str = "escape-open";
-pub const TRIED_WRITES: &str = "agents.json.new cursor.new board.json.new node/probe .b/probe rider.toml prompts ../tools/probe";
+pub const TRIED_WRITES: &str = "agents.json.new cursor.new board.json.new node/probe .b/probe rider.toml prompts ../tools/probe \
+     board wait roles run node.lock ship.toml";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +124,7 @@ pub enum Behaviour {
     PlantFilters,
     PlantPromisor,
     OpenApp,
+    PlantGitConfig,
     ReportDecision,
     HoldAttempt,
     MergePr,
@@ -189,6 +191,7 @@ impl Behaviour {
             Behaviour::PlantFilters => "plant-filters",
             Behaviour::PlantPromisor => "plant-promisor",
             Behaviour::OpenApp => "open-app",
+            Behaviour::PlantGitConfig => "plant-git-config",
             Behaviour::ReportDecision => "report-decision",
             Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
@@ -410,6 +413,17 @@ case "$behaviour" in
       printf 'tree 1234567890123456789012345678901234567890\nparent %s\n' "$(git rev-parse HEAD)"
       printf 'author t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\nx\n'
     }} | git hash-object -t commit -w --stdin --literally) && git update-ref HEAD "$absent" || exit 1 ;;
+  plant-git-config)
+    common=$(git rev-parse --path-format=absolute --git-common-dir)
+    own=$(git rev-parse --absolute-git-dir)
+    for target in config config.worktree hooks/post-checkout info/attributes remotes/origin; do
+      if ( : >> "$common/$target" ) 2>/dev/null; then echo "$target written"; else echo "$target refused"; fi
+    done > "$world/{ARGS_DIR}/$task-$attempt.git-config"
+    if ( : >> "$own/config.worktree" ) 2>/dev/null; then echo "own written"; else echo "own refused"; fi \
+      >> "$world/{ARGS_DIR}/$task-$attempt.git-config"
+    git config core.sshCommand planted 2>/dev/null && echo "git config written" \
+      >> "$world/{ARGS_DIR}/$task-$attempt.git-config"
+    commit || exit 1 ;;
   open-app)
     app="$world/{ARGS_DIR}/$task-$attempt.app"
     mkdir -p "$app/Contents/MacOS"
@@ -427,7 +441,8 @@ case "$behaviour" in
     planted="$world/{ARGS_DIR}/$task-$attempt.fsmonitor"
     printf '#!/bin/sh\n: > "%s.ran"\n' "$planted" > "$planted"
     chmod +x "$planted"
-    commit && git config core.fsmonitor "$planted" || exit 1 ;;
+    commit || exit 1
+    git config core.fsmonitor "$planted" 2>/dev/null || : ;;
   signal-daemon-detached)
     signalled="$world/{ARGS_DIR}/$task-$attempt.signal"
     daemon=$(awk '{{print $2}}' "$world/rider-home/daemon.lock")
@@ -554,6 +569,13 @@ pub fn opened(world: &Path, task: &str, attempt: u32) -> (String, String) {
     };
     let (code, output) = (read("code"), read("out"));
     (code.trim().to_string(), output)
+}
+
+pub fn git_config_writes(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.git-config"));
+    fs::read_to_string(&path).expect("read what the agent wrote to git's directory")
 }
 
 pub fn tried_writes(world: &Path, task: &str, attempt: u32) -> String {
