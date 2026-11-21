@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
@@ -31,6 +32,7 @@ const COMMIT_HEX_LENS: [usize; 2] = [40, 64];
 const ORIGIN_PREFIX: &str = "origin/";
 const HEADS_PREFIX: &str = "refs/heads/";
 const BRANCH_FIELD: &[u8] = b"branch refs/heads/";
+const WORKTREE_FIELD: &[u8] = b"worktree ";
 // Set when rider starts from a git hook, these would point git at another repository.
 pub const ENV_REMOVED: [&str; 8] = [
     "GIT_DIR",
@@ -716,7 +718,7 @@ pub fn git_dir(dir: &Path) -> Result<PathBuf, GitError> {
     Ok(path)
 }
 
-fn parse_worktree_branches(stdout: &[u8]) -> Result<Vec<String>, GitError> {
+fn parse_worktree_branches(stdout: &[u8]) -> Result<Vec<(PathBuf, String)>, GitError> {
     assert!(
         stdout.len() <= OUTPUT_BYTES_MAX,
         "output is bounded before it is parsed"
@@ -726,9 +728,14 @@ fn parse_worktree_branches(stdout: &[u8]) -> Result<Vec<String>, GitError> {
         args: WORKTREE_LIST.join(" "),
         stdout: String::from_utf8_lossy(stdout).into_owned(),
     };
-    let mut branches: Vec<String> = Vec::new();
+    let mut branches: Vec<(PathBuf, String)> = Vec::new();
+    let mut dir: Option<PathBuf> = None;
     let mut fields = stdout.split(|&byte| byte == 0);
     for field in fields.by_ref().take(fields_max) {
+        if let Some(path) = field.strip_prefix(WORKTREE_FIELD) {
+            dir = Some(PathBuf::from(OsStr::from_bytes(path)));
+            continue;
+        }
         let Some(name) = field.strip_prefix(BRANCH_FIELD) else {
             continue;
         };
@@ -739,21 +746,24 @@ fn parse_worktree_branches(stdout: &[u8]) -> Result<Vec<String>, GitError> {
         else {
             continue;
         };
+        let Some(dir) = dir.clone() else {
+            return Err(malformed());
+        };
         if branches.len() == WORKTREES_MAX {
             return Err(malformed());
         }
-        branches.push(name.to_string());
+        branches.push((dir, name.to_string()));
     }
     if fields.next().is_some() {
         return Err(malformed());
     }
     assert!(branches.len() <= WORKTREES_MAX);
-    assert!(branches.iter().all(|branch| is_safe_ref(branch)));
+    assert!(branches.iter().all(|(_, branch)| is_safe_ref(branch)));
     Ok(branches)
 }
 
-/// The local branches checked out in any worktree of `repo`, the main checkout included.
-pub fn worktree_branches(repo: &Path) -> Result<Vec<String>, GitError> {
+/// Each worktree of `repo` on a local branch, the main checkout included, with that branch.
+pub fn worktree_branches(repo: &Path) -> Result<Vec<(PathBuf, String)>, GitError> {
     assert!(repo.is_absolute(), "git runs in absolute directories");
     let args = WORKTREE_LIST.map(OsStr::new);
     let stdout = run_ok(repo, &args)?;

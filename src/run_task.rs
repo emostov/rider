@@ -5,27 +5,33 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+type Launch<'a> = dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> + 'a;
 use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::board::{
-    Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
+    Amendment, Board, BoardError, MESSAGE_CHARS_MAX, REPLIES_MAX, TaskId, TaskState, TaskView,
+    Thread, message_tail, one_line,
 };
 use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
+use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES};
 use crate::core::TASKS_MAX;
 use crate::daemon::SUBTREE;
+use crate::feed::Cursor;
 use crate::git::{self, GitError};
 use crate::harness::{
-    self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
-    SESSION_BYTES_MAX, SessionId, command_for,
+    self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, Io, LOG_BYTES_MAX,
+    PROMPT_BYTES_MAX, Resume, SESSION_BYTES_MAX, SessionId, command_for, stderr_log,
 };
 use crate::roles::{Harness, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
+pub const DELIVERY_ROUNDS_MAX: u8 = 3;
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
 /// The failed attempts after which a task is blocked, unless the configuration sets them.
@@ -66,6 +72,13 @@ const RESULT_FILE: &str = "result.json";
 pub const RESULT_FILE_BYTES_MAX: u64 = 64 * 1024;
 const SESSION_FILE_BYTES_MAX: usize = 4096;
 const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
+const DELIVERY_NOTE: &str = "These replies were posted in your task's thread while you worked. \
+                             They amend the brief, and the latest wins.";
+const COMMIT_ASK: &str = "Act on them, commit, and end with a new final message.";
+const REPORT_ASK: &str = "Act on them without committing, and end with a new final report.";
+const TOO_LONG_NOTE: &str = "Replies posted while the agent worked are too long to deliver to it.";
+const THREAD_READS_MAX: u32 = 3;
+const THREAD_PAUSE_MILLIS: u64 = 500;
 const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as the \
                           last attempt left them, uncommitted changes included.";
 
@@ -74,7 +87,6 @@ static BOARD_IDENTITY: Mutex<Option<(String, BoardIdentity)>> = Mutex::new(None)
 /// Where rider keeps its files, and how its agents reach the board.
 pub struct Env {
     pub home: PathBuf,
-    pub prompts: PathBuf,
     pub profile: String,
     pub board_url: String,
     /// Failed attempts after which a task is blocked instead of run again.
@@ -159,7 +171,7 @@ pub fn run_task(
     env: &Env,
     board: &dyn Board,
     claimed: Option<&'static RoleSpec>,
-    launch: &dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError>,
+    launch: &Launch,
 ) -> Result<Ran, RunError> {
     let attempt = match prepare_attempt(id, env, board)? {
         Prepared::Ready(attempt) => attempt,
@@ -175,7 +187,7 @@ pub fn run_task(
             found,
         });
     }
-    let launched = attempt.launch(launch);
+    let launched = attempt.launch(board, launch);
     let judgement = judge_attempt(id, board, &attempt, launched)?;
     settle_attempt(id, env, board, &attempt, &judgement)?;
     Ok(Ran::Settled(judgement.verdict))
@@ -190,7 +202,10 @@ pub struct Attempt {
     // Where the task's branch started: its `start` label, else where this attempt started.
     reference: String,
     cmd: CommandLine,
+    prompt: String,
+    home: PathBuf,
     log: PathBuf,
+    delivery: Mutex<Delivery>,
     // Why the task resumes, or starts fresh though `resume=1` asked otherwise.
     resume_note: Option<String>,
     // When `cmd` resumes a session: that session, and the command that starts fresh instead.
@@ -201,10 +216,16 @@ pub struct Attempt {
     stopped: AtomicBool,
 }
 
+#[derive(Default)]
+struct Delivery {
+    seen: Option<Cursor>,
+    delivered: Vec<Amendment>,
+    log: Option<PathBuf>,
+}
+
 struct Fallback {
     session: SessionId,
     cmd: CommandLine,
-    home: PathBuf,
 }
 
 impl Attempt {
@@ -220,13 +241,138 @@ impl Attempt {
         branch
     }
 
-    /// Runs the attempt's agent in its worktree through `launch`, logging to its own log.
-    pub fn launch(
-        &self,
-        launch: &dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError>,
-    ) -> Result<Exit, HarnessError> {
+    pub fn launch(&self, board: &dyn Board, launch: &Launch) -> Result<Exit, HarnessError> {
         assert!(self.checkout.dir.is_absolute() && self.log.is_absolute());
         assert!(!self.cmd.program.is_empty());
+        let id = self.brief.id;
+        let Some(start) = self.read_thread(board) else {
+            return self.launch_first(launch);
+        };
+        let epoch = start.epoch;
+        self.delivery().seen = Some(start.cursor);
+        let mut launched = self.launch_first(launch);
+        for round in 1..=DELIVERY_ROUNDS_MAX {
+            let held = |thread: &Thread| {
+                thread.state == TaskState::Claimed
+                    && thread.epoch == epoch
+                    && !self.stopped.load(Ordering::SeqCst)
+            };
+            if !matches!(launched, Ok(Exit::Code(0))) || self.stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(thread) = self.read_thread(board) else {
+                break;
+            };
+            let new = self.undelivered(&thread);
+            if !held(&thread) || new.is_empty() {
+                break;
+            }
+            let Some((cmd, how)) = self.delivery_command(&new) else {
+                let _ = board.reply(id, TOO_LONG_NOTE);
+                break;
+            };
+            let note = format!(
+                "Delivering {} replies posted while the agent worked: {how} (round {round} of \
+                 {DELIVERY_ROUNDS_MAX}).",
+                new.len()
+            );
+            let _ = board.reply(id, &note);
+            if !self.read_thread(board).is_some_and(|gate| held(&gate)) {
+                break;
+            }
+            let log = log_path(&self.home, id, self.failed + 1);
+            let mut delivery = self.delivery();
+            delivery.seen = Some(thread.cursor);
+            delivery.delivered.extend(new);
+            assert!(delivery.delivered.len() <= REPLIES_MAX * usize::from(DELIVERY_ROUNDS_MAX));
+            delivery.log = Some(log.clone());
+            drop(delivery);
+            launched = launch(&cmd, &self.checkout.dir, &log);
+        }
+        launched
+    }
+
+    fn delivery(&self) -> MutexGuard<'_, Delivery> {
+        self.delivery.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn undelivered(&self, thread: &Thread) -> Vec<Amendment> {
+        let Some(seen) = self.delivery().seen else {
+            return Vec::new();
+        };
+        let new: Vec<Amendment> = (thread.amendments.iter())
+            .filter(|amendment| amendment.id > seen)
+            .cloned()
+            .collect();
+        assert!(new.len() <= thread.amendments.len());
+        new
+    }
+
+    fn read_thread(&self, board: &dyn Board) -> Option<Thread> {
+        let id = self.brief.id;
+        for read in 1..=THREAD_READS_MAX {
+            match board.thread(id) {
+                Ok(thread) => return Some(thread),
+                Err(_) if read < THREAD_READS_MAX => {
+                    thread::sleep(Duration::from_millis(THREAD_PAUSE_MILLIS));
+                }
+                Err(error) => {
+                    let note = format!(
+                        "Rider could not read the task's thread in {THREAD_READS_MAX} tries, so \
+                         replies posted while the agent worked may not reach it: {error}."
+                    );
+                    let _ = board.reply(id, &one_line(&note));
+                }
+            }
+        }
+        None
+    }
+
+    fn delivery_command(&self, new: &[Amendment]) -> Option<(CommandLine, &'static str)> {
+        assert!(!new.is_empty() && new.len() <= REPLIES_MAX);
+        let ask = if self.brief.role.commits_expected {
+            COMMIT_ASK
+        } else {
+            REPORT_ASK
+        };
+        let render = |amendments: &[Amendment]| {
+            let mut text = format!("{DELIVERY_NOTE} {ask}");
+            for amendment in amendments {
+                let by = amendment.profile.as_deref().unwrap_or("the owner");
+                text.push_str(&format!("\n\nFrom {by}:\n{}", amendment.text));
+            }
+            text
+        };
+        let session = match self.brief.role.harness {
+            Harness::Claude => harness::session_id(&self.log()),
+            Harness::Codex | Harness::CodexReview => None,
+        };
+        let dir = &self.checkout.dir;
+        let (cmd, how) = match &session {
+            Some(session) => {
+                let resume = Some(Resume::InPlace(session));
+                let cmd = command_for(self.brief.role, &render(new), dir, resume);
+                (cmd, "resuming the agent's session")
+            }
+            None => {
+                let mut all = self.delivery().delivered.clone();
+                all.extend_from_slice(new);
+                let prompt = format!("{}\n\n{RETRY_NOTE}\n\n{}", self.prompt, render(&all));
+                let cmd = command_for(self.brief.role, &prompt, dir, None);
+                (cmd, "running the agent again in its worktree")
+            }
+        };
+        let mut cmd = cmd.ok()?;
+        cmd.env.clone_from(&self.cmd.env);
+        let prompt = match &cmd.io {
+            Io::Stream => cmd.args.last(),
+            Io::PromptOnStdin(prompt) => Some(prompt),
+        };
+        assert!(prompt.is_some_and(|prompt| prompt.contains(DELIVERY_NOTE)));
+        Some((cmd, how))
+    }
+
+    fn launch_first(&self, launch: &Launch) -> Result<Exit, HarnessError> {
         assert!(self.fresh_log.get().is_none(), "an attempt launches once");
         let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
         let refused =
@@ -234,7 +380,7 @@ impl Attempt {
         let stopped = self.stopped.load(Ordering::SeqCst);
         match self.fallback.as_ref().filter(|_| refused && !stopped) {
             Some(fresh) => {
-                let log = log_path(&fresh.home, self.brief.id, self.failed + 1);
+                let log = log_path(&self.home, self.brief.id, self.failed + 1);
                 let log = self.fresh_log.get_or_init(|| log);
                 launch(&fresh.cmd, &self.checkout.dir, log)
             }
@@ -249,8 +395,9 @@ impl Attempt {
     }
 
     // The log of the agent run whose work the attempt is judged by.
-    fn log(&self) -> &Path {
-        self.fresh_log.get().unwrap_or(&self.log)
+    fn log(&self) -> PathBuf {
+        let log = self.delivery().log.clone();
+        log.unwrap_or_else(|| self.fresh_log.get().unwrap_or(&self.log).clone())
     }
 }
 
@@ -390,7 +537,23 @@ pub fn judge_attempt(
         // The note only informs; losing it must not stop the attempt.
         let _ = board.reply(id, &note);
     }
-    let (verdict, work) = inspect(id, board, attempt, launched)?;
+    let (mut verdict, work) = inspect(id, board, attempt, launched)?;
+    if matches!(verdict, Verdict::Complete { .. })
+        && let Some(thread) = attempt.read_thread(board)
+    {
+        let missed = attempt.undelivered(&thread);
+        if missed.is_empty() {
+            let mut delivery = attempt.delivery();
+            delivery.seen = delivery.seen.map(|_| thread.cursor);
+        } else {
+            let reason = format!(
+                "{} replies from the lead or owner reached the thread after the agent's last \
+                 run and were not delivered to it, so a retry reads them",
+                missed.len()
+            );
+            verdict = Verdict::Fail { reason };
+        }
+    }
     assert!(!matches!(verdict, Verdict::Complete { .. }) || work.is_some());
     Ok(Judgement { verdict, work })
 }
@@ -596,7 +759,7 @@ fn prepare(
     let dir = worktree::dir_for(&brief, &env.home);
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
     let retry = fs::symlink_metadata(&dir).is_ok();
-    let prompt = build_prompt(env, &brief, retry)?;
+    let prompt = build_prompt(&brief, retry)?;
     let session = brief.resume.then(|| resume_session(&brief, &env.home));
     let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
         (Ok(_), Some(onto)) => format!("Resuming the Claude session of task #{}.", onto.0),
@@ -606,7 +769,8 @@ fn prepare(
     let resume = session.and_then(Result::ok);
     let id = brief.id.0.to_string();
     let command = |resume: Option<&SessionId>| {
-        let mut cmd = command_for(brief.role, &prompt, &dir, resume).map_err(|error| {
+        let cmd = command_for(brief.role, &prompt, &dir, resume.map(Resume::Fork));
+        let mut cmd = cmd.map_err(|error| {
             let reason = format!(
                 "Rider cannot build the agent's command: {}.",
                 harness_reason(&error)
@@ -625,7 +789,6 @@ fn prepare(
         Some(session) => Some(Fallback {
             session,
             cmd: command(None)?,
-            home: env.home.clone(),
         }),
         None => None,
     };
@@ -644,7 +807,10 @@ fn prepare(
         reference,
         checkout,
         cmd,
+        prompt,
+        home: env.home.clone(),
         log,
+        delivery: Mutex::new(Delivery::default()),
         resume_note,
         fallback,
         fresh_log: OnceLock::new(),
@@ -726,8 +892,8 @@ fn session_path(home: &Path, id: TaskId) -> PathBuf {
 fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     let path = session_path(home, attempt.brief.id);
     let session = match attempt.brief.role.harness {
-        Harness::Claude => harness::session_id(attempt.log()),
-        Harness::Codex => None,
+        Harness::Claude => harness::session_id(&attempt.log()),
+        Harness::Codex | Harness::CodexReview => None,
     };
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
     let fits = |repo: &&str| repo.len() < SESSION_FILE_BYTES_MAX - SESSION_BYTES_MAX - 2;
@@ -762,8 +928,22 @@ fn log_path(home: &Path, id: TaskId, attempt: u16) -> PathBuf {
     path
 }
 
-fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> {
-    let path = env.prompts.join(brief.role.prompt_file);
+fn role_prompt(prompt_file: &str) -> Result<String, Block> {
+    let built_in = PROMPTS.iter().find(|(name, _)| *name == prompt_file);
+    match built_in.map(|(_, text)| text.trim_end()) {
+        Some(text) if prompt_file == IMPLEMENT_PROMPT => {
+            Ok(format!("{text}\n\n{}", SLOP_RULES.trim_end()))
+        }
+        Some(text) => Ok(text.to_string()),
+        None => read_prompt_file(Path::new(prompt_file)),
+    }
+}
+
+fn read_prompt_file(path: &Path) -> Result<String, Block> {
+    assert!(
+        path.is_absolute(),
+        "a prompt not built in is an absolute path"
+    );
     let unreadable = |error: io::Error| {
         let reason = format!(
             "Rider cannot read its prompt file {}: {error}.",
@@ -771,7 +951,7 @@ fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> 
         );
         Block::new("rider_error", reason)
     };
-    let file = File::open(&path).map_err(unreadable)?;
+    let file = File::open(path).map_err(unreadable)?;
     let mut role_prompt = String::new();
     let mut bounded = file.take(PROMPT_FILE_BYTES_MAX + 1);
     bounded
@@ -784,7 +964,14 @@ fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> 
         );
         return Err(Block::new("rider_error", reason));
     }
-    let role_prompt = role_prompt.trim_end();
+    role_prompt.truncate(role_prompt.trim_end().len());
+    assert!(!role_prompt.ends_with(char::is_whitespace));
+    Ok(role_prompt)
+}
+
+fn build_prompt(brief: &Brief, retry: bool) -> Result<String, Block> {
+    let role_prompt = role_prompt(brief.role.prompt_file)?;
+    let role_prompt = role_prompt.as_str();
     let mut prompt = format!("{role_prompt}\n\n# Task {}\n\n{}", brief.id.0, brief.text);
     if retry {
         prompt.push_str("\n\n");
@@ -922,11 +1109,11 @@ fn inspect(
         }
     };
     let harness = &attempt.brief.role.harness;
-    let last_message = harness::last_message(harness, attempt.log());
+    let last_message = harness::last_message(harness, &attempt.log());
     let outcome = Outcome {
         exit,
         state_after,
-        stream_failed: harness::stream_reports_failure(harness, attempt.log()),
+        stream_failed: harness::stream_reports_failure(harness, &attempt.log()),
         clean: evidence.clean,
         branch: attempt.checkout.branch.as_deref(),
         on_branch: evidence.on_branch,
@@ -1006,6 +1193,19 @@ fn complete(
     assert!(!summary.trim().is_empty() && summary.chars().count() <= SUMMARY_CHARS_MAX);
     // The fenced write goes first: a retry writes nothing twice, and a lost claim nothing.
     board.complete(id, summary)?;
+    // `vb tasks complete` has no precondition on the thread, so a reply posted during the
+    // write is only found afterwards.
+    if let Some(thread) = attempt.read_thread(board) {
+        let missed = attempt.undelivered(&thread);
+        if !missed.is_empty() {
+            let note = format!(
+                "{} replies from the lead or owner landed while rider completed the task and \
+                 were not delivered to its agent.",
+                missed.len()
+            );
+            let _ = board.reply(id, &note);
+        }
+    }
     let behind = match (attempt.brief.onto, attempt.branch()) {
         (Some(onto), Some(branch)) if work.head != attempt.reference => {
             let (behind, cut) = stacked_behind(board, attempt, onto, branch, &work.head)
@@ -1186,8 +1386,23 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
         "a failure always states its reason"
     );
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
-    let header = format!("The whole log: {}", attempt.log().display());
-    let tail = log_tail(attempt.log());
+    // `codex review` prints errors, such as a provider's content-filter stop, only on stderr.
+    let (header, tail) = match attempt.brief.role.harness {
+        Harness::Claude | Harness::Codex => {
+            let log = attempt.log();
+            (format!("The whole log: {}", log.display()), log_tail(&log))
+        }
+        Harness::CodexReview => {
+            let stderr = stderr_log(&attempt.log());
+            let header = format!(
+                "The final text: {}\nThe whole transcript: {}",
+                attempt.log().display(),
+                stderr.display()
+            );
+            let tail = format!("{}\n{}", log_tail(&stderr), log_tail(&attempt.log()));
+            (header, tail)
+        }
+    };
     let budget = TAIL_REPLY_CHARS_MAX.saturating_sub(header.chars().count() + 1);
     let tail = if tail.trim().is_empty() {
         NO_OUTPUT

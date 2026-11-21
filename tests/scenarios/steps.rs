@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::fake_agent::{self, Behaviour, Run};
-use crate::world::{Daemon, MAIN, PROJECT, World};
+use crate::world::{Daemon, LEAD, MAIN, PROJECT, World};
 
 /// How long a scenario waits for its tasks to settle.
 pub const SETTLE_SECONDS_MAX: u64 = 90;
@@ -86,6 +86,19 @@ pub fn given_a_board_and_a_repository() -> Option<World> {
 /// Given the board answers: Rider's schemas on it, and a scratch repository with one commit.
 pub fn given_the_schemas_and_a_repository(world: &World) {
     register_schemas(world);
+    given_a_repository(world);
+}
+
+/// Given a running board on which no one registered Rider's schemas, a rider home, and a
+/// repository with one commit on `main`; `None` when the Board CLI or Node is not installed.
+pub fn given_a_fresh_board_and_a_repository() -> Option<World> {
+    let mut world = World::new()?;
+    world.start_board();
+    given_a_repository(&world);
+    Some(world)
+}
+
+fn given_a_repository(world: &World) {
     fs::create_dir_all(&world.repo).expect("create the repository");
     let repo = world.repo.clone();
     for args in [
@@ -108,6 +121,41 @@ fn register_schemas(world: &World) {
         let file = file.to_str().expect("UTF-8 path");
         world.vb_lead(&["schemas", "create", name, "--file", file], None);
     }
+}
+
+/// Rider's schemas as the board lists them, by id, each with its JSON Schema.
+pub fn rider_schemas_on_the_board(world: &World) -> BTreeMap<String, Value> {
+    let listed: Schemas = parse(&world.vb_lead(&["schemas", "list", "--json"], None));
+    let ids: Vec<&str> = SCHEMAS.iter().map(|(id, _)| *id).collect();
+    listed
+        .schemas
+        .into_iter()
+        .filter(|schema| ids.contains(&schema.id.as_str()))
+        .map(|schema| (schema.id, schema.schema))
+        .collect()
+}
+
+/// Rider's schemas as its source tree holds them, by id.
+pub fn rider_schemas_in_the_source() -> BTreeMap<String, Value> {
+    SCHEMAS
+        .iter()
+        .map(|(id, file)| {
+            let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            let text = fs::read_to_string(&file).expect("read a schema");
+            (id.to_string(), parse(&text))
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct Schemas {
+    schemas: Vec<ListedSchema>,
+}
+
+#[derive(Deserialize)]
+struct ListedSchema {
+    id: String,
+    schema: Value,
 }
 
 /// When the board's data is deleted and a fresh board, with the schemas, takes its place.
@@ -195,9 +243,8 @@ pub fn when_the_lead_creates(world: &World, task: &NewTask) -> String {
     for (key, value) in &task.labels {
         args.extend(["--label".to_string(), format!("{key}={value}")]);
     }
-    if !task.needs.is_empty() {
-        args.push("--needs".to_string());
-        args.extend(task.needs.iter().cloned());
+    for need in &task.needs {
+        args.extend(["--needs".to_string(), need.clone()]);
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = world.vb_lead(&args, Some(&task.text));
@@ -778,11 +825,28 @@ exec '{}' "$@"
 /// waits, up to `HELD_TENTHS_MAX` tenths of a second, until `release` exists.
 pub fn given_vb_waits_for(world: &World, word: &str, marker: &Path, release: &Path) {
     assert!(!word.is_empty() && !word.contains(['\'', ' ']));
+    given_vb_waits_on(world, &format!("*\" {word} \"*"), marker, release);
+}
+
+/// Given the result post of `task` touches `marker` and then waits like `given_vb_waits_for`.
+pub fn given_vb_waits_for_the_result_post(
+    world: &World,
+    task: &str,
+    marker: &Path,
+    release: &Path,
+) {
+    assert!(task.bytes().all(|b| b.is_ascii_digit()));
+    let pattern = format!("*\" post {task} --schema rider-result@2 \"*");
+    given_vb_waits_on(world, &pattern, marker, release);
+}
+
+fn given_vb_waits_on(world: &World, pattern: &str, marker: &Path, release: &Path) {
+    assert!(!pattern.contains('\''));
     let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
     fs::remove_file(&world.vb).expect("remove the Board CLI link");
     let script = format!(
         r#"#!/bin/sh
-case " $* " in *" {word} "*)
+case " $* " in {pattern})
   : > '{}'
   n=0
   while [ ! -e '{}' ] && [ $n -lt {HELD_TENTHS_MAX} ]; do sleep 0.1; n=$((n + 1)); done;;
@@ -794,6 +858,38 @@ exec '{}' "$@"
         real.display()
     );
     crate::world::write_executable(&world.vb, &script);
+}
+
+pub fn given_vb_fails_one_read_once(world: &World, armed: &Path) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" {LEAD} "*) ;; *" read "*)
+  if rm '{}' 2>/dev/null; then echo "read failed" >&2; exit 1; fi;;
+esac
+exec '{}' "$@"
+"#,
+        armed.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+pub fn when_the_agent_attempt_has_started(world: &World, task: &str, attempt: u32) -> Run {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    loop {
+        let runs = agent_runs_for(world, task);
+        if let Some(run) = runs.into_iter().find(|run| run.attempt == attempt) {
+            return run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attempt {attempt} of task {task} never started:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
 }
 
 /// Given the first `vb read <task>` of each of `tasks` touches `marker-<task>` under the world's
@@ -833,6 +929,35 @@ pub fn given_vb_fails_the_identity_read(world: &World) {
     let script = format!(
         r#"#!/bin/sh
 case " $* " in *" rider/identity "*) echo 'identity unavailable' >&2; exit 1;; esac
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb` run appends its first two arguments, as one line, to `calls`.
+pub fn given_vb_records_its_calls(world: &World, calls: &Path) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s %s\n' "$1" "$2" >> '{}'
+exec '{}' "$@"
+"#,
+        calls.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb schemas create` waits a second, then fails saying `schemas refused`.
+pub fn given_vb_refuses_to_create_schemas(world: &World) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+[ "$1 $2" = "schemas create" ] && {{ sleep 1; echo 'schemas refused' >&2; exit 1; }}
 exec '{}' "$@"
 "#,
         real.display()

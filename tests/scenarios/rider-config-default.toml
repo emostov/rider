@@ -40,6 +40,18 @@ needs_of = true
 builds = false
 skills = []
 
+[roles.native-review]
+harness = "codex-review"
+model = "gpt-6.2-sol"
+title = "Native-review"
+model_name = "Sol 6.2"
+model_slug = "sol-6-2"
+prompt = "native-review"
+commits = false
+needs_of = true
+builds = false
+skills = []
+
 [roles.security]
 harness = "claude"
 model = "claude-mythos-5-2"
