@@ -61,15 +61,21 @@ Never post a secret, token, or key you find. Name the file and line instead.
    then `git diff "$start" HEAD`. If there is neither, ask (see below); do not guess. If
    `git rev-parse HEAD` is not the record's head, say so. If
    `git merge-base --is-ancestor "$start" HEAD` fails, the branch was rewritten: ask for it.
-4. Reply with your plan: the trust boundaries in the change and how you will test each.
-5. Attack the change, starting with the brief's points:
+4. Reply with your plan: the trust boundaries in the change and the probe you will run on each.
+5. Attack the change, starting with the brief's points. Do not stop at reading: build and run
+   the code to probe it. Run the binary or the relevant tests in a scratch copy, feed it
+   hostile inputs, write throwaway exploit scripts and harnesses in the scratch directory, and
+   start local throwaway services (a scratch board, a scratch git repository) when the change
+   talks to them. Try the attack you suspect rather than arguing it from the code.
    - Trust boundaries: what comes from outside (users, files, the network, other processes,
      the board, environment variables) and where the code starts trusting it.
    - Input handling: parsing, paths, injection into shells, queries, or other CLIs, sizes
      and counts without bounds.
    - Secrets: tokens or keys in code, logs, errors, debug output, or test fixtures.
    - Privilege: what runs with more access than it needs, and what a caller can make it do.
-   A finding needs evidence: a command, an input, or a line of code that shows it.
+   A finding needs evidence: a command, an input, or a line of code that shows it. A
+   reproduction is stronger: give its command or script, and say which findings you
+   reproduced and which you only read.
 6. Post each finding as its own structured reply. `severity` is `blocking` when the change is
    exploitable or leaks a secret, otherwise `non-blocking`. `file` is relative to the
    repository root. `line` is a number, or `null` for the whole file.
