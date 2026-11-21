@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::board::{Board, ListedTask, NewTask, TaskId, TaskState};
 use crate::brief::label;
 use crate::core::TASKS_MAX;
-use crate::git::{self, ENV_REMOVED, Group};
+use crate::git::{self, ENV_REMOVED, GitHub, Group};
 use crate::roles::ROLES;
 use crate::run_task::{RESUMABLE_ROLES, recorded_session};
 use crate::worktree::BRANCH_LABEL;
@@ -237,6 +237,7 @@ enum Checks {
 }
 
 struct Watched<'a> {
+    hub: &'a GitHub,
     task: Option<TaskId>,
     pr: Option<&'a str>,
     channel: &'a str,
@@ -347,8 +348,16 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
             break;
         }
         watches += 1;
+        let Some(hub) = hub_of(Path::new(repo)).filter(|hub| is_pr_of(pr, hub)) else {
+            log(&format!(
+                "github watch #{}: {pr} is not a PR of its origin",
+                task.0
+            ));
+            continue;
+        };
         let running = matches!(view.state, TaskState::Ready | TaskState::Claimed);
         let watched = Watched {
+            hub: &hub,
             task: Some(task),
             pr: Some(pr),
             channel: &listed.channel,
@@ -397,6 +406,27 @@ fn recorded_pr<'a>(tasks: &'a [ListedTask], repo: &str, branch: &str) -> Option<
     url
 }
 
+fn hub_of(repo: &Path) -> Option<GitHub> {
+    if !repo.is_absolute() {
+        return None;
+    }
+    let url = git::origin_url(repo).ok().flatten()?;
+    let hub = git::github_remote(&url);
+    assert!(hub.as_ref().is_none_or(|hub| !hub.host.is_empty()));
+    hub
+}
+
+fn is_pr_of(url: &str, hub: &GitHub) -> bool {
+    assert!(!url.is_empty() && !hub.name.is_empty());
+    let prefix = format!("https://{}/{}/{}/pull/", hub.host, hub.owner, hub.name);
+    let number = url.get(prefix.len()..).unwrap_or_default();
+    url.len() > prefix.len()
+        && url
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn watch_unowned(
     board: &dyn Board,
     tasks: &[ListedTask],
@@ -423,6 +453,9 @@ fn watch_unowned(
     let mut posted = 0usize;
     for (repo_label, channel) in repos {
         let repo = Path::new(repo_label);
+        let Some(hub) = hub_of(repo) else {
+            continue;
+        };
         let args = [
             "pr",
             "list",
@@ -433,7 +466,8 @@ fn watch_unowned(
             "--json",
             OPEN_FIELDS,
         ];
-        let open = gh(repo, &args).and_then(|out| parse::<Vec<WireOpenPr>>(&out, "gh pr list"));
+        let open =
+            gh(repo, &hub, &args).and_then(|out| parse::<Vec<WireOpenPr>>(&out, "gh pr list"));
         let open = match open {
             Ok(open) => open,
             Err(WatchError::RateLimited) => return Err(WatchError::RateLimited),
@@ -450,6 +484,7 @@ fn watch_unowned(
         });
         for pr in unowned.take(WATCHES_MAX) {
             let watched = Watched {
+                hub: &hub,
                 task: None,
                 pr: None,
                 channel,
@@ -484,7 +519,7 @@ fn watch_one(
     let prs: Vec<WirePr> = match watched.pr {
         Some(url) => {
             let args = ["pr", "view", url, "--json", PR_FIELDS];
-            vec![parse(&gh(watched.repo, &args)?, "gh pr view")?]
+            vec![parse(&gh(watched.repo, watched.hub, &args)?, "gh pr view")?]
         }
         None => {
             let args = [
@@ -499,7 +534,7 @@ fn watch_one(
                 "--json",
                 PR_FIELDS,
             ];
-            parse(&gh(watched.repo, &args)?, "gh pr list")?
+            parse(&gh(watched.repo, watched.hub, &args)?, "gh pr list")?
         }
     };
     let Some(pr) = prs.into_iter().find(|pr| !pr.is_cross_repository) else {
@@ -518,7 +553,7 @@ fn watch_one(
         pr.number
     );
     let args = ["api", "--paginate", "--slurp", &path];
-    let pages: Vec<Vec<WireInline>> = parse(&gh(watched.repo, &args)?, "gh api")?;
+    let pages: Vec<Vec<WireInline>> = parse(&gh(watched.repo, watched.hub, &args)?, "gh api")?;
     if pages.len() > PAGES_MAX {
         return Err(WatchError::TooMany {
             what: "review comment pages",
@@ -540,7 +575,9 @@ fn watch_one(
         } = change;
         let (trusted, reason) = match &author {
             None => (true, "the repository's own checks"),
-            Some(login) if trusts(watched.repo, login, authors)? => (true, "write access"),
+            Some(login) if trusts(watched.repo, watched.hub, login, authors)? => {
+                (true, "write access")
+            }
             Some(_) => (false, "no write access to the repository"),
         };
         record["trust"] = json!(if trusted { "trusted" } else { "untrusted" });
@@ -579,7 +616,12 @@ fn watch_one(
     Ok(posted)
 }
 
-fn trusts(repo: &Path, login: &str, authors: &mut Vec<(String, bool)>) -> Result<bool, WatchError> {
+fn trusts(
+    repo: &Path,
+    hub: &GitHub,
+    login: &str,
+    authors: &mut Vec<(String, bool)>,
+) -> Result<bool, WatchError> {
     let valid = !login.is_empty()
         && login.len() <= LOGIN_BYTES_MAX
         && login
@@ -598,7 +640,7 @@ fn trusts(repo: &Path, login: &str, authors: &mut Vec<(String, bool)>) -> Result
         });
     }
     let path = format!("repos/{{owner}}/{{repo}}/collaborators/{login}/permission");
-    let trusted = match gh(repo, &["api", &path]) {
+    let trusted = match gh(repo, hub, &["api", &path]) {
         Ok(text) => {
             let wire: WirePermission = parse(&text, "gh api permission")?;
             TRUSTED_PERMISSIONS.contains(&wire.permission.as_str())
@@ -687,7 +729,7 @@ fn ci_brief(watched: &Watched, pr: &WirePr) -> Result<String, WatchError> {
     let tail = match url.rsplit_once("/job/") {
         Some((_, id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
             let args = ["run", "view", "--job", id, "--log-failed"];
-            match gh(watched.repo, &args) {
+            match gh(watched.repo, watched.hub, &args) {
                 Err(WatchError::RateLimited) => return Err(WatchError::RateLimited),
                 Err(error) => format!("(no log: {error})"),
                 Ok(log) => log,
@@ -884,7 +926,7 @@ fn parse<T: serde::de::DeserializeOwned>(text: &str, what: &'static str) -> Resu
     })
 }
 
-fn gh(repo: &Path, args: &[&str]) -> Result<String, WatchError> {
+fn gh(repo: &Path, hub: &GitHub, args: &[&str]) -> Result<String, WatchError> {
     assert!(!args.is_empty() && repo.is_absolute());
     let line = args.join(" ");
     let mut process = Process::new("gh");
@@ -892,7 +934,10 @@ fn gh(repo: &Path, args: &[&str]) -> Result<String, WatchError> {
     for name in ENV_REMOVED {
         process.env_remove(name);
     }
+    let target = format!("{}/{}/{}", hub.host, hub.owner, hub.name);
     process
+        .env("GH_REPO", target)
+        .env("GH_HOST", &hub.host)
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

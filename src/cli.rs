@@ -33,7 +33,7 @@ use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
-use crate::git::{self, GitError};
+use crate::git::{self, GitError, GitHub};
 use crate::github::PR_LABEL;
 use crate::harness::LOG_BYTES_MAX;
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
@@ -1644,12 +1644,6 @@ struct Finished {
     base: Option<String>,
 }
 
-struct GitHub {
-    host: String,
-    owner: String,
-    name: String,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WirePr {
@@ -1808,34 +1802,7 @@ fn github(repo: &Path, id: TaskId) -> Result<GitHub, CliError> {
     let url = url.ok_or_else(|| {
         refuse("has an origin whose configured, fetch and push URLs are not one and the same")
     })?;
-    let rest = ["https://", "ssh://git@"]
-        .iter()
-        .find_map(|scheme| url.strip_prefix(scheme))
-        .and_then(|rest| rest.split_once('/'))
-        .or_else(|| {
-            url.strip_prefix("git@")
-                .and_then(|rest| rest.split_once(':'))
-        });
-    let (host, path) = rest.ok_or_else(|| refuse("has an origin that is not a GitHub URL"))?;
-    let path = path.strip_suffix('/').unwrap_or(path);
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let word = |text: &str| {
-        !text.is_empty()
-            && !text.starts_with(['-', '.'])
-            && (text.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-    };
-    let parsed = path
-        .split_once('/')
-        .filter(|(owner, name)| word(owner) && word(name));
-    let Some((owner, name)) = parsed.filter(|_| word(host) && !host.contains('@')) else {
-        return Err(refuse("has an origin that is not a GitHub URL"));
-    };
-    assert!(word(owner) && word(name));
-    Ok(GitHub {
-        host: host.to_string(),
-        owner: owner.to_string(),
-        name: name.to_string(),
-    })
+    git::github_remote(&url).ok_or_else(|| refuse("has an origin that is not a GitHub URL"))
 }
 
 fn publish(task: &Finished, id: TaskId) -> Result<(), CliError> {

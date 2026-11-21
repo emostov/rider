@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ const STATES: [&str; 7] = [
     "blocked",
     "canceled",
 ];
+const ORIGIN: &str = "https://github.com/example/repo.git";
 const PR_URL: &str = "https://github.com/example/repo/pull/7";
 const HEAD: &str = "2ae54426992ec8249006b5ea9b5531e8900062f3";
 
@@ -41,10 +43,21 @@ fn given_gh_prints(world: &World, pr_list: &str, comments: &str) {
     let log = fixture("run-log-failed.txt");
     fs::write(world.root.join("gh-log.txt"), log).expect("write the log fixture");
     given_gh_grants(world, "reviewer", "permission-write.json");
+    let origin = Command::new("git")
+        .args(["-C", world.repo_label(), "remote", "add", "origin", ORIGIN])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run git remote add");
+    let added = String::from_utf8_lossy(&origin.stderr);
+    assert!(
+        origin.status.success() || added.contains("already exists"),
+        "{added}"
+    );
     let root = world.root.display();
     let script = format!(
         r#"#!/bin/sh
 echo "$*" >> '{root}/gh-calls.log'
+echo "$GH_REPO $GH_HOST" >> '{root}/gh-repos.log'
 case "$1 $2" in
   pr*)
     case " $* " in
@@ -830,4 +843,51 @@ fn an_untrusted_comment_never_reaches_a_running_fix_worker() {
 
     assert_eq!(when_the_tasks_settle(&world, &[&fix]), vec!["completed"]);
     assert_eq!(agent_runs_for(&world, &fix).len(), 1);
+}
+
+#[test]
+fn every_gh_call_names_the_recorded_prs_repository() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-review.json", "pulls-comments.json");
+    let task = given_a_settled_task(&mut world, Behaviour::CommitThenFail, "failed");
+
+    when_records_reach(&world, &task, 3);
+
+    let log = fs::read_to_string(world.root.join("gh-repos.log")).expect("read the gh log");
+    let named: Vec<&str> = log
+        .lines()
+        .filter(|line| *line != "github.com/example/repo github.com")
+        .collect();
+    assert_eq!(named, Vec::<&str>::new());
+}
+
+#[test]
+fn a_recorded_pr_of_another_repository_is_not_watched() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
+    let other = "https://github.com/someone-else/repo/pull/7";
+    let task = when_the_lead_creates(
+        &world,
+        &an_implement_task(&world, "Add one work file.").label("pr", other),
+    );
+    given_the_agent_will(&world, &task, &[Behaviour::CommitThenFail]);
+    given_a_running_daemon_with(&mut world, &[FAST_POLL]);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+
+    when_a_round_passes(&world);
+    when_a_round_passes(&world);
+
+    let viewed: Vec<String> = gh_call_lines(&world)
+        .into_iter()
+        .filter(|line| line.contains(" view "))
+        .collect();
+    assert_eq!(viewed, Vec::<String>::new());
+    assert_eq!(
+        task_records(&world, &task, "rider-github"),
+        Vec::<Value>::new()
+    );
 }

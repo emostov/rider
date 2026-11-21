@@ -318,6 +318,42 @@ fn isolated(program: &str) -> Process {
 
 /// Runs `process` in its own process group, feeding it `input` if given, and kills the group
 /// unless it ends within `limit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHub {
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+}
+
+pub fn github_remote(url: &str) -> Option<GitHub> {
+    let rest = ["https://", "ssh://git@"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))
+        .and_then(|rest| rest.split_once('/'))
+        .or_else(|| {
+            url.strip_prefix("git@")
+                .and_then(|rest| rest.split_once(':'))
+        });
+    let (host, path) = rest?;
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let word = |text: &str| {
+        !text.is_empty()
+            && !text.starts_with(['-', '.'])
+            && (text.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    let parsed = path
+        .split_once('/')
+        .filter(|(owner, name)| word(owner) && word(name));
+    let (owner, name) = parsed.filter(|_| word(host) && !host.contains('@'))?;
+    assert!(word(owner) && word(name) && word(host));
+    Some(GitHub {
+        host: host.to_string(),
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
 pub enum Group {
     Idle,
     Running(Pid),
