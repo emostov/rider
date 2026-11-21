@@ -19,7 +19,7 @@ use serde::Deserialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, TaskId, TaskState, TaskView, VbCli};
+use crate::board::{self, Board, BoardError, ResultHead, TaskId, TaskState, TaskView, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
@@ -69,7 +69,9 @@ const WAIT_PROFILE: &str = "rider-wait";
 const LEAD_PREFIX: &str = "lead-";
 const PR_PROFILE: &str = "rider-pr";
 const PR_TITLE_CHARS_MAX: usize = 200;
-const PR_LIST_MAX: usize = 2;
+const PR_LIST_MAX: usize = 20;
+const BASE_CHAIN_MAX: usize = 16;
+const PR_FIELDS: &str = "--json=url,headRefName,headRepository,headRepositoryOwner";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
 /// How long the feed must stay quiet after an event before the wait reports it.
@@ -1157,48 +1159,175 @@ fn io_error(action: &'static str, path: &Path, error: &io::Error) -> CliError {
 struct Finished {
     repo: PathBuf,
     branch: String,
+    head: String,
     title: String,
     summary: String,
+}
+
+struct GitHub {
+    host: String,
+    owner: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WirePr {
     url: String,
+    #[serde(rename = "headRefName")]
+    head_ref: String,
+    #[serde(rename = "headRepository")]
+    head_repository: Option<WireRepoName>,
+    #[serde(rename = "headRepositoryOwner")]
+    head_owner: Option<WireOwner>,
 }
 
-fn finished(view: TaskView) -> Result<Finished, CliError> {
+#[derive(Deserialize)]
+struct WireRepoName {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct WireOwner {
+    login: String,
+}
+
+fn label<'a>(view: &'a TaskView, key: &str) -> Option<&'a str> {
+    let found = view.labels.iter().find(|(name, _)| name == key);
+    found.map(|(_, value)| value.as_str())
+}
+
+fn finished(view: &TaskView, record: Option<ResultHead>) -> Result<Finished, CliError> {
     let id = view.id;
     let refuse = |why| CliError::NotPushable { id, why };
     if view.state != TaskState::Completed {
         return Err(refuse("is not completed"));
     }
-    let label = |key: &str| {
-        let found = view.labels.iter().find(|(name, _)| name == key);
-        found.map(|(_, value)| value.as_str())
-    };
-    let repo = label("repo")
-        .map(PathBuf::from)
-        .filter(|repo| repo.is_absolute());
+    let repo = label(view, "repo").map(PathBuf::from);
+    let repo = repo.filter(|repo| repo.is_absolute());
     let repo = repo.ok_or_else(|| refuse("has no repo label holding an absolute path"))?;
-    let branch = label("branch").filter(|branch| git::is_safe_ref(branch));
-    let branch = branch.ok_or_else(|| refuse("has no branch label naming a branch"))?;
+    let record = record.ok_or_else(|| refuse("has no rider-result record"))?;
+    let branch = record.branch.filter(|branch| git::is_plain_branch(branch));
+    let branch = branch.ok_or_else(|| refuse("has no result branch naming one branch"))?;
+    if label(view, "branch") != Some(branch.as_str()) {
+        return Err(refuse(
+            "has a branch label that differs from its result's branch",
+        ));
+    }
+    if !git::is_commit_id(&record.head) {
+        return Err(refuse("has a result head that is not a commit id"));
+    }
     let first = view.text.lines().next().unwrap_or_default().trim();
     let title: String = first.chars().take(PR_TITLE_CHARS_MAX).collect();
-    if title.is_empty() {
-        return Err(refuse("has no first line to title its PR"));
+    if title.is_empty() || record.summary.trim().is_empty() {
+        return Err(refuse("has no first line or no result summary for its PR"));
     }
-    let branch = branch.to_string();
-    let summary = view.result.filter(|result| !result.trim().is_empty());
-    let summary = summary.ok_or_else(|| refuse("has no result to describe its PR"))?;
-    assert!(repo.is_absolute() && git::is_safe_ref(&branch));
-    assert!(!title.is_empty() && title.chars().count() <= PR_TITLE_CHARS_MAX);
+    assert!(repo.is_absolute() && git::is_plain_branch(&branch));
+    assert!(title.chars().count() <= PR_TITLE_CHARS_MAX);
     Ok(Finished {
         repo,
         branch,
+        head: record.head,
         title,
-        summary,
+        summary: record.summary,
     })
+}
+
+fn base_branch(board: &dyn Board, view: &TaskView) -> Result<Option<String>, CliError> {
+    let refuse = |why| CliError::NotPushable { id: view.id, why };
+    let mut current = view.clone();
+    for _ in 0..BASE_CHAIN_MAX {
+        let id_of = |key| label(&current, key).map(|text| parse_task_id(text).ok());
+        let base = match (id_of("base"), label(&current, "from"), id_of("onto")) {
+            (Some(Some(base)), _, _) => {
+                let parent = board.read_task(base).map_err(CliError::Board)?;
+                label(&parent, "branch").map(str::to_string)
+            }
+            (Some(None), _, _) | (_, _, Some(None)) => {
+                return Err(refuse("has a bad base or onto"));
+            }
+            (None, Some(from), _) => Some(from.to_string()),
+            (None, None, Some(Some(onto))) => {
+                current = board.read_task(onto).map_err(CliError::Board)?;
+                continue;
+            }
+            (None, None, None) => return Ok(None),
+        };
+        let base = base.filter(|base| git::is_plain_branch(base));
+        let base = base.ok_or_else(|| refuse("has a base without one plain branch"))?;
+        assert!(git::is_plain_branch(&base));
+        return Ok(Some(base));
+    }
+    Err(refuse("has an onto chain longer than rider pr follows"))
+}
+
+fn github(repo: &Path, id: TaskId) -> Result<GitHub, CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    if git::config_value(repo, "remote.origin.pushurl")
+        .map_err(CliError::Git)?
+        .is_some()
+    {
+        return Err(refuse(
+            "is in a repository whose origin has a separate push URL",
+        ));
+    }
+    let url = git::config_value(repo, "remote.origin.url").map_err(CliError::Git)?;
+    let url = url.ok_or_else(|| refuse("is in a repository without an origin"))?;
+    let rest = ["https://", "ssh://git@"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))
+        .and_then(|rest| rest.split_once('/'))
+        .or_else(|| {
+            url.strip_prefix("git@")
+                .and_then(|rest| rest.split_once(':'))
+        });
+    let (host, path) = rest.ok_or_else(|| refuse("has an origin that is not a GitHub URL"))?;
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let word = |text: &str| {
+        !text.is_empty()
+            && !text.starts_with(['-', '.'])
+            && (text.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    let parsed = path
+        .split_once('/')
+        .filter(|(owner, name)| word(owner) && word(name));
+    let Some((owner, name)) = parsed.filter(|_| word(host) && !host.contains('@')) else {
+        return Err(refuse("has an origin that is not a GitHub URL"));
+    };
+    assert!(word(owner) && word(name));
+    Ok(GitHub {
+        host: host.to_string(),
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+fn publish(task: &Finished, id: TaskId) -> Result<(), CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    let (repo, branch, head) = (&task.repo, &task.branch, &task.head);
+    if !git::commit_exists(repo, head).map_err(CliError::Git)? {
+        return Err(refuse("has a result head this repository does not hold"));
+    }
+    match git::remote_branch(repo, branch).map_err(CliError::Git)? {
+        Some(tip) if tip == *head => return Ok(()),
+        Some(tip) => {
+            let seen = git::tracking_branch(repo, branch).map_err(CliError::Git)?;
+            if seen.as_deref() != Some(tip.as_str()) {
+                return Err(refuse(
+                    "has a branch that moved on origin since this repository saw it",
+                ));
+            }
+            if !git::is_ancestor(repo, &tip, head).map_err(CliError::Git)? {
+                return Err(refuse(
+                    "has a branch on origin that its result does not contain",
+                ));
+            }
+        }
+        None => {}
+    }
+    assert!(git::is_commit_id(head));
+    git::push_commit(repo, head, branch).map_err(CliError::Git)
 }
 
 fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
@@ -1207,51 +1336,58 @@ fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
         url: config.board_url.clone(),
         profile: PR_PROFILE.to_string(),
     };
-    let task = finished(board.read_task(id).map_err(CliError::Board)?)?;
-    git::push_branch(&task.repo, &task.branch).map_err(CliError::Git)?;
-    let limit = PR_LIST_MAX.to_string();
+    let view = board.read_task(id).map_err(CliError::Board)?;
+    let task = finished(&view, board.result_head(id).map_err(CliError::Board)?)?;
+    let base = base_branch(&board, &view)?;
+    let hub = github(&task.repo, id)?;
+    publish(&task, id)?;
+    let repo_arg = format!("--repo={}/{}/{}", hub.host, hub.owner, hub.name);
+    let head_arg = format!("--head={}", task.branch);
+    let limit = format!("--limit={PR_LIST_MAX}");
     let list = [
         "pr",
         "list",
-        "--head",
-        &task.branch,
-        "--state",
-        "open",
-        "--json",
-        "url",
-        "--limit",
+        &repo_arg,
+        &head_arg,
+        "--state=open",
+        PR_FIELDS,
         &limit,
     ];
     let listed = git::gh(&task.repo, &list.map(OsStr::new), None).map_err(CliError::Git)?;
     let bad = |bytes: &[u8]| CliError::BadGh(String::from_utf8_lossy(bytes).into_owned());
-    let mut open: Vec<WirePr> = serde_json::from_slice(&listed).map_err(|_| bad(&listed))?;
-    if open.len() > 1 {
+    let open: Vec<WirePr> = serde_json::from_slice(&listed).map_err(|_| bad(&listed))?;
+    if open.len() >= PR_LIST_MAX {
         return Err(bad(&listed));
     }
-    let url = match open.pop() {
+    let ours = |pr: &WirePr| {
+        pr.head_ref == task.branch
+            && (pr.head_owner.as_ref()).is_some_and(|o| o.login.eq_ignore_ascii_case(&hub.owner))
+            && (pr.head_repository.as_ref()).is_some_and(|r| r.name.eq_ignore_ascii_case(&hub.name))
+    };
+    let mut matching = open.into_iter().filter(ours);
+    let found = matching.next();
+    if matching.next().is_some() {
+        return Err(bad(&listed));
+    }
+    let url = match found {
+        Some(found) => found.url,
         None => {
             let title = format!("--title={}", task.title);
-            let create = [
-                "pr",
-                "create",
-                "--draft",
-                "--head",
-                &task.branch,
-                &title,
-                "--body-file",
-                "-",
-            ];
+            let head = format!("--head={}:{}", hub.owner, task.branch);
+            let base = base.map(|base| format!("--base={base}"));
+            let mut create = vec!["pr", "create", &repo_arg, "--draft", &head, &title];
+            create.extend(base.as_deref());
+            create.extend(["--body-file", "-"]);
             let body = Some(task.summary.into_bytes());
-            let created = git::gh(&task.repo, &create.map(OsStr::new), body);
-            let created = created.map_err(CliError::Git)?;
+            let args: Vec<&OsStr> = create.iter().map(OsStr::new).collect();
+            let created = git::gh(&task.repo, &args, body).map_err(CliError::Git)?;
             String::from_utf8_lossy(&created).trim().to_string()
         }
-        Some(found) => found.url,
     };
     if !url.starts_with("https://") || url.contains(char::is_whitespace) {
         return Err(CliError::BadGh(url));
     }
-    assert!(open.is_empty() && !url.is_empty());
+    assert!(!url.is_empty());
     say(&url);
     Ok(0)
 }

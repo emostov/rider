@@ -1268,7 +1268,6 @@ impl World {
                         until: fake.lease_until,
                     }),
                     version: Cursor(fake.version),
-                    result: None,
                 },
                 channel: "work/sim".to_string(),
             })

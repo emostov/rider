@@ -186,7 +186,6 @@ fn listed(
                 until: Timestamp(START.0 + LEASE_MILLIS),
             }),
             version: Cursor(1),
-            result: None,
         },
         channel: "work/sim".to_string(),
     }

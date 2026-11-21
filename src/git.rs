@@ -26,7 +26,7 @@ const POLLS_MAX: u64 = GIT_DEADLINE.as_secs() * 1000 / POLL_MILLIS + 1;
 const READERS_JOIN_WAIT: Duration = Duration::from_secs(2);
 const READERS_JOIN_POLLS_MAX: u64 = READERS_JOIN_WAIT.as_secs() * 1000 / POLL_MILLIS + 1;
 const WORKTREE_FIELDS_MAX: usize = 8;
-const ARGS_MAX: usize = 12;
+const ARGS_MAX: usize = 16;
 const COMMIT_HEX_LENS: [usize; 2] = [40, 64];
 const ORIGIN_PREFIX: &str = "origin/";
 const HEADS_PREFIX: &str = "refs/heads/";
@@ -835,16 +835,97 @@ pub fn remove_worktree(repo: &Path, dir: &Path) -> Result<(), GitError> {
     run_ok(repo, &args).map(|_| ())
 }
 
-pub fn push_branch(repo: &Path, branch: &str) -> Result<(), GitError> {
+pub fn is_plain_branch(name: &str) -> bool {
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || b"-_./".contains(&b);
+    let plain = is_safe_ref(name)
+        && name.bytes().all(allowed)
+        && !name.starts_with(['.', '/'])
+        && !name.ends_with(['.', '/'])
+        && !name.ends_with(".lock")
+        && !name.contains("//")
+        && !name.contains("/.");
+    assert!(!plain || !name.contains(['*', ':', '^', '~', '?', '[', '\\', '@']));
+    assert!(!plain || is_safe_ref(name));
+    plain
+}
+
+pub fn config_value(repo: &Path, key: &str) -> Result<Option<String>, GitError> {
     assert!(repo.is_absolute(), "git runs in absolute directories");
-    assert!(
-        is_safe_ref(branch),
-        "refs are checked before they reach git"
-    );
-    let refspec = format!("{HEADS_PREFIX}{branch}:{HEADS_PREFIX}{branch}");
-    let args = ["push", "--quiet", "origin", &refspec].map(OsStr::new);
+    assert!(!key.starts_with('-') && key.contains('.'));
+    let args = ["config", "--get", "--end-of-options", key].map(OsStr::new);
+    let value = query(repo, &args)?;
+    assert!(value.as_ref().is_none_or(|value| !value.contains('\n')));
+    Ok(value)
+}
+
+pub fn remote_branch(repo: &Path, branch: &str) -> Result<Option<String>, GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    assert!(is_plain_branch(branch));
+    let full = format!("{HEADS_PREFIX}{branch}");
+    let args = ["ls-remote", "--heads", "origin", &full].map(OsStr::new);
+    let stdout = run_ok(repo, &args)?;
+    let text = std::str::from_utf8(&stdout).map_err(|_| parse_error(&args, &stdout))?;
+    let mut found = None;
+    for line in text.lines() {
+        let Some((commit, name)) = line.split_once('\t') else {
+            return Err(parse_error(&args, &stdout));
+        };
+        if name != full {
+            continue;
+        }
+        if !is_commit_id(commit) || found.is_some() {
+            return Err(parse_error(&args, &stdout));
+        }
+        found = Some(commit.to_string());
+    }
+    assert!(found.as_deref().is_none_or(is_commit_id));
+    Ok(found)
+}
+
+pub fn tracking_branch(repo: &Path, branch: &str) -> Result<Option<String>, GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    assert!(is_plain_branch(branch));
+    let full = format!("refs/remotes/{ORIGIN_PREFIX}{branch}");
+    let args = [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        &full,
+    ]
+    .map(OsStr::new);
+    let Some(commit) = query(repo, &args)? else {
+        return Ok(None);
+    };
+    if !is_commit_id(&commit) {
+        return Err(parse_error(&args, commit.as_bytes()));
+    }
+    Ok(Some(commit))
+}
+
+// Push configuration would otherwise add tags, submodule pushes or push options.
+pub fn push_commit(repo: &Path, commit: &str, branch: &str) -> Result<(), GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    assert!(is_commit_id(commit) && is_plain_branch(branch));
+    let refspec = format!("{commit}:{HEADS_PREFIX}{branch}");
+    let args = [
+        "-c",
+        "push.default=nothing",
+        "-c",
+        "push.followTags=false",
+        "-c",
+        "push.recurseSubmodules=no",
+        "-c",
+        "push.pushOption=",
+        "push",
+        "--quiet",
+        "--no-follow-tags",
+        "--recurse-submodules=no",
+        "origin",
+        &refspec,
+    ];
     assert!(!refspec.starts_with('+'));
-    run_ok(repo, &args).map(|_| ())
+    run_ok(repo, &args.map(OsStr::new)).map(|_| ())
 }
 
 pub fn gh(repo: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Vec<u8>, GitError> {
@@ -855,6 +936,8 @@ pub fn gh(repo: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Vec<u8
     process
         .current_dir(repo)
         .args(args)
+        .env_remove("GH_REPO")
+        .env_remove("GH_HOST")
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     if input.is_some() {
