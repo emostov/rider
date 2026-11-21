@@ -251,7 +251,8 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
     let dir = worktree_dir(&world, &review).display().to_string();
     let options = ["exec", "--model", "gpt-6.1-sol", "--json"]
         .into_iter()
-        .chain(["--dangerously-bypass-approvals-and-sandbox", "-C", &dir]);
+        .chain(["--dangerously-bypass-approvals-and-sandbox"])
+        .chain(["--disable", "plugins", "--disable", "apps", "-C", &dir]);
     let expected: Vec<String> = options.map(String::from).collect();
     assert_eq!(fake_agent::options(&world.root, &review, 0), expected);
     assert_eq!(task_label(&world, &review, "branch"), None);
@@ -1559,6 +1560,9 @@ fn claude_options(session: Option<&str>) -> Vec<String> {
         "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
+        "--strict-mcp-config",
+        "--mcp-config",
+        r#"{"mcpServers":{}}"#,
     ]
     .map(String::from)
     .into();

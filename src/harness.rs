@@ -27,7 +27,7 @@ pub const LOG_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
-const ARGS_MAX: usize = 16;
+const ARGS_MAX: usize = 24;
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
@@ -184,6 +184,9 @@ pub fn command_for(
                 "stream-json",
                 "--verbose",
                 "--dangerously-skip-permissions",
+                "--strict-mcp-config",
+                "--mcp-config",
+                r#"{"mcpServers":{}}"#,
             ],
         ),
         Harness::Codex => (
@@ -194,6 +197,12 @@ pub fn command_for(
                 model,
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
+                // `-c mcp_servers={}` merges into the user's table instead of replacing it;
+                // these drop the servers plugins and apps add.
+                "--disable",
+                "plugins",
+                "--disable",
+                "apps",
                 "-C",
                 &dir,
             ],

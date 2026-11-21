@@ -8,7 +8,8 @@ All runs: exit 0, `ok.txt` committed, final message `DONE`.
 ## Claude Code
 
 ```
-claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-skip-permissions "<prompt>"
+claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-skip-permissions \
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}' -- "<prompt>"
 ```
 
 - Run with cwd set to the worktree. There is no working-directory flag in use.
@@ -31,7 +32,8 @@ claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-sk
 ## Codex
 
 ```
-codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox -C <DIR> "<prompt>"
+codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox \
+  --disable plugins --disable apps -C <DIR> -- "<prompt>"
 ```
 
 - Flags match the brief. `--skip-git-repo-check` also exists but was not needed.
@@ -51,6 +53,19 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   `turn.failed`, or a top-level `error` after which no `turn.completed` comes (Codex gave up), fails.
   Fixture: `codex-reconnect.jsonl`, cut from a real review run, with the provider
   URL and `cf-ray` id redacted.
+
+## MCP servers
+
+Observed on 2026-11-20 with Claude Code 2.1.x and codex-cli 0.170.0, prompt `Reply with the single word DONE.`, in a fresh empty git repo.
+
+- Claude: `claude --help` lists `--mcp-config <configs...>` ("Load MCP servers from JSON files or strings") and `--strict-mcp-config` ("Only use MCP servers from --mcp-config, ignoring all other MCP configurations"). The inline string `'{"mcpServers":{}}'` is accepted; no file is needed. `--mcp-config` takes several values, so the next argument must be an option or `--`. Built-in tools stay. Measured with `--model claude-haiku-5-5`:
+
+  | | init `tools` | init `mcp_servers` | first request input tokens |
+  | --- | --- | --- | --- |
+  | user's MCP setup | 333 | 27 | 41,036 |
+  | `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` | 27 | 0 | 29,666 |
+
+- Codex: `-c mcp_servers={}` does not remove servers. `codex -c 'mcp_servers={}' mcp list` still lists every server, because the override is merged into the config table instead of replacing it. Plugins and apps add servers of their own; `--disable plugins --disable apps` (the `-c features.<name>=false` shorthand) removes those: `codex --disable plugins --disable apps mcp list` lists only the servers declared under `[mcp_servers.*]` in `~/.codex/config.toml`. Turn input tokens for `codex exec`: 19,938 before, 17,281 after. No flag drops the servers declared in `config.toml` except `--ignore-user-config`, which also drops the model provider, so those still load. Rider runs only `codex exec`; there is no `codex review` harness.
 
 ## tact
 
