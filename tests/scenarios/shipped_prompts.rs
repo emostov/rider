@@ -163,8 +163,8 @@ fn the_shipped_lead_skill_names_every_role_rider_config_prints() {
         "attempts_exhausted",
         "rider_error",
         "awaiting_approval",
-        "pass `--as lead` on every `vb` command",
-        "`vb reply 12 --as lead -- \"<text>\"`",
+        "pass `--as lead` on every `rider vb` command",
+        "`rider vb reply 12 --as lead -- \"<text>\"`",
         "rider-result@2",
         "vb tasks reopen",
         "vb tasks unblock",
@@ -184,7 +184,8 @@ fn the_shipped_lead_skill_names_every_role_rider_config_prints() {
     let turn = &lead[lead.find("## Each turn").expect("lead.md has a turn order")..];
     assert!(turn.contains("2. Finish tasks left without `role`"));
     assert!(turn.contains("select(.message.labels.role == null)"));
-    let relabel = "`vb label <id> role=implement --as lead`, then `vb tasks reopen <id>";
+    let relabel =
+        "`rider vb label <id> role=implement --as lead`, then `rider vb tasks reopen <id>";
     let relabel = lead
         .find(relabel)
         .expect("lead.md relabels a light task before reopening");
