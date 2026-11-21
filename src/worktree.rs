@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use crate::board::{Board, BoardError, LABELS_MAX, TaskId, TaskView};
+use crate::board::{Board, BoardError, LABELS_MAX, TaskId, TaskState, TaskView};
 use crate::brief::Brief;
 use crate::git::{self, GitError, REF_BYTES_MAX};
 
@@ -336,7 +336,10 @@ fn add(repo: &Path, dir: &Path, plan: Plan) -> Result<Option<String>, WorktreeEr
             if !git::branch_exists(repo, &branch)? {
                 let commit = git::commit_of(repo, &from)?;
                 git::add_on_new_branch(repo, dir, &branch, &commit)?;
-            } else if git::worktree_branches(repo)?.contains(&branch) {
+            } else if git::worktree_branches(repo)?
+                .iter()
+                .any(|(_, held)| *held == branch)
+            {
                 return Err(WorktreeError::BranchBusy(branch));
             } else {
                 git::add_on_branch(repo, dir, &branch)?;
@@ -344,7 +347,10 @@ fn add(repo: &Path, dir: &Path, plan: Plan) -> Result<Option<String>, WorktreeEr
             Some(branch)
         }
         Plan::Onto { task, branch } => {
-            if git::worktree_branches(repo)?.contains(&branch) {
+            if git::worktree_branches(repo)?
+                .iter()
+                .any(|(_, held)| *held == branch)
+            {
                 return Err(WorktreeError::OntoBranchBusy(task));
             }
             git::add_on_branch(repo, dir, &branch)?;
@@ -493,6 +499,29 @@ pub fn prepare(
         return reuse(brief, board, dir, identity);
     }
     let plan = plan(brief, board)?;
+    if let Plan::Onto { branch, .. } = &plan {
+        let holders = git::worktree_branches(&brief.repo)?;
+        let held = holders.into_iter().find(|(_, held)| held == branch);
+        let project = dir.parent().filter(|project| project.exists());
+        if let Some((held, _)) = held
+            && let Some(project) = project
+            && held
+                .parent()
+                .is_some_and(|parent| parent.is_absolute() && same_dir(parent, project))
+            && let Some(owner) = held
+                .file_name()
+                .and_then(|name| name.to_str()?.parse().ok())
+            && recorded_board(&held).ok().flatten().as_deref() == Some(identity.0.as_str())
+            && board.read_task(TaskId(owner))?.state == TaskState::Completed
+        {
+            let left = Checkout {
+                dir: held,
+                branch: Some(branch.clone()),
+                start_head: String::new(),
+            };
+            let _ = release(&left, &brief.repo, home);
+        }
+    }
     let branch = add(&brief.repo, &dir, plan)?;
     let path = record_path(&dir)?;
     fs::write(&path, &identity.0).map_err(|error| WorktreeError::BoardRecord {

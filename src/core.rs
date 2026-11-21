@@ -413,6 +413,8 @@ pub enum Event {
     },
     /// A renewal or fenced write was refused because the claim is no longer held.
     ClaimLost(RunId),
+    /// A closing write, `Settle` or `Release`, was refused because the claim is no longer held.
+    CloseLost(RunId),
     /// A closing write, `Settle` or `Release`, succeeded.
     Settled(RunId),
     /// A board call timed out or could not connect.
@@ -769,7 +771,11 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
                 entry.lease_until = entry.lease_until.max(until);
             }
         }
-        Event::ClaimLost(run) => {
+        Event::ClaimLost(run) | Event::CloseLost(run) => {
+            let index = state.run_index(run);
+            if let (Some(index), Event::CloseLost(_)) = (index, &event) {
+                state.runs[index].settling = false;
+            }
             state.pending_claims.retain(|pending| pending.run != run);
             if let Some(index) = state.run_index(run) {
                 abandon(state, index, actions);
@@ -1337,6 +1343,11 @@ fn board_failed(state: &mut State, call: Call) {
         // Whether the board granted it is unknown; an unrenewed claim lapses within the lease.
         Call::Claim(_) if entry.phase == Phase::Claiming => remove_run(state, index),
         Call::Renew(_) => entry.renewing = false,
+        Call::Settle(_) | Call::Release(_)
+            if entry.settling && entry.phase == Phase::Abandoning =>
+        {
+            remove_run(state, index);
+        }
         Call::Settle(_) | Call::Release(_) if entry.settling => {
             entry.settling = false;
             entry.settle_tries = entry.settle_tries.saturating_add(1);
@@ -1582,7 +1593,11 @@ fn abandon(state: &mut State, index: usize, actions: &mut Vec<Action>) {
     let entry = &mut state.runs[index];
     assert!(index < AGENTS_MAX as usize);
     if !entry.agent_alive {
-        remove_run(state, index);
+        if entry.phase == Phase::Settling && entry.settling {
+            set_phase(entry, Phase::Abandoning, now);
+        } else {
+            remove_run(state, index);
+        }
         return;
     }
     let already_stopping = matches!(entry.phase, Phase::Stopping(_) | Phase::Abandoning);
@@ -1618,6 +1633,10 @@ fn send_stop(entry: &mut Run, actions: &mut Vec<Action>) {
     entry.stop_tries = 1;
     let (run, task) = (entry.id, entry.task);
     actions.push(Action::StopAgent { run, task });
+}
+
+fn closing(run: &Run) -> bool {
+    run.phase == Phase::Settling || (run.phase == Phase::Abandoning && run.settling)
 }
 
 fn holds_claim(phase: Phase) -> bool {
@@ -1842,9 +1861,9 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     let builders_full = builders.count() >= usize::from(state.config.builders_max);
     let mut best: Option<(usize, usize, u8)> = None;
     for (index, task) in state.tasks.iter().enumerate() {
-        let role = task
-            .role
-            .filter(|role| !task.claim_refused && !(builders_full && roles[*role].builds));
+        let role = task.role.filter(|role| {
+            task.project.is_some() && !task.claim_refused && !(builders_full && roles[*role].builds)
+        });
         let Some(role) = role else {
             continue;
         };
@@ -1854,7 +1873,7 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
             run.task == task.id
                 || (task.branch.is_some() && run.branch == task.branch)
                 || task.onto == Some(run.task)
-                || (task.onto.is_some() && run.phase == Phase::Settling && run.branch.is_some())
+                || (task.onto.is_some() && closing(run) && run.branch.is_some())
         });
         if task.state != TaskState::Ready || taken {
             continue;
@@ -1876,7 +1895,8 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     assert!(best.is_none_or(|(index, _, _)| index < state.tasks.len()));
     let claimable = |index: usize| {
         let task = &state.tasks[index];
-        task.state == TaskState::Ready && !task.claim_refused && task.role.is_some()
+        let ready = task.state == TaskState::Ready && !task.claim_refused;
+        ready && task.role.is_some() && task.project.is_some()
     };
     assert!(best.is_none_or(|(index, _, slot)| claimable(index) && slot >= 1));
     assert!(best.is_none_or(|(_, role, _)| !(builders_full && roles[role].builds)));
@@ -1932,6 +1952,7 @@ fn phase_expired(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         }
         // The closing write is abandoned, as when its tries run out.
         Phase::Settling => give_up_claim(state, index),
+        Phase::Abandoning if !entry.agent_alive => remove_run(state, index),
         // Only an observed exit ends the agent; past the tries it is lost, not gone.
         Phase::Stopping(_) | Phase::Abandoning if entry.stop_tries < STOP_TRIES_MAX => {
             entry.stop_tries = entry.stop_tries.saturating_add(1);
@@ -1981,7 +2002,7 @@ pub struct PidFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unaccounted {
     Tasks(Vec<TaskId>),
-    /// Neither the agents file nor the pid files could be read.
+    /// The pid files could not be read.
     Every,
 }
 
@@ -2015,8 +2036,7 @@ pub fn recover(
         }
     }
     let unaccounted = match pid_files {
-        None if records.is_none() => Unaccounted::Every,
-        None => Unaccounted::Tasks(Vec::new()),
+        None => Unaccounted::Every,
         Some(files) => {
             let mut tasks: Vec<TaskId> = Vec::new();
             for file in files {
