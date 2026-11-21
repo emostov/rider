@@ -70,11 +70,12 @@ account can: files, credentials and the network.
 On macOS Rider starts each agent under `sandbox-exec`. The agent and every process it starts
 cannot connect to the daemon's socket, signal a process outside the agent's sandbox, open apps
 through LaunchServices or send Apple events, or write Rider's control files, `rider.toml`,
-`<rider home>/prompts`, its repository's git `config`, `hooks`, `info` and `remotes` (commits
-and branches stay writable), any directory on `PATH`, or the install directory of a program the
+`<rider home>/prompts`, anything in its repository's git directories but objects, refs, logs
+and its own worktree's state (so commits and branches still work), any directory on `PATH`, or the install directory of a program the
 daemon runs (`rider`, `git`, `node`, `npm`, `sh` and the Board CLI). The daemon runs its own git
 commands under the same sandbox with no network, so hooks, filters and remotes set in a
-repository's config run confined.
+repository's config run confined. Every git call Rider makes, `rider pr`'s included, ignores
+credential helpers and askpass programs, so `rider pr` pushes over ssh, not https.
 
 On Linux agents are not confined: an agent can run `rider down` or `rider kill`, stop the
 daemon, or rewrite its files. The same holds on macOS when the daemon itself was started inside
