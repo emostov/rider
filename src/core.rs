@@ -376,6 +376,7 @@ pub enum Event {
     Feed(BoardEvent),
     FeedLost,
     FeedResumed(Cursor),
+    WorktreeChecked,
     /// A listing: its tasks, the cursor read before its first page, and how many it left out.
     Snapshot {
         tasks: Vec<ListedTask>,
@@ -490,6 +491,7 @@ pub enum Action {
         client: ClientId,
         reply: Reply,
     },
+    ReleaseWorktree(TaskId),
     Exit(i32),
 }
 
@@ -718,7 +720,8 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             }
             retry_feed(state, actions);
         }
-        Event::Feed(feed) => track_feed(state, &feed),
+        Event::Feed(feed) => track_feed(state, &feed, actions),
+        Event::WorktreeChecked => {}
         Event::FeedLost => feed_lost(state, actions),
         Event::FeedResumed(cursor) => {
             state.feed_since = state.now;
@@ -1051,7 +1054,7 @@ fn claim_refused(state: &mut State, run: RunId) {
     assert!(next.is_none_or(|(index, _, _)| state.tasks[index].id != task));
 }
 
-fn track_feed(state: &mut State, feed: &BoardEvent) {
+fn track_feed(state: &mut State, feed: &BoardEvent, actions: &mut Vec<Action>) {
     assert!(state.tasks.len() <= state.config.tasks_max);
     state.feed_delivered = true;
     // The feed delivers in cursor order and a snapshot covers every open task as of its
@@ -1073,6 +1076,10 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         return;
     }
     if is_closed(task_state) {
+        let idle = state.runs.iter().all(|run| run.task != feed.task);
+        if task_state == TaskState::Canceled && index.is_some() && idle {
+            actions.push(Action::ReleaseWorktree(feed.task));
+        }
         match index {
             Some(index) => _ = state.tasks.remove(index),
             None => untracked_left(state),

@@ -36,7 +36,8 @@ use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
     Attempt, Env, IdentityUnknown, Judgement, Prepared, RunError, board_identity_at_start,
-    judge_attempt, launch_agent, prepare_attempt, release_if_canceled, settle_attempt,
+    judge_attempt, launch_agent, prepare_attempt, release_canceled_idle, release_if_canceled,
+    settle_attempt,
 };
 use crate::settle::Verdict;
 use crate::socket::{self, SOCKET_FILE, Socket};
@@ -991,6 +992,11 @@ fn job(
                     .write(&format!("restarting the board failed: {error}"));
                 Input::plain(Event::BoardExited)
             }
+        }),
+        Action::ReleaseWorktree(task) => Box::new(move || {
+            let board = shared.board(DAEMON_PROFILE);
+            release_canceled_idle(task, &shared.paths.home, &shared.paths.board_url, &board);
+            Input::plain(Event::WorktreeChecked)
         }),
         Action::Reply { .. } | Action::Exit(_) => return Ok(None),
     };

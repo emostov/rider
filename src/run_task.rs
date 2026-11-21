@@ -1239,16 +1239,43 @@ fn complete(
 
 fn release_or_note(id: TaskId, home: &Path, board: &dyn Board, checkout: &Checkout, repo: &Path) {
     assert!(home.is_absolute() && repo.is_absolute());
-    let Err(error) = worktree::release(checkout, repo, home) else {
+    if let Err(error) = worktree::release(checkout, repo, home) {
+        note_kept(id, board, &checkout.dir, error);
+    }
+}
+
+pub fn release_canceled_idle(id: TaskId, home: &Path, url: &str, board: &dyn Board) {
+    assert!(home.is_absolute() && !url.is_empty());
+    let Ok(view) = board.read_task(id) else {
         return;
     };
+    let Ok(mut brief) = parse_brief(&view) else {
+        return;
+    };
+    if view.state != TaskState::Canceled || view.id != id {
+        return;
+    }
+    brief.role = role_in_repo(brief.role, &brief.repo);
+    let dir = worktree::dir_for(&brief, home);
+    let ours = board_identity(url, board).is_ok_and(|identity| {
+        fs::symlink_metadata(&dir).is_ok() && worktree::made_for(&dir, &identity).unwrap_or(false)
+    });
+    if !ours {
+        return;
+    }
+    if let Err(error) = worktree::release_ended(&brief, &view, home) {
+        note_kept(id, board, &dir, error);
+    }
+}
+
+fn note_kept(id: TaskId, board: &dyn Board, dir: &Path, error: WorktreeError) {
+    assert!(dir.is_absolute());
     let why = match error {
         WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
         other => other.to_string(),
     };
-    let dir = checkout.dir.display();
-    // The warning comes before git's reason, which may be long enough to be cut short.
-    let held = git::current_branch(&checkout.dir).ok().flatten();
+    let held = git::current_branch(dir).ok().flatten();
+    let dir = dir.display();
     let note = match held {
         Some(branch) => format!(
             "Kept the worktree at {dir}, so branch {branch} stays checked out there: tasks \

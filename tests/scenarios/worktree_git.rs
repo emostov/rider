@@ -1127,3 +1127,34 @@ fn rider_clean_yes_keeps_a_canceled_tasks_worktree_while_its_agent_runs() {
     assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
     world.release_agent(&task);
 }
+
+#[test]
+fn a_blocked_task_canceled_after_its_agent_exits_has_its_worktree_removed() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Block]);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["blocked"]);
+    assert!(when_rider_status_shows_within(
+        &world,
+        "0 of 32 running",
+        SETTLE_SECONDS_MAX
+    ));
+    let branch = task_label(&world, &task, "branch").expect("the task has a branch label");
+
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+
+    let dir = worktree_dir(&world, &task);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while dir.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    when_the_daemon_stops(&mut world);
+    then_the_worktree_is_removed(&world, &task);
+    assert!(
+        branches(&world).contains(&branch),
+        "branch {branch} is kept"
+    );
+}
