@@ -124,8 +124,8 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
     for word in words {
         assert!(lead.contains(word), "lead.md lacks {word}");
     }
-    assert!(lead.contains("pass `--as lead` on every `vb` command"));
-    assert!(lead.contains("`vb reply 12 --as lead -- \"<text>\"`"));
+    assert!(lead.contains("pass `--as lead` on every `rider vb` command"));
+    assert!(lead.contains("`rider vb reply 12 --as lead -- \"<text>\"`"));
     assert!(
         !lead.contains("--as lead-"),
         "lead.md names a lead- profile"
@@ -197,7 +197,7 @@ fn lead_retries_a_failed_light_task_as_implement_by_relabelling_first() {
         assert!(lead.contains(word), "lead.md lacks {word}");
     }
     let relabel = lead
-        .find("`vb label <id> role=implement --as lead`, then `vb tasks reopen <id>")
+        .find("`rider vb label <id> role=implement --as lead`, then `rider vb tasks reopen <id>")
         .expect("lead.md relabels a light task before reopening it");
     assert!(relabel > lead.find("## Roles").expect("lead.md has a role table"));
 }
