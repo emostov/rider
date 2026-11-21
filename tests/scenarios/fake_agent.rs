@@ -47,6 +47,9 @@ pub enum Behaviour {
     /// As Codex stopped by the provider's content filter, exiting 1: `codex exec` prints the
     /// recorded `CONTENT_FILTER_EVENTS`, and `codex review` prints `CONTENT_FILTER_ERROR` on stderr.
     ContentFilterStop,
+    /// Like `ContentFilterStop` as `codex exec`, after 24 long commands whose output starts with
+    /// an escape sequence, and while `last-command` runs.
+    ContentFilterStopLong,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
     /// Like `Hold`, but ignores SIGTERM.
@@ -139,6 +142,7 @@ impl Behaviour {
             Behaviour::ReviewNothing => "review-nothing",
             Behaviour::ReviewInterrupted => "review-interrupted",
             Behaviour::ContentFilterStop => "content-filter-stop",
+            Behaviour::ContentFilterStopLong => "content-filter-stop-long",
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::HoldTalking => "hold-talking",
@@ -323,6 +327,21 @@ case "$behaviour" in
       printf 'exec\n/bin/zsh -lc ls\n succeeded in 5ms:\nsrc\n' >&2
       printf '%s\ntokens used\n4,080\n' "{CONTENT_FILTER_ERROR}" >&2
     fi
+    exit 1 ;;
+  content-filter-stop-long)
+    pad=$(printf '%160s' '' | tr ' ' c)
+    out=$(printf '%160s' '' | tr ' ' o)
+    i=0
+    while [ $i -lt 24 ]; do
+      item='"id":"item_'$i'","type":"command_execution","command":"cmd'$i' '$pad'"'
+      item="$item"',"aggregated_output":"\u001b[2J'$out'","exit_code":0,"status":"completed"'
+      echo '{{"type":"item.completed","item":{{'"$item"'}}}}'
+      i=$((i + 1))
+    done
+    item='"id":"item_99","type":"command_execution","command":"last-command","status":"in_progress"'
+    echo '{{"type":"item.started","item":{{'"$item"'}}}}'
+    cat <<'EVENTS' | tail -n 2
+{CONTENT_FILTER_EVENTS}EVENTS
     exit 1 ;;
   wander-branch) git switch -q -c elsewhere && commit || exit 1 ;;
   detach) git checkout -q --detach && commit || exit 1 ;;

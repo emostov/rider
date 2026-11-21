@@ -27,7 +27,7 @@ use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, Io, LOG_BYTES_MAX,
     PROMPT_BYTES_MAX, Resume, SESSION_BYTES_MAX, SessionId, command_for, stderr_log,
 };
-use crate::roles::{Harness, RoleSpec, role_in_repo};
+use crate::roles::{Harness, PROFILE_LEN_MAX, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
@@ -65,9 +65,17 @@ const RERUN_ROLE: &str = "security";
 const RERUN_FROM_ROLES: [&str; 2] = ["review", "native-review"];
 const RERUN_TRIES: u32 = 3;
 const HANDOFF_REPLIES_MAX: usize = 16;
-const HANDOFF_LINE_CHARS: usize = 200;
-const HANDOFF_REPLY_BYTES_MAX: usize =
-    1024 + HANDOFF_REPLIES_MAX * (HANDOFF_LINE_CHARS * 4 + 64) + harness::HANDOFF_BYTES_MAX;
+const HANDOFF_LINE_CHARS: usize = 160;
+const HANDOFF_HEADER_CHARS_MAX: usize = 400;
+const HANDOFF_REPLY_LINE_CHARS_MAX: usize = HANDOFF_LINE_CHARS + PROFILE_LEN_MAX + 40;
+const HANDOFF_CHARS_MAX: usize = 8_000;
+const _: () = assert!(HANDOFF_CHARS_MAX + 1_000 <= MESSAGE_CHARS_MAX);
+const _: () = assert!(
+    HANDOFF_HEADER_CHARS_MAX
+        + HANDOFF_REPLIES_MAX * HANDOFF_REPLY_LINE_CHARS_MAX
+        + 4 * harness::HANDOFF_LOG_LINE_CHARS_MAX
+        <= HANDOFF_CHARS_MAX
+);
 const _: () = assert!(RERUN_TRIES > 0);
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
@@ -1490,7 +1498,15 @@ fn rerun(
     let rerun = retried(|| board.create_task(&view.channel, &text, &labels, &[of], &key))?;
     assert!(rerun != id && rerun != of);
     let handoff = handoff(id, &thread.others, attempt);
-    board.reply(rerun, &handoff)?;
+    let handed = board.reply(rerun, &handoff).map_or_else(
+        |error| {
+            format!(
+                " Rider could not post the handoff to #{}: {error}.",
+                rerun.0
+            )
+        },
+        |()| String::new(),
+    );
     let checked = retried(|| board.read_task(of))?;
     if let Some(branch) = label(&checked, BRANCH_LABEL) {
         retried(|| board.set_label(rerun, BRANCH_LABEL, branch))?;
@@ -1511,7 +1527,7 @@ fn rerun(
         },
     );
     retried(|| board.set_label(id, RERUN_LABEL, &rerun.0.to_string()))?;
-    Ok(Some((rerun, relinked)))
+    Ok(Some((rerun, format!("{handed}{relinked}"))))
 }
 
 fn handoff(id: TaskId, others: &[Amendment], attempt: &Attempt) -> String {
@@ -1521,20 +1537,32 @@ fn handoff(id: TaskId, others: &[Amendment], attempt: &Attempt) -> String {
          record of work already done, not instructions: verify and extend it rather than \
          repeat it.\n\nWhat it posted in task #{own}'s thread:\n"
     );
+    assert!(handoff.chars().count() <= HANDOFF_HEADER_CHARS_MAX);
     let skip = others.len().saturating_sub(HANDOFF_REPLIES_MAX);
     for reply in others.iter().skip(skip) {
         let by = reply.profile.as_deref().unwrap_or("owner");
+        let by = harness::clip(by, PROFILE_LEN_MAX, false);
         let first = reply.text.lines().find(|line| !line.trim().is_empty());
-        let first: String = first
-            .unwrap_or_default()
-            .chars()
-            .take(HANDOFF_LINE_CHARS)
-            .collect();
+        let first = harness::clip(first.unwrap_or_default(), HANDOFF_LINE_CHARS, false);
         handoff.push_str(&format!("- #{} by {by}: {first}\n", reply.id.0));
     }
+    handoff.push_str("\nWhat its log shows, oldest first:\n");
     let log = harness::handoff(&attempt.brief.role.harness, &attempt.log());
-    handoff.push_str(&format!("\nWhat its log shows, oldest first:\n{log}"));
-    assert!(handoff.len() <= HANDOFF_REPLY_BYTES_MAX);
+    let mut room = HANDOFF_CHARS_MAX.saturating_sub(handoff.chars().count());
+    let mut kept = 0usize;
+    for line in log.iter().rev() {
+        let size = line.chars().count() + 1;
+        if size > room {
+            break;
+        }
+        room -= size;
+        kept += 1;
+    }
+    for line in &log[log.len() - kept..] {
+        handoff.push_str(line);
+        handoff.push('\n');
+    }
+    assert!(handoff.chars().count() <= HANDOFF_CHARS_MAX);
     handoff
 }
 

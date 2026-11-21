@@ -49,10 +49,9 @@ const REVIEW_INTERRUPTED: &str = "Review was interrupted.";
 const CONTENT_FILTER: &str = "This content was flagged for possible cybersecurity risk.";
 const STDERR_TAIL_BYTES: u64 = 64 * 1024;
 const STDERR_FINAL_LINES: usize = 8;
-pub const HANDOFF_BYTES_MAX: usize = 6 * 1024;
-const HANDOFF_LINES_MAX: usize = 24;
+pub const HANDOFF_LINES_MAX: usize = 24;
 const CLIP_CHARS: usize = 160;
-const _: () = assert!(HANDOFF_LINES_MAX * (CLIP_CHARS * 8 + 32) > HANDOFF_BYTES_MAX);
+pub const HANDOFF_LOG_LINE_CHARS_MAX: usize = 2 * CLIP_CHARS + 64;
 const POISONED: &str = "the log lock was poisoned";
 
 const _: () = {
@@ -902,8 +901,12 @@ fn stderr_tail(log: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&tail).into_owned())
 }
 
-fn clip(text: &str, chars_max: usize, from_end: bool) -> String {
-    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+pub fn clip(text: &str, chars_max: usize, from_end: bool) -> String {
+    let bidi = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let shown: String = (text.chars())
+        .map(|c| if c.is_control() || bidi(c) { ' ' } else { c })
+        .collect();
+    let line = shown.split_whitespace().collect::<Vec<_>>().join(" ");
     let count = line.chars().count();
     let clipped: String = if from_end {
         line.chars().skip(count.saturating_sub(chars_max)).collect()
@@ -911,12 +914,13 @@ fn clip(text: &str, chars_max: usize, from_end: bool) -> String {
         line.chars().take(chars_max).collect()
     };
     assert!(clipped.chars().count() <= chars_max);
+    assert!(!clipped.chars().any(|c| c.is_control() || bidi(c)));
     clipped
 }
 
 // What a stopped run did, from its own log: the commands it ran with their exit codes and a
 // tail of their output, its last message, and what it was running when it stopped.
-pub fn handoff(harness: &Harness, log: &Path) -> String {
+pub fn handoff(harness: &Harness, log: &Path) -> Vec<String> {
     let mut lines: VecDeque<String> = VecDeque::new();
     let mut push = |line: String| {
         if lines.len() == HANDOFF_LINES_MAX {
@@ -964,16 +968,14 @@ pub fn handoff(harness: &Harness, log: &Path) -> String {
             kept.for_each(|line| push(format!("    {}", clip(line, CLIP_CHARS, false))));
         }
     }
-    let mut text = String::new();
-    for line in lines {
-        if text.len() + line.len() + 1 > HANDOFF_BYTES_MAX {
-            break;
-        }
-        text.push_str(&line);
-        text.push('\n');
-    }
-    assert!(text.len() <= HANDOFF_BYTES_MAX);
-    text
+    let lines: Vec<String> = lines.into();
+    assert!(lines.len() <= HANDOFF_LINES_MAX);
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.chars().count() <= HANDOFF_LOG_LINE_CHARS_MAX)
+    );
+    lines
 }
 
 /// Whether the stream at `log` records a failed run; false when the log is unreadable.

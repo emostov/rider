@@ -244,6 +244,62 @@ fn a_review_stopped_by_the_content_filter_is_rerun_once_on_mythos_with_a_handoff
     assert_eq!(read["message"]["task"]["needs"], json!([review_rerun]));
 }
 
+#[test]
+fn a_long_handoff_is_cut_to_fit_the_board_and_the_rerun_still_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    let review = NewTask::new("Review the work: git diff main...HEAD.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built);
+    let review = when_the_lead_creates(&world, &review);
+    let profile = "a-worker-with-a-long-profile-xyz";
+    let long = format!("\u{1b}]0;owned\u{7}\u{202e}{}", "w".repeat(300));
+    for _ in 0..16 {
+        let output = world.vb_as(profile, &["reply", &review, "-"], Some(&long));
+        assert_eq!(output.code, Some(0), "{output:?}");
+    }
+    world.vb_lead(&["label", &review, "role=review"], None);
+    given_the_agent_will(&world, &review, &[Behaviour::ContentFilterStopLong]);
+    given_the_agent_will(&world, "default", &[Behaviour::CommitNothing]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "failed"]);
+    assert_eq!(exit, Some(0));
+    let reruns = reruns_on_the_board(&world);
+    let rerun = reruns_of(&reruns, &review);
+    assert_eq!(
+        task_label(&world, &rerun, "role"),
+        Some("security".to_string())
+    );
+    let handoff = reply_texts(&world, &rerun);
+    let handoff = handoff.split("```json").next().unwrap_or_default();
+    assert!(
+        handoff.starts_with("Handoff from the Codex run"),
+        "{handoff}"
+    );
+    assert!(
+        handoff.chars().count() <= 9_000,
+        "{}",
+        handoff.chars().count()
+    );
+    let controls: Vec<char> = (handoff.chars())
+        .filter(|c| (c.is_control() && *c != '\n') || ('\u{202a}'..='\u{202e}').contains(c))
+        .collect();
+    assert_eq!(controls, Vec::<char>::new());
+    assert!(
+        handoff
+            .trim_end()
+            .ends_with("- was running `last-command` when it stopped"),
+        "{handoff}"
+    );
+    assert!(handoff.contains(&format!("by {profile}: ")), "{handoff}");
+}
+
 fn reply_profile(world: &World, id: &str, text: &str) -> String {
     let replies = task_replies(world, id);
     let found = replies.iter().find(|reply| reply["text"] == json!(text));
