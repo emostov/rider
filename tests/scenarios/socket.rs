@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[cfg(target_os = "macos")]
 use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
