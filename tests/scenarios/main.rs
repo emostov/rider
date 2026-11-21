@@ -10,6 +10,7 @@ mod codex_review;
 )]
 mod fake_agent;
 mod harness_cli;
+mod queue;
 mod queue_unclaimed;
 mod review_pr;
 mod run_task;
@@ -2959,12 +2960,15 @@ fn an_event_the_lead_caused_does_not_end_the_wait() {
         return;
     };
     let held = when_the_lead_creates(&world, &NewTask::new("Hold this part back."));
+    let held_too = when_the_lead_creates(&world, &NewTask::new("Hold this part back too."));
     let done = when_the_lead_creates(&world, &NewTask::new("Write this part."));
     given_the_lead_has_waited(&world);
     when_a_worker_claims(&world, "w-1", &done);
 
     let wait = when_rider_wait_starts(&world, &["--timeout", "1"]);
     world.vb_lead(&["tasks", "block", &held, "held by the lead"], None);
+    let legacy = world.vb_as("lead-legacy", &["tasks", "block", &held_too, "held"], None);
+    assert_eq!(legacy.code, Some(0), "{legacy:?}");
     when_the_worker_completes(&world, "w-1", &done);
     let output = then_rider_wait_ends(wait);
 

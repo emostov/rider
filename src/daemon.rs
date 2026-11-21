@@ -21,7 +21,7 @@ use signal_hook::iterator::Signals;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
-    Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
+    Board, BoardError, Listing, TaskId, TaskState, TaskView, Thread, Timestamp, VbCli, one_line,
     parse_failure_reason, register_schemas,
 };
 use crate::cli::board_serve;
@@ -938,7 +938,7 @@ fn job(
             let context = find(contexts, run, Event::AgentExited(run))?;
             let attempt = context.attempt.clone().ok_or(Event::AgentExited(run))?;
             shared.log.write(&format!("spawned #{} {profile}", task.0));
-            Box::new(move || spawn(&shared, run, task, &attempt))
+            Box::new(move || spawn(&shared, run, task, &profile, &attempt))
         }
         Action::StopAgent { run, task } => {
             let context = contexts.iter().find(|context| context.run == run);
@@ -1109,7 +1109,7 @@ fn run_error_text(error: &RunError) -> String {
     }
 }
 
-fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input {
+fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Attempt) -> Input {
     let pid_file = shared.pid_file(task);
     let vb_dir = shared
         .paths
@@ -1141,7 +1141,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     };
     // A full queue makes the worker wait: the recorder is never far behind.
     let _ = shared.recorder.send(Recorded::Started(task));
-    let launched = attempt.launch(&launch);
+    let launched = attempt.launch(&shared.board(profile), &launch);
     // The agent is gone, so its pid may be reused: nothing may signal it any more.
     let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&pid_file);
@@ -1395,6 +1395,9 @@ impl Board for Guarded<'_> {
         values: &[&str],
     ) -> Result<Listing, BoardError> {
         self.board.list_labelled(channel, key, values)
+    }
+    fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
+        self.board.thread(id)
     }
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
         self.board.blocking_findings(id)
