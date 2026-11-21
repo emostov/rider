@@ -97,7 +97,19 @@ fn each_roles_agent_gets_a_short_prompt_with_its_rules_and_no_way_to_settle_its_
         unit_tests,
     ];
     then_the_prompt_has(&agent_prompt(&world, &review, 0), "review", &review_rules);
-    then_the_prompt_has(&agent_prompt(&world, &security, 0), "security", &reviewer);
+    let isolated = [
+        "Copy the repository\n   to `scratch=$(mktemp -d)`",
+        "Never give it real credentials, tokens, keys, or the owner's\n   configuration",
+        "It may reach only localhost.",
+        "Put a time\n   limit on every command and service you start",
+        "do not run it: review that part from the source",
+    ];
+    let security_rules: Vec<&str> = reviewer.iter().chain(&isolated).copied().collect();
+    then_the_prompt_has(
+        &agent_prompt(&world, &security, 0),
+        "security",
+        &security_rules,
+    );
     let tester = [
         "The `of=<id>` label on\n   your task names the task under test.",
         "scratch=$(mktemp -d)",
