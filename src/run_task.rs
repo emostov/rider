@@ -197,7 +197,7 @@ pub fn run_task(
         });
     }
     let launched = attempt.launch(board, launch);
-    let judgement = judge_attempt(id, board, &attempt, launched)?;
+    let judgement = judge_attempt(id, board, &attempt, &launched)?;
     settle_attempt(id, env, board, &attempt, &judgement)?;
     Ok(Ran::Settled(judgement.verdict))
 }
@@ -456,13 +456,14 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
     let identity = board_identity(&env.board_url, board)?;
     let attempt = match prepare(brief, failed, start, env, board, &identity) {
         Ok(attempt) => attempt,
-        Err(block) => return Ok(block.prepared()),
+        Err(Unprepared::Blocked(block)) => return Ok(block.prepared()),
+        Err(Unprepared::CallFailed(error)) => return Err(RunError::Board(error)),
     };
     if let Some(branch) = &attempt.checkout.branch {
         if let Some(block) = label_branch(id, board, &view, branch)? {
             return Ok(block.prepared());
         }
-        if !attempt.retry && start_label.is_none() {
+        if start_label.is_none() && (attempt.failed == 0 || !attempt.retry) {
             board.set_label(id, START_LABEL, &attempt.checkout.start_head)?;
         }
     }
@@ -533,7 +534,7 @@ pub fn judge_attempt(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<Judgement, RunError> {
     if let Some(fresh) = attempt.fallback.as_ref()
         && attempt.fresh_log.get().is_some()
@@ -672,10 +673,10 @@ fn unneeded_on_branch(
         .tasks
         .iter()
         .map(|listed| &listed.view)
-        .filter(|task| task.id != view.id && in_repo(task, &brief.repo))
+        .filter(|task| task.id != view.id)
         .collect();
     let mut targets: Vec<TaskId> = vec![onto];
-    for task in &open {
+    for task in open.iter().filter(|task| in_repo(task, &brief.repo)) {
         let target = label(task, BRANCH_LABEL)
             .is_none()
             .then(|| parse_id_label(task, "onto").ok().flatten())
@@ -706,8 +707,9 @@ fn unneeded_on_branch(
         let inherited = works_onto
             .and_then(branch_of)
             .and_then(|(_, b)| b.as_deref());
-        own.or(inherited) == Some(branch.as_str())
-            || own.is_none() && works_onto.is_some_and(|id| members.contains(&id))
+        in_repo(task, &brief.repo)
+            && (own.or(inherited) == Some(branch.as_str())
+                || own.is_none() && works_onto.is_some_and(|id| members.contains(&id)))
     });
     let after = closure(&open, view.id, |task, members| {
         task.needs.iter().any(|need| members.contains(need))
@@ -763,7 +765,7 @@ fn prepare(
     env: &Env,
     board: &dyn Board,
     identity: &BoardIdentity,
-) -> Result<Attempt, Block> {
+) -> Result<Attempt, Unprepared> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
     let dir = worktree::dir_for(&brief, &env.home);
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
@@ -801,8 +803,13 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = worktree::prepare(&brief, board, &env.home, identity);
-    let checkout = checkout.map_err(|error| worktree_block(&error))?;
+    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
+        Ok(checkout) => checkout,
+        Err(WorktreeError::Board(error)) if error.call_failed() => {
+            return Err(Unprepared::CallFailed(error));
+        }
+        Err(error) => return Err(worktree_block(&error).into()),
+    };
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
     assert!(log.is_absolute());
@@ -825,6 +832,17 @@ fn prepare(
         fresh_log: OnceLock::new(),
         stopped: AtomicBool::new(false),
     })
+}
+
+enum Unprepared {
+    Blocked(Block),
+    CallFailed(BoardError),
+}
+
+impl From<Block> for Unprepared {
+    fn from(block: Block) -> Unprepared {
+        Unprepared::Blocked(block)
+    }
 }
 
 fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
@@ -1095,7 +1113,7 @@ fn inspect(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<(Verdict, Option<Work>), RunError> {
     let fail = |reason: String| (Verdict::Fail { reason }, None);
     let state_after = board.read_task(id)?.state;
@@ -1106,7 +1124,7 @@ fn inspect(
         other => return Err(RunError::LostClaim(other)),
     }
     let exit = match launched {
-        Ok(exit) => exit,
+        Ok(exit) => *exit,
         Err(error) => return Ok(fail(error.to_string())),
     };
     let evidence = match evidence(attempt) {

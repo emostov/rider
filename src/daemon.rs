@@ -561,7 +561,7 @@ fn serve_if_down(shared: &Arc<Shared>) {
         return;
     }
     match shared.board(DAEMON_PROFILE).list_open(SUBTREE) {
-        Err(error) if call_failed(&error) => {}
+        Err(error) if error.call_failed() => {}
         _ => return,
     }
     assert!(port.is_none_or(|port| !port.is_empty()));
@@ -869,6 +869,7 @@ fn absorb(input: Input, contexts: &mut [RunContext], log: &Log) -> Event {
         | Event::Prepared { run, .. }
         | Event::AgentExited(run)
         | Event::Judged { run, .. }
+        | Event::BoardFailed(Call::Judge(run))
         | Event::Settled(run) => Some(*run),
         _ => None,
     };
@@ -1003,16 +1004,6 @@ fn find(contexts: &mut [RunContext], run: RunId, missing: Event) -> Result<&mut 
     found.ok_or(missing)
 }
 
-fn call_failed(error: &BoardError) -> bool {
-    matches!(
-        error,
-        BoardError::Spawn(_)
-            | BoardError::Io(_)
-            | BoardError::TimedOut { .. }
-            | BoardError::Unreachable { .. }
-    )
-}
-
 fn claim(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     assert!(!profile.is_empty());
     let sent = now();
@@ -1026,7 +1017,7 @@ fn claim(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
             },
             _ => Event::ClaimRefused(run),
         },
-        Err(error) if call_failed(&error) => Event::BoardFailed(Call::Claim(run)),
+        Err(error) if error.call_failed() => Event::BoardFailed(Call::Claim(run)),
         Err(_) => Event::ClaimRefused(run),
     };
     Input::plain(event)
@@ -1046,7 +1037,7 @@ fn resume(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
             },
             _ => Event::ClaimRefused(run),
         },
-        Err(error) if call_failed(&error) => Event::BoardFailed(Call::Claim(run)),
+        Err(error) if error.call_failed() => Event::BoardFailed(Call::Claim(run)),
         // `claim_lost` or `claim_not_held`: the task becomes ready when its lease lapses.
         Err(_) => Event::ClaimRefused(run),
     };
@@ -1079,6 +1070,9 @@ fn prepare(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
             kind: kind.to_string(),
             reason,
         }),
+        Err(RunError::Board(error)) if error.call_failed() => {
+            Input::plain(Event::BoardFailed(Call::Prepare(run)))
+        }
         Err(error) => Input::plain(run_error_event(run, &error, "prepare")),
     }
 }
@@ -1198,13 +1192,17 @@ fn judge(
     launched: Result<Exit, HarnessError>,
 ) -> Input {
     let board = shared.board(profile);
-    match judge_attempt(task, &board, attempt, launched) {
+    match judge_attempt(task, &board, attempt, &launched) {
         Ok(judgement) => Input {
             event: Event::Judged {
                 run,
                 verdict: judgement.verdict.clone(),
             },
             extra: Extra::Judgement(Arc::new(judgement)),
+        },
+        Err(RunError::Board(error)) if error.call_failed() => Input {
+            event: Event::BoardFailed(Call::Judge(run)),
+            extra: Extra::Launched(launched),
         },
         Err(RunError::Board(error)) if !matches!(error, BoardError::ClaimLost { .. }) => {
             let reason = format!("rider could not judge the attempt: {error}");
@@ -1227,7 +1225,7 @@ fn renew(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
             },
             None => Event::ClaimLost(run),
         },
-        Err(error) if call_failed(&error) => Event::BoardFailed(Call::Renew(run)),
+        Err(error) if error.call_failed() => Event::BoardFailed(Call::Renew(run)),
         Err(_) => Event::ClaimLost(run),
     };
     Input::plain(event)
@@ -1287,7 +1285,7 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
     }
     let event = match written {
         Ok(()) => Event::Settled(run),
-        Err(RunError::Board(error)) if call_failed(&error) => Event::BoardFailed(Call::Settle(run)),
+        Err(RunError::Board(error)) if error.call_failed() => Event::BoardFailed(Call::Settle(run)),
         Err(RunError::Board(BoardError::ClaimLost { .. }) | RunError::LostClaim(_)) => {
             Event::CloseLost(run)
         }
