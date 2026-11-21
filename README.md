@@ -46,11 +46,8 @@ review threads) and saves the answers in `<rider home>/ship.toml`.
 ## Quickstart
 
 Rider needs Rust, Node 22, and `claude` or `codex` on `PATH`, signed in for the roles
-that use them. Install the Board CLI where Rider looks for it:
-
-```sh
-npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board
-```
+that use them. Rider installs the Board CLI it needs under its home the first time `rider up`,
+`rider serve` or `rider vb` runs, and `rider vb <args>` runs it on the local board.
 
 Open a coding-agent session in a terminal you keep open and say "ride a swarm to <goal>".
 The `ride-swarm` skill makes that session the lead. The lead starts the daemon with
@@ -108,12 +105,12 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
   `daemon.log` says why: an error in `rider.toml` names the field and the file.
 - **`rider daemon` exits saying `daemon.lock` is held.** Another daemon runs on the same
   home, and the error names its pid. One daemon serves every project, so use that one.
-- **`vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
+- **`rider vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
   its first task.
 - **A failed task's log reply is cut short.** The reply keeps within the board's message
   limit and names the whole log; `rider logs <id>` prints it.
 - **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
-  `vb label`, then `vb tasks unblock <id>`.
+  `rider vb label`, then `rider vb tasks unblock <id>`.
 - **A task is blocked as `rider_error`: "Rider will not reuse the worktree ... was not made
   for this board".** Worktrees are named by task id, so after the board's data is replaced a
   new task can reuse the id of an old task whose worktree is still there. Each worktree Rider
@@ -124,7 +121,7 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
   after replacing the board, and do not post in or delete `rider/identity`. A worktree with no
   record, or with another board's, is left as it is. Keep what you need from the directory
   the reason names, remove it with `git worktree remove <dir>` from the repository, then
-  `vb tasks unblock <id>`.
+  `rider vb tasks unblock <id>`.
 - **Many `node ... vb` processes are left running.** `rider reap` lists Board CLI processes
   whose board no longer answers; `rider reap --yes` stops them.
 

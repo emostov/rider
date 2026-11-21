@@ -5,10 +5,10 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
+use std::process::{Command as Process, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -35,8 +35,11 @@ const ENVIRONMENT: &str = r#"environment:
 
 /// Upper bound on the boards one `rider reap` names.
 pub const REAP_URLS_MAX: usize = 8;
+/// Upper bound on the arguments `rider vb` passes on to the Board CLI.
+pub const VB_ARGS_MAX: usize = 64;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
-pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
+pub const ARGS_MAX: usize = VB_ARGS_MAX + 1;
+const _: () = assert!(ARGS_MAX >= 2 * REAP_URLS_MAX + 2);
 /// Every role's prompt file and the files they read, once each, built into the binary.
 pub const PROMPTS: [(&str, &str); 5] = [
     ("implement.md", include_str!("../prompts/implement.md")),
@@ -50,7 +53,9 @@ const HOME_DEFAULT_DIR: &str = ".rider";
 /// The directory under the Rider home that holds the built-in worker prompts.
 pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
-const VB_DIR: &str = "node/node_modules/.bin";
+const NODE_DIR: &str = "node";
+/// The Board CLI version rider installs under its home when it finds none there.
+const BOARD_PACKAGE: &str = "@vercel/board@0.52.0";
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the characters of a project or profile name.
 const NAME_CHARS_MAX: usize = 64;
@@ -160,6 +165,18 @@ pub enum Command {
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
     },
+    /// Run the Board CLI on rider's board, passing every argument on as given.
+    ///
+    /// BOARD_URL is set to rider's board unless it is already set.
+    #[command(disable_help_flag = true)]
+    Vb {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<OsString>,
+    },
 }
 
 /// An argument value rider does not accept.
@@ -259,7 +276,7 @@ impl Config {
     }
 
     fn vb_dir(&self) -> PathBuf {
-        self.home.join(VB_DIR)
+        self.home.join(NODE_DIR).join("node_modules/.bin")
     }
 
     fn prompts(&self) -> PathBuf {
@@ -362,6 +379,10 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    /// The Board CLI is missing and there is no `npm` to install it with.
+    NoNpm,
+    /// `npm install` of the Board CLI failed or left no `vb`.
+    NotInstalled(String),
 }
 
 impl fmt::Display for CliError {
@@ -387,6 +408,11 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::NoNpm => write!(
+                f,
+                "the Board CLI is missing and npm is not on PATH: install Node 22, then retry"
+            ),
+            CliError::NotInstalled(why) => write!(f, "could not install {BOARD_PACKAGE}: {why}"),
             CliError::BadCursor(path) => {
                 write!(f, "{} does not hold a board cursor", path.display())
             }
@@ -439,6 +465,49 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             timeout,
             lead,
         } => wait(config, project, *timeout, lead.as_deref()),
+        Command::Vb { args } => vb(config, args),
+    }
+}
+
+fn vb(config: &Config, args: &[OsString]) -> Result<u8, CliError> {
+    assert!(args.len() <= VB_ARGS_MAX);
+    let vb = install_vb(config)?;
+    assert!(vb.is_absolute() && !config.board_url.is_empty());
+    let error = Process::new(&vb)
+        .args(args)
+        .env("BOARD_URL", &config.board_url)
+        .exec();
+    Err(io_error("run", &vb, &error))
+}
+
+fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
+    let vb = config.vb_dir().join("vb");
+    if vb.is_file() {
+        return Ok(vb);
+    }
+    let prefix = config.home.join(NODE_DIR);
+    assert!(prefix.is_absolute() && vb.starts_with(&prefix));
+    eprintln!(
+        "rider: installing {BOARD_PACKAGE} into {}",
+        prefix.display()
+    );
+    let status = Process::new("npm")
+        .arg("install")
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg(BOARD_PACKAGE)
+        .stdin(Stdio::null())
+        .stdout(io::stderr())
+        .status();
+    match status {
+        Err(error) if error.kind() == ErrorKind::NotFound => Err(CliError::NoNpm),
+        Err(error) => Err(io_error("run", Path::new("npm"), &error)),
+        Ok(status) if !status.success() => Err(CliError::NotInstalled(format!("npm {status}"))),
+        Ok(_) if !vb.is_file() => Err(CliError::NotInstalled(format!(
+            "npm left no {}",
+            vb.display()
+        ))),
+        Ok(_) => Ok(vb),
     }
 }
 
@@ -516,7 +585,7 @@ fn serve(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    let vb = config.vb_dir().join("vb");
+    let vb = install_vb(config)?;
     let mut command = board_serve(&config.home, &vb).map_err(io("create", dir.clone()))?;
     // The board runs in the foreground, so it shares rider's terminal, standard input included.
     let status = command.status().map_err(io("run", vb))?;
@@ -567,6 +636,7 @@ fn up(config: &Config) -> Result<u8, CliError> {
         println!("{}", status_line(&data));
         return Ok(0);
     }
+    install_vb(config)?;
     fs::create_dir_all(&config.home).map_err(|error| CliError::Io {
         action: "create",
         path: config.home.clone(),

@@ -10,11 +10,8 @@ daemon runs one agent per ready task in its own git worktree, and a lead plans t
 into tasks. When the user rides a swarm from this session, **this session is the lead**.
 
 `<skill>` is the directory that contains this SKILL.md. It holds `lead.md`, the lead's
-instructions, and `schemas/`. The board is reached with `vb`, which needs:
-
-```sh
-export BOARD_URL=http://127.0.0.1:4100/api/board PATH="$HOME/.rider/node/node_modules/.bin:$PATH"
-```
+instructions, and `schemas/`. The board is reached with `rider vb`, which runs the Board CLI
+on the local board, installing it first if it is missing.
 
 ## Swarm status
 
@@ -26,11 +23,11 @@ answer from memory.
 | Is the board up? | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4100` (`000` is down) |
 | Is the daemon up, and what is open? | `rider status` (board, running count, open tasks by project) |
 | Which agents run? | `rider agents` |
-| Which projects exist? | `vb channels list work/` |
-| A project's tasks, with each result's summary | `vb tasks work/<project> --state all` |
-| Why tasks are blocked | `vb tasks work/<project> --state blocked` |
-| Questions waiting on the user | `vb tasks decisions --state blocked` ("Couldn't find channel" means none) |
-| One task in full | `vb read <id>` |
+| Which projects exist? | `rider vb channels list work/` |
+| A project's tasks, with each result's summary | `rider vb tasks work/<project> --state all` |
+| Why tasks are blocked | `rider vb tasks work/<project> --state blocked` |
+| Questions waiting on the user | `rider vb tasks decisions --state blocked` ("Couldn't find channel" means none) |
+| One task in full | `rider vb read <id>` |
 
 1. What needs the user: open decisions, and tasks blocked as `rider_error`, `branch_busy`,
    or `attempts_exhausted`.
@@ -49,7 +46,6 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 1. **Install what is missing.** Check each with `command -v`; install only what is absent,
    and tell the user what you installed.
    - `rider`: `cargo install --locked --git https://github.com/emostov/rider swarm-rider`
-   - `vb` (the Board CLI): `npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board`
    - `claude`, `codex`, `jq`, Node 22, and Rust cannot be installed for the user: name the
      missing ones and stop. `claude` and `codex` must be signed in.
 2. **Agree the shape.** Ask in one question only for what the request and the repository do
@@ -59,8 +55,8 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    (`git -C <repo> merge --no-ff <branch>` on a clean checkout, `git merge --abort` and a
    restack task on conflict, never push), or the user merges when asked in `decisions`.
 3. **Board.** If it is down, start `rider serve` as a background command and check again.
-   `vb schemas list` must list `rider-result@2` and `rider-finding@1`;
-   register a missing one with `vb schemas create rider-result@2 --file
+   `rider vb schemas list` must list `rider-result@2` and `rider-finding@1`;
+   register a missing one with `rider vb schemas create rider-result@2 --file
    <skill>/schemas/rider-result@2.json` (`rider-finding@1` from `rider-finding.json`).
 4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
    run `rider up`, which starts it in the background, and check `rider status` again.

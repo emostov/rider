@@ -191,7 +191,7 @@ fn lead_retries_a_failed_light_task_as_implement_by_relabelling_first() {
         assert!(lead.contains(word), "lead.md lacks {word}");
     }
     let relabel = lead
-        .find("`vb label <id> role=implement --as lead-fable-5-2`, then `vb tasks reopen <id>")
+        .find("`rider vb label <id> role=implement --as lead-fable-5-2`, then `rider vb tasks reopen <id>")
         .expect("lead.md relabels a light task before reopening it");
     assert!(relabel > lead.find("## Roles").expect("lead.md has a role table"));
 }
