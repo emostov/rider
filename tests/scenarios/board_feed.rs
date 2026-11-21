@@ -569,3 +569,47 @@ fi"#,
     );
     then_the_daemon_stops_cleanly(world);
 }
+
+const HELD_READ_SECONDS_MAX: u64 = 30;
+
+#[test]
+fn rider_kill_while_the_worker_reads_the_thread_before_launch_starts_no_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let held = world.root.join("read-held");
+    let released = world.root.join("read-released");
+    given_vb_first_runs(
+        &world,
+        &format!(
+            r#"case " $* " in " read {task} "*" --as implement-"*)
+  [ -d '{worktree}' ] || exec '{vb}' "$@"
+  : > '{held}'
+  n=0
+  while [ ! -e '{released}' ] && [ "$n" -lt 600 ]; do n=$((n + 1)); sleep 0.1; done ;;
+esac"#,
+            worktree = world.home.join("worktrees/repo").join(&task).display(),
+            vb = fs::read_link(&world.vb)
+                .expect("the Board CLI is a link")
+                .display(),
+            held = held.display(),
+            released = released.display(),
+        ),
+    );
+    given_a_running_daemon(&mut world);
+    let deadline = Instant::now() + Duration::from_secs(HELD_READ_SECONDS_MAX);
+    while !held.exists() {
+        assert!(Instant::now() < deadline, "{}", world.daemon_log());
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let kill = when_rider_runs(&world, &["kill", &task]);
+    fs::write(&released, "").expect("release the held read");
+
+    assert_eq!(kill.code, Some(0), "{kill:?}");
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+    let runs = agent_runs_for(&world, &task);
+    assert!(runs.is_empty(), "an agent started after the kill: {runs:?}");
+    then_the_daemon_stops_cleanly(world);
+}
