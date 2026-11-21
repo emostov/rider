@@ -577,7 +577,11 @@ fn an_agent_running_rider_kill_or_down_is_refused_and_keeps_running() {
 
     let stops = when_the_stop_attempts_end(&world, &task);
 
-    let refused = "forbidden: down and kill are refused from the daemon's own agents";
+    let refused = if cfg!(target_os = "macos") {
+        "talking to the daemon: Operation not permitted"
+    } else {
+        "forbidden: down and kill are refused from the daemon's own agents"
+    };
     assert_eq!(
         stops.lines().filter(|line| line.contains(refused)).count(),
         2,
@@ -689,6 +693,7 @@ fn rider_up_refuses_a_symlink_at_daemon_log_and_leaves_its_target_alone() {
     assert!(!world.home.join("rider.sock").exists());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_known_gap_an_orphaned_agent_child_in_its_own_process_group_can_still_stop_the_daemon() {
     let Some(mut world) = given_a_board_and_a_repository() else {

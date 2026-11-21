@@ -27,9 +27,9 @@ user can change, or that carries a macOS ACL.
 Agents run as the same user as the daemon, so nothing can reliably stop them from stopping it.
 As a guard against accidents, the daemon refuses `down` and `kill` from a process that descends
 from it, or whose process group's leader does, which covers an agent running `rider down` or
-`rider kill` itself. It does not stop a process that has left both (a child in its own process
-group whose parent has exited), nor an agent that signals the daemon directly. Keeping agents
-from stopping the daemon needs a separate user or a sandbox.
+`rider kill` itself. Without the macOS sandbox below, it does not stop a process that has left
+both (a child in its own process group whose parent has exited), nor an agent that signals the
+daemon directly.
 
 ## Agent sandbox
 

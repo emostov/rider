@@ -165,7 +165,7 @@ const HOME_DIRS: [&str; 4] = ["board", "wait", "roles", "run"];
 #[cfg(target_os = "macos")]
 const HOME_FILES: [&str; 2] = ["node.lock", "ship.toml"];
 #[cfg(target_os = "macos")]
-const GIT_SHARED_DIRS: [&str; 3] = ["objects", "refs", "logs"];
+const GIT_SHARED_DIRS: [&str; 4] = ["objects", "refs", "reftable", "logs"];
 #[cfg(target_os = "macos")]
 const GIT_SHARED_FILES: [&str; 5] = [
     "packed-refs",

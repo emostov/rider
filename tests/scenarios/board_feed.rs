@@ -339,7 +339,16 @@ fn a_descendant_of_a_waiting_vb_is_killed_with_no_kill_command_on_path() {
         .display()
         .to_string();
     assert!(!Path::new(&vb_dir).join("kill").exists());
-    then_the_hung_identity_read_left_nothing(world, "wait", &vb_dir);
+    let git_only = world.root.join("git-only");
+    fs::create_dir_all(&git_only).expect("create the git-only directory");
+    let git = std::process::Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("find git");
+    let git = String::from_utf8(git.stdout).expect("a UTF-8 path");
+    std::os::unix::fs::symlink(git.trim(), git_only.join("git")).expect("link git");
+    let path = format!("{vb_dir}:{}", git_only.display());
+    then_the_hung_identity_read_left_nothing(world, "wait", &path);
 }
 
 const BURST_EVENTS: u64 = 400;
