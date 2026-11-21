@@ -67,8 +67,10 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
    `lead-fable-5-2`. Answer the user before anything else.
 
-To send a finished branch for the owner's review, open its PR, and get CI green, follow the
-`ship-swarm` skill. Its loops follow the owner's settings in `<rider home>/ship.toml`.
+To push a completed task's branch and open its draft PR, run `rider pr <task id>`: it pushes
+without force, refuses a branch that moved on origin, reuses an open PR, and prints the URL.
+It never marks ready, merges, or deletes. To send a finished branch for the owner's review
+and get CI green, follow the `ship-swarm` skill. Its loops follow the owner's settings in `<rider home>/ship.toml`.
 
 ## Stop the swarm
 

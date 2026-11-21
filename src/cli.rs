@@ -1,7 +1,7 @@
 //! The command line: parse the arguments, read the environment once, and run one command.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -15,15 +15,17 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use fs4::{FileExt, TryLockError};
+use serde::Deserialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, TaskId, VbCli};
+use crate::board::{self, Board, BoardError, TaskId, TaskState, TaskView, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
+use crate::git::{self, GitError};
 use crate::harness::LOG_BYTES_MAX;
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
@@ -65,6 +67,9 @@ const WAIT_DIR: &str = "wait";
 const WAIT_PROFILE: &str = "rider-wait";
 /// The profile prefix of a lead, as the ride-swarm skill names it.
 const LEAD_PREFIX: &str = "lead-";
+const PR_PROFILE: &str = "rider-pr";
+const PR_TITLE_CHARS_MAX: usize = 200;
+const PR_LIST_MAX: usize = 2;
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
 /// How long the feed must stay quiet after an event before the wait reports it.
@@ -140,6 +145,13 @@ pub enum Command {
         /// Stop the listed processes.
         #[arg(long)]
         yes: bool,
+    },
+    /// Push a completed task's branch to origin and open its draft PR; print the PR's URL.
+    ///
+    /// Never forces: a branch that moved on origin is refused. An open PR is reused.
+    Pr {
+        #[arg(value_name = "ID", value_parser = parse_task_id)]
+        id: TaskId,
     },
     /// Block until something needs the lead, then print what happened since the last wait.
     ///
@@ -362,6 +374,12 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    NotPushable {
+        id: TaskId,
+        why: &'static str,
+    },
+    Git(GitError),
+    BadGh(String),
 }
 
 impl fmt::Display for CliError {
@@ -387,6 +405,15 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::NotPushable { id, why } => write!(f, "task #{} {why}", id.0),
+            CliError::Git(error) => write!(f, "{error}"),
+            CliError::BadGh(output) => {
+                write!(
+                    f,
+                    "gh printed output rider cannot use: {}",
+                    board::one_line(output)
+                )
+            }
             CliError::BadCursor(path) => {
                 write!(f, "{} does not hold a board cursor", path.display())
             }
@@ -434,6 +461,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
         Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
+        Command::Pr { id } => pr(config, *id),
         Command::Wait {
             project,
             timeout,
@@ -1124,4 +1152,106 @@ fn io_error(action: &'static str, path: &Path, error: &io::Error) -> CliError {
         path: path.to_path_buf(),
         message: error.to_string(),
     }
+}
+
+struct Finished {
+    repo: PathBuf,
+    branch: String,
+    title: String,
+    summary: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePr {
+    url: String,
+}
+
+fn finished(view: TaskView) -> Result<Finished, CliError> {
+    let id = view.id;
+    let refuse = |why| CliError::NotPushable { id, why };
+    if view.state != TaskState::Completed {
+        return Err(refuse("is not completed"));
+    }
+    let label = |key: &str| {
+        let found = view.labels.iter().find(|(name, _)| name == key);
+        found.map(|(_, value)| value.as_str())
+    };
+    let repo = label("repo")
+        .map(PathBuf::from)
+        .filter(|repo| repo.is_absolute());
+    let repo = repo.ok_or_else(|| refuse("has no repo label holding an absolute path"))?;
+    let branch = label("branch").filter(|branch| git::is_safe_ref(branch));
+    let branch = branch.ok_or_else(|| refuse("has no branch label naming a branch"))?;
+    let first = view.text.lines().next().unwrap_or_default().trim();
+    let title: String = first.chars().take(PR_TITLE_CHARS_MAX).collect();
+    if title.is_empty() {
+        return Err(refuse("has no first line to title its PR"));
+    }
+    let branch = branch.to_string();
+    let summary = view.result.filter(|result| !result.trim().is_empty());
+    let summary = summary.ok_or_else(|| refuse("has no result to describe its PR"))?;
+    assert!(repo.is_absolute() && git::is_safe_ref(&branch));
+    assert!(!title.is_empty() && title.chars().count() <= PR_TITLE_CHARS_MAX);
+    Ok(Finished {
+        repo,
+        branch,
+        title,
+        summary,
+    })
+}
+
+fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: PR_PROFILE.to_string(),
+    };
+    let task = finished(board.read_task(id).map_err(CliError::Board)?)?;
+    git::push_branch(&task.repo, &task.branch).map_err(CliError::Git)?;
+    let limit = PR_LIST_MAX.to_string();
+    let list = [
+        "pr",
+        "list",
+        "--head",
+        &task.branch,
+        "--state",
+        "open",
+        "--json",
+        "url",
+        "--limit",
+        &limit,
+    ];
+    let listed = git::gh(&task.repo, &list.map(OsStr::new), None).map_err(CliError::Git)?;
+    let bad = |bytes: &[u8]| CliError::BadGh(String::from_utf8_lossy(bytes).into_owned());
+    let mut open: Vec<WirePr> = serde_json::from_slice(&listed).map_err(|_| bad(&listed))?;
+    if open.len() > 1 {
+        return Err(bad(&listed));
+    }
+    let url = match open.pop() {
+        None => {
+            let title = format!("--title={}", task.title);
+            let create = [
+                "pr",
+                "create",
+                "--draft",
+                "--head",
+                &task.branch,
+                &title,
+                "--body-file",
+                "-",
+            ];
+            let body = Some(task.summary.into_bytes());
+            let created = git::gh(&task.repo, &create.map(OsStr::new), body);
+            let created = created.map_err(CliError::Git)?;
+            String::from_utf8_lossy(&created).trim().to_string()
+        }
+        Some(found) => found.url,
+    };
+    if !url.starts_with("https://") || url.contains(char::is_whitespace) {
+        return Err(CliError::BadGh(url));
+    }
+    assert!(open.is_empty() && !url.is_empty());
+    say(&url);
+    Ok(0)
 }

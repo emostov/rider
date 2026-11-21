@@ -119,6 +119,7 @@ pub struct TaskView {
     pub claim: Option<Claim>,
     /// The cursor of the newest event that changed the task's message.
     pub version: Cursor,
+    pub result: Option<String>,
 }
 
 /// A task as a listing shows it, with the channel it is in.
@@ -645,6 +646,8 @@ struct WireTask {
     needs: Vec<String>,
     #[serde(deserialize_with = "nullable")]
     claim: Option<WireHolder>,
+    #[serde(default, deserialize_with = "nullable")]
+    result: Option<String>,
 }
 
 /// A task's message, as `read` prints under `message` and `claim` under `task`.
@@ -905,6 +908,7 @@ fn view_from_wire(message: WireMessage) -> Result<TaskView, BoardError> {
         epoch: task.epoch,
         claim,
         version: Cursor(version),
+        result: task.result,
     };
     assert!(view.text.len() < OUTPUT_BYTES_MAX);
     assert_eq!(view.claim.is_some(), view.state == TaskState::Claimed);

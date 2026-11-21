@@ -67,13 +67,14 @@ Watching is optional. The lead keeps you updated, but you can look yourself:
 rider status        # the board, the running count, and every open task by project
 rider agents        # every agent the daemon runs
 rider logs <id>     # the newest attempt's log of a task; -f follows it
+rider pr <id>       # push a completed task's branch and open its draft PR
 ```
 
 The board's web inspector is at <http://127.0.0.1:4100>.
 
 Agents run unsandboxed, with permission prompts skipped. Point Rider only at repositories you
-are prepared to have changed. Rider never pushes or merges; work stays on local branches named
-`rider/<task id>-<slug>`.
+are prepared to have changed. Work stays on local branches named `rider/<task id>-<slug>`. Rider never merges, and pushes
+only when the lead runs `rider pr <id>`.
 
 ## Stopping
 
