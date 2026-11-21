@@ -20,7 +20,7 @@ use crate::fake_agent;
 /// The project every scenario runs; its tasks go in the channel `work/<PROJECT>`.
 pub const PROJECT: &str = "demo";
 /// The profile the tests write tasks as.
-pub const LEAD: &str = "lead-fable-5-2";
+pub const LEAD: &str = "lead";
 /// The base branch of the scratch repository.
 pub const MAIN: &str = "main";
 

@@ -1,4 +1,4 @@
-//! Fake `claude` and `codex` scripts that play a scripted worker, one behaviour per attempt.
+//! Fake `claude` and `codex` (also as `codex review`) scripts that play a scripted worker, one behaviour per attempt.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,7 @@ pub const SLOW_SECONDS: u64 = 35;
 pub const LEFTOVER_SECONDS: u64 = 30;
 /// How many bytes a `CommitFlooding` agent prints after its report.
 pub const FLOOD_BYTES: u64 = 65 * 1024 * 1024;
+pub const PR_REF: &str = "refs/rider/pr/412";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,14 @@ pub enum Behaviour {
     Block,
     /// Prints nothing and exits `FAIL_EXIT_CODE`.
     ExitNonZero,
+    /// As `codex review`, prints no final text and exits 0.
+    ReviewNothing,
+    /// As `codex review` whose review delegate never started: prints Codex's interruption
+    /// message and exits 0.
+    ReviewInterrupted,
+    /// As `codex review` stopped by the provider's content filter: prints `CONTENT_FILTER_ERROR`
+    /// on stderr and exits 1.
+    ContentFilterStop,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
     /// Like `Hold`, but ignores SIGTERM.
@@ -116,6 +125,9 @@ pub enum Behaviour {
     CommitLeavingEscapee,
     /// Commits and reports like `Commit`, then prints `FLOOD_BYTES` bytes and exits 0.
     CommitFlooding,
+    ReportDecision,
+    HoldAttempt,
+    MergePr,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -140,6 +152,9 @@ impl Behaviour {
             Behaviour::LeaveUncommitted => "leave-uncommitted",
             Behaviour::Block => "block",
             Behaviour::ExitNonZero => "exit-non-zero",
+            Behaviour::ReviewNothing => "review-nothing",
+            Behaviour::ReviewInterrupted => "review-interrupted",
+            Behaviour::ContentFilterStop => "content-filter-stop",
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::HoldTalking => "hold-talking",
@@ -173,9 +188,19 @@ impl Behaviour {
             Behaviour::CommitLeavingOrphan => "commit-leaving-orphan",
             Behaviour::CommitLeavingEscapee => "commit-leaving-escapee",
             Behaviour::CommitFlooding => "commit-flooding",
+            Behaviour::ReportDecision => "report-decision",
+            Behaviour::HoldAttempt => "hold-attempt",
+            Behaviour::MergePr => "merge-pr",
         }
     }
 }
+
+/// What Codex's interruption message for a review that never started begins with.
+pub const REVIEW_INTERRUPTED: &str =
+    "Review was interrupted. Please re-run /review and wait for it to complete.";
+/// The error a `ContentFilterStop` agent prints on stderr.
+pub const CONTENT_FILTER_ERROR: &str =
+    "ERROR: This content was flagged for possible cybersecurity risk.";
 
 /// The question a blocking agent asks.
 pub const BLOCK_QUESTION: &str = "The fake agent needs an answer.";
@@ -213,6 +238,14 @@ pub fn hold_line(task: &str) -> String {
     format!(r#"{{"type":"fake","text":"holding task {task}"}}"#)
 }
 
+pub fn heard(decisions: &[&str]) -> String {
+    let heard: Vec<String> = decisions
+        .iter()
+        .map(|word| format!("Decision {word}"))
+        .collect();
+    format!("Fake agent heard {}.", heard.join(", "))
+}
+
 /// The final message a fake agent reports; it becomes the task's result.
 pub fn summary(task: &str, attempt: u32) -> String {
     format!("Fake agent finished task {task} attempt {attempt}.")
@@ -230,6 +263,7 @@ fn script() -> String {
 world="${WORLD_VAR}"
 task="$BOARD_TASK"
 harness=$(basename "$0")
+[ "$harness" = codex ] && [ "$1" = review ] && harness=codex-review
 runs="$world/{RUNS_FILE}"
 attempt=$( (grep "^start $task " "$runs" 2>/dev/null || true) | wc -l | tr -d ' ')
 plan="$world/{BEHAVIOURS_DIR}/$task"
@@ -238,6 +272,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+[ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
@@ -256,7 +291,10 @@ done
 [ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
 report() {{
-  if [ "$harness" = codex ]; then
+  if [ "$harness" = codex-review ]; then
+    printf 'OpenAI Codex v0.0.0\n--------\ncodex\n%s\n' "$summary" >&2
+    echo "$summary"
+  elif [ "$harness" = codex ]; then
     echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
     echo '{{"type":"turn.started"}}'
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
@@ -292,6 +330,9 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  review-nothing) exit 0 ;;
+  review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
+  content-filter-stop) echo "{CONTENT_FILTER_ERROR}" >&2; exit 1 ;;
   wander-branch) git switch -q -c elsewhere && commit || exit 1 ;;
   detach) git checkout -q --detach && commit || exit 1 ;;
   commit-then-fail) commit; exit {fail} ;;
@@ -335,9 +376,25 @@ case "$behaviour" in
     sleep {leftover} & echo $! > "$world/{LEFTOVERS_DIR}/$task"; exit 0 ;;
   commit-leaving-escapee)
     commit || exit 1; report
-    sh -c 'set -m; sleep {leftover} & echo $! > "$1"' sh "$world/{LEFTOVERS_DIR}/$task"
+    perl -e 'setpgrp(0, 0); exec "sleep", $ARGV[0]' {leftover} &
+    echo $! > "$world/{LEFTOVERS_DIR}/$task"
     exit 0 ;;
   commit-flooding) commit || exit 1; report; yes | head -c {flood}; exit 0 ;;
+  hold-attempt)
+    step=0
+    while [ ! -e "$world/{RELEASES_DIR}/$task-$attempt" ]; do
+      step=$((step + 1))
+      [ "$step" -le {steps} ] || exit 1
+      sleep 0.1
+    done
+    commit || exit 1 ;;
+  report-decision)
+    for arg in "$@"; do prompt="$arg"; done
+    heard=$(printf '%s\n' "$prompt" | grep -o 'Decision [a-z0-9]*' | paste -s -d '#' - \
+      | sed 's/#/, /g')
+    [ -n "$heard" ] || heard="Decision none"
+    summary="Fake agent heard $heard." ;;
+  merge-pr) git merge -q --no-edit {PR_REF} || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
@@ -408,6 +465,12 @@ pub fn leftover(world: &Path, task: &str) -> u32 {
     pid
 }
 
+/// What attempt `attempt` of `task`, started as `codex review`, read from its standard input.
+pub fn stdin(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.stdin"));
+    fs::read_to_string(&path).expect("read an agent's standard input")
+}
+
 /// The arguments attempt `attempt` of `task` was started with, one per line.
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
@@ -447,13 +510,19 @@ pub fn release(world: &Path, task: &str) {
     assert!(path.exists());
 }
 
+pub fn release_attempt(world: &Path, task: &str, attempt: u32) {
+    let path = world.join(RELEASES_DIR).join(format!("{task}-{attempt}"));
+    fs::write(&path, "").expect("release an agent's attempt");
+    assert!(path.exists());
+}
+
 /// One start of a fake agent, as it recorded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     pub task: String,
     pub attempt: u32,
     pub pid: u32,
-    /// `claude` or `codex`.
+    /// `claude`, `codex`, or `codex-review`.
     pub harness: String,
     pub behaviour: String,
     pub dir: PathBuf,

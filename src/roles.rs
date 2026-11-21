@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 pub enum Harness {
     Claude,
     Codex,
+    CodexReview,
 }
 
 /// One role an agent can take on a task.
@@ -50,7 +51,7 @@ const _: () = assert!(BUILDERS_DEFAULT > 0 && BUILDERS_DEFAULT <= AGENTS_MAX);
 /// The longest profile name the board accepts.
 pub const PROFILE_LEN_MAX: usize = 32;
 
-pub const ROLES: [RoleSpec; 5] = [
+pub const ROLES: [RoleSpec; 6] = [
     RoleSpec {
         label: "implement",
         harness: Harness::Claude,
@@ -96,6 +97,22 @@ pub const ROLES: [RoleSpec; 5] = [
         slots: AGENTS_MAX,
         pool_slots: 8,
         prompt_file: "review.md",
+        skills: &[],
+        enabled: true,
+    },
+    RoleSpec {
+        label: "native-review",
+        harness: Harness::CodexReview,
+        model: "gpt-6.2-sol",
+        commits_expected: false,
+        needs_of: true,
+        builds: false,
+        title: "Native-review",
+        model_name: "Sol 6.2",
+        model_slug: "sol-6-2",
+        slots: AGENTS_MAX,
+        pool_slots: 8,
+        prompt_file: "native-review.md",
         skills: &[],
         enabled: true,
     },

@@ -18,15 +18,17 @@ use fs4::{FileExt, TryLockError};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, TaskId, VbCli};
+use crate::board::{self, Board, BoardError, Listing, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
 use crate::harness::LOG_BYTES_MAX;
+use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
+use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
 const ENVIRONMENT: &str = r#"environment:
@@ -37,19 +39,24 @@ const ENVIRONMENT: &str = r#"environment:
 pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
-/// Every role's prompt file and the files they read, once each, built into the binary.
-pub const PROMPTS: [(&str, &str); 5] = [
-    ("implement.md", include_str!("../prompts/implement.md")),
+pub const IMPLEMENT_PROMPT: &str = "implement.md";
+pub const SLOP_RULES: &str = include_str!("../prompts/slop-rules.md");
+/// Every role's prompt and the slop rules, once each, built into the binary.
+pub const PROMPTS: [(&str, &str); 6] = [
+    (IMPLEMENT_PROMPT, include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
+    (
+        "native-review.md",
+        include_str!("../prompts/native-review.md"),
+    ),
     ("security.md", include_str!("../prompts/security.md")),
-    ("slop-rules.md", include_str!("../prompts/slop-rules.md")),
+    ("slop-rules.md", SLOP_RULES),
     ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
-/// The directory under the Rider home that holds the built-in worker prompts.
-pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
+const SKILLS_DIR: &str = "skills";
 const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the characters of a project or profile name.
@@ -61,9 +68,13 @@ const WAIT_MINUTES_MAX: u32 = 60;
 const WAIT_MINUTES_DEFAULT: u32 = 54;
 /// The directory under the Rider home that holds each project's wait cursor.
 const WAIT_DIR: &str = "wait";
+/// The failure reason of a read of a channel that does not exist yet.
+const CHANNEL_NOT_FOUND: &str = "channel_not_found";
+/// The profile `rider queue` reads the board as.
+const QUEUE_PROFILE: &str = "rider-queue";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
-/// The profile prefix of a lead, as the ride-swarm skill names it.
+const LEAD_PROFILE: &str = "lead";
 const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
@@ -111,6 +122,12 @@ pub enum Command {
     Status,
     /// Print every agent the daemon runs.
     Agents,
+    /// Print the owner's review queue, then the work the daemon runs.
+    Queue {
+        /// Print the items with every label as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the newest attempt's log of a task; -f follows it until the agent exits.
     Logs {
         #[arg(value_name = "ID", value_parser = parse_task_id)]
@@ -156,9 +173,32 @@ pub enum Command {
             value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
         )]
         timeout: u32,
-        /// The lead's profile, whose own events never end the wait; by default any lead-*.
+        /// The lead's profile, whose own events never end the wait.
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
+    },
+    /// List, print or install the skills built into rider.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
+}
+
+/// What to do with the built-in skills.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SkillsCommand {
+    /// Print each skill's name and description.
+    List,
+    /// Print a skill's SKILL.md.
+    Show {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Write each skill as DIR/<skill>/ and update every recorded older install.
+    Install {
+        /// The agent's skills directory (default <rider home>/skills).
+        #[arg(long, value_name = "DIR")]
+        into: Option<PathBuf>,
     },
 }
 
@@ -261,10 +301,6 @@ impl Config {
     fn vb_dir(&self) -> PathBuf {
         self.home.join(VB_DIR)
     }
-
-    fn prompts(&self) -> PathBuf {
-        self.home.join(PROMPTS_DIR)
-    }
 }
 
 /// An environment variable rider cannot use.
@@ -362,6 +398,10 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    Queue(QueueError),
+    Skills(SkillsError),
+    /// `rider skills install` left these skill directories as they were.
+    SkillsRefused(usize),
 }
 
 impl fmt::Display for CliError {
@@ -387,6 +427,11 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::Queue(error) => write!(f, "{error}"),
+            CliError::Skills(error) => write!(f, "{error}"),
+            CliError::SkillsRefused(count) => {
+                write!(f, "{count} skills were not installed; see the lines above")
+            }
             CliError::BadCursor(path) => {
                 write!(f, "{} does not hold a board cursor", path.display())
             }
@@ -394,30 +439,16 @@ impl fmt::Display for CliError {
     }
 }
 
+impl From<SkillsError> for CliError {
+    fn from(error: SkillsError) -> CliError {
+        CliError::Skills(error)
+    }
+}
+
 impl From<ConfigError> for CliError {
     fn from(error: ConfigError) -> CliError {
         CliError::Config(error)
     }
-}
-
-/// Writes every role's prompt under the prompts directory, replacing what is there.
-pub fn write_prompts(config: &Config) -> Result<(), CliError> {
-    let dir = config.prompts();
-    let io = |action, path: &Path| {
-        let path = path.to_path_buf();
-        move |error: io::Error| CliError::Io {
-            action,
-            path,
-            message: error.to_string(),
-        }
-    };
-    fs::create_dir_all(&dir).map_err(io("create", &dir))?;
-    for (name, text) in PROMPTS.iter() {
-        assert!(!name.contains('/') && !text.is_empty());
-        let path = dir.join(name);
-        fs::write(&path, text).map_err(io("write", &path))?;
-    }
-    Ok(())
 }
 
 /// Runs `command` and returns the exit code rider should end with.
@@ -430,6 +461,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Down { now } => down(config, *now),
         Command::Status => status(config),
         Command::Agents => agents(config),
+        Command::Queue { json } => queue(config, *json),
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
@@ -439,6 +471,82 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             timeout,
             lead,
         } => wait(config, project, *timeout, lead.as_deref()),
+        Command::Skills { command } => run_skills(config, command),
+    }
+}
+
+fn run_skills(config: &Config, command: &SkillsCommand) -> Result<u8, CliError> {
+    match command {
+        SkillsCommand::List => {
+            for name in SKILLS {
+                say(&format!("{name}  {}", skills::description(name)?));
+            }
+        }
+        SkillsCommand::Show { name } => {
+            let text = skills::show(name)?;
+            let mut out = io::stdout().lock();
+            out.write_all(text.as_bytes())
+                .map_err(|error| CliError::Io {
+                    action: "write",
+                    path: PathBuf::from("standard output"),
+                    message: error.to_string(),
+                })?;
+        }
+        SkillsCommand::Install { into } => {
+            let dir = match into {
+                Some(into) => skills::resolve(into)?,
+                None => InstallDir::parse(&config.home.join(SKILLS_DIR))?,
+            };
+            let (report, others) = skills::install(&config.home, &dir)?;
+            let mut refused = 0_usize;
+            for (path, outcome) in &report {
+                say(&skill_line(path, outcome));
+                if matches!(outcome, Ok(Outcome::Edited(_) | Outcome::Foreign) | Err(_)) {
+                    refused += 1;
+                }
+            }
+            say_updates(&others);
+            if refused > 0 {
+                return Err(CliError::SkillsRefused(refused));
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn skill_line(path: &Path, outcome: &Result<Outcome, SkillsError>) -> String {
+    let path = path.display();
+    match outcome {
+        Ok(Outcome::Installed) => format!("installed {path}"),
+        Ok(Outcome::UpToDate) => format!("up to date {path}"),
+        Ok(Outcome::Replaced { from }) => format!("replaced {path} (was {from})"),
+        Ok(Outcome::Edited(files)) => {
+            format!("skipped {path}: edited by hand: {}", files.join(", "))
+        }
+        Ok(Outcome::Foreign) => format!("skipped {path}: not installed by rider"),
+        Ok(Outcome::Newer(version)) => {
+            format!(
+                "kept {path}: rider {version} installed it, newer than {}",
+                skills::VERSION
+            )
+        }
+        Ok(Outcome::Absent) => format!("skipped {path}: removed"),
+        Err(error) => format!("skipped {path}: {error}"),
+    }
+}
+
+fn update_skills(config: &Config) {
+    match skills::update_recorded(&config.home) {
+        Ok(report) => say_updates(&report),
+        Err(error) => say(&format!("rider: the skills were not updated: {error}")),
+    }
+}
+
+fn say_updates(report: &Report) {
+    for (path, outcome) in report {
+        if !matches!(outcome, Ok(Outcome::UpToDate | Outcome::Absent)) {
+            say(&skill_line(path, outcome));
+        }
     }
 }
 
@@ -540,19 +648,19 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
     let (table, limits) = settings(config)?;
-    write_prompts(config)?;
+    update_skills(config);
     let paths = Paths {
         home: config.home.clone(),
-        prompts: config.prompts(),
         vb: config.vb_dir().join("vb"),
         board_url: config.board_url.clone(),
     };
-    assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
+    assert!(paths.vb.is_absolute() && paths.home.is_absolute());
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
 }
 
 /// How long `rider up` waits for the daemon's socket to answer.
 const UP_SECONDS_MAX: u64 = 30;
+const UP_LOG_TAIL_BYTES: usize = 4096;
 /// How often `rider up` asks the socket again.
 const UP_POLL_MILLIS: u64 = 100;
 /// Upper bound on the lines one `rider down` prints.
@@ -561,6 +669,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
+    update_skills(config);
     if let Ok(mut client) = Client::connect(&config.home) {
         let data = client.send("status", &[]).map_err(CliError::Client)?;
         println!("rider: the daemon is already running");
@@ -600,13 +709,15 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
     for _ in 0..polls {
         if let Ok(mut client) = Client::connect(&config.home) {
-            let data = client.send("status", &[]).map_err(CliError::Client)?;
+            let data = match client.send("status", &[]) {
+                Ok(data) => data,
+                Err(error) => return Err(not_started(&mut child, &log_path, deadline, error)),
+            };
             println!("{}", status_line(&data));
             return Ok(0);
         }
         if let Ok(Some(exit)) = child.try_wait() {
-            let why = format!("it exited with {exit}; see {}", log_path.display());
-            return Err(CliError::NotStarted(why));
+            return Err(exited(exit, &log_path));
         }
         if Instant::now() >= deadline {
             break;
@@ -616,6 +727,52 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let socket = config.home.join(SOCKET_FILE);
     let why = format!("{} did not answer in {UP_SECONDS_MAX} s", socket.display());
     Err(CliError::NotStarted(why))
+}
+
+fn not_started(
+    child: &mut std::process::Child,
+    log_path: &Path,
+    deadline: Instant,
+    error: ClientError,
+) -> CliError {
+    assert!(log_path.is_absolute());
+    let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(exit)) => return exited(exit, log_path),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(UP_POLL_MILLIS));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(polls > 0);
+    CliError::Client(error)
+}
+
+fn exited(exit: std::process::ExitStatus, log_path: &Path) -> CliError {
+    assert!(log_path.is_absolute());
+    let why = format!("it exited with {exit}: {}", last_line(log_path));
+    CliError::NotStarted(format!("{why}; see {}", log_path.display()))
+}
+
+fn last_line(log_path: &Path) -> String {
+    let mut tail = Vec::with_capacity(UP_LOG_TAIL_BYTES);
+    let read = File::open(log_path).and_then(|mut file| {
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(UP_LOG_TAIL_BYTES as u64);
+        io::Seek::seek(&mut file, io::SeekFrom::Start(start))?;
+        file.take(UP_LOG_TAIL_BYTES as u64).read_to_end(&mut tail)
+    });
+    let text = String::from_utf8_lossy(&tail);
+    let line = text.lines().rev().find(|line| !line.trim().is_empty());
+    let line = match (read, line) {
+        (Ok(_), Some(line)) => line.trim().to_string(),
+        (Ok(_), None) => "its log is empty".to_string(),
+        (Err(error), _) => format!("its log could not be read: {error}"),
+    };
+    assert!(!line.is_empty() && line.len() <= 4 * UP_LOG_TAIL_BYTES);
+    line
 }
 
 fn down(config: &Config, now: bool) -> Result<u8, CliError> {
@@ -694,18 +851,105 @@ fn status(config: &Config) -> Result<u8, CliError> {
             .iter()
             .filter(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE) == project);
         for task in in_project {
-            println!(
-                "  #{} {} {} {} {} {}",
-                task["id"],
-                text(&task["state"]),
-                text(&task["role"]),
-                text(&task["profile"]),
-                age(&task["age_ms"]),
-                text(&task["branch"]),
-            );
+            println!("{}", task_row(task));
         }
     }
     Ok(0)
+}
+
+fn task_row(task: &serde_json::Value) -> String {
+    format!(
+        "  #{} {} {} {} {} {}",
+        task["id"],
+        text(&task["state"]),
+        text(&task["role"]),
+        text(&task["profile"]),
+        age(&task["age_ms"]),
+        text(&task["branch"]),
+    )
+}
+
+fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
+    let repos = queue::opted_in(&config.home).map_err(CliError::Queue)?;
+    if repos.is_empty() {
+        let path = config.home.join(STAND_IN_FILE);
+        say(&format!(
+            "no repository is opted in to the queue; add to {}:",
+            path.display()
+        ));
+        say("[repo.\"/path/to/checkout\"]\nqueue = true");
+        return Ok(1);
+    }
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: QUEUE_PROFILE.to_string(),
+    };
+    let listings = thread::scope(|scope| {
+        let reads: Vec<_> = [QUEUE_CHANNEL, DECISIONS]
+            .map(|channel| scope.spawn(|| open_tasks(&board, channel)))
+            .into();
+        let joined = reads.into_iter().map(|read| {
+            let read = read.join();
+            read.unwrap_or_else(|_| Err(BoardError::Io("a board read panicked".into())))
+        });
+        joined.collect::<Result<Vec<_>, BoardError>>()
+    });
+    let mut tasks = Vec::new();
+    for listing in listings.map_err(CliError::Board)? {
+        let total = listing.tasks.len().saturating_add(listing.left_out);
+        if total.saturating_add(tasks.len()) > QUEUE_ITEMS_MAX {
+            return Err(CliError::Queue(QueueError::TooManyItems));
+        }
+        tasks.extend(listing.tasks);
+    }
+    let now = jiff::Timestamp::now().as_millisecond();
+    let now = u64::try_from(now).unwrap_or(0);
+    let view = queue::view(&tasks, now).map_err(CliError::Queue)?;
+    if json {
+        say(&view.json.to_string());
+        return Ok(0);
+    }
+    let mut lines = view.lines;
+    lines.push(String::new());
+    lines.extend(running(config));
+    let mut out = io::stdout().lock();
+    let written = lines.iter().try_for_each(|line| writeln!(out, "{line}"));
+    written
+        .and_then(|()| out.flush())
+        .map_err(|error| io_error("write", Path::new("standard output"), &error))?;
+    Ok(0)
+}
+
+// The open tasks in `channel`; none when the channel does not exist yet.
+fn open_tasks(board: &VbCli, channel: &str) -> Result<Listing, BoardError> {
+    match board.list_labelled(channel, "board.task", &OPEN_STATES) {
+        Err(BoardError::Exit { stderr, .. })
+            if board::parse_failure_reason(&stderr).as_deref() == Some(CHANNEL_NOT_FOUND) =>
+        {
+            Ok(Listing {
+                tasks: Vec::new(),
+                cursor: Cursor(0),
+                left_out: 0,
+            })
+        }
+        listed => listed,
+    }
+}
+
+fn running(config: &Config) -> Vec<String> {
+    let Ok(mut client) = Client::connect(&config.home) else {
+        return vec!["daemon not running".to_string()];
+    };
+    let Ok(data) = client.send("status", &[]) else {
+        return vec!["running work unavailable: the daemon did not answer".to_string()];
+    };
+    let mut lines = vec![format!("running {} of {}", data["running"], data["limit"])];
+    let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
+    let claimed = tasks.iter().filter(|task| task["state"] == "claimed");
+    lines.extend(claimed.map(task_row));
+    assert!(!lines.is_empty());
+    lines
 }
 
 fn agents(config: &Config) -> Result<u8, CliError> {
@@ -799,7 +1043,7 @@ impl Watch<'_> {
             .and_then(|actor| actor.rsplit_once('+'));
         let by_lead = profile.is_some_and(|(_, profile)| match self.lead {
             Some(lead) => profile == lead,
-            None => profile.starts_with(LEAD_PREFIX),
+            None => profile == LEAD_PROFILE || profile.starts_with(LEAD_PREFIX),
         });
         if by_lead {
             return None;
