@@ -261,6 +261,7 @@ echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
 [ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
+env | grep -E '^(GH|GITHUB)_' | sort > "$world/{ARGS_DIR}/$task-$attempt.gh-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -445,6 +446,15 @@ pub fn git_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
         .join(ARGS_DIR)
         .join(format!("{task}-{attempt}.git-env"));
     let text = fs::read_to_string(&path).expect("read an agent's git environment");
+    text.lines().map(str::to_string).collect()
+}
+
+/// The `GH_*` and `GITHUB_*` variables, as `NAME=value`, attempt `attempt` of `task` saw.
+pub fn gh_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.gh-env"));
+    let text = fs::read_to_string(&path).expect("read an agent's GitHub environment");
     text.lines().map(str::to_string).collect()
 }
 

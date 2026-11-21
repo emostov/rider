@@ -35,6 +35,7 @@ pub struct Brief {
     pub resume: bool,
     /// Label `restack=1`: the task rebases its `onto` branch, so it may drop the starting commit.
     pub restack: bool,
+    pub untrusted: bool,
     pub text: String,
 }
 
@@ -56,6 +57,7 @@ pub enum BriefError {
     BadFrom(String),
     BadResume(String),
     BadRestack(String),
+    BadUntrusted(String),
     RestackWithoutOnto,
     /// An `onto` task on a role without commits, which names only a session to resume.
     OntoWithoutResume {
@@ -130,6 +132,10 @@ impl fmt::Display for BriefError {
             BriefError::BadRestack(value) => write!(
                 f,
                 "Change the `restack` label from {value:?} to 1, or remove it."
+            ),
+            BriefError::BadUntrusted(value) => write!(
+                f,
+                "Change the `untrusted` label from {value:?} to 1, or remove it."
             ),
             BriefError::RestackWithoutOnto => write!(
                 f,
@@ -207,6 +213,11 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         Some("1") => true,
         Some(other) => return Err(BriefError::BadRestack(echo(other))),
     };
+    let untrusted = match label(view, "untrusted") {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => return Err(BriefError::BadUntrusted(echo(other))),
+    };
     if restack && onto.is_none() {
         return Err(BriefError::RestackWithoutOnto);
     }
@@ -225,6 +236,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         from,
         resume,
         restack,
+        untrusted,
         text: view.text.clone(),
     };
     assert!(brief.repo.is_absolute());

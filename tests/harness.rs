@@ -56,6 +56,7 @@ fn fake(args: &[&str]) -> CommandLine {
         program: env!("CARGO_BIN_EXE_fake_agent").to_string(),
         args: args.iter().map(|a| a.to_string()).collect(),
         env: Vec::new(),
+        hidden: &[],
         io: Io::Stream,
     }
 }
@@ -459,6 +460,7 @@ until [ -e '{}' ] || [ "$n" -gt 600 ]; do n=$((n + 1)); sleep 0.05; done"#,
                 started.display().to_string(),
             ],
             env: Vec::new(),
+            hidden: &[],
             io: Io::Stream,
         };
         let (root, log) = (

@@ -65,6 +65,7 @@ pub struct CommandLine {
     pub args: Vec<String>,
     /// Set on top of the inherited environment.
     pub env: Vec<(String, String)>,
+    pub hidden: &'static [&'static str],
     pub io: Io,
 }
 
@@ -270,6 +271,7 @@ pub fn command_for(
         program,
         args,
         env,
+        hidden: &[],
         io,
     })
 }
@@ -534,7 +536,7 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for name in git::ENV_REMOVED {
+    for name in git::ENV_REMOVED.iter().chain(cmd.hidden) {
         process.env_remove(name);
     }
     let spawned = CommandWrap::from(process)

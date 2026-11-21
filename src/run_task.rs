@@ -32,6 +32,13 @@ use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
 pub const DELIVERY_ROUNDS_MAX: u8 = 3;
+const UNTRUSTED_DIR: &str = "untrusted";
+const UNTRUSTED_HIDDEN: [&str; 4] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
 /// The failed attempts after which a task is blocked, unless the configuration sets them.
@@ -363,6 +370,7 @@ impl Attempt {
         };
         let mut cmd = cmd.ok()?;
         cmd.env.clone_from(&self.cmd.env);
+        cmd.hidden = self.cmd.hidden;
         let prompt = match &cmd.io {
             Io::Stream => cmd.args.last(),
             Io::PromptOnStdin(prompt) => Some(prompt),
@@ -773,6 +781,13 @@ fn prepare(
     });
     let resume = session.and_then(Result::ok);
     let id = brief.id.0.to_string();
+    let gh_config = env.home.join(UNTRUSTED_DIR).join(&id).join("gh-config");
+    if brief.untrusted {
+        fs::create_dir_all(&gh_config).map_err(|error| {
+            let reason = format!("Rider cannot create {}: {error}.", gh_config.display());
+            Block::new("rider_error", reason)
+        })?;
+    }
     let command = |resume: Option<&SessionId>| {
         let cmd = command_for(brief.role, &prompt, &dir, resume.map(Resume::Fork));
         let mut cmd = cmd.map_err(|error| {
@@ -787,6 +802,12 @@ fn prepare(
             ("BOARD_PROFILE".to_string(), env.profile.clone()),
             ("BOARD_URL".to_string(), env.board_url.clone()),
         ]);
+        if brief.untrusted {
+            cmd.hidden = &UNTRUSTED_HIDDEN;
+            let dir = gh_config.to_string_lossy().into_owned();
+            cmd.env.push(("GH_CONFIG_DIR".to_string(), dir));
+        }
+        assert!(!brief.untrusted || cmd.hidden.contains(&"GH_TOKEN"));
         Ok::<CommandLine, Block>(cmd)
     };
     let cmd = command(resume.as_ref())?;
