@@ -1,6 +1,7 @@
 //! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
+mod board_feed;
 mod brief_settle;
 #[expect(
     dead_code,
