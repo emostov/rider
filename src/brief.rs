@@ -59,8 +59,8 @@ pub enum BriefError {
     RestackWithoutOnto,
     /// The `base` task, which the task does not need.
     BaseNotNeeded(TaskId),
-    /// The `of` task, which the task does not need.
-    OfNotNeeded(TaskId),
+    /// The `of` task, which the task does not need and which is not done.
+    OfNotDone(TaskId),
     /// An unfinished task on the branch of the `onto` task that the task does not need.
     OntoNotNeeded {
         unfinished: TaskId,
@@ -136,10 +136,10 @@ impl fmt::Display for BriefError {
                  from its `base` task's branch only once that task is done.",
                 base.0
             ),
-            BriefError::OfNotNeeded(of) => write!(
+            BriefError::OfNotDone(of) => write!(
                 f,
-                "Add task #{} to this task's needs, or change the `of` label: a task checks \
-                 the work of its `of` task only once that task is done.",
+                "Unblock this task once task #{} is done, or change the `of` label: a task \
+                 checks the work of its `of` task only once that task is done.",
                 of.0
             ),
             BriefError::OntoNotNeeded { unfinished, onto } => write!(
@@ -180,9 +180,6 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     }
     if let Some(base) = base.filter(|base| !view.needs.contains(base)) {
         return Err(BriefError::BaseNotNeeded(base));
-    }
-    if let Some(of) = of.filter(|of| role.needs_of && !view.needs.contains(of)) {
-        return Err(BriefError::OfNotNeeded(of));
     }
     let from = label(view, "from").map(parse_from).transpose()?;
     let resume = match label(view, "resume") {

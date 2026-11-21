@@ -100,7 +100,19 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    /// Prints a stream in its harness's shape with `STREAM_MESSAGES`, a failed tool call and
+    /// `STREAM_ERROR` as the run's error, then exits `FAIL_EXIT_CODE`.
+    StreamError,
 }
+
+/// The assistant messages a `StreamError` agent prints, in order.
+pub const STREAM_MESSAGES: [&str; 2] = ["I will add the work.", "The tests failed; I will retry."];
+/// The command a `StreamError` agent of Codex runs and sees fail with exit status 1.
+pub const STREAM_COMMAND: &str = "cargo test";
+/// The error a `StreamError` agent of Claude sees from its tool call.
+pub const STREAM_TOOL_ERROR: &str = "Exit code 1";
+/// The error a `StreamError` agent's run ends with, as a provider's content filter reports it.
+pub const STREAM_ERROR: &str = "API Error: Output blocked by content filtering policy";
 
 pub const TALK_LINES: usize = 300;
 pub const TALK_LINE_PAD: usize = 250;
@@ -153,6 +165,7 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::StreamError => "stream-error",
         }
     }
 }
@@ -204,6 +217,8 @@ fn script() -> String {
     let slow = SLOW_SECONDS;
     let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
+    let ([said0, said1], error) = (STREAM_MESSAGES, STREAM_ERROR);
+    let (command, tool_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR);
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -308,6 +323,24 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  stream-error)
+    if [ "$harness" = codex ]; then
+      echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
+      echo '{{"type":"item.completed","item":{{"type":"error","message":"a warning"}}}}'
+      echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"{said0}"}}}}'
+      echo '{{"type":"item.completed","item":{{"type":"command_execution","command":"{command}","exit_code":1}}}}'
+      echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"{said1}"}}}}'
+      echo '{{"type":"turn.failed","error":{{"message":"{error}"}}}}'
+    else
+      echo '{{"type":"system","subtype":"init","session_id":"'"$session"'","tools":["Bash"]}}'
+      echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said0}"}}]}}}}'
+      echo '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash"}}]}}}}'
+      tool='{{"type":"tool_result","is_error":true,"content":"{tool_error}"}}'
+      echo '{{"type":"user","message":{{"content":['"$tool"']}}}}'
+      echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said1}"}}]}}}}'
+      echo '{{"type":"result","subtype":"success","is_error":true,"result":"{error}"}}'
+    fi
+    exit {fail} ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'

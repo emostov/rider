@@ -166,6 +166,7 @@ pub struct Task {
     pub branch: Option<String>,
     /// The task whose branch this one continues, from its `onto` label.
     pub onto: Option<TaskId>,
+    pub of: Option<TaskId>,
     /// The project the task's channel names under `work/`, if it names one.
     pub project: Option<String>,
     /// The task's board version: the cursor of the newest event this was learned from.
@@ -1080,7 +1081,8 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         state: task_state,
         role: role_of(&state.config, &feed.labels),
         branch: label(&feed.labels, "branch"),
-        onto: onto_of(&feed.labels),
+        onto: id_label(&feed.labels, "onto"),
+        of: id_label(&feed.labels, "of"),
         project: project_of(&feed.channel),
         seen: feed.cursor,
         claim_refused: false,
@@ -1243,7 +1245,8 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
                 state: view.state,
                 role: role_of(&state.config, &view.labels),
                 branch: label(&view.labels, "branch"),
-                onto: onto_of(&view.labels),
+                onto: id_label(&view.labels, "onto"),
+                of: id_label(&view.labels, "of"),
                 project: project_of(channel),
                 seen: view.version,
                 claim_refused: false,
@@ -1280,10 +1283,11 @@ fn label(labels: &[(String, String)], key: &str) -> Option<String> {
     found.map(|(_, value)| value.clone())
 }
 
-// A malformed `onto` is left to preparation, which blocks the task as an invalid brief.
-fn onto_of(labels: &[(String, String)]) -> Option<TaskId> {
+// A malformed id label is left to preparation, which blocks the task as an invalid brief.
+fn id_label(labels: &[(String, String)], key: &str) -> Option<TaskId> {
     assert!(labels.len() <= LABELS_MAX);
-    let value = label(labels, "onto")?;
+    assert!(key == "onto" || key == "of");
+    let value = label(labels, key)?;
     let digits = value.strip_prefix('#').unwrap_or(&value);
     digits.parse::<u64>().ok().map(TaskId)
 }
@@ -1856,7 +1860,11 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
                 || task.onto == Some(run.task)
                 || (task.onto.is_some() && run.phase == Phase::Settling && run.branch.is_some())
         });
-        if task.state != TaskState::Ready || taken {
+        let of_open = task.of.is_some_and(|of| {
+            state.tasks.iter().any(|other| other.id == of)
+                || state.untracked.iter().any(|(other, _)| *other == of)
+        });
+        if task.state != TaskState::Ready || taken || of_open {
             continue;
         }
         let slots = state.config.roles[role].slots;

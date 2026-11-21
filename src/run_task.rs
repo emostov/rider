@@ -292,6 +292,12 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
         Ok(validated) => validated,
         Err(block) => return Ok(block.prepared()),
     };
+    if let Some(of) = brief.of.filter(|of| !view.needs.contains(of))
+        && board.read_task(of)?.state != TaskState::Completed
+    {
+        let reason = BriefError::OfNotDone(of).to_string();
+        return Ok(Block::new("invalid_brief", reason).prepared());
+    }
     if let Some(error) = unneeded_on_branch(&brief, &view, board)? {
         return Ok(Block::new("invalid_brief", error.to_string()).prepared());
     }
@@ -1169,7 +1175,8 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     );
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
     let header = format!("The whole log: {}", attempt.log().display());
-    let tail = log_tail(attempt.log());
+    let account = harness::failure_account(&attempt.brief.role.harness, attempt.log());
+    let tail = account.unwrap_or_else(|| log_tail(attempt.log()));
     let budget = TAIL_REPLY_CHARS_MAX.saturating_sub(header.chars().count() + 1);
     let tail = if tail.trim().is_empty() {
         NO_OUTPUT

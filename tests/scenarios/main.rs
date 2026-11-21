@@ -1812,29 +1812,55 @@ fn an_onto_task_that_does_not_need_an_unfinished_task_on_its_branch_is_blocked()
 }
 
 #[test]
-fn a_review_that_does_not_need_the_task_it_checks_is_blocked() {
+fn a_review_that_does_not_need_the_task_it_checks_waits_for_it_and_runs_on_its_work() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Hold]);
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &built);
+
+    world.release_agent(&built);
+    let states = when_the_tasks_settle(&world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let branch = then_the_branch_has_the_agents_commit(&world, &built, 0);
+    let head = branch_head(&world, &branch);
+    assert_eq!(fake_agent::head(&world.root, &review, 0), (head, None));
+    assert_eq!(agent_runs_for(&world, &review).len(), 1);
+}
+
+#[test]
+fn a_review_of_a_failed_task_it_does_not_need_is_blocked() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = an_implement_task(&world, "Add the work.").label("attempt", "2");
+    let built = when_the_lead_creates(&world, &built);
+    given_the_agent_will(&world, &built, &[Behaviour::ExitNonZero]);
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&built]);
+    assert_eq!(states, vec!["failed"]);
     let review = NewTask::new("Review the work.")
         .label("repo", world.repo_label())
         .label("of", &built)
         .role("review");
     let review = when_the_lead_creates(&world, &review);
 
-    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&review]);
 
-    assert_eq!(
-        (states, exit),
-        (
-            vec!["completed".to_string(), "blocked".to_string()],
-            Some(0)
-        )
-    );
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
     let reason = format!(
-        "Add task #{built} to this task's needs, or change the `of` label: a task checks \
-         the work of its `of` task only once that task is done."
+        "Unblock this task once task #{built} is done, or change the `of` label: a task \
+         checks the work of its `of` task only once that task is done."
     );
     assert_eq!(
         task_block(&world, &review),
