@@ -6,6 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -140,6 +142,11 @@ exec "$@""#;
 
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+#[cfg(target_os = "macos")]
+const SANDBOX_REFUSED_EXIT: i32 = 71;
+#[cfg(target_os = "macos")]
+const SANDBOX_PROBE: &str =
+    "(version 1)\n(allow default)\n(deny file-write* (literal \"/var/empty/rider-probe\"))\n";
 #[cfg(target_os = "macos")]
 const HOME_DEPTH_MAX: usize = 64;
 #[cfg(target_os = "macos")]
@@ -379,6 +386,7 @@ struct Shared {
     lease_millis: u64,
     grace_millis: u64,
     runner_seconds: u64,
+    confine: bool,
     attempts: u8,
     feed: Mutex<FeedSlot>,
     /// The board process the daemon started, if it had to.
@@ -520,6 +528,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         lease_millis,
         grace_millis: timing.grace_millis,
         runner_seconds: timing.runner_millis / 1000,
+        confine: confines_agents(&log),
         attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
         served: Mutex::new(ServedSlot::default()),
@@ -1140,11 +1149,14 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let runner_seconds = shared.runner_seconds;
     let home = shared.paths.home.clone();
     let vb = shared.paths.vb.clone();
+    let confine = shared.confine;
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
-        args.extend(confinement(&home, &vb)?);
+        if confine {
+            args.extend(confinement(&home, &vb)?);
+        }
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
         let mut env = cmd.env.clone();
@@ -1220,6 +1232,33 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
         profile,
         "--".to_string(),
     ])
+}
+
+// sandbox-exec exits 71, printing `sandbox_apply: Operation not permitted`, when the process
+// that starts it is already in a sandbox: macOS refuses to apply a second profile that denies
+// anything, though it accepts one that only allows.
+#[cfg(target_os = "macos")]
+fn confines_agents(log: &Log) -> bool {
+    let probe = Command::new(SANDBOX_EXEC)
+        .args(["-p", SANDBOX_PROBE, "--", "/usr/bin/true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let nested = probe.is_ok_and(|status| status.code() == Some(SANDBOX_REFUSED_EXIT));
+    if nested {
+        log.write(
+            "agents run unconfined: the daemon runs in a sandbox, \
+             and macOS does not let it confine an agent again",
+        );
+    }
+    !nested
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confines_agents(log: &Log) -> bool {
+    let _ = log;
+    false
 }
 
 #[cfg(not(target_os = "macos"))]

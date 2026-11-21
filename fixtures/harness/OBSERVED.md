@@ -121,8 +121,10 @@ being `(allow default)` plus a `deny network-outbound` of
   profile with exit 65.
 - A command not found on `PATH` makes it print `sandbox-exec: execvp() of '<command>' failed:
   No such file or directory` and exit 71.
-- A process already in a sandbox cannot apply another: `sandbox-exec` inside one prints
-  `sandbox_apply: Operation not permitted` and exits 71.
+- A process already in a sandbox cannot apply another that denies anything: `sandbox-exec`
+  inside one prints `sandbox_apply: Operation not permitted` and exits 71. A nested profile of
+  only `(allow default)` is accepted and exits 0, so the daemon probes with a profile holding
+  one `deny`.
 
 ## Fixture redaction
 

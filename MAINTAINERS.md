@@ -29,9 +29,10 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
   `daemon.log` says why: an error in `rider.toml` names the field and the file.
 - **`rider daemon` exits saying `daemon.lock` is held.** Another daemon runs on the same
   home, and the error names its pid. One daemon serves every project, so use that one.
-- **On macOS every agent fails at once with `sandbox_apply: Operation not permitted`.** The
-  daemon was started inside a sandbox, and macOS does not let a sandboxed process confine an
-  agent again. Start `rider up` from a terminal that is not sandboxed.
+- **On macOS `daemon.log` says `agents run unconfined: the daemon runs in a sandbox`.** The
+  daemon was started inside a sandbox (as in a Rider agent running Rider's own scenarios), and
+  macOS does not let a sandboxed process confine an agent again, so its agents run without
+  Rider's confinement. Start `rider up` from a terminal that is not sandboxed to confine them.
 - **`rider vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
   its first task.
 - **A failed task's log reply is cut short.** The reply keeps within the board's message
