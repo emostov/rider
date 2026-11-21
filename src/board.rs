@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde::de::{DeserializeOwned, Deserializer, IgnoredAny};
 
 use crate::core::TASKS_MAX;
+use crate::daemon::DAEMON_PROFILE;
 use crate::feed::Cursor;
 
 /// A task's ID on the board. The board prints IDs as decimal strings.
@@ -1139,6 +1140,8 @@ pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
     Ok(blocking)
 }
 
+const LEAD_PROFILE: &str = "lead";
+
 pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     let thread: WireTaskThread = parse(json)?;
     let authors: WireThreadAuthors = parse(json)?;
@@ -1166,7 +1169,10 @@ pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     for reply in thread.replies {
         let by = &reply.by;
         // The board verifies `actor` and `principal`; a profile is only a name its login picks.
-        let amends = by.principal == owner && (by.actor == owner || by.actor == creator);
+        let from = |profile: &str| by.actor == format!("{owner}+{profile}");
+        let amends = by.principal == owner
+            && !from(DAEMON_PROFILE)
+            && (by.actor == owner || by.actor == creator || from(LEAD_PROFILE));
         if !amends {
             continue;
         }

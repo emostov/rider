@@ -545,7 +545,7 @@ fn watch_one(
         };
         record["trust"] = json!(if trusted { "trusted" } else { "untrusted" });
         record["trust_reason"] = json!(reason);
-        if fix.is_some() && trusted && watched.running {
+        if watched.running && (fix.is_some() || !trusted) {
             continue;
         }
         match fix.filter(|_| watched.resumable && trusted) {
