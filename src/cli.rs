@@ -74,7 +74,7 @@ const CHANNEL_NOT_FOUND: &str = "channel_not_found";
 const QUEUE_PROFILE: &str = "rider-queue";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
-/// The profile prefix of a lead, as the ride-swarm skill names it.
+const LEAD_PROFILE: &str = "lead";
 const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
@@ -173,7 +173,7 @@ pub enum Command {
             value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
         )]
         timeout: u32,
-        /// The lead's profile, whose own events never end the wait; by default any lead-*.
+        /// The lead's profile, whose own events never end the wait.
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
     },
@@ -1043,7 +1043,7 @@ impl Watch<'_> {
             .and_then(|actor| actor.rsplit_once('+'));
         let by_lead = profile.is_some_and(|(_, profile)| match self.lead {
             Some(lead) => profile == lead,
-            None => profile.starts_with(LEAD_PREFIX),
+            None => profile == LEAD_PROFILE || profile.starts_with(LEAD_PREFIX),
         });
         if by_lead {
             return None;
