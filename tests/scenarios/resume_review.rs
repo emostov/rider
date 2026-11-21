@@ -252,8 +252,10 @@ fn a_review(world: &World, text: &str, of: &str) -> NewTask {
 fn codex_options(dir: &std::path::Path) -> Vec<String> {
     let dir = dir.to_str().expect("UTF-8 path");
     let head = ["exec", "--model", REVIEW_MODEL, "--json"];
-    let tail = ["--dangerously-bypass-approvals-and-sandbox", "-C", dir];
+    let bypass = ["--dangerously-bypass-approvals-and-sandbox"];
+    let tail = ["--disable", "plugins", "--disable", "apps", "-C", dir];
     head.iter()
+        .chain(&bypass)
         .chain(&tail)
         .map(|arg| arg.to_string())
         .collect()
@@ -264,7 +266,8 @@ fn codex_resume_options() -> Vec<String> {
     let options = ["exec", "resume", "--model", REVIEW_MODEL, "--json"];
     let options = options
         .iter()
-        .chain(&["--dangerously-bypass-approvals-and-sandbox"]);
+        .chain(&["--dangerously-bypass-approvals-and-sandbox"])
+        .chain(&["--disable", "plugins", "--disable", "apps"]);
     options.map(|arg| arg.to_string()).collect()
 }
 
