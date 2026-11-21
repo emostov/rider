@@ -2100,6 +2100,50 @@ fn an_agent_that_finishes_while_the_board_is_down_completes_once_the_board_is_ba
 }
 
 #[test]
+fn a_base_read_that_cannot_reach_the_board_is_retried_and_the_task_completes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let base = when_the_lead_creates(&world, &an_implement_task(&world, "Add the base work."));
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&base]);
+    assert_eq!(states, vec!["completed"]);
+    given_vb_cannot_reach_the_board_once(&world, "read", &base, "");
+    let stacked = NewTask::new("Add the stacked work.")
+        .label("repo", world.repo_label())
+        .label("base", &base)
+        .needs(&base)
+        .role("implement");
+    let stacked = when_the_lead_creates(&world, &stacked);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&stacked]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert_eq!(task_block(&world, &stacked), None);
+    assert!(world.root.join(format!("unreachable-read-{base}")).exists());
+}
+
+#[test]
+fn a_start_label_write_that_cannot_reach_the_board_is_retried_before_the_agent_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_vb_cannot_reach_the_board_once(&world, "label", &task, "start=");
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert!(
+        world
+            .root
+            .join(format!("unreachable-label-{task}"))
+            .exists()
+    );
+    let main = world.git_ok(&["rev-parse", MAIN]);
+    assert_eq!(task_label(&world, &task, "start"), Some(main));
+}
+
+#[test]
 fn an_onto_task_runs_when_a_task_on_its_branch_waits_for_it_through_a_task_of_no_repository() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;

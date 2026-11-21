@@ -298,13 +298,14 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
     let identity = board_identity(&env.board_url, board)?;
     let attempt = match prepare(brief, failed, start, env, board, &identity) {
         Ok(attempt) => attempt,
-        Err(block) => return Ok(block.prepared()),
+        Err(Unprepared::Blocked(block)) => return Ok(block.prepared()),
+        Err(Unprepared::CallFailed(error)) => return Err(RunError::Board(error)),
     };
     if let Some(branch) = &attempt.checkout.branch {
         if let Some(block) = label_branch(id, board, &view, branch)? {
             return Ok(block.prepared());
         }
-        if !attempt.retry && start_label.is_none() {
+        if start_label.is_none() && (attempt.failed == 0 || !attempt.retry) {
             board.set_label(id, START_LABEL, &attempt.checkout.start_head)?;
         }
     }
@@ -590,7 +591,7 @@ fn prepare(
     env: &Env,
     board: &dyn Board,
     identity: &BoardIdentity,
-) -> Result<Attempt, Block> {
+) -> Result<Attempt, Unprepared> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
     let dir = worktree::dir_for(&brief, &env.home);
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
@@ -628,8 +629,13 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = worktree::prepare(&brief, board, &env.home, identity);
-    let checkout = checkout.map_err(|error| worktree_block(&error))?;
+    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
+        Ok(checkout) => checkout,
+        Err(WorktreeError::Board(error)) if error.call_failed() => {
+            return Err(Unprepared::CallFailed(error));
+        }
+        Err(error) => return Err(worktree_block(&error).into()),
+    };
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
     assert!(log.is_absolute());
@@ -649,6 +655,17 @@ fn prepare(
         fresh_log: OnceLock::new(),
         stopped: AtomicBool::new(false),
     })
+}
+
+enum Unprepared {
+    Blocked(Block),
+    CallFailed(BoardError),
+}
+
+impl From<Block> for Unprepared {
+    fn from(block: Block) -> Unprepared {
+        Unprepared::Blocked(block)
+    }
 }
 
 fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
