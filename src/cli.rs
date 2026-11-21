@@ -1,36 +1,47 @@
 //! The command line: parse the arguments, read the environment once, and run one command.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
+use std::process::{Command as Process, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use fs4::{FileExt, TryLockError};
-use signal_hook::consts::{SIGINT, SIGTERM};
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, kill_process_group};
+use serde::Deserialize;
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::flag;
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, Listing, TaskId, VbCli};
+use crate::board::{
+    self, Board, BoardError, Listing, NEEDS_MAX, TaskId, TaskState, TaskView, VbCli,
+};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
+use crate::git::{self, GitError};
 use crate::harness::LOG_BYTES_MAX;
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::queue_wait::{self, WaitError};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
+use crate::run_task::{RESULT_FILE_BYTES_MAX, result_path};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
-use crate::socket::{self, Client, ClientError, SOCKET_FILE};
+use crate::socket::{self, Client, ClientError, SocketPath};
 
 const ENVIRONMENT: &str = r#"environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
@@ -38,8 +49,11 @@ const ENVIRONMENT: &str = r#"environment:
 
 /// Upper bound on the boards one `rider reap` names.
 pub const REAP_URLS_MAX: usize = 8;
+/// Upper bound on the arguments `rider vb` passes on: a full needs list with its words and options.
+pub const VB_ARGS_MAX: usize = NEEDS_MAX + 64;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
-pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
+pub const ARGS_MAX: usize = VB_ARGS_MAX + 1;
+const _: () = assert!(ARGS_MAX >= 2 * REAP_URLS_MAX + 2);
 pub const IMPLEMENT_PROMPT: &str = "implement.md";
 pub const SLOP_RULES: &str = include_str!("../prompts/slop-rules.md");
 /// Every role's prompt and the slop rules, once each, built into the binary.
@@ -57,8 +71,31 @@ pub const PROMPTS: [(&str, &str); 6] = [
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
 const BOARD_DIR: &str = "board";
+const NODE_DIR: &str = "node";
+/// The Board CLI rider installs under its home when it finds none there, every package locked.
+const BOARD_PACKAGE: [(&str, &str); 2] = [
+    ("package.json", include_str!("../board-cli/package.json")),
+    (
+        "package-lock.json",
+        include_str!("../board-cli/package-lock.json"),
+    ),
+];
+const NPM_FLAGS: [&str; 5] = [
+    "--ignore-scripts",
+    "--no-global",
+    "--no-audit",
+    "--no-fund",
+    "--loglevel=error",
+];
+/// The only variables npm gets from rider's environment.
+const NPM_VARS: [&str; 2] = ["PATH", "HOME"];
+const INSTALL_SECONDS_MAX: u64 = 600;
+const INSTALL_SIGNALS: [i32; 4] = [SIGTERM, SIGINT, SIGHUP, SIGQUIT];
+const INSTALL_LOCK: &str = "node.lock";
+const INSTALL_POLL_MILLIS: u64 = 100;
+/// Upper bound on the bytes of npm's error output that rider shows.
+const INSTALL_OUTPUT_BYTES_MAX: u64 = 64 * 1024;
 const SKILLS_DIR: &str = "skills";
-const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the characters of a project or profile name.
 const NAME_CHARS_MAX: usize = 64;
@@ -77,6 +114,11 @@ const QUEUE_PROFILE: &str = "rider-queue";
 const WAIT_PROFILE: &str = "rider-wait";
 const LEAD_PROFILE: &str = "lead";
 const LEAD_PREFIX: &str = "lead-";
+const PR_PROFILE: &str = "rider-pr";
+const PR_TITLE_CHARS_MAX: usize = 200;
+const PR_LIST_MAX: usize = 20;
+const BASE_CHAIN_MAX: usize = 16;
+const PR_FIELDS: &str = "--json=url,headRefName,headRepository,headRepositoryOwner";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
 /// How long the feed must stay quiet after an event before the wait reports it.
@@ -180,6 +222,13 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Push a completed task's branch to origin and open its draft PR; print the PR's URL.
+    ///
+    /// Never forces: a branch that moved on origin is refused. An open PR is reused.
+    Pr {
+        #[arg(value_name = "ID", value_parser = parse_task_id)]
+        id: TaskId,
+    },
     /// Block until something needs the lead, then print what happened since the last wait.
     ///
     /// Exits 3, printing nothing, when the timeout passes first.
@@ -198,6 +247,18 @@ pub enum Command {
         /// The lead's profile, whose own events never end the wait.
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
+    },
+    /// Run the Board CLI on rider's board, passing every argument on as given.
+    ///
+    /// BOARD_URL is set to rider's board unless it is already set.
+    #[command(disable_help_flag = true)]
+    Vb {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<OsString>,
     },
     /// List, print or install the skills built into rider.
     Skills {
@@ -321,7 +382,7 @@ impl Config {
     }
 
     fn vb_dir(&self) -> PathBuf {
-        self.home.join(VB_DIR)
+        self.home.join(NODE_DIR).join("node_modules/.bin")
     }
 }
 
@@ -420,6 +481,16 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    NotPushable {
+        id: TaskId,
+        why: &'static str,
+    },
+    Git(GitError),
+    BadGh(String),
+    /// The Board CLI is missing and there is no `npm` to install it with.
+    NoNpm,
+    /// `npm install` of the Board CLI failed or left no `vb`.
+    NotInstalled(String),
     Queue(QueueError),
     QueueWait(WaitError),
     Skills(SkillsError),
@@ -450,6 +521,20 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::NotPushable { id, why } => write!(f, "task #{} {why}", id.0),
+            CliError::Git(error) => write!(f, "{error}"),
+            CliError::BadGh(output) => {
+                write!(
+                    f,
+                    "gh printed output rider cannot use: {}",
+                    board::one_line(output)
+                )
+            }
+            CliError::NoNpm => write!(
+                f,
+                "the Board CLI is missing and npm is not on PATH: install Node 22, then retry"
+            ),
+            CliError::NotInstalled(why) => write!(f, "could not install the Board CLI: {why}"),
             CliError::Queue(error) => write!(f, "{error}"),
             CliError::QueueWait(error) => write!(f, "{error}"),
             CliError::Skills(error) => write!(f, "{error}"),
@@ -494,11 +579,13 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
         Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
+        Command::Pr { id } => pr(config, *id),
         Command::Wait {
             project,
             timeout,
             lead,
         } => wait(config, project, *timeout, lead.as_deref()),
+        Command::Vb { args } => vb(config, args),
         Command::Skills { command } => run_skills(config, command),
     }
 }
@@ -578,6 +665,177 @@ fn say_updates(report: &Report) {
     }
 }
 
+fn vb(config: &Config, args: &[OsString]) -> Result<u8, CliError> {
+    assert!(args.len() <= VB_ARGS_MAX);
+    let vb = install_vb(config)?;
+    assert!(vb.is_absolute() && !config.board_url.is_empty());
+    let error = Process::new(&vb)
+        .args(args)
+        .env("BOARD_URL", &config.board_url)
+        .exec();
+    Err(io_error("run", &vb, &error))
+}
+
+fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
+    let vb = config.vb_dir().join("vb");
+    if vb.is_file() {
+        return Ok(vb);
+    }
+    let prefix = config.home.join(NODE_DIR);
+    assert!(prefix.is_absolute() && vb.starts_with(&prefix));
+    fs::create_dir_all(&prefix).map_err(|error| io_error("create", &prefix, &error))?;
+    let lock_path = config.home.join(INSTALL_LOCK);
+    let lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path);
+    let lock = lock.map_err(|error| io_error("open", &lock_path, &error))?;
+    lock.lock()
+        .map_err(|error| io_error("lock", &lock_path, &error))?;
+    if vb.is_file() {
+        return Ok(vb);
+    }
+    for (name, text) in BOARD_PACKAGE {
+        let path = prefix.join(name);
+        fs::write(&path, text).map_err(|error| io_error("write", &path, &error))?;
+    }
+    eprintln!("rider: installing the Board CLI into {}", prefix.display());
+    let mut npm = Process::new("npm");
+    npm.env_clear()
+        .args(["ci", "--prefix"])
+        .arg(&prefix)
+        .args(NPM_FLAGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for var in NPM_VARS {
+        if let Some(value) = env::var_os(var) {
+            npm.env(var, value);
+        }
+    }
+    let handlers = InstallSignals::register()?;
+    let spawned = CommandWrap::from(npm).wrap(ProcessGroup::leader()).spawn();
+    let child = match spawned {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err(CliError::NoNpm),
+        Err(error) => return Err(io_error("run", Path::new("npm"), &error)),
+        Ok(child) => child,
+    };
+    let (status, shown) = supervise_npm(child, &handlers.stopped)?;
+    drop(handlers);
+    if !status.success() {
+        let text: String = String::from_utf8_lossy(&shown)
+            .chars()
+            .map(|c| {
+                if c.is_control() && !matches!(c, '\n' | '\t') {
+                    '?'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let _ = io::stderr().write_all(text.as_bytes());
+        return Err(CliError::NotInstalled(format!("npm {status}")));
+    }
+    if !vb.is_file() {
+        let why = format!("npm left no {}", vb.display());
+        return Err(CliError::NotInstalled(why));
+    }
+    Ok(vb)
+}
+
+struct InstallSignals {
+    stopped: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl InstallSignals {
+    fn register() -> Result<InstallSignals, CliError> {
+        let handlers = InstallSignals {
+            stopped: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        let signals = Path::new("signals");
+        for signal in INSTALL_SIGNALS {
+            flag::register_conditional_default(signal, Arc::clone(&handlers.done))
+                .and_then(|_| flag::register(signal, Arc::clone(&handlers.stopped)))
+                .map_err(|error| io_error("handle", signals, &error))?;
+        }
+        assert!(!handlers.done.load(Ordering::SeqCst));
+        Ok(handlers)
+    }
+}
+
+impl Drop for InstallSignals {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+fn supervise_npm(
+    mut child: Box<dyn ChildWrapper>,
+    stopped: &AtomicBool,
+) -> Result<(ExitStatus, Vec<u8>), CliError> {
+    let npm = Path::new("npm");
+    let deadline = Instant::now() + Duration::from_secs(INSTALL_SECONDS_MAX);
+    let group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+    let group = group.ok_or_else(|| CliError::NotInstalled("npm has no process id".into()))?;
+    let stderr = child.stderr().take();
+    let (sender, shown) = sync_channel(1);
+    let reader = thread::Builder::new()
+        .name("npm-stderr".into())
+        .spawn(move || {
+            let mut text = Vec::new();
+            let Some(mut stderr) = stderr else {
+                let _ = sender.send(text);
+                return;
+            };
+            let _ = (&mut stderr)
+                .take(INSTALL_OUTPUT_BYTES_MAX)
+                .read_to_end(&mut text);
+            let _ = sender.send(text);
+            let _ = io::copy(&mut stderr, &mut io::sink());
+        });
+    reader.map_err(|error| io_error("read", npm, &error))?;
+    let polls = INSTALL_SECONDS_MAX * 1000 / INSTALL_POLL_MILLIS;
+    let mut ended = Err(CliError::NotInstalled(format!(
+        "npm ran longer than {INSTALL_SECONDS_MAX} s"
+    )));
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                ended = Ok(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ended = Err(io_error("wait for", npm, &error));
+                break;
+            }
+        }
+        if stopped.load(Ordering::SeqCst) {
+            ended = Err(CliError::Interrupted);
+            break;
+        }
+        thread::sleep(Duration::from_millis(INSTALL_POLL_MILLIS));
+    }
+    match kill_process_group(group, Signal::KILL) {
+        // Darwin refuses (EPERM) to signal a group whose only member is the exited leader.
+        Ok(()) | Err(Errno::SRCH | Errno::PERM) => {}
+        Err(error) => return Err(io_error("stop", npm, &error.into())),
+    }
+    if ended.is_err() {
+        child
+            .wait()
+            .map_err(|error| io_error("stop", npm, &error))?;
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    let shown = shown.recv_timeout(left.max(Duration::from_secs(1)));
+    let shown = shown.map_err(|_| CliError::NotInstalled("npm's output did not end".into()))?;
+    assert!(u64::try_from(shown.len()).is_ok_and(|len| len <= INSTALL_OUTPUT_BYTES_MAX));
+    ended.map(|status| (status, shown))
+}
+
 fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliError> {
     if urls.len() > REAP_URLS_MAX {
         return Err(CliError::TooManyUrls);
@@ -652,7 +910,7 @@ fn serve(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    let vb = config.vb_dir().join("vb");
+    let vb = install_vb(config)?;
     let mut command = board_serve(&config.home, &vb).map_err(io("create", dir.clone()))?;
     // The board runs in the foreground, so it shares rider's terminal, standard input included.
     let status = command.status().map_err(io("run", vb))?;
@@ -675,10 +933,12 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 }
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
+    let socket = SocketPath::under(&config.home).map_err(CliError::Client)?;
     let (table, limits) = settings(config)?;
     update_skills(config);
     let paths = Paths {
         home: config.home.clone(),
+        socket,
         vb: config.vb_dir().join("vb"),
         board_url: config.board_url.clone(),
     };
@@ -697,6 +957,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
+    let socket = SocketPath::under(&config.home).map_err(CliError::Client)?;
     update_skills(config);
     if let Ok(mut client) = Client::connect(&config.home) {
         let data = client.send("status", &[]).map_err(CliError::Client)?;
@@ -704,6 +965,7 @@ fn up(config: &Config) -> Result<u8, CliError> {
         println!("{}", status_line(&data));
         return Ok(0);
     }
+    install_vb(config)?;
     fs::create_dir_all(&config.home).map_err(|error| CliError::Io {
         action: "create",
         path: config.home.clone(),
@@ -752,8 +1014,10 @@ fn up(config: &Config) -> Result<u8, CliError> {
         }
         thread::sleep(Duration::from_millis(UP_POLL_MILLIS));
     }
-    let socket = config.home.join(SOCKET_FILE);
-    let why = format!("{} did not answer in {UP_SECONDS_MAX} s", socket.display());
+    let why = format!(
+        "{} did not answer in {UP_SECONDS_MAX} s",
+        socket.path().display()
+    );
     Err(CliError::NotStarted(why))
 }
 
@@ -1428,4 +1692,317 @@ fn io_error(action: &'static str, path: &Path, error: &io::Error) -> CliError {
         path: path.to_path_buf(),
         message: error.to_string(),
     }
+}
+
+struct Finished {
+    repo: PathBuf,
+    branch: String,
+    head: String,
+    title: String,
+    summary: String,
+    base: Option<String>,
+}
+
+struct GitHub {
+    host: String,
+    owner: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePr {
+    url: String,
+    #[serde(rename = "headRefName")]
+    head_ref: String,
+    #[serde(rename = "headRepository")]
+    head_repository: Option<WireRepoName>,
+    #[serde(rename = "headRepositoryOwner")]
+    head_owner: Option<WireOwner>,
+}
+
+#[derive(Deserialize)]
+struct WireRepoName {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct WireOwner {
+    login: String,
+}
+
+fn label<'a>(view: &'a TaskView, key: &str) -> Option<&'a str> {
+    let found = view.labels.iter().find(|(name, _)| name == key);
+    found.map(|(_, value)| value.as_str())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettledRecord {
+    repo: String,
+    branch: Option<String>,
+    head: String,
+    summary: String,
+    base: Option<String>,
+}
+
+fn settled(home: &Path, id: TaskId) -> Result<SettledRecord, CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    let path = result_path(home, id);
+    let io = |error: io::Error| CliError::Io {
+        action: "read",
+        path: path.clone(),
+        message: error.to_string(),
+    };
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(refuse(
+                "has no result Rider recorded when it settled the task",
+            ));
+        }
+        Err(error) => return Err(io(error)),
+    };
+    let mut bytes = Vec::new();
+    file.take(RESULT_FILE_BYTES_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > RESULT_FILE_BYTES_MAX {
+        return Err(refuse("has a recorded result larger than Rider writes"));
+    }
+    let record: SettledRecord = serde_json::from_slice(&bytes)
+        .map_err(|_| refuse("has a recorded result Rider cannot read"))?;
+    assert!(bytes.len() as u64 <= RESULT_FILE_BYTES_MAX);
+    Ok(record)
+}
+
+fn finished(view: &TaskView, home: &Path) -> Result<Finished, CliError> {
+    let id = view.id;
+    let refuse = |why| CliError::NotPushable { id, why };
+    if view.state != TaskState::Completed {
+        return Err(refuse("is not completed"));
+    }
+    let record = settled(home, id)?;
+    let repo = PathBuf::from(record.repo);
+    if !repo.is_absolute() {
+        return Err(refuse(
+            "has a recorded repository that is not an absolute path",
+        ));
+    }
+    let branch = record.branch.filter(|branch| git::is_plain_branch(branch));
+    let branch = branch.ok_or_else(|| refuse("has no result branch naming one branch"))?;
+    if label(view, "branch") != Some(branch.as_str()) {
+        return Err(refuse(
+            "has a branch label that differs from its result's branch",
+        ));
+    }
+    if !git::is_commit_id(&record.head) {
+        return Err(refuse("has a result head that is not a commit id"));
+    }
+    let first = view.text.lines().next().unwrap_or_default().trim();
+    let title: String = first.chars().take(PR_TITLE_CHARS_MAX).collect();
+    if title.is_empty() || record.summary.trim().is_empty() {
+        return Err(refuse("has no first line or no result summary for its PR"));
+    }
+    assert!(repo.is_absolute() && git::is_plain_branch(&branch));
+    assert!(title.chars().count() <= PR_TITLE_CHARS_MAX);
+    Ok(Finished {
+        repo,
+        branch,
+        head: record.head,
+        title,
+        summary: record.summary,
+        base: record.base,
+    })
+}
+
+struct Chain {
+    root: TaskId,
+    base: String,
+}
+
+fn chain(
+    board: &dyn Board,
+    view: &TaskView,
+    home: &Path,
+    task: &Finished,
+) -> Result<Chain, CliError> {
+    let refuse = |why| CliError::NotPushable { id: view.id, why };
+    let mut root = view.id;
+    let mut steps = 0_usize;
+    let mut current = view.clone();
+    while let Some(onto) = label(&current, "onto") {
+        let onto = parse_task_id(onto).map_err(|_| refuse("has a bad onto"))?;
+        steps += 1;
+        if steps > BASE_CHAIN_MAX {
+            return Err(refuse("has an onto chain longer than rider pr follows"));
+        }
+        current = board.read_task(onto).map_err(CliError::Board)?;
+        root = current.id;
+    }
+    let base = match &task.base {
+        Some(base) => base.clone(),
+        None if root != view.id => {
+            let settled = settled(home, root)?;
+            if Path::new(&settled.repo) != task.repo {
+                return Err(refuse("has an onto chain in another repository"));
+            }
+            settled
+                .base
+                .ok_or_else(|| refuse("has an onto chain without a recorded base"))?
+        }
+        None => return Err(refuse("has no base branch Rider recorded")),
+    };
+    if !git::is_plain_branch(&base) {
+        return Err(refuse("has a recorded base that is not one plain branch"));
+    }
+    assert!(steps <= BASE_CHAIN_MAX);
+    assert!(git::is_plain_branch(&base));
+    Ok(Chain { root, base })
+}
+
+fn github(repo: &Path, id: TaskId) -> Result<GitHub, CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    let url = git::origin_url(repo).map_err(CliError::Git)?;
+    let url = url.ok_or_else(|| {
+        refuse("has an origin whose configured, fetch and push URLs are not one and the same")
+    })?;
+    let rest = ["https://", "ssh://git@"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))
+        .and_then(|rest| rest.split_once('/'))
+        .or_else(|| {
+            url.strip_prefix("git@")
+                .and_then(|rest| rest.split_once(':'))
+        });
+    let (host, path) = rest.ok_or_else(|| refuse("has an origin that is not a GitHub URL"))?;
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let word = |text: &str| {
+        !text.is_empty()
+            && !text.starts_with(['-', '.'])
+            && (text.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    let parsed = path
+        .split_once('/')
+        .filter(|(owner, name)| word(owner) && word(name));
+    let Some((owner, name)) = parsed.filter(|_| word(host) && !host.contains('@')) else {
+        return Err(refuse("has an origin that is not a GitHub URL"));
+    };
+    assert!(word(owner) && word(name));
+    Ok(GitHub {
+        host: host.to_string(),
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+fn publish(task: &Finished, id: TaskId) -> Result<(), CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    let (repo, branch, head) = (&task.repo, &task.branch, &task.head);
+    if !git::commit_exists(repo, head).map_err(CliError::Git)? {
+        return Err(refuse("has a result head this repository does not hold"));
+    }
+    let local = git::commit_of(repo, &format!("refs/heads/{branch}")).map_err(CliError::Git)?;
+    if !git::is_ancestor(repo, head, &local).map_err(CliError::Git)? {
+        return Err(refuse("has a result head that is not on its local branch"));
+    }
+    match git::remote_branch(repo, branch).map_err(CliError::Git)? {
+        Some(tip) if tip == *head => return Ok(()),
+        Some(tip) => {
+            let seen = git::tracking_branch(repo, branch).map_err(CliError::Git)?;
+            if seen.as_deref() != Some(tip.as_str()) {
+                return Err(refuse(
+                    "has a branch that moved on origin since this repository saw it",
+                ));
+            }
+            if !git::is_ancestor(repo, &tip, head).map_err(CliError::Git)? {
+                return Err(refuse(
+                    "has a branch on origin that its result does not contain",
+                ));
+            }
+        }
+        None => {}
+    }
+    assert!(git::is_commit_id(head));
+    git::push_commit(repo, head, branch).map_err(CliError::Git)
+}
+
+fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: PR_PROFILE.to_string(),
+    };
+    let view = board.read_task(id).map_err(CliError::Board)?;
+    let task = finished(&view, config.home())?;
+    let Chain { root, base } = chain(&board, &view, config.home(), &task)?;
+    let own = format!("rider/{}-", root.0);
+    let default = git::default_branch(&task.repo).map_err(CliError::Git)?;
+    if !task.branch.starts_with(&own)
+        || base == task.branch
+        || default.as_ref() == Some(&task.branch)
+    {
+        let why = "has a branch that is not the one Rider made for it";
+        return Err(CliError::NotPushable { id, why });
+    }
+    let hub = github(&task.repo, id)?;
+    publish(&task, id)?;
+    let repo_arg = format!("--repo={}/{}/{}", hub.host, hub.owner, hub.name);
+    let head_arg = format!("--head={}", task.branch);
+    let limit = format!("--limit={PR_LIST_MAX}");
+    let list = [
+        "pr",
+        "list",
+        &repo_arg,
+        &head_arg,
+        "--state=open",
+        PR_FIELDS,
+        &limit,
+    ];
+    let listed = git::gh(&task.repo, &list.map(OsStr::new), None).map_err(CliError::Git)?;
+    let bad = |bytes: &[u8]| CliError::BadGh(String::from_utf8_lossy(bytes).into_owned());
+    let open: Vec<WirePr> = serde_json::from_slice(&listed).map_err(|_| bad(&listed))?;
+    if open.len() >= PR_LIST_MAX {
+        return Err(bad(&listed));
+    }
+    let ours = |pr: &WirePr| {
+        pr.head_ref == task.branch
+            && (pr.head_owner.as_ref()).is_some_and(|o| o.login.eq_ignore_ascii_case(&hub.owner))
+            && (pr.head_repository.as_ref()).is_some_and(|r| r.name.eq_ignore_ascii_case(&hub.name))
+    };
+    let mut matching = open.into_iter().filter(ours);
+    let found = matching.next();
+    if matching.next().is_some() {
+        return Err(bad(&listed));
+    }
+    let url = match found {
+        Some(found) => found.url,
+        None => {
+            let title = format!("--title={}", task.title);
+            let head = format!("--head={}:{}", hub.owner, task.branch);
+            let base = format!("--base={base}");
+            let create = [
+                "pr",
+                "create",
+                &repo_arg,
+                "--draft",
+                &head,
+                &title,
+                &base,
+                "--body-file",
+                "-",
+            ];
+            let body = Some(task.summary.into_bytes());
+            let args = create.map(OsStr::new);
+            let created = git::gh(&task.repo, &args, body).map_err(CliError::Git)?;
+            String::from_utf8_lossy(&created).trim().to_string()
+        }
+    };
+    if !url.starts_with("https://") || url.contains(char::is_whitespace) {
+        return Err(CliError::BadGh(url));
+    }
+    assert!(!url.is_empty());
+    say(&url);
+    Ok(0)
 }
