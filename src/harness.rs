@@ -27,7 +27,7 @@ pub const LOG_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
-const ARGS_MAX: usize = 16;
+const ARGS_MAX: usize = 24;
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.

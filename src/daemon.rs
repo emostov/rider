@@ -136,6 +136,21 @@ PATH="$RIDER_AGENT_VB_DIR${PATH:+:$PATH}"
 export PATH
 exec "$@""#;
 
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+#[cfg(target_os = "macos")]
+const HOME_DEPTH_MAX: usize = 64;
+#[cfg(target_os = "macos")]
+const CONTROL_FILES: [&str; 7] = [
+    SOCKET_FILE,
+    LOCK_FILE,
+    AGENTS_FILE,
+    CURSOR_FILE,
+    BOARD_FILE,
+    LOG_FILE,
+    BOARD_LOG_FILE,
+];
+
 /// Where the daemon's files are and how it reaches the board and its agents.
 pub struct Paths {
     pub home: PathBuf,
@@ -1103,10 +1118,12 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     let ack = ack_file(&pid_file);
     let ack_text = ack.to_string_lossy().into_owned();
     let runner_seconds = shared.runner_seconds;
+    let home = shared.paths.home.clone();
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
+        args.extend(confinement(&home)?);
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
         let mut env = cmd.env.clone();
@@ -1131,6 +1148,57 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
         event: Event::AgentExited(run),
         extra: Extra::Launched(launched),
     }
+}
+
+// macOS still ships the deprecated sandbox-exec. Every process a confined agent starts,
+// detached or in a group of its own, inherits the profile and cannot leave it.
+#[cfg(target_os = "macos")]
+fn confinement(home: &Path) -> Result<Vec<String>, HarnessError> {
+    let unusable = |why: String| HarnessError::Spawn(format!("cannot confine the agent: {why}"));
+    let home = fs::canonicalize(home)
+        .map_err(|error| unusable(format!("resolve {}: {error}", home.display())))?;
+    let quote = |path: &Path| match path.to_str() {
+        Some(text) if !text.contains(['"', '\\']) && !text.contains(char::is_control) => {
+            Ok(format!("\"{text}\""))
+        }
+        _ => Err(unusable(format!(
+            "{} cannot be named in a profile",
+            path.display()
+        ))),
+    };
+    if home.components().count() > HOME_DEPTH_MAX {
+        return Err(unusable(format!("{} is too deep", home.display())));
+    }
+    let mut denied = Vec::with_capacity(HOME_DEPTH_MAX + CONTROL_FILES.len() + 2);
+    for dir in home.ancestors() {
+        denied.push(format!("(literal {})", quote(dir)?));
+    }
+    for name in CONTROL_FILES {
+        denied.push(format!("(literal {})", quote(&home.join(name))?));
+    }
+    for name in [AGENTS_DIR, LOGS_DIR] {
+        denied.push(format!("(subpath {})", quote(&home.join(name))?));
+    }
+    let socket = quote(&home.join(SOCKET_FILE))?;
+    let profile = format!(
+        "(version 1)\n(allow default)\n\
+         (deny network-outbound (remote unix-socket (path-literal {socket})))\n\
+         (deny file-write* {})\n",
+        denied.join(" ")
+    );
+    assert!(denied.len() > CONTROL_FILES.len() && profile.contains(&socket));
+    Ok(vec![
+        SANDBOX_EXEC.to_string(),
+        "-p".to_string(),
+        profile,
+        "--".to_string(),
+    ])
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confinement(home: &Path) -> Result<Vec<String>, HarnessError> {
+    assert!(home.is_absolute());
+    Ok(Vec::new())
 }
 
 fn stop_agent(shared: &Shared, run: RunId, task: TaskId, attempt: Option<&Attempt>) -> Input {

@@ -100,6 +100,9 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    /// Runs `rider down --now` in a child of its own process group, waits for that child to
+    /// record its exit code and output, then commits like `Commit`.
+    StopRiderDetached,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -153,6 +156,7 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::StopRiderDetached => "stop-rider-detached",
         }
     }
 }
@@ -204,6 +208,11 @@ fn script() -> String {
     let slow = SLOW_SECONDS;
     let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
+    let rider = env!("CARGO_BIN_EXE_rider");
+    assert!(
+        !rider.contains('\''),
+        "the rider binary's path is quoted in the script"
+    );
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -308,6 +317,18 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  stop-rider-detached)
+    stopped="$world/{ARGS_DIR}/$task-$attempt.stop"
+    set -m
+    ( '{rider}' down --now > "$stopped.out" 2>&1; echo "$?" > "$stopped.code" ) &
+    set +m
+    step=0
+    while [ ! -s "$stopped.code" ]; do
+      step=$((step + 1))
+      [ "$step" -le {steps} ] || exit 1
+      sleep 0.1
+    done
+    commit || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
@@ -357,6 +378,19 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+/// The exit code and output of the `rider down --now` that attempt `attempt` of `task` started
+/// in a detached child, once the child has recorded them.
+pub fn detached_stop(world: &Path, task: &str, attempt: u32) -> (String, String) {
+    let read = |end: &str| {
+        let path = world
+            .join(ARGS_DIR)
+            .join(format!("{task}-{attempt}.stop.{end}"));
+        fs::read_to_string(&path).expect("read what the detached stop recorded")
+    };
+    let (code, output) = (read("code"), read("out"));
+    (code.trim().to_string(), output)
 }
 
 /// The names of the `GIT_*` variables attempt `attempt` of `task` was started with.

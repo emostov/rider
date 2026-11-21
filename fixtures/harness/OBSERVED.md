@@ -65,6 +65,26 @@ Prompt: `Count slowly to 500, one number per message, running `sleep 2` between 
 | claude | 143 | no `result` event written |
 | codex | 143 | stream stops mid-turn |
 
+## sandbox-exec (macOS)
+
+Observed on macOS 26.7 with `/usr/bin/sandbox-exec -p <profile> -- <command>`, the profile
+being `(allow default)` plus a `deny network-outbound` of
+`(remote unix-socket (path-literal "<home>/rider.sock"))` and a `deny file-write*` of
+`literal` and `subpath` filters under the home:
+
+- `connect` to the denied socket fails with `EPERM` (`Operation not permitted`), also through a
+  symlink to it and through a relative path. A hard link to it cannot be made (`EPERM`).
+- Writing, removing, renaming or `chmod` of a denied path fails with `EPERM`. Denying the
+  `literal` home directory does not stop files being created inside it.
+- Children inherit the profile, including a background child in a process group of its own;
+  nothing a confined process starts can leave it.
+- Paths are matched after symlinks resolve, so the profile must name the real path (a temporary
+  directory is under `/private/var`, not `/var`).
+- `--` before the command is accepted. A `(param "X")` that no `-D X=...` defines fails the
+  profile with exit 65.
+- A process already in a sandbox cannot apply another: `sandbox-exec` inside one prints
+  `sandbox_apply: Operation not permitted` and exits 71.
+
 ## Fixture redaction
 
 The raw streams held private material, so the committed fixtures were scrubbed. No credentials were found (bearer tokens, `sk-`, `ghp_`, JWT prefixes, authorization headers). What was removed:

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
 
@@ -212,6 +213,26 @@ fn rider_logs_follow_splits_a_line_too_long_for_one_stream_line_between_characte
         followed.stdout.replace('\n', "") == line,
         "the split line changed"
     );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_detached_child_of_an_agent_is_refused_the_socket_and_cannot_stop_rider() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::StopRiderDetached]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    let (code, output) = fake_agent::detached_stop(&world.root, &task, 0);
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    assert_ne!(code, "0", "{output}");
+    assert!(output.contains("Operation not permitted"), "{output}");
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }

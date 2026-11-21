@@ -71,8 +71,16 @@ rider logs <id>     # the newest attempt's log of a task; -f follows it
 
 The board's web inspector is at <http://127.0.0.1:4100>.
 
-Agents run unsandboxed, with permission prompts skipped. Point Rider only at repositories you
-are prepared to have changed. Rider never pushes or merges; work stays on local branches named
+Agents run with permission prompts skipped and can change anything your user can. Point Rider
+only at repositories you are prepared to have changed.
+
+On macOS Rider starts each agent under `sandbox-exec`. The agent, and every process it starts,
+detached or in a process group of its own, cannot connect to `rider.sock`, so it cannot run
+`rider down`, `rider kill` or any other command that talks to the daemon. It also cannot write,
+rename or delete `rider.sock`, `daemon.lock`, `agents.json`, `cursor`, `board.json`,
+`daemon.log`, `board.log`, anything under `agents/` or `logs/`, the Rider home itself, or a
+directory above it. Everything else is allowed: an agent can still signal the daemon's process
+and change `rider.toml`, `prompts/` and the rest of the home. On Linux agents are not confined. Rider never pushes or merges; work stays on local branches named
 `rider/<task id>-<slug>`.
 
 ## Stopping
@@ -108,6 +116,9 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
   `daemon.log` says why: an error in `rider.toml` names the field and the file.
 - **`rider daemon` exits saying `daemon.lock` is held.** Another daemon runs on the same
   home, and the error names its pid. One daemon serves every project, so use that one.
+- **On macOS every agent fails at once with `sandbox_apply: Operation not permitted`.** The
+  daemon was started inside a sandbox, and macOS does not let a sandboxed process confine an
+  agent again. Start `rider up` from a terminal that is not sandboxed.
 - **`vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
   its first task.
 - **A failed task's log reply is cut short.** The reply keeps within the board's message
