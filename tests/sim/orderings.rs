@@ -461,7 +461,6 @@ fn an_agent_finishing_during_an_outage_is_settled_when_the_board_returns() {
 }
 
 #[test]
-#[ignore = "known gap: a resumed claim whose renewal fails is not resumed again"]
 fn a_failed_startup_renewal_is_retried_when_the_board_returns() {
     let task = TaskId(1);
     let mut script = Script::bare();
@@ -479,7 +478,14 @@ fn a_failed_startup_renewal_is_retried_when_the_board_returns() {
     script.step(Event::BoardFailed(Call::Claim(run)));
     script.tick_after(60 * SECOND);
     let back = script.snapshot(vec![task_listed()]);
-    let resumed =
-        (back.iter()).any(|action| matches!(action, Action::Resume { task: t, .. } if *t == task));
-    assert!(resumed, "the board returned, and the core sent {back:?}");
+    let again = match back.as_slice() {
+        [Action::Resume { run, task: t, .. }, Action::ListTasks] if *t == task => *run,
+        other => panic!("the board returned, and the core sent {other:?}"),
+    };
+    assert_eq!(
+        script.claimed(again),
+        vec![Action::Prepare { run: again, task }]
+    );
+    let later = script.snapshot(vec![task_listed()]);
+    assert_eq!(later, vec![]);
 }

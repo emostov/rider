@@ -263,6 +263,13 @@ pub enum BoardHealth {
     Down { since: Timestamp },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resumption {
+    NotYet,
+    Answering(Vec<RunId>),
+    Done,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopping {
     No,
@@ -532,9 +539,7 @@ pub struct State {
     down_clients: Vec<ClientId>,
     /// Clients following a task's log, told when its agent is gone; at most `CLIENTS_MAX`.
     log_clients: Vec<(ClientId, TaskId)>,
-    /// The first snapshot was taken, and the claims it showed held by the core's profiles were
-    /// resumed.
-    recovered: bool,
+    resumption: Resumption,
     /// Tasks whose claims are left to lapse, not resumed: an agent from before may still run.
     unaccounted: Unaccounted,
     exited: bool,
@@ -570,7 +575,7 @@ impl State {
             board_since: Some(now),
             down_clients: Vec::new(),
             log_clients: Vec::new(),
-            recovered: false,
+            resumption: Resumption::NotYet,
             unaccounted: Unaccounted::Tasks(Vec::new()),
             exited: false,
         };
@@ -581,7 +586,7 @@ impl State {
     /// Leaves the claims of `unaccounted` tasks to their leases instead of resuming them.
     pub fn leave_to_lease(&mut self, unaccounted: Unaccounted) {
         assert!(
-            !self.recovered,
+            self.resumption == Resumption::NotYet,
             "recovery decides before the first snapshot"
         );
         if let Unaccounted::Tasks(tasks) = &unaccounted {
@@ -691,6 +696,11 @@ pub fn step(state: &mut State, event: Event) -> Vec<Action> {
         .collect();
     apply(state, event, &mut actions);
     assert!(state.cursor >= cursor);
+    if let Resumption::Answering(runs) = &state.resumption
+        && !(state.runs.iter()).any(|run| run.phase == Phase::Claiming && runs.contains(&run.id))
+    {
+        state.resumption = Resumption::Done;
+    }
     expire_leases(state, &mut actions);
     on_time(state, &mut actions);
     expire_phases(state, &mut actions);
@@ -732,9 +742,8 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             state.board = BoardHealth::Up;
             state.cursor = state.cursor.max(cursor);
             reconcile(state, &tasks, cursor, left_out);
-            if !state.recovered && state.board() == BoardHealth::Up {
-                state.recovered = true;
-                resume_held(state, &tasks, actions);
+            if state.resumption == Resumption::NotYet && state.board() == BoardHealth::Up {
+                state.resumption = Resumption::Answering(resume_held(state, &tasks, actions));
             }
         }
         Event::BoardFailed(call) => board_failed(state, call),
@@ -1307,6 +1316,11 @@ fn mark_down(state: &mut State) {
 
 fn board_failed(state: &mut State, call: Call) {
     mark_down(state);
+    if let (Call::Claim(run), Resumption::Answering(runs)) = (call, &state.resumption)
+        && runs.contains(&run)
+    {
+        state.resumption = Resumption::NotYet;
+    }
     let now = state.now;
     let pause = state.config.settle_pause_millis;
     for pending in state.pending_claims.iter_mut() {
@@ -1777,21 +1791,23 @@ fn new_run(
 }
 
 /// Starts a run for each claimed task a listing shows held by one of the core's profiles,
-/// renewing the claim as that profile, while the limits allow.
-fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action>) {
+/// renewing the claim as that profile, while the limits allow; returns the resuming runs.
+fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action>) -> Vec<RunId> {
     assert!(state.board() == BoardHealth::Up);
+    let mut resumed = Vec::new();
     if state.stopping != Stopping::No {
-        return;
+        return resumed;
     }
     let Unaccounted::Tasks(unaccounted) = state.unaccounted.clone() else {
-        return;
+        return resumed;
     };
     let roles = state.config.roles.len();
     for ListedTask { view, .. } in tasks {
         if state.runs.len() >= usize::from(state.config.agents_max) {
             break;
         }
-        if unaccounted.contains(&view.id) {
+        let given_up = (state.pending_claims.iter()).any(|pending| pending.task == view.id);
+        if unaccounted.contains(&view.id) || given_up {
             continue;
         }
         let holder = view
@@ -1829,9 +1845,11 @@ fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action
         let task = view.id;
         let (run, profile) = new_run(state, task, role, slot, branch);
         actions.push(Action::Resume { run, task, profile });
+        resumed.push(run);
     }
-    assert!(state.runs.len() <= usize::from(state.config.agents_max));
+    assert!(resumed.len() <= usize::from(state.config.agents_max));
     assert!(branches_unique(&state.runs));
+    resumed
 }
 
 /// The oldest claimable task, its role, and the lowest free slot of that role; a task of a
