@@ -95,6 +95,7 @@ const BOARD_STOP_MILLIS_MAX: u64 = 10_000;
 const AGENTS_DIR: &str = "agents";
 const STAGED_SUFFIX: &str = ".new";
 const LEFT_EXTENSION: &str = "left";
+const STOP_EXTENSION: &str = "stop";
 /// The directory under the Rider home holding each task's attempt logs.
 pub const LOGS_DIR: &str = "logs";
 const LOCK_BYTES_MAX: u64 = 256;
@@ -136,6 +137,7 @@ until read -r group start 2>/dev/null < "$RIDER_AGENT_ACK_FILE" && [ "$group" = 
   [ "$n" -gt 600 ] && exit 1
   sleep 0.05
 done
+[ -e "$RIDER_AGENT_STOP_FILE" ] && exit 1
 PATH="$RIDER_AGENT_VB_DIR${PATH:+:$PATH}"
 export PATH
 exec "$@""#;
@@ -476,6 +478,12 @@ fn pid_file(home: &Path, task: TaskId) -> PathBuf {
 fn ack_file(pid_file: &Path) -> PathBuf {
     let path = pid_file.with_extension("ack");
     assert!(path != pid_file);
+    path
+}
+
+fn stop_file(pid_file: &Path) -> PathBuf {
+    let path = pid_file.with_extension(STOP_EXTENSION);
+    assert!(path != pid_file && path != ack_file(pid_file));
     path
 }
 
@@ -1146,12 +1154,15 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let pid_text = pid_file.to_string_lossy().into_owned();
     let ack = ack_file(&pid_file);
     let ack_text = ack.to_string_lossy().into_owned();
+    let stop = stop_file(&pid_file);
+    let stop_text = stop.to_string_lossy().into_owned();
     let runner_seconds = shared.runner_seconds;
     let home = shared.paths.home.clone();
     let vb = shared.paths.vb.clone();
     let confine = shared.confine;
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
+    let _ = fs::remove_file(&stop);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
         if confine {
@@ -1163,6 +1174,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
         env.push(("RIDER_AGENT_VB_DIR".to_string(), vb_dir.clone()));
         env.push(("RIDER_AGENT_PID_FILE".to_string(), pid_text.clone()));
         env.push(("RIDER_AGENT_ACK_FILE".to_string(), ack_text.clone()));
+        env.push(("RIDER_AGENT_STOP_FILE".to_string(), stop_text.clone()));
         let wrapped = CommandLine {
             program: "/bin/sh".to_string(),
             args,
@@ -1177,6 +1189,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     // The agent is gone, so its pid may be reused: nothing may signal it any more.
     let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&pid_file);
+    let _ = fs::remove_file(stop_file(&pid_file));
     let _ = shared.recorder.send(Recorded::Ended(task));
     Input {
         event: Event::AgentExited(run),
@@ -1269,10 +1282,16 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
 
 fn stop_agent(shared: &Shared, run: RunId, task: TaskId, attempt: Option<&Attempt>) -> Input {
     assert!(shared.grace_millis > 0 && shared.grace_millis <= GRACE_MILLIS);
+    let path = shared.pid_file(task);
     if let Some(attempt) = attempt {
         attempt.stop();
+        // The marker goes before the pid file is read, and the wrapper writes its pid before
+        // it looks for the marker, so an agent starting now either sees it or is signalled.
+        if let Err(error) = fs::write(stop_file(&path), "") {
+            let line = format!("could not mark #{} stopped: {error}", task.0);
+            shared.log.write(&line);
+        }
     }
-    let path = shared.pid_file(task);
     let mut stopped = None;
     // A refused resume's fresh start may have begun before the attempt was told to stop.
     for _ in 0..AGENT_GROUPS_MAX {
@@ -2014,7 +2033,7 @@ fn clear_agents(home: &Path, unaccounted: &Unaccounted, lease_millis: u64, log: 
             age.is_some_and(|age| age > lease) && agent_group(&path).is_none()
         };
         let removed = match extension {
-            Some("ack") => fs::remove_file(&path),
+            Some("ack" | STOP_EXTENSION) => fs::remove_file(&path),
             Some("pid" | LEFT_EXTENSION) if task.is_none() => {
                 log.write(&format!("removing {}: it names no task", path.display()));
                 fs::remove_file(&path)
