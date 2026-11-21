@@ -31,7 +31,7 @@ use crate::core::{
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
-use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
+use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
@@ -211,6 +211,7 @@ struct Timing {
     attempt_millis_max: u64,
     tick_millis: u64,
     grace_millis: u64,
+    runner_millis: u64,
 }
 
 impl Timing {
@@ -220,6 +221,7 @@ impl Timing {
             attempt_millis_max: ATTEMPT_MILLIS_MAX,
             tick_millis: TICK_SECONDS * 1000,
             grace_millis: GRACE_MILLIS,
+            runner_millis: ATTEMPT_SECONDS_MAX * 1000,
         };
         let pairs = setting
             .unwrap_or_default()
@@ -237,6 +239,7 @@ impl Timing {
                 "attempt" => (&mut timing.attempt_millis_max, 1, ATTEMPT_MILLIS_MAX),
                 "tick" => (&mut timing.tick_millis, 1, TICK_SECONDS * 1000),
                 "grace" => (&mut timing.grace_millis, 1, GRACE_MILLIS),
+                "runner" => (&mut timing.runner_millis, 1000, ATTEMPT_SECONDS_MAX * 1000),
                 _ => return Err(DaemonError::Setting(format!("unknown setting {key:?}"))),
             };
             *field = value
@@ -252,6 +255,8 @@ impl Timing {
         assert!(timing.lease_millis >= 3 && timing.lease_millis <= LEASE_MILLIS);
         assert!(timing.tick_millis > 0 && timing.attempt_millis_max > 0);
         assert!(timing.grace_millis > 0 && timing.grace_millis <= GRACE_MILLIS);
+        assert!(timing.runner_millis >= 1000);
+        assert!(timing.runner_millis <= ATTEMPT_SECONDS_MAX * 1000);
         Ok(timing)
     }
 }
@@ -354,6 +359,7 @@ struct Shared {
     events: SyncSender<Input>,
     lease_millis: u64,
     grace_millis: u64,
+    runner_seconds: u64,
     attempts: u8,
     feed: Mutex<FeedSlot>,
     /// The board process the daemon started, if it had to.
@@ -494,6 +500,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         socket,
         lease_millis,
         grace_millis: timing.grace_millis,
+        runner_seconds: timing.runner_millis / 1000,
         attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
         served: Mutex::new(ServedSlot::default()),
@@ -1111,6 +1118,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     let pid_text = pid_file.to_string_lossy().into_owned();
     let ack = ack_file(&pid_file);
     let ack_text = ack.to_string_lossy().into_owned();
+    let runner_seconds = shared.runner_seconds;
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
@@ -1126,7 +1134,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
             args,
             env,
         };
-        launch_agent(&wrapped, dir, log)
+        launch_agent(&wrapped, dir, log, runner_seconds)
     };
     // A full queue makes the worker wait: the recorder is never far behind.
     let _ = shared.recorder.send(Recorded::Started(task));

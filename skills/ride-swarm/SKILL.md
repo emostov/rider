@@ -48,7 +48,7 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 
 1. **Install what is missing.** Check each with `command -v`; install only what is absent,
    and tell the user what you installed.
-   - `rider`: `cargo install --locked --git https://github.com/emostov/rider rider`
+   - `rider`: `cargo install --locked --git https://github.com/emostov/rider swarm-rider`
    - `vb` (the Board CLI): `npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board`
    - `claude`, `codex`, `jq`, Node 22, and Rust cannot be installed for the user: name the
      missing ones and stop. `claude` and `codex` must be signed in.

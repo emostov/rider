@@ -246,6 +246,32 @@ impl World {
         assert!(reap(&mut board), "the board outlived its kill");
     }
 
+    /// Then, with the daemon gone and the board stopped, no process carrying the world's mark is
+    /// left within `REAP_SECONDS_MAX`.
+    pub fn then_no_process_of_the_world_is_left(&mut self) {
+        assert!(self.daemon.is_none(), "the daemon has exited");
+        self.stop_board();
+        let deadline = Instant::now() + Duration::from_secs(REAP_SECONDS_MAX);
+        let mut left = world_processes(self, deadline)
+            .expect("list the world's processes")
+            .iter()
+            .map(|process| process.pid)
+            .collect::<Vec<u32>>();
+        while !left.is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(POLL_MILLIS));
+            left = world_processes(self, deadline)
+                .expect("list the world's processes")
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<u32>>();
+        }
+        assert_eq!(
+            left,
+            Vec::<u32>::new(),
+            "the world's processes outlived rider"
+        );
+    }
+
     /// Stops the board, deletes its data, and starts a fresh board on the same port.
     pub fn wipe_board(&mut self) {
         self.stop_board();
