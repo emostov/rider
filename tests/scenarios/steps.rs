@@ -195,9 +195,8 @@ pub fn when_the_lead_creates(world: &World, task: &NewTask) -> String {
     for (key, value) in &task.labels {
         args.extend(["--label".to_string(), format!("{key}={value}")]);
     }
-    if !task.needs.is_empty() {
-        args.push("--needs".to_string());
-        args.extend(task.needs.iter().cloned());
+    for need in &task.needs {
+        args.extend(["--needs".to_string(), need.clone()]);
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = world.vb_lead(&args, Some(&task.text));
