@@ -10,6 +10,8 @@ mod codex_review;
 )]
 mod fake_agent;
 mod harness_cli;
+mod queue_unclaimed;
+mod review_pr;
 mod run_task;
 mod skills;
 mod socket;
@@ -1049,6 +1051,49 @@ fn rider_config_for_a_repository_prints_its_merged_role_table() {
         "skills = [\"polish-branch\"]\n",
     );
     assert_eq!(merged.stdout, merged_expected);
+}
+
+#[test]
+fn rider_config_for_a_repository_that_opts_into_the_queue_prints_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(
+        &world,
+        &format!("[repo.\"{}\"]\nqueue = true\n", world.repo_label()),
+    );
+
+    let plain = when_rider_runs(&world, &["config"]);
+    let queued = when_rider_runs(&world, &["config", "--repo", world.repo_label()]);
+
+    assert_eq!(plain.code, Some(0), "{plain:?}");
+    assert_eq!(queued.code, Some(0), "{queued:?}");
+    let default = include_str!("rider-config-default.toml");
+    assert_eq!(plain.stdout, default);
+    let section = format!("\n[repo.\"{}\"]\nqueue = true\n", world.repo_label());
+    assert_eq!(queued.stdout, format!("{default}{section}"));
+}
+
+#[test]
+fn rider_config_refuses_a_queue_value_other_than_true_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let field = format!("repo.\"{}\".queue", world.repo_label());
+
+    for value in ["false", "\"true\"", "\"yes\"", "1"] {
+        let toml = format!("[repo.\"{}\"]\nqueue = {value}\n", world.repo_label());
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config", "--repo", world.repo_label()]);
+
+        assert_eq!(output.code, Some(1), "{value}: {output:?}");
+        assert!(output.stderr.contains(&field), "{value}: {output:?}");
+        assert!(
+            output.stderr.contains("must be true"),
+            "{value}: {output:?}"
+        );
+    }
 }
 
 /// `table` with `from` replaced by `to` inside the `[roles.<role>]` section.

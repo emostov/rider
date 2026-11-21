@@ -1897,9 +1897,9 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     let builders_full = builders.count() >= usize::from(state.config.builders_max);
     let mut best: Option<(usize, usize, u8)> = None;
     for (index, task) in state.tasks.iter().enumerate() {
-        let role = task
-            .role
-            .filter(|role| !task.claim_refused && !(builders_full && roles[*role].builds));
+        let role = task.role.filter(|role| {
+            task.project.is_some() && !task.claim_refused && !(builders_full && roles[*role].builds)
+        });
         let Some(role) = role else {
             continue;
         };
@@ -1931,7 +1931,8 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     assert!(best.is_none_or(|(index, _, _)| index < state.tasks.len()));
     let claimable = |index: usize| {
         let task = &state.tasks[index];
-        task.state == TaskState::Ready && !task.claim_refused && task.role.is_some()
+        let ready = task.state == TaskState::Ready && !task.claim_refused;
+        ready && task.role.is_some() && task.project.is_some()
     };
     assert!(best.is_none_or(|(index, _, slot)| claimable(index) && slot >= 1));
     assert!(best.is_none_or(|(_, role, _)| !(builders_full && roles[role].builds)));
