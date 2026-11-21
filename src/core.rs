@@ -232,8 +232,6 @@ pub struct Run {
     pub stop_tries: u8,
     /// Every stop went unanswered: the run, its slot and its claim stay until the agent exits.
     pub agent_lost: bool,
-    /// The phase's board call could not reach the board; it is sent again from then on, once
-    /// the board is up.
     pub resend_at: Option<Timestamp>,
 }
 
@@ -270,6 +268,7 @@ pub enum BoardHealth {
 enum Resumption {
     NotYet,
     Answering(Vec<RunId>),
+    Retrying(Vec<RunId>),
     Done,
 }
 
@@ -747,8 +746,8 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
             state.board = BoardHealth::Up;
             state.cursor = state.cursor.max(cursor);
             reconcile(state, &tasks, cursor, left_out);
-            if state.resumption == Resumption::NotYet && state.board() == BoardHealth::Up {
-                state.resumption = Resumption::Answering(resume_held(state, &tasks, actions));
+            if state.board() == BoardHealth::Up {
+                resume_again(state, &tasks, actions);
             }
         }
         Event::BoardFailed(call) => board_failed(state, call),
@@ -1319,12 +1318,29 @@ fn mark_down(state: &mut State) {
     assert!(before == BoardHealth::Up || state.board == before);
 }
 
+fn resume_again(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action>) {
+    let mut runs = match &mut state.resumption {
+        Resumption::NotYet => Vec::new(),
+        Resumption::Retrying(runs) => std::mem::take(runs),
+        Resumption::Answering(_) | Resumption::Done => return,
+    };
+    runs.retain(|id| run_in(state, *id, Phase::Claiming).is_some());
+    runs.extend(resume_held(state, tasks, actions));
+    assert!(runs.len() <= usize::from(state.config.agents_max));
+    assert!(
+        runs.iter()
+            .all(|id| run_in(state, *id, Phase::Claiming).is_some())
+    );
+    state.resumption = Resumption::Answering(runs);
+}
+
 fn board_failed(state: &mut State, call: Call) {
     mark_down(state);
-    if let (Call::Claim(run), Resumption::Answering(runs)) = (call, &state.resumption)
+    if let (Call::Claim(run), Resumption::Answering(runs) | Resumption::Retrying(runs)) =
+        (call, &mut state.resumption)
         && runs.contains(&run)
     {
-        state.resumption = Resumption::NotYet;
+        state.resumption = Resumption::Retrying(std::mem::take(runs));
     }
     let now = state.now;
     let pause = state.config.settle_pause_millis;
@@ -1711,10 +1727,12 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
         if entry.phase == Phase::Settling {
             try_settle(state, index, actions);
         }
+        let limit = state.config.phase_millis_max(state.runs[index].phase);
         let entry = &mut state.runs[index];
         if let Some(at) = entry.resend_at
             && state.board == BoardHealth::Up
             && now >= at
+            && now.0 < entry.phase_start.0.saturating_add(limit)
         {
             entry.resend_at = None;
             let (run, task) = (entry.id, entry.task);
@@ -1822,7 +1840,7 @@ fn new_run(
 }
 
 /// Starts a run for each claimed task a listing shows held by one of the core's profiles,
-/// renewing the claim as that profile, while the limits allow; returns the resuming runs.
+/// renewing the claim as that profile, while the limits allow.
 fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action>) -> Vec<RunId> {
     assert!(state.board() == BoardHealth::Up);
     let mut resumed = Vec::new();
