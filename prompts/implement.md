@@ -60,7 +60,7 @@ Post milestones, not heartbeats: a reply is a finished step with its command and
    Then polish your own diff (there are no separate polish tasks), without changing behaviour:
    run `cargo fmt` and `cargo clippy --all-targets -- -D warnings` and fix what they report;
    check every changed line against each `AGENTS.md` rule (bounds, assertions, error enums,
-   comments, function length) and against `${RIDER_HOME:-$HOME/.rider}/prompts/slop-rules.md`;
+   comments, function length) and against the slop rules at the end of this prompt;
    remove dead code, clones and one-use helpers your diff added. Then rerun the proof.
 6. Commit all of it on the current branch: `git add <paths>` then
    `git commit -m "<one sentence saying what changed>"`. Make as many commits as make sense.
