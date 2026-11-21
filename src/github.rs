@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -217,7 +218,7 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
         .map(|task| task.view.id)
         .collect();
     let mut tasks: Vec<&ListedTask> = listing.tasks.iter().collect();
-    tasks.sort_by_key(|task| std::cmp::Reverse(task.view.id.0));
+    tasks.sort_by_key(|task| Reverse(task.view.version));
     let mut branches: Vec<&str> = Vec::new();
     let mut authors: Vec<(String, bool)> = Vec::new();
     let mut watches = 0usize;

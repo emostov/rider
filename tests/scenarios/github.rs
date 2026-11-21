@@ -515,3 +515,36 @@ exec '{real}' "$@"
         vec![failed_record("lead")]
     );
 }
+
+#[test]
+fn the_owner_is_the_task_that_last_worked_on_the_branch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let base = given_a_completed_task(&mut world);
+    let older = when_the_lead_creates(&world, &NewTask::new("Fix the work last."));
+    let newer = NewTask::new("Fix the work first.")
+        .label("repo", world.repo_label())
+        .label("onto", &base)
+        .role("implement");
+    let newer = when_the_lead_creates(&world, &newer);
+    assert_eq!(when_the_tasks_settle(&world, &[&newer]), vec!["completed"]);
+    world.vb_lead(
+        &["label", &older, &format!("repo={}", world.repo_label())],
+        None,
+    );
+    world.vb_lead(&["label", &older, &format!("onto={newer}")], None);
+    world.vb_lead(&["label", &older, "role=implement"], None);
+    assert_eq!(when_the_tasks_settle(&world, &[&older]), vec!["completed"]);
+
+    given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
+    let records = when_records_reach(&world, &older, 1);
+
+    let fix = queued_fix(&records[0]);
+    then_the_fix_resumes(&world, &fix, &older);
+    assert_eq!(
+        task_records(&world, &newer, "rider-github"),
+        Vec::<Value>::new()
+    );
+}
