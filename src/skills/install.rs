@@ -57,6 +57,7 @@ fn embedded(skill: &str) -> Manifest {
         .map(|(path, text)| (path.to_string(), digest(text.as_bytes())))
         .collect();
     assert!(!files.is_empty() && files.len() <= SKILL_FILES_MAX);
+    assert!(version_key(VERSION).is_some());
     let listing: String = files
         .iter()
         .map(|(path, sum)| format!("{path}\0{sum}\n"))
@@ -96,7 +97,6 @@ fn read_bounded(path: &Path, most: u64) -> Result<Option<Vec<u8>>, SkillsError> 
     Ok(Some(bytes))
 }
 
-// Each file under `root` but the manifest, with its digest, or `None` when it is no plain file.
 fn on_disk(root: &Path) -> Result<BTreeMap<String, Option<String>>, SkillsError> {
     let mut files = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];

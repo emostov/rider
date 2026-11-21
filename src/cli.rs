@@ -504,12 +504,12 @@ fn run_skills(config: &Config, command: &SkillsCommand) -> Result<u8, CliError> 
                 None => config.home.join(SKILLS_DIR),
             };
             let report = skills::install_into(&dir, Mode::Install);
-            let refused = report
-                .iter()
-                .filter(|(_, outcome)| !installs(outcome))
-                .count();
+            let mut refused = 0_usize;
             for (path, outcome) in &report {
                 say(&skill_line(path, outcome));
+                if matches!(outcome, Ok(Outcome::Edited(_) | Outcome::Foreign) | Err(_)) {
+                    refused += 1;
+                }
             }
             skills::record(&config.home, &dir)?;
             update_skills(config, Some(&dir));
@@ -519,13 +519,6 @@ fn run_skills(config: &Config, command: &SkillsCommand) -> Result<u8, CliError> 
         }
     }
     Ok(0)
-}
-
-fn installs(outcome: &Result<Outcome, SkillsError>) -> bool {
-    matches!(
-        outcome,
-        Ok(Outcome::Installed | Outcome::UpToDate | Outcome::Replaced { .. } | Outcome::Newer(_))
-    )
 }
 
 fn skill_line(path: &Path, outcome: &Result<Outcome, SkillsError>) -> String {
@@ -549,7 +542,6 @@ fn skill_line(path: &Path, outcome: &Result<Outcome, SkillsError>) -> String {
     }
 }
 
-// Replaces each recorded older install, printing only what changed or was skipped.
 fn update_skills(config: &Config, except: Option<&Path>) {
     let report: Report = match skills::update_recorded(&config.home, except) {
         Ok(report) => report,

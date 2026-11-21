@@ -36,8 +36,14 @@ Paste this into your coding agent:
 ```
 Install Rider: clone https://github.com/emostov/rider if you don't have it yet, then run
 `cargo install --locked --path <that clone>`, which installs the `rider` binary. Then run
-`npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
+`rider skills install --into <your agent's skills directory>`, such as `~/.claude/skills`
+for Claude Code or `~/.codex/skills` for Codex.
 ```
+
+The skills are built into `rider`, so they match the binary. Rider records each directory it
+installed into and updates the skills there when a newer `rider up`, `rider daemon` or
+`rider skills install` runs; a skill edited by hand is left as it is and named. `rider skills
+list` and `rider skills show <name>` print the built-in skills.
 
 Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
