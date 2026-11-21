@@ -36,9 +36,10 @@ const CHUNK_BYTES: usize = 64 * 1024;
 const READS_MAX: u64 = 1 << 32;
 const READERS: usize = 2;
 const DRAIN_SECONDS_MAX: u64 = 5;
-// Reader threads alive across all runs: two per running agent, plus room for readers left
-// blocked on a pipe that a process outside the agent's group still holds open.
-const READER_THREADS_MAX: usize = 4 * READERS * AGENTS_MAX as usize;
+const STDIN_WRITERS: usize = 1;
+// Pipe threads alive across all runs: two readers and a stdin writer per running agent, plus
+// room for threads left blocked on a pipe that a process outside the agent's group holds open.
+const READER_THREADS_MAX: usize = 4 * (READERS + STDIN_WRITERS) * AGENTS_MAX as usize;
 const LINE_BYTES_MAX: usize = 4 * 1024 * 1024;
 // Every line holds at least its newline, so a log read up to `LOG_BYTES_MAX` has fewer lines.
 const LINES_MAX: u64 = LOG_BYTES_MAX + 1;
@@ -51,7 +52,7 @@ const _: () = {
     assert!(SKIP_READS_MAX * LINE_BYTES_MAX as u64 > LOG_BYTES_MAX);
     assert!(DRAIN_SECONDS_MAX > 0 && POLL_MILLIS > 0);
     assert!(POLLS_MAX * POLL_MILLIS > (ATTEMPT_SECONDS_MAX + KILL_GRACE_SECONDS) * 1000);
-    assert!(READER_THREADS_MAX > READERS * AGENTS_MAX as usize);
+    assert!(READER_THREADS_MAX > (READERS + STDIN_WRITERS) * AGENTS_MAX as usize);
 };
 
 static READER_THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -562,11 +563,16 @@ fn start_readers(
     Ok(())
 }
 
-fn feed(child: &mut dyn ChildWrapper, io: &Io) -> Result<(), HarnessError> {
-    let Io::PromptOnStdin(prompt) = io else {
+fn feed(
+    child: &mut dyn ChildWrapper,
+    io: &Io,
+    slot: Option<ReaderSlot>,
+) -> Result<(), HarnessError> {
+    let (Io::PromptOnStdin(prompt), Some(slot)) = (io, slot) else {
         assert!(child.stdin().is_none());
         return Ok(());
     };
+    assert!(slot.live.load(Ordering::SeqCst) > 0);
     assert!(prompt.len() <= PROMPT_BYTES_MAX);
     let missing = || HarnessError::Spawn("the agent has no stdin".to_string());
     let mut stdin = child.stdin().take().ok_or_else(missing)?;
@@ -575,6 +581,7 @@ fn feed(child: &mut dyn ChildWrapper, io: &Io) -> Result<(), HarnessError> {
     // says what happened.
     let builder = thread::Builder::new().name("agent-stdin".to_string());
     let started = builder.spawn(move || {
+        let _slot = slot;
         let _ = stdin.write_all(prompt.as_bytes());
     });
     started.map_err(|error| HarnessError::Spawn(format!("starting the stdin writer: {error}")))?;
@@ -609,6 +616,10 @@ pub fn run_on_clock(
         slot.ok_or(HarnessError::ReadersExhausted)
     };
     let slots = [reserve()?, reserve()?];
+    let writer = match cmd.io {
+        Io::Stream => None,
+        Io::PromptOnStdin(_) => Some(reserve()?),
+    };
     let shared = open_log(log, log_bytes_max)?;
     let apart = match cmd.io {
         Io::Stream => None,
@@ -622,7 +633,7 @@ pub fn run_on_clock(
     let (done, finished) = mpsc::sync_channel(READERS);
     let logs = [&shared, apart.as_ref().unwrap_or(&shared)];
     let started = start_readers(child.as_mut(), slots, logs, &done);
-    if let Err(error) = started.and_then(|()| feed(child.as_mut(), &cmd.io)) {
+    if let Err(error) = started.and_then(|()| feed(child.as_mut(), &cmd.io, writer)) {
         let _ = kill_and_reap(child.as_mut());
         shared.close();
         apart.as_ref().map(|apart| apart.close());
