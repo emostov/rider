@@ -596,7 +596,7 @@ fn a_reply_delivered_to_a_qa_agent_asks_for_a_report_and_no_commit() {
         agent_prompt(&world, &qa, 1),
         "These replies were posted in your task's thread while you worked. They amend the \
          brief, and the latest wins. Act on them without committing, and end with a new final \
-         report.\n\nFrom lead-fable-5-2:\nDecision green.\n"
+         report.\n\nFrom lead:\nDecision green.\n"
     );
 }
 
