@@ -440,6 +440,36 @@ fi"#,
     then_the_daemon_stops_cleanly(world);
 }
 
+#[test]
+fn a_complete_refused_with_an_unknown_error_envelope_is_retried() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Commit]);
+    let completes = world.root.join("completes");
+    given_vb_first_runs(
+        &world,
+        &format!(
+            r#"if [ "$1 $2" = "tasks complete" ]; then
+  echo complete >> '{completes}'
+  if [ "$(wc -l < '{completes}')" -eq 1 ]; then
+    echo '{{"status":"unexpected","reason":"claim_lost"}}' >&2; exit 1
+  fi
+fi"#,
+            completes = completes.display()
+        ),
+    );
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    let tries = fs::read_to_string(&completes).expect("read the complete log");
+    assert_eq!(tries.lines().count(), 2, "{}", world.daemon_log());
+    then_the_daemon_stops_cleanly(world);
+}
+
 const LABELS_OVER_MAX: usize = 33;
 
 #[test]
