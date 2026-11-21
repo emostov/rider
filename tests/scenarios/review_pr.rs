@@ -24,15 +24,18 @@ fn given_a_fetched_pr_behind_origin_main(world: &World) -> PullRequest {
     world.git_ok(&["commit", "-q", "-m", "Add the pull request's file"]);
     let head = world.git_ok(&["rev-parse", "HEAD"]);
     world.git_ok(&["push", "-q", "origin", "HEAD:refs/pull/412/head"]);
-    world.git_ok(&["checkout", "-q", MAIN]);
+    world.git_ok(&["checkout", "-q", "--detach", MAIN]);
     fs::write(world.repo.join("main.txt"), "main moved on\n").expect("write main's file");
     world.git_ok(&["add", "main.txt"]);
     world.git_ok(&["commit", "-q", "-m", "Move main on"]);
-    world.git_ok(&["push", "-q", "origin", MAIN]);
+    world.git_ok(&["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    world.git_ok(&["checkout", "-q", MAIN]);
     let fetched = format!("refs/pull/412/head:{PR_REF}");
     world.git_ok(&["fetch", "-q", "origin", MAIN, &fetched]);
     let main = world.git_ok(&["rev-parse", "--verify", REMOTE_MAIN]);
     assert_eq!(world.git_ok(&["rev-parse", "--verify", PR_REF]), head);
+    let local = branch_head(world, MAIN);
+    assert!(local != main && is_ancestor(world, &local, &main));
     assert!(!is_ancestor(world, &main, &head) && !is_ancestor(world, &head, &main));
     PullRequest { main, head }
 }
