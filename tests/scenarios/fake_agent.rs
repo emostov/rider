@@ -80,6 +80,22 @@ pub enum Behaviour {
     BadBytes,
     /// Prints 40 lines of 250 four-byte characters each, then exits `FAIL_EXIT_CODE`.
     WideLines,
+    /// Kills itself with SIGKILL.
+    ExitOnSignal,
+    /// Commits like `Commit`, then reports a failed result and exits 0.
+    CommitReportingFailure,
+    /// Commits like `Commit` and exits 0 without reporting anything.
+    CommitSilently,
+    /// Commits like `Commit`, then reports a result of only whitespace.
+    CommitReportingBlank,
+    /// Checks out a new branch `elsewhere-<task>`, then commits like `Commit`.
+    LeaveBranch,
+    /// Blocks its own task like `Block`, then exits `FAIL_EXIT_CODE`.
+    BlockThenExitNonZero,
+    /// Commits like `Commit`, then points a new branch `shared-<task>` at that commit.
+    CommitShared,
+    /// Holds like `Hold`, then reports success having committed nothing.
+    HoldThenNothing,
 }
 
 impl Behaviour {
@@ -110,6 +126,14 @@ impl Behaviour {
             Behaviour::LongLine => "long-line",
             Behaviour::BadBytes => "bad-bytes",
             Behaviour::WideLines => "wide-lines",
+            Behaviour::ExitOnSignal => "exit-on-signal",
+            Behaviour::CommitReportingFailure => "commit-reporting-failure",
+            Behaviour::CommitSilently => "commit-silently",
+            Behaviour::CommitReportingBlank => "commit-reporting-blank",
+            Behaviour::LeaveBranch => "leave-branch",
+            Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
+            Behaviour::CommitShared => "commit-shared",
+            Behaviour::HoldThenNothing => "hold-then-nothing",
         }
     }
 }
@@ -173,6 +197,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -252,11 +277,24 @@ case "$behaviour" in
       exit 1
     fi
     commit || exit 1 ;;
+  hold-then-nothing) hold ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
     hold
     commit || exit 1 ;;
+  exit-on-signal) kill -KILL $$ ;;
+  commit-reporting-failure)
+    commit || exit 1
+    echo '{{"type":"result","subtype":"error_during_execution","is_error":true}}'
+    exit 0 ;;
+  commit-silently) commit || exit 1; exit 0 ;;
+  commit-reporting-blank) commit || exit 1; summary="  " ;;
+  leave-branch) git checkout -q -b "elsewhere-$task" && commit || exit 1 ;;
+  commit-shared) commit && git branch "shared-$task" || exit 1 ;;
+  block-then-exit-non-zero)
+    vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1
+    exit {fail} ;;
   *) echo "unknown behaviour $behaviour" >&2; exit 97 ;;
 esac
 report
@@ -289,6 +327,15 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+/// The names of the `GIT_*` variables attempt `attempt` of `task` was started with.
+pub fn git_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.git-env"));
+    let text = fs::read_to_string(&path).expect("read an agent's git environment");
+    text.lines().map(str::to_string).collect()
 }
 
 /// The commit and the branch ref, `None` when detached, that attempt `attempt` of `task`

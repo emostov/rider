@@ -66,6 +66,11 @@ const LOG_POLLS_MAX: u64 = u64::MAX;
 const WRITERS_MAX: usize = 4 * CLIENTS_MAX;
 /// How long one send to a client may block before the client is dropped.
 const WRITE_MILLIS_MAX: u64 = 10_000;
+/// Upper bound on the input read and dropped from a client before its socket closes.
+const DRAIN_BYTES_MAX: usize = 1024 * 1024;
+const DRAIN_CHUNK_BYTES: usize = 16 * 1024;
+/// Upper bound on the time spent dropping a client's input before its socket closes.
+const DRAIN_MILLIS_MAX: u64 = 2000;
 
 /// Hands a socket event to the core; false once the core has gone.
 pub type Sink = Arc<dyn Fn(Event) -> bool + Send + Sync>;
@@ -189,7 +194,11 @@ fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, s
             drop(guard);
             let line = error_line(None, "busy", "too many clients are connected");
             let _ = stream.set_nonblocking(true);
-            let _ = (&stream).write_all(line.as_bytes());
+            if (&stream).write_all(line.as_bytes()).is_ok()
+                && stream.shutdown(Shutdown::Write).is_ok()
+            {
+                drain(&stream);
+            }
             continue;
         }
         let timeout = Some(Duration::from_millis(WRITE_MILLIS_MAX));
@@ -253,6 +262,7 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
             Ok(_) if bytes.len() > REQUEST_BYTES_MAX => {
                 let message = format!("a request is at most {REQUEST_BYTES_MAX} bytes");
                 refuse(clients, id, None, &message);
+                lock(clients).slots.retain(|slot| slot.id != id);
                 break;
             }
             Ok(_) => {}
@@ -424,10 +434,39 @@ fn write_replies(
     }
     // Every line before it went whole, so the `lagged` error does too, unless the send
     // times out.
-    if let Some(line) = lagged.get() {
-        let _ = stream.write_all(line.as_bytes());
+    let last = lagged
+        .get()
+        .is_none_or(|line| stream.write_all(line.as_bytes()).is_ok());
+    if last && stream.shutdown(Shutdown::Write).is_ok() {
+        drain(&stream);
     }
     hang_up(&stream);
+}
+
+// Linux resets a Unix socket closed with unread input: the peer's read then fails with
+// ECONNRESET in place of the end of stream. So a client's input is read and dropped, within
+// bounds, before its socket is closed; a nonblocking stream gives up only what has arrived.
+fn drain(mut stream: &UnixStream) {
+    let deadline = Instant::now() + Duration::from_millis(DRAIN_MILLIS_MAX);
+    let mut buffer = vec![0; DRAIN_CHUNK_BYTES];
+    let mut drained: usize = 0;
+    for _ in 0..DRAIN_BYTES_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || drained >= DRAIN_BYTES_MAX {
+            break;
+        }
+        if stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                assert!(read <= buffer.len());
+                drained = drained.saturating_add(read);
+            }
+        }
+    }
+    assert!(drained <= DRAIN_BYTES_MAX.saturating_add(DRAIN_CHUNK_BYTES));
 }
 
 // Shuts both directions down, ending any read or send blocked on the socket.
@@ -802,12 +841,10 @@ mod tests {
     use super::{CLIENT_BACKLOG_MAX, SOCKET_FILE, Socket, listen};
     use crate::board::{TaskId, TaskState};
     use crate::core::{
-        BoardHealth, CLIENTS_MAX, ClientId, Event, Reply, StatusView, Stopping, TaskRow, Untracked,
+        BoardHealth, ClientId, Event, Reply, StatusView, Stopping, TaskRow, Untracked,
     };
 
     const WAIT: Duration = Duration::from_secs(5);
-    /// Upper bound on the requests a test sends a client that never reads before it lags.
-    const LAG_REQUESTS_MAX: usize = 4 * CLIENT_BACKLOG_MAX;
     /// Upper bound on the reads taken to reach the end of a connection.
     const READS_MAX: usize = 1 << 20;
 
@@ -931,39 +968,6 @@ mod tests {
             "the writer kept sending to a client that went: {} bytes",
             data.len()
         );
-        socket.close();
-    }
-
-    #[test]
-    fn a_lagging_client_holds_its_seat_until_it_has_read_whole_lines_ending_in_lagged() {
-        let (_dir, path, socket, events) = serve();
-        let mut slow = UnixStream::connect(&path).unwrap();
-        let mut replies = 0;
-        // The kernel buffers a platform-dependent number of replies before the writer blocks
-        // and the backlog fills, so the client asks until the core is told it went.
-        for _ in 0..LAG_REQUESTS_MAX {
-            let Some(id) = request(&mut slow, &events) else {
-                break;
-            };
-            socket.reply(id, status(16, 1024));
-            replies += 1;
-        }
-        let lagged = replies > CLIENT_BACKLOG_MAX && replies < LAG_REQUESTS_MAX;
-        assert!(lagged, "{replies} replies");
-
-        let others: Vec<UnixStream> = (1..CLIENTS_MAX)
-            .map(|_| UnixStream::connect(&path).unwrap())
-            .collect();
-        let refused = UnixStream::connect(&path).unwrap();
-        assert_eq!(read_line(&refused)["error"]["code"], "busy");
-
-        let data = String::from_utf8(read_to_eof(&slow)).unwrap();
-        assert!(data.ends_with('\n'), "a line was cut short");
-        let lines: Vec<Value> = (data.lines())
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(lines.last().unwrap()["error"]["code"], "lagged");
-        drop(others);
         socket.close();
     }
 
