@@ -413,3 +413,32 @@ fn a_merged_pr_ends_the_watch() {
         Vec::<Value>::new()
     );
 }
+
+#[test]
+fn stopping_the_daemon_ends_a_gh_call_in_flight() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let task = given_a_completed_task(&mut world);
+    let pid_file = world.root.join("gh-pid");
+    let script = format!(
+        "#!/bin/sh\necho $$ > '{}'\nexec sleep 20\n",
+        pid_file.display()
+    );
+    write_executable(&world.agents.join("gh"), &script);
+    let deadline = Instant::now() + Duration::from_secs(RECORD_SECONDS_MAX);
+    let pid = loop {
+        let text = fs::read_to_string(&pid_file).unwrap_or_default();
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "gh never ran: {task}");
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert!(!is_alive(pid), "gh {pid} outlived the daemon");
+}

@@ -7,10 +7,12 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
+use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::board;
 
@@ -308,6 +310,53 @@ fn command(dir: &Path, args: &[&OsStr]) -> Process {
 
 /// Runs `process` in its own process group, feeding it `input` if given, and kills the group
 /// unless it ends within `limit`.
+pub enum Group {
+    Idle,
+    Running(Pid),
+    Stopped,
+}
+
+pub fn spawn_tracked(
+    process: Process,
+    line: &str,
+    limit: Duration,
+    slot: &Mutex<Group>,
+) -> Result<Output, GitError> {
+    assert!(!line.is_empty());
+    let mut child = {
+        let mut group = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*group, Group::Stopped) {
+            return Err(GitError::Spawn(format!("{line}: rider is stopping")));
+        }
+        let spawned = CommandWrap::from(process)
+            .wrap(ProcessGroup::leader())
+            .spawn();
+        let child = spawned.map_err(|error| GitError::Spawn(format!("{line}: {error}")))?;
+        let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+        let Some(pid) = pid else {
+            return Err(GitError::Spawn(format!("{line}: no process id")));
+        };
+        *group = Group::Running(pid);
+        child
+    };
+    let output = collect(child.as_mut(), line, limit);
+    let mut group = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if matches!(*group, Group::Running(_)) {
+        *group = Group::Idle;
+    }
+    assert!(!matches!(*group, Group::Running(_)));
+    output
+}
+
+pub fn stop_tracked(slot: &Mutex<Group>) {
+    let mut group = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Group::Running(pid) = *group {
+        assert!(pid.as_raw_pid() > 1, "never signal the caller's own group");
+        let _ = kill_process_group(pid, Signal::KILL);
+    }
+    *group = Group::Stopped;
+}
+
 pub fn spawn_and_collect(
     process: Process,
     line: &str,

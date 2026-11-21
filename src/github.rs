@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use serde_json::{Value, json};
 use crate::board::{Board, ListedTask, NewTask, TaskId, TaskState};
 use crate::brief::label;
 use crate::core::TASKS_MAX;
-use crate::git::{self, ENV_REMOVED};
+use crate::git::{self, ENV_REMOVED, Group};
 use crate::roles::ROLES;
 use crate::run_task::{RESUMABLE_ROLES, session_path};
 use crate::worktree::BRANCH_LABEL;
@@ -161,6 +162,12 @@ struct Change {
 enum Fix {
     Ci,
     Change(String),
+}
+
+static GH_GROUP: Mutex<Group> = Mutex::new(Group::Idle);
+
+pub fn stop() {
+    git::stop_tracked(&GH_GROUP);
 }
 
 pub fn start(
@@ -657,7 +664,7 @@ fn gh(repo: &Path, args: &[&str]) -> Result<String, WatchError> {
         .stderr(Stdio::piped());
     let limit = Duration::from_secs(GH_SECONDS_MAX);
     let output =
-        git::spawn_and_collect(process, &line, limit, None).map_err(|error| WatchError::Gh {
+        git::spawn_tracked(process, &line, limit, &GH_GROUP).map_err(|error| WatchError::Gh {
             args: line.clone(),
             detail: error.to_string(),
         })?;

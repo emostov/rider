@@ -554,6 +554,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let code = drive(&mut state, &inputs, &jobs, &shared);
     save_cursor(&shared, state.cursor());
     shared.socket.close();
+    github::stop();
     stop_feed(&shared);
     drop(board);
     let code = code?;
