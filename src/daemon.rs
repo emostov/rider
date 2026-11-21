@@ -39,6 +39,7 @@ use crate::core::{
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
 use crate::git::{self, GitError};
+use crate::github;
 use crate::harness::{
     ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PrivateOpenError,
     open_private,
@@ -640,6 +641,14 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
     start_signals(shared.events.clone())?;
+    let watcher_log = Arc::clone(&shared);
+    github::start(
+        Box::new(shared.board(DAEMON_PROFILE)),
+        shared.paths.home.clone(),
+        timing.tick_millis,
+        Box::new(move |line| watcher_log.log.write(line)),
+    )
+    .map_err(DaemonError::Thread)?;
     let mut config = Config::from_roles(roles);
     config.agents_max = limits.agents;
     config.builders_max = limits.builders_at_once;
@@ -651,6 +660,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let code = drive(&mut state, &inputs, &jobs, &shared);
     save_cursor(&shared, state.cursor());
     shared.socket.close();
+    github::stop();
     stop_feed(&shared);
     drop(board);
     let code = code?;
@@ -1805,6 +1815,26 @@ impl Board for Guarded<'_> {
     fn reply(&self, id: TaskId, text: &str) -> Result<(), BoardError> {
         self.gate(false)?;
         self.board.reply(id, text)
+    }
+    fn post_record(
+        &self,
+        id: TaskId,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError> {
+        self.gate(false)?;
+        self.board.post_record(id, schema, json, key)
+    }
+    fn post_thread_record(
+        &self,
+        channel: &str,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError> {
+        self.gate(false)?;
+        self.board.post_thread_record(channel, schema, json, key)
     }
     fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError> {
         self.gate(false)?;

@@ -7,11 +7,12 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
+use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::board;
 
@@ -137,10 +138,10 @@ impl fmt::Display for GitError {
 
 type Reader = JoinHandle<Result<Vec<u8>, GitError>>;
 
-struct Output {
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// Whether `name` can go to `git` as a ref: not empty, not an option, no whitespace or `..`.
@@ -393,7 +394,90 @@ fn isolated(program: &str) -> Process {
 
 /// Runs `process` in its own process group, feeding it `input` if given, and kills the group
 /// unless it ends within `limit`.
-fn spawn_and_collect(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHub {
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+}
+
+pub fn github_remote(url: &str) -> Option<GitHub> {
+    let rest = ["https://", "ssh://git@"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))
+        .and_then(|rest| rest.split_once('/'))
+        .or_else(|| {
+            url.strip_prefix("git@")
+                .and_then(|rest| rest.split_once(':'))
+        });
+    let (host, path) = rest?;
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let word = |text: &str| {
+        !text.is_empty()
+            && !text.starts_with(['-', '.'])
+            && (text.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    let parsed = path
+        .split_once('/')
+        .filter(|(owner, name)| word(owner) && word(name));
+    let (owner, name) = parsed.filter(|_| word(host) && !host.contains('@'))?;
+    assert!(word(owner) && word(name) && word(host));
+    Some(GitHub {
+        host: host.to_string(),
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+pub enum Group {
+    Idle,
+    Running(Pid),
+    Stopped,
+}
+
+pub fn spawn_tracked(
+    process: Process,
+    line: &str,
+    limit: Duration,
+    slot: &Mutex<Group>,
+) -> Result<Output, GitError> {
+    assert!(!line.is_empty());
+    let mut child = {
+        let mut group = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*group, Group::Stopped) {
+            return Err(GitError::Spawn(format!("{line}: rider is stopping")));
+        }
+        let spawned = CommandWrap::from(process)
+            .wrap(ProcessGroup::leader())
+            .spawn();
+        let child = spawned.map_err(|error| GitError::Spawn(format!("{line}: {error}")))?;
+        let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+        let Some(pid) = pid else {
+            return Err(GitError::Spawn(format!("{line}: no process id")));
+        };
+        *group = Group::Running(pid);
+        child
+    };
+    let output = collect(child.as_mut(), line, limit);
+    let mut group = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if matches!(*group, Group::Running(_)) {
+        *group = Group::Idle;
+    }
+    assert!(!matches!(*group, Group::Running(_)));
+    output
+}
+
+pub fn stop_tracked(slot: &Mutex<Group>) {
+    let mut group = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Group::Running(pid) = *group {
+        assert!(pid.as_raw_pid() > 1, "never signal the caller's own group");
+        let _ = kill_process_group(pid, Signal::KILL);
+    }
+    *group = Group::Stopped;
+}
+
+pub fn spawn_and_collect(
     process: Process,
     line: &str,
     limit: Duration,

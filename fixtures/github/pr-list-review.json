@@ -1,0 +1,48 @@
+[
+  {
+    "number": 7,
+    "url": "https://github.com/example/repo/pull/7",
+    "headRefOid": "2ae54426992ec8249006b5ea9b5531e8900062f3",
+    "state": "OPEN",
+    "statusCheckRollup": [],
+    "reviews": [
+      {
+        "id": "PRR_kwDODKw3uc8AAAABYyKRuQ",
+        "author": {
+          "login": "reviewer"
+        },
+        "authorAssociation": "CONTRIBUTOR",
+        "body": "Please split the parser out of the loop.",
+        "submittedAt": "2026-11-18T14:05:03Z",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "commit": {
+          "oid": "2ae54426992ec8249006b5ea9b5531e8900062f3"
+        }
+      }
+    ],
+    "comments": [
+      {
+        "id": "IC_kwDODKw3uc8AAAABoB4mUQ",
+        "author": {
+          "login": "commenter"
+        },
+        "authorAssociation": "NONE",
+        "body": "Is the cap of 64 enough for a large swarm?",
+        "createdAt": "2026-11-18T14:21:22Z",
+        "includesCreatedEdit": false,
+        "isMinimized": false,
+        "minimizedReason": "",
+        "reactionGroups": [],
+        "url": "https://github.com/example/repo/pull/7#issuecomment-1",
+        "viewerDidAuthor": false
+      }
+    ],
+    "author": {
+      "login": "owner",
+      "is_bot": false
+    },
+    "isCrossRepository": false
+  }
+]

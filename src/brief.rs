@@ -35,6 +35,7 @@ pub struct Brief {
     pub resume: bool,
     /// Label `restack=1`: the task rebases its `onto` branch, so it may drop the starting commit.
     pub restack: bool,
+    pub github: bool,
     pub untrusted: bool,
     pub text: String,
 }
@@ -58,6 +59,7 @@ pub enum BriefError {
     BadFrom(String),
     BadResume(String),
     BadRestack(String),
+    BadSource(String),
     BadUntrusted(String),
     UntrustedInGit(&'static str),
     RestackWithoutOnto,
@@ -140,6 +142,10 @@ impl fmt::Display for BriefError {
             BriefError::BadRestack(value) => write!(
                 f,
                 "Change the `restack` label from {value:?} to 1, or remove it."
+            ),
+            BriefError::BadSource(value) => write!(
+                f,
+                "Change the `source` label from {value:?} to github, or remove it."
             ),
             BriefError::BadUntrusted(value) => write!(
                 f,
@@ -243,6 +249,11 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         Some("1") => true,
         Some(other) => return Err(BriefError::BadRestack(echo(other))),
     };
+    let github = match label(view, "source") {
+        None => false,
+        Some("github") => true,
+        Some(other) => return Err(BriefError::BadSource(echo(other))),
+    };
     if restack && onto.is_none() {
         return Err(BriefError::RestackWithoutOnto);
     }
@@ -255,6 +266,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         ("from", from.is_some()),
         ("restack", restack),
         ("onto", onto.is_some() && role.commits_expected),
+        ("source", github),
     ];
     if let Some((key, _)) = in_git.iter().find(|(_, set)| untrusted && *set) {
         return Err(BriefError::UntrustedInGit(key));
@@ -270,6 +282,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         from,
         resume,
         restack,
+        github,
         untrusted,
         text: view.text.clone(),
     };
@@ -279,7 +292,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     assert!(brief.base.is_none_or(|base| view.needs.contains(&base)));
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
     assert!(!brief.role.needs_of || brief.of.is_some() || brief.untrusted);
-    assert!(!brief.untrusted || (brief.base.is_none() && brief.from.is_none()));
+    assert!(!brief.untrusted || (brief.base.is_none() && brief.from.is_none() && !brief.github));
     assert!(brief.of != Some(brief.id));
     assert!(brief.role.commits_expected || brief.role.needs_of);
     Ok(brief)

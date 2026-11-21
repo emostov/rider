@@ -96,8 +96,15 @@ const SESSION_FILE: &str = "session";
 const RESULT_FILE: &str = "result.json";
 pub const RESULT_FILE_BYTES_MAX: u64 = 64 * 1024;
 const SESSION_FILE_BYTES_MAX: usize = 4096;
+// gh reads a token from any of these before its config, and treats an empty one as unset.
+const GITHUB_TOKENS: [&str; 4] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
 const HARNESS_WORD_BYTES_MAX: usize = 6;
-const RESUMABLE_ROLES: [&str; 3] = ["implement", "light", "review"];
+pub(crate) const RESUMABLE_ROLES: [&str; 3] = ["implement", "light", "review"];
 const DELIVERY_NOTE: &str = "These replies were posted in your task's thread while you worked. \
                              They amend the brief, and the latest wins.";
 const COMMIT_ASK: &str = "Act on them, commit, and end with a new final message.";
@@ -966,6 +973,16 @@ fn prepare(
             ("BOARD_PROFILE".to_string(), env.profile.clone()),
             ("BOARD_URL".to_string(), env.board_url.clone()),
         ]);
+        if brief.github {
+            let scratch = env.home.join(LOGS_DIR).join(&id).join("gh-config");
+            let tokens = GITHUB_TOKENS.map(|name| (name.to_string(), String::new()));
+            cmd.env.extend(tokens);
+            let scratch = (
+                "GH_CONFIG_DIR".to_string(),
+                scratch.to_string_lossy().into_owned(),
+            );
+            cmd.env.push(scratch);
+        }
         if brief.untrusted {
             cmd.untrusted = true;
             let dir = gh_config.to_string_lossy().into_owned();
@@ -1035,6 +1052,45 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
         ));
     }
     let onto = brief.onto.ok_or("the task has no `onto` label")?;
+    let recorded = recorded_session(home, onto, &brief.repo)?;
+    if recorded.untrusted && !brief.untrusted {
+        return Err(format!(
+            "task #{}'s session was recorded by an untrusted task, and this task is not \
+             untrusted",
+            onto.0
+        ));
+    }
+    if recorded.harness != brief.role.harness {
+        return Err(format!(
+            "task #{}'s session was recorded by {}, and role {} runs {}",
+            onto.0,
+            harness_name(recorded.harness),
+            brief.role.label,
+            harness_name(brief.role.harness)
+        ));
+    }
+    if recorded.harness == Harness::Codex && brief.role.label != "review" {
+        return Err(format!(
+            "Codex continues a session in place, so only a review resumes one, and role {} \
+             is not review",
+            brief.role.label
+        ));
+    }
+    Ok(recorded.id)
+}
+
+pub(crate) struct RecordedSession {
+    pub id: SessionId,
+    pub harness: Harness,
+    pub untrusted: bool,
+}
+
+pub(crate) fn recorded_session(
+    home: &Path,
+    onto: TaskId,
+    wanted: &Path,
+) -> Result<RecordedSession, String> {
+    assert!(home.is_absolute() && wanted.is_absolute());
     let path = session_path(home, onto);
     let mut text = String::new();
     let read = File::open(&path).and_then(|file| {
@@ -1074,39 +1130,20 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
         Some(_) => return Err(malformed()),
     };
     let session = SessionId::parse(session).ok_or_else(malformed)?;
-    if untrusted && !brief.untrusted {
-        return Err(format!(
-            "task #{}'s session was recorded by an untrusted task, and this task is not \
-             untrusted",
-            onto.0
-        ));
-    }
-    if harness != brief.role.harness {
-        return Err(format!(
-            "task #{}'s session was recorded by {}, and role {} runs {}",
-            onto.0,
-            harness_name(harness),
-            brief.role.label,
-            harness_name(brief.role.harness)
-        ));
-    }
-    if harness == Harness::Codex && brief.role.label != "review" {
-        return Err(format!(
-            "Codex continues a session in place, so only a review resumes one, and role {} \
-             is not review",
-            brief.role.label
-        ));
-    }
-    if repo != brief.repo {
+    if repo != wanted {
         return Err(format!(
             "task #{}'s session was recorded in repository {}, not this task's {}",
             onto.0,
             repo.display(),
-            brief.repo.display()
+            wanted.display()
         ));
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);
-    Ok(session)
+    Ok(RecordedSession {
+        id: session,
+        harness,
+        untrusted,
+    })
 }
 
 fn harness_name(harness: Harness) -> &'static str {
@@ -1124,7 +1161,7 @@ pub fn result_path(home: &Path, id: TaskId) -> PathBuf {
     path
 }
 
-fn session_path(home: &Path, id: TaskId) -> PathBuf {
+pub(crate) fn session_path(home: &Path, id: TaskId) -> PathBuf {
     assert!(home.is_absolute());
     let path = home
         .join(LOGS_DIR)
@@ -1470,6 +1507,7 @@ fn complete(
     let end = result.char_indices().nth(SUMMARY_CHARS_MAX);
     let summary = &result[..end.map_or(result.len(), |(index, _)| index)];
     assert!(!summary.trim().is_empty() && summary.chars().count() <= SUMMARY_CHARS_MAX);
+    let recorded = record_session(attempt, &env.home);
     // The fenced write goes first: a retry writes nothing twice, and a lost claim nothing.
     board.complete(id, summary)?;
     // `vb tasks complete` has no precondition on the thread, so a reply posted during the
@@ -1508,7 +1546,7 @@ fn complete(
         summary,
         usage: attempt.usage().map(UsageRecord::from),
     };
-    if let Err(error) = record_session(attempt, &env.home) {
+    if let Err(error) = recorded {
         let note = format!("Rider could not record the agent's session: {error}.");
         let _ = board.reply(id, &one_line(&note));
     }

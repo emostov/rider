@@ -55,14 +55,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
 const POLLS_MAX: u64 =
     (BOARD_CALL_SECONDS_MAX as u64 + WAIT_SECONDS_MAX as u64) * 1000 / POLL_MILLIS + 1;
 /// Upper bound on the arguments of one `vb` run.
-const ARGS_MAX: usize = 24;
+const ARGS_MAX: usize = 32;
 /// How long a claim holds its task before the board may give it to someone else.
 const CLAIM_LEASE: &str = "1h";
 /// Failure reasons that mean a claim found nothing, not that it went wrong.
 const CLAIM_EMPTY_REASONS: [&str; 2] = ["timeout", "nothing_ready"];
 /// The first word of every command `vb` is run with.
 const VERBS: [&str; 6] = ["read", "tasks", "label", "reply", "post", "schemas"];
-pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
+pub const RIDER_SCHEMAS: [(&str, &str); 3] = [
     (
         "rider-result@3",
         include_str!("../skills/ride-swarm/schemas/rider-result@3.json"),
@@ -71,11 +71,15 @@ pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
         "rider-finding@1",
         include_str!("../skills/ride-swarm/schemas/rider-finding.json"),
     ),
+    (
+        "rider-github@1",
+        include_str!("../skills/ride-swarm/schemas/rider-github@1.json"),
+    ),
 ];
 const SCHEMAS_LISTED_MAX: usize = 1024;
 /// The number of global arguments: `--json --url <url> --as <profile>`.
 const GLOBAL_ARGS_LEN: usize = 5;
-pub const CREATE_LABELS_MAX: usize = 4;
+pub const CREATE_LABELS_MAX: usize = 5;
 pub const CREATE_NEEDS_MAX: usize = 1;
 pub const SET_NEEDS_MAX: usize = 12;
 const _: () = assert!(3 + SET_NEEDS_MAX + GLOBAL_ARGS_LEN <= ARGS_MAX);
@@ -307,6 +311,20 @@ pub trait Board {
     fn set_label(&self, id: TaskId, key: &str, value: &str) -> Result<(), BoardError>;
     fn reply(&self, id: TaskId, text: &str) -> Result<(), BoardError>;
     fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError>;
+    fn post_record(
+        &self,
+        id: TaskId,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError>;
+    fn post_thread_record(
+        &self,
+        channel: &str,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError>;
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError>;
     fn fail(&self, id: TaskId, reason: &str) -> Result<(), BoardError>;
     fn block(&self, id: TaskId, reason: &str, kind: &str) -> Result<(), BoardError>;
@@ -394,6 +412,7 @@ enum Command<'a> {
     PostRoot {
         channel: &'a str,
         text: &'a str,
+        record: Option<(&'a str, &'a str)>,
     },
     List {
         subtree: &'a str,
@@ -414,6 +433,7 @@ enum Command<'a> {
         id: TaskId,
         schema: &'a str,
         json: &'a str,
+        key: Option<&'a str>,
     },
     Complete {
         id: TaskId,
@@ -545,7 +565,17 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             let limit = IDENTITY_THREADS_MAX.to_string();
             (to_strings(&["read", channel, "--limit", &limit]), None)
         }
-        Command::PostRoot { channel, text } => (to_strings(&["post", channel]), Some(text.into())),
+        Command::PostRoot {
+            channel,
+            text,
+            record,
+        } => {
+            let mut words = to_strings(&["post", channel]);
+            if let Some((schema, key)) = record {
+                words.extend(to_strings(&["--schema", schema, "--idempotency-key", key]));
+            }
+            (words, Some(text.into()))
+        }
         Command::List {
             subtree,
             state,
@@ -568,8 +598,16 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
         }
         // A reply's text goes on stdin; `-` tells `vb` to read it there.
         Command::Reply { id, .. } => (to_strings(&["reply", &id.0.to_string(), "-"]), None),
-        Command::Post { id, schema, json } => {
-            let words = to_strings(&["post", &id.0.to_string(), "--schema", schema]);
+        Command::Post {
+            id,
+            schema,
+            json,
+            key,
+        } => {
+            let mut words = to_strings(&["post", &id.0.to_string(), "--schema", schema]);
+            if let Some(key) = key {
+                words.extend(to_strings(&["--idempotency-key", key]));
+            }
             (words, Some(json.to_string()))
         }
         Command::Complete { id, result } => {
@@ -647,9 +685,8 @@ fn command_args(command: &Command, url: &str, profile: &str) -> Vec<String> {
 /// which may span many lines.
 fn command_stdin<'a>(command: &Command<'a>) -> Option<&'a str> {
     let stdin = match *command {
-        Command::Reply { text, .. } => Some(text),
+        Command::Reply { text, .. } | Command::Create { text, .. } => Some(text),
         Command::CreateSchema { json, .. } => Some(json),
-        Command::Create { text, .. } => Some(text),
         _ => None,
     };
     assert!(
@@ -1160,8 +1197,9 @@ pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     for reply in thread.replies {
         let by = &reply.by;
         // The board verifies `actor` and `principal`; a profile is only a name its login picks.
+        let from_lead = by.actor == format!("{owner}+{LEAD_PROFILE}");
         let by_creator = by.actor == creator && made_by_lead;
-        let amends = by.principal == owner && (by.actor == owner || by_creator);
+        let amends = by.principal == owner && (by.actor == owner || by_creator || from_lead);
         let id = Cursor(parse_id_text(&reply.id)?.0);
         let (profile, text) = (reply.by.profile, reply.text);
         let to = if amends { &mut amendments } else { &mut others };
@@ -1595,6 +1633,7 @@ impl Board for VbCli {
         let output = self.run(&Command::PostRoot {
             channel,
             text: &marker,
+            record: None,
         })?;
         if output.code != Some(0) {
             return Err(BoardError::Exit {
@@ -1664,7 +1703,52 @@ impl Board for VbCli {
         assert!(schema.contains('@'), "a schema is named as name@version");
         assert!(!json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
         check_message(json)?;
-        self.write(&Command::Post { id, schema, json })
+        let key = None;
+        self.write(&Command::Post {
+            id,
+            schema,
+            json,
+            key,
+        })
+    }
+
+    fn post_record(
+        &self,
+        id: TaskId,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError> {
+        assert!(schema.contains('@'), "a schema is named as name@version");
+        assert!(!key.is_empty() && !json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
+        check_message(json)?;
+        let key = Some(key);
+        self.write(&Command::Post {
+            id,
+            schema,
+            json,
+            key,
+        })
+    }
+
+    fn post_thread_record(
+        &self,
+        channel: &str,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError> {
+        assert!(schema.contains('@'), "a schema is named as name@version");
+        assert!(!key.is_empty() && !json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
+        check_message(json)?;
+        let record = Some((schema, key));
+        let text = json;
+        self.read(&Command::PostRoot {
+            channel,
+            text,
+            record,
+        })
+        .map(|_| ())
     }
 
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError> {

@@ -11,6 +11,7 @@ mod codex_review;
     reason = "behaviours and readers for the scenarios still to come"
 )]
 mod fake_agent;
+mod github;
 mod harness_cli;
 mod pr;
 mod queue;

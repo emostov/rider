@@ -25,7 +25,11 @@ pub const DAEMON_STOP_SECONDS_MAX: u64 = 90;
 pub const SETTLED: [&str; 4] = ["completed", "failed", "blocked", "canceled"];
 const POLL_MILLIS: u64 = 200;
 const LIST_LIMIT: &str = "500";
-const SCHEMAS: [(&str, &str); 2] = [
+const SCHEMAS: [(&str, &str); 3] = [
+    (
+        "rider-github@1",
+        "skills/ride-swarm/schemas/rider-github@1.json",
+    ),
     (
         "rider-result@3",
         "skills/ride-swarm/schemas/rider-result@3.json",
