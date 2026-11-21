@@ -602,6 +602,8 @@ fn work_lost_by_removal(dir: &Path) -> Result<Option<&'static str>, WorktreeErro
     // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
     } else if git::head_reflog_only_commit_count(dir)? != 0 {
         Some("commits only its HEAD reflog reaches")
+    } else if git::orig_head_only_commit_count(dir)? != 0 {
+        Some("commits only its ORIG_HEAD reaches")
     } else {
         None
     };

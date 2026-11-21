@@ -1237,3 +1237,55 @@ fn rider_clean_yes_does_not_follow_a_symlink_at_an_ended_tasks_path() {
     let kept = format!("kept #{ended} {}: it is a symlink", link.display());
     assert!(output.stdout.lines().any(|line| line == kept), "{output:?}");
 }
+
+#[test]
+fn a_tracked_edit_hidden_by_a_silent_fsmonitor_hook_fails_the_task_and_keeps_the_worktree() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let hook = world.root.join("fsmonitor.sh");
+    fs::write(&hook, "#!/bin/sh\nprintf 'x\\0'\n").expect("write the hook");
+    let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+    fs::set_permissions(&hook, mode).expect("make the hook runnable");
+    let new = an_implement_task(&world, "Add the work.");
+
+    let (task, state) = when_a_task_settles_after_a_hold(&mut world, &new, |world, dir| {
+        fs::write(dir.join("notes.txt"), "committed\n").expect("write the notes");
+        git_in(world, dir, &["add", "--", "notes.txt"]);
+        git_in(world, dir, &["commit", "-q", "-m", "Notes."]);
+        let hook = hook.to_str().expect("a UTF-8 path");
+        git_in(world, &world.repo, &["config", "core.fsmonitor", hook]);
+        git_in(world, dir, &["status", "--porcelain"]);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(dir.join("notes.txt"), "edited\n").expect("edit the notes");
+    });
+
+    then_the_task_failed_because(
+        &world,
+        &task,
+        &state,
+        "the worktree has uncommitted changes",
+    );
+    let notes = worktree_dir(&world, &task).join("notes.txt");
+    assert_eq!(fs::read_to_string(notes).ok(), Some("edited\n".to_string()));
+}
+
+#[test]
+fn a_finished_worktree_whose_orig_head_alone_names_a_commit_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo.clone();
+    git_in(&world, &repo, &["config", "core.logAllRefUpdates", "false"]);
+
+    let task = when_a_held_agent_finishes_after(&mut world, |world, dir| {
+        git_in(
+            world,
+            dir,
+            &["commit", "-q", "--allow-empty", "-m", "Dropped."],
+        );
+        git_in(world, dir, &["reset", "-q", "--hard", "HEAD~1"]);
+    });
+
+    then_the_worktree_is_kept_because(&world, &task, "commits only its ORIG_HEAD reaches");
+}
