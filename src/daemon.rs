@@ -31,7 +31,10 @@ use crate::core::{
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
-use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
+use crate::harness::{
+    ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PrivateOpenError,
+    open_private,
+};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
@@ -165,7 +168,6 @@ pub enum DaemonError {
     QueueClosed,
     /// `TEST_MILLIS_VAR` is malformed.
     Setting(String),
-    /// The daemon's log exists and is not a regular file.
     NotAFile(PathBuf),
     /// The board's identity could not be read at start-up.
     Identity(IdentityUnknown),
@@ -175,6 +177,7 @@ pub enum DaemonError {
 impl fmt::Display for DaemonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
             DaemonError::Held { path, holder } => {
                 write!(f, "{} is held by {holder}", path.display())
             }
@@ -187,7 +190,6 @@ impl fmt::Display for DaemonError {
             DaemonError::JobsFull => write!(f, "more than {JOBS_QUEUED_MAX} actions waited"),
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
-            DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
             DaemonError::Identity(error) => write!(f, "{error}"),
             DaemonError::Schemas(error) => {
                 write!(
@@ -196,6 +198,19 @@ impl fmt::Display for DaemonError {
                 )
             }
         }
+    }
+}
+
+fn log_error(path: &Path) -> impl FnOnce(PrivateOpenError) -> DaemonError {
+    let path = path.to_path_buf();
+    move |error| match error {
+        PrivateOpenError::NotAFile => DaemonError::NotAFile(path),
+        PrivateOpenError::Replaced => DaemonError::Io {
+            action: "open",
+            message: error.to_string(),
+            path,
+        },
+        PrivateOpenError::Io(error) => io_error("open", &path)(error),
     }
 }
 
@@ -599,8 +614,8 @@ fn start_board(shared: &Arc<Shared>) -> Result<(), DaemonError> {
     }
     let home = &shared.paths.home;
     let path = home.join(BOARD_LOG_FILE);
-    let log = OpenOptions::new().create(true).append(true).open(&path);
-    let log = log.map_err(io_error("open", &path))?;
+    let log = open_private(&path, OpenOptions::new().append(true));
+    let log = log.map_err(log_error(&path))?;
     let err = log.try_clone().map_err(io_error("share", &path))?;
     let vb = &shared.paths.vb;
     let mut command = board_serve(home, vb).map_err(io_error("create the board under", home))?;
@@ -1574,23 +1589,9 @@ struct Log {
 }
 
 impl Log {
-    // Anything there but a regular file is refused before opening, which would block on a FIFO.
     fn start(path: &Path) -> Result<Log, DaemonError> {
-        match fs::metadata(path) {
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(DaemonError::NotAFile(path.to_path_buf()));
-            }
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(io_error("inspect", path)(error));
-            }
-            Ok(_) | Err(_) => {}
-        }
-        let opened = OpenOptions::new().create(true).append(true).open(path);
-        let file = opened.map_err(io_error("open", path))?;
-        let metadata = file.metadata().map_err(io_error("inspect", path))?;
-        if !metadata.is_file() {
-            return Err(DaemonError::NotAFile(path.to_path_buf()));
-        }
+        let file = open_private(path, OpenOptions::new().append(true));
+        let file = file.map_err(log_error(path))?;
         let (lines, queued) = sync_channel::<String>(LOG_QUEUE_MAX);
         let dropped = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&dropped);

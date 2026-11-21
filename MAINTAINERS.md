@@ -20,6 +20,17 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
 | `daemon.log`, `board.log` | what the daemon and the board it started printed |
 | `rider.sock` | the daemon's control socket |
 
+The home, its logs and the socket are readable only by their owner. Every rider command that
+creates the home refuses one that other users can write to, that sits under a path another
+user can change, or that carries a macOS ACL.
+
+Agents run as the same user as the daemon, so nothing can reliably stop them from stopping it.
+As a guard against accidents, the daemon refuses `down` and `kill` from a process that descends
+from it, or whose process group's leader does, which covers an agent running `rider down` or
+`rider kill` itself. It does not stop a process that has left both (a child in its own process
+group whose parent has exited), nor an agent that signals the daemon directly. Keeping agents
+from stopping the daemon needs a separate user or a sandbox.
+
 ## Troubleshooting
 
 `rider vb` runs the Board CLI under `<rider home>/node/node_modules/.bin` on the local board

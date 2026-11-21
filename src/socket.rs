@@ -12,8 +12,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use nix::sys::socket::{getsockopt, sockopt};
+use rustix::process::{Pid as RawPid, getpgid};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sysinfo::{Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{TaskId, TaskState};
 use crate::core::{
@@ -71,6 +74,7 @@ const DRAIN_BYTES_MAX: usize = 1024 * 1024;
 const DRAIN_CHUNK_BYTES: usize = 16 * 1024;
 /// Upper bound on the time spent dropping a client's input before its socket closes.
 const DRAIN_MILLIS_MAX: u64 = 2000;
+const ANCESTORS_MAX: usize = 1024;
 const IDLE_MILLIS_MAX: u64 = 5000;
 // A socket address holds at most 108 bytes of path on Linux and 104 on macOS and the BSDs,
 // a closing NUL included.
@@ -281,13 +285,19 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
             Ok(0) | Err(_) => break,
             Ok(_) if bytes.len() > REQUEST_BYTES_MAX => {
                 let message = format!("a request is at most {REQUEST_BYTES_MAX} bytes");
-                refuse(clients, id, None, &message);
+                refuse(clients, id, None, "bad_request", &message);
                 lock(clients).slots.retain(|slot| slot.id != id);
                 break;
             }
             Ok(_) => {}
         }
         match parse_request(&std::mem::take(&mut bytes)) {
+            Ok((request_id, Request::Down { .. } | Request::Kill(_)))
+                if !from_outside_the_daemon(&reader) =>
+            {
+                let message = "down and kill are refused from the daemon's own agents";
+                refuse(clients, id, Some(request_id), "forbidden", message);
+            }
             Ok((request_id, request)) => {
                 let mut guard = lock(clients);
                 let Some(slot) = guard.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -296,7 +306,7 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
                 if slot.request.is_some() {
                     drop(guard);
                     let message = "one command at a time per connection";
-                    refuse(clients, id, Some(request_id), message);
+                    refuse(clients, id, Some(request_id), "bad_request", message);
                     continue;
                 }
                 slot.request = Some(request_id);
@@ -308,7 +318,9 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
                     break;
                 }
             }
-            Err((request_id, message)) => refuse(clients, id, request_id, &message),
+            Err((request_id, message)) => {
+                refuse(clients, id, request_id, "bad_request", &message);
+            }
         }
     }
     remove(&mut lock(clients), id);
@@ -323,10 +335,10 @@ fn remove(guard: &mut Clients, id: ClientId) {
     assert!(guard.slots.iter().all(|slot| slot.id != id));
 }
 
-fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, message: &str) {
+fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, code: &str, text: &str) {
     let mut guard = lock(clients);
     if let Some(index) = guard.slots.iter().position(|slot| slot.id == id) {
-        let line = error_line(request, "bad_request", message);
+        let line = error_line(request, code, text);
         queue(&mut guard, index, Outgoing::Refusal(line), request);
     }
 }
@@ -346,6 +358,48 @@ fn queue(guard: &mut Clients, index: usize, outgoing: Outgoing, request: Option<
         Err(TrySendError::Disconnected(_)) => hang_up(&guard.slots.remove(index).stream),
     }
     assert!(guard.slots.len() <= CLIENTS_MAX);
+}
+
+// Whether the peer is neither in nor below a process the daemon started: walking up from the
+// peer and from its group's leader never meets the daemon. Unknown counts as inside.
+fn from_outside_the_daemon(reader: &BufReader<UnixStream>) -> bool {
+    let Ok(peer) = peer_pid(reader.get_ref()) else {
+        return false;
+    };
+    let Some(group) = RawPid::from_raw(peer).and_then(|pid| getpgid(Some(pid)).ok()) else {
+        return false;
+    };
+    let daemon = SysPid::from_u32(std::process::id());
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let starts = [peer, group.as_raw_nonzero().get()];
+    for start in starts {
+        let Ok(start) = u32::try_from(start) else {
+            return false;
+        };
+        let mut at = Some(SysPid::from_u32(start));
+        for _ in 0..ANCESTORS_MAX {
+            let Some(pid) = at else { break };
+            if pid == daemon && start != std::process::id() {
+                return false;
+            }
+            at = system.process(pid).and_then(sysinfo::Process::parent);
+        }
+    }
+    assert!(peer > 0);
+    true
+}
+
+#[cfg(target_vendor = "apple")]
+fn peer_pid(stream: &UnixStream) -> nix::Result<i32> {
+    getsockopt(stream, sockopt::LocalPeerPid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> nix::Result<i32> {
+    getsockopt(stream, sockopt::PeerCredentials).map(|credentials| credentials.pid())
 }
 
 /// The request in `bytes`, or the request id, if readable, and why it is refused.

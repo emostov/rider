@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
@@ -34,7 +35,7 @@ use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
 use crate::git::{self, GitError};
-use crate::harness::LOG_BYTES_MAX;
+use crate::harness::{LOG_BYTES_MAX, open_private};
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
@@ -639,6 +640,7 @@ fn say_updates(report: &Report) {
 
 fn vb(config: &Config, args: &[OsString]) -> Result<u8, CliError> {
     assert!(args.len() <= VB_ARGS_MAX);
+    secure_home(&config.home)?;
     let vb = install_vb(config)?;
     assert!(vb.is_absolute() && !config.board_url.is_empty());
     let error = Process::new(&vb)
@@ -874,6 +876,7 @@ fn print_config(config: &Config, repo: Option<&Path>) -> Result<u8, CliError> {
 }
 
 fn serve(config: &Config) -> Result<u8, CliError> {
+    secure_home(&config.home)?;
     let dir = config.home.join(BOARD_DIR);
     let io = |action, path: PathBuf| {
         move |error: io::Error| CliError::Io {
@@ -905,6 +908,7 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 }
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
+    secure_home(&config.home)?;
     let socket = SocketPath::under(&config.home).map_err(CliError::Client)?;
     let (table, limits) = settings(config)?;
     update_skills(config);
@@ -918,6 +922,118 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
 }
 
+const HOME_ANCESTORS_MAX: usize = 256;
+const LS_BYTES_MAX: u64 = 64 * 1024;
+const ACL_ENTRIES_MAX: usize = 1024;
+const ACL_RIGHTS_ANY: &[&str] = &[
+    "read",
+    "list",
+    "search",
+    "execute",
+    "readattr",
+    "readextattr",
+    "readsecurity",
+    "write",
+    "add_file",
+    "append",
+    "add_subdirectory",
+    "delete",
+    "delete_child",
+    "writeattr",
+    "writeextattr",
+    "writesecurity",
+    "chown",
+];
+const ACL_RIGHTS_CHANGE: &[&str] = &[
+    "write",
+    "add_file",
+    "append",
+    "add_subdirectory",
+    "delete",
+    "delete_child",
+    "writeattr",
+    "writeextattr",
+    "writesecurity",
+    "chown",
+];
+
+// Creates the home 0700 or narrows it to 0700. Refuses a home that is not the user's own, a
+// home on a path another user could change (an ancestor not owned by root or the user, or
+// writable by others without the sticky bit), and a home carrying an ACL.
+fn secure_home(home: &Path) -> Result<(), CliError> {
+    assert!(home.is_absolute());
+    let refuse = |message: String| CliError::Io {
+        action: "secure",
+        path: home.to_path_buf(),
+        message,
+    };
+    let failed = |error: io::Error| refuse(error.to_string());
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)
+        .map_err(failed)?;
+    let resolved = fs::canonicalize(home).map_err(failed)?;
+    let uid = rustix::process::getuid().as_raw();
+    let metadata = fs::metadata(&resolved).map_err(failed)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        let message = "it must be a directory of the current user that others cannot write to";
+        return Err(refuse(message.to_string()));
+    }
+    let macos = cfg!(target_os = "macos");
+    if macos && acl_allows(&resolved, ACL_RIGHTS_ANY).map_err(failed)? {
+        return Err(refuse("it carries an ACL; chmod -N removes it".to_string()));
+    }
+    let chains = [home, resolved.as_path()];
+    let ancestors = chains.iter().flat_map(|path| path.ancestors().skip(1));
+    for ancestor in ancestors.take(HOME_ANCESTORS_MAX) {
+        let metadata = fs::symlink_metadata(ancestor).map_err(failed)?;
+        let owned = metadata.uid() == uid || metadata.uid() == 0;
+        let shared =
+            metadata.is_dir() && metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+        let acl = macos
+            && metadata.is_dir()
+            && acl_allows(ancestor, ACL_RIGHTS_CHANGE).map_err(failed)?;
+        if !owned || shared || acl {
+            let message = format!("another user can change {}", ancestor.display());
+            return Err(refuse(message));
+        }
+    }
+    fs::set_permissions(&resolved, fs::Permissions::from_mode(0o700)).map_err(failed)?;
+    assert!(fs::metadata(&resolved).map_err(failed)?.mode() & 0o077 == 0);
+    Ok(())
+}
+
+// macOS mode bits do not show an ACL, and neither std nor rustix reads one; `ls -lde` lists
+// its entries below the file. It is run inside the directory on `.`, so no path name can
+// shift its lines. Linux needs no check: narrowing the mode to 0700 also narrows the POSIX ACL
+// mask to nothing.
+fn acl_allows(dir: &Path, rights: &[&str]) -> io::Result<bool> {
+    assert!(dir.is_absolute() && !rights.is_empty());
+    let mut child = Process::new("/bin/ls")
+        .args(["-lde", "."])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut text = String::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout.take(LS_BYTES_MAX).read_to_string(&mut text)?;
+    }
+    let status = child.wait()?;
+    let mut lines = text.lines();
+    if !status.success() || lines.next().is_none_or(|line| !line.ends_with(" .")) {
+        return Err(io::Error::other(format!("ls -lde answered {text:?}")));
+    }
+    let allowed = lines.take(ACL_ENTRIES_MAX).any(|entry| {
+        let mut words = entry.split_whitespace().skip_while(|word| *word != "allow");
+        let granted = words.nth(1).unwrap_or_default();
+        granted.split(',').any(|right| rights.contains(&right))
+    });
+    Ok(allowed)
+}
+
 /// How long `rider up` waits for the daemon's socket to answer.
 const UP_SECONDS_MAX: u64 = 30;
 const UP_LOG_TAIL_BYTES: usize = 4096;
@@ -929,6 +1045,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
+    secure_home(&config.home)?;
     let socket = SocketPath::under(&config.home).map_err(CliError::Client)?;
     update_skills(config);
     if let Ok(mut client) = Client::connect(&config.home) {
@@ -938,11 +1055,6 @@ fn up(config: &Config) -> Result<u8, CliError> {
         return Ok(0);
     }
     install_vb(config)?;
-    fs::create_dir_all(&config.home).map_err(|error| CliError::Io {
-        action: "create",
-        path: config.home.clone(),
-        message: error.to_string(),
-    })?;
     let log_path = config.home.join(daemon::LOG_FILE);
     let io = |action: &'static str, path: &Path| {
         let path = path.to_path_buf();
@@ -952,16 +1064,17 @@ fn up(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path);
-    let log = log.map_err(io("open", &log_path))?;
+    let log = open_private(&log_path, fs::OpenOptions::new().append(true));
+    let log = log.map_err(|error| CliError::Io {
+        action: "open",
+        path: log_path.clone(),
+        message: error.to_string(),
+    })?;
     let err = log.try_clone().map_err(io("open", &log_path))?;
     let exe = env::current_exe().map_err(io("find", Path::new("rider")))?;
     let mut child = Process::new(&exe)
         .arg("daemon")
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .stdout(log)
         .stderr(err)
         .process_group(0)
@@ -1330,6 +1443,7 @@ impl Watch<'_> {
 
 fn wait(config: &Config, project: &str, minutes: u32, lead: Option<&str>) -> Result<u8, CliError> {
     assert!(minutes <= WAIT_MINUTES_MAX);
+    secure_home(&config.home)?;
     let deadline = Instant::now() + Duration::from_secs(u64::from(minutes) * 60);
     let board = VbCli {
         vb: config.vb_dir().join("vb"),

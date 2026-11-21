@@ -370,7 +370,7 @@ fn reader_slots_are_returned_after_each_run() {
 }
 
 #[test]
-fn a_log_write_that_hangs_does_not_stop_the_time_limit() {
+fn a_log_that_is_a_fifo_with_a_reader_is_refused_before_the_agent_starts() {
     let _sharing = sharing_the_reader_budget();
     let scratch = Scratch::new("fifo");
     let log = scratch.root.join("agent.log");
@@ -380,26 +380,36 @@ fn a_log_write_that_hangs_does_not_stop_the_time_limit() {
         .status();
     assert_eq!(made.map(|status| status.success()).ok(), Some(true));
     let (release, released) = mpsc::sync_channel::<()>(0);
+    let (opened, reading) = mpsc::sync_channel::<()>(0);
     let fifo = log.clone();
     let unread = thread::spawn(move || {
-        let reader = fs::File::open(fifo).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fifo)
+            .unwrap();
+        let _ = opened.send(());
         let _ = released.recv();
         drop(reader);
     });
-    let (sent, finished) = mpsc::sync_channel(1);
+    reading.recv().unwrap();
     let cmd = fake(&["1024", "4096", "60", "0"]);
-    let root = scratch.root.clone();
-    thread::spawn(move || {
-        let start = Instant::now();
-        let exit = run(&cmd, &root, &log, 1, 1 << 24);
-        let _ = sent.send((exit, start.elapsed()));
-    });
-    let outcome = finished.recv_timeout(Duration::from_secs(20));
+    let start = Instant::now();
+
+    let exit = run(&cmd, &scratch.root, &log, 1, 1 << 24);
+
+    let elapsed = start.elapsed();
     drop(release);
     unread.join().unwrap();
-    let (exit, elapsed) = outcome.expect("run returns while its log write hangs");
-    assert_eq!(exit.unwrap(), Exit::TimedOut);
-    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+    let expected = format!(
+        "{}: it is not a regular file of the current user",
+        log.display()
+    );
+    assert!(
+        matches!(&exit, Err(HarnessError::Log(message)) if *message == expected),
+        "{exit:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }
 
 fn run_with_wall_clock(name: &str, shift: fn(SystemTime) -> SystemTime) -> (Exit, Duration) {

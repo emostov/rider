@@ -109,6 +109,12 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    /// Runs `$RIDER_BIN kill <task>` and `$RIDER_BIN down --now`, records their output in
+    /// `stop_attempts(task)`, then holds like `Hold`.
+    TryToStop,
+    /// Starts a child in its own process group that, once orphaned, runs
+    /// `$RIDER_BIN down --now` and records its output in `stop_attempts(task)`; then holds.
+    OrphanStops,
     /// Prints a stream in its harness's shape with `STREAM_MESSAGES`, a failed tool call and
     /// `STREAM_ERROR` as the run's error, then exits `FAIL_EXIT_CODE`.
     StreamError,
@@ -189,6 +195,8 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::TryToStop => "try-to-stop",
+            Behaviour::OrphanStops => "orphan-stops",
             Behaviour::StreamError => "stream-error",
             Behaviour::StreamForged => "stream-forged",
             Behaviour::StreamThenStderr => "stream-then-stderr",
@@ -235,6 +243,11 @@ pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}"));
     let text = fs::read_to_string(&path).expect("read an agent's recorded arguments");
     text.lines().map(str::to_string).collect()
+}
+
+/// What a `TryToStop` agent's stop commands printed, once both have ended.
+pub fn stop_attempts(world: &Path, task: &str) -> Option<String> {
+    fs::read_to_string(world.join(HEADS_DIR).join(format!("{task}-stops"))).ok()
 }
 
 /// The line a `HoldTalking` agent prints before it holds.
@@ -375,6 +388,19 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  orphan-stops)
+    stops="$world/{HEADS_DIR}/$task-stops"
+    # dash, Linux's sh, ignores `set -m` without a terminal, so perl makes the new group.
+    ( perl -e 'setpgrp(0, 0); exec @ARGV' /bin/sh -c 'sleep 1; "$RIDER_BIN" down --now > "$1.new" 2>&1; echo "down exit $?" >> "$1.new"; mv "$1.new" "$1"' sh "$stops" & )
+    hold
+    commit || exit 1 ;;
+  try-to-stop)
+    stops="$world/{HEADS_DIR}/$task-stops"
+    "$RIDER_BIN" kill "$task" > "$stops.new" 2>&1; echo "kill exit $?" >> "$stops.new"
+    "$RIDER_BIN" down --now >> "$stops.new" 2>&1; echo "down exit $?" >> "$stops.new"
+    mv "$stops.new" "$stops"
+    hold
+    commit || exit 1 ;;
   stream-error)
     if [ "$harness" = codex ]; then
       echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
