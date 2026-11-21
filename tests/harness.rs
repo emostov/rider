@@ -309,6 +309,13 @@ fn failures_in_the_stream_are_reported() {
 }
 
 #[test]
+fn a_claude_stream_is_judged_by_its_last_result() {
+    let recovered = r#"{"type":"result","subtype":"error_during_execution","is_error":true}
+{"type":"result","subtype":"success","is_error":false}"#;
+    assert!(!reports_failure(Harness::Claude, recovered));
+}
+
+#[test]
 fn a_codex_turn_is_judged_by_how_it_ended() {
     let path = Path::new("fixtures/harness/codex-reconnect.jsonl");
     assert!(!stream_reports_failure(&Harness::Codex, path));

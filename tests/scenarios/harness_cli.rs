@@ -4,6 +4,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::process::Command;
 
+use crate::fake_agent::{BLOCK_QUESTION, Behaviour};
 use crate::steps::*;
 use crate::world::{World, run_bounded, write_executable};
 
@@ -239,4 +240,31 @@ fn rider_without_board_url_reaches_the_local_board_on_port_4100() {
     let args = fs::read_to_string(&record).expect("read the fake vb's arguments");
     let url = args.lines().skip_while(|arg| *arg != "--url").nth(1);
     assert_eq!(url, Some("http://127.0.0.1:4100/api/board"), "{args}");
+}
+
+#[test]
+fn an_agent_whose_inherited_path_lacks_the_board_cli_still_runs_rider_homes_vb() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let vb_dir = world
+        .vb
+        .parent()
+        .expect("vb has a directory")
+        .display()
+        .to_string();
+    let path = world.child_path().replace(&format!(":{vb_dir}:"), ":");
+    assert!(!path.contains(&vb_dir), "{path}");
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Block]);
+
+    given_a_running_daemon_with(&mut world, &[("PATH", &path)]);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["blocked"]);
+    let block = task_block(&world, &task);
+    assert_eq!(
+        block,
+        Some(("needs_input".to_string(), BLOCK_QUESTION.to_string()))
+    );
 }
