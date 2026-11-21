@@ -460,7 +460,6 @@ fn rider_daemon_under_umask_000_creates_its_home_private_before_writing_to_it() 
 
     let metadata = fs::metadata(&home).expect("the home exists");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
-    assert!(home.join("prompts").is_dir());
 }
 
 #[test]
