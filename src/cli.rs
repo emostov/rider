@@ -9,6 +9,8 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,7 +18,10 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use fs4::{FileExt, TryLockError};
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
-use signal_hook::consts::{SIGINT, SIGTERM};
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, kill_process_group};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::flag;
 use signal_hook::iterator::Signals;
 
 use crate::board::{self, Board, BoardError, NEEDS_MAX, TaskId, VbCli};
@@ -78,6 +83,8 @@ const NPM_FLAGS: [&str; 5] = [
 /// The only variables npm gets from rider's environment.
 const NPM_VARS: [&str; 2] = ["PATH", "HOME"];
 const INSTALL_SECONDS_MAX: u64 = 600;
+const INSTALL_SIGNALS: [i32; 4] = [SIGTERM, SIGINT, SIGHUP, SIGQUIT];
+const INSTALL_LOCK: &str = "node.lock";
 const INSTALL_POLL_MILLIS: u64 = 100;
 /// Upper bound on the bytes of npm's error output that rider shows.
 const INSTALL_OUTPUT_BYTES_MAX: u64 = 64 * 1024;
@@ -602,6 +609,18 @@ fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
     let prefix = config.home.join(NODE_DIR);
     assert!(prefix.is_absolute() && vb.starts_with(&prefix));
     fs::create_dir_all(&prefix).map_err(|error| io_error("create", &prefix, &error))?;
+    let lock_path = config.home.join(INSTALL_LOCK);
+    let lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path);
+    let lock = lock.map_err(|error| io_error("open", &lock_path, &error))?;
+    lock.lock()
+        .map_err(|error| io_error("lock", &lock_path, &error))?;
+    if vb.is_file() {
+        return Ok(vb);
+    }
     for (name, text) in BOARD_PACKAGE {
         let path = prefix.join(name);
         fs::write(&path, text).map_err(|error| io_error("write", &path, &error))?;
@@ -620,14 +639,27 @@ fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
             npm.env(var, value);
         }
     }
+    let handlers = InstallSignals::register()?;
     let spawned = CommandWrap::from(npm).wrap(ProcessGroup::leader()).spawn();
     let child = match spawned {
         Err(error) if error.kind() == ErrorKind::NotFound => return Err(CliError::NoNpm),
         Err(error) => return Err(io_error("run", Path::new("npm"), &error)),
         Ok(child) => child,
     };
-    let status = supervise_npm(child)?;
+    let (status, shown) = supervise_npm(child, &handlers.stopped)?;
+    drop(handlers);
     if !status.success() {
+        let text: String = String::from_utf8_lossy(&shown)
+            .chars()
+            .map(|c| {
+                if c.is_control() && !matches!(c, '\n' | '\t') {
+                    '?'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let _ = io::stderr().write_all(text.as_bytes());
         return Err(CliError::NotInstalled(format!("npm {status}")));
     }
     if !vb.is_file() {
@@ -637,23 +669,59 @@ fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
     Ok(vb)
 }
 
-fn supervise_npm(mut child: Box<dyn ChildWrapper>) -> Result<ExitStatus, CliError> {
+struct InstallSignals {
+    stopped: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl InstallSignals {
+    fn register() -> Result<InstallSignals, CliError> {
+        let handlers = InstallSignals {
+            stopped: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        let signals = Path::new("signals");
+        for signal in INSTALL_SIGNALS {
+            flag::register_conditional_default(signal, Arc::clone(&handlers.done))
+                .and_then(|_| flag::register(signal, Arc::clone(&handlers.stopped)))
+                .map_err(|error| io_error("handle", signals, &error))?;
+        }
+        assert!(!handlers.done.load(Ordering::SeqCst));
+        Ok(handlers)
+    }
+}
+
+impl Drop for InstallSignals {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+fn supervise_npm(
+    mut child: Box<dyn ChildWrapper>,
+    stopped: &AtomicBool,
+) -> Result<(ExitStatus, Vec<u8>), CliError> {
     let npm = Path::new("npm");
-    let signals = Signals::new([SIGTERM, SIGINT]);
-    let mut signals = signals.map_err(|error| io_error("handle", Path::new("signals"), &error))?;
+    let deadline = Instant::now() + Duration::from_secs(INSTALL_SECONDS_MAX);
+    let group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+    let group = group.ok_or_else(|| CliError::NotInstalled("npm has no process id".into()))?;
     let stderr = child.stderr().take();
+    let (sender, shown) = sync_channel(1);
     let reader = thread::Builder::new()
         .name("npm-stderr".into())
         .spawn(move || {
-            let mut shown = Vec::new();
-            if let Some(mut stderr) = stderr {
-                let _ = (&mut stderr)
-                    .take(INSTALL_OUTPUT_BYTES_MAX)
-                    .read_to_end(&mut shown);
-                let _ = io::copy(&mut stderr, &mut io::sink());
-            }
-            shown
+            let mut text = Vec::new();
+            let Some(mut stderr) = stderr else {
+                let _ = sender.send(text);
+                return;
+            };
+            let _ = (&mut stderr)
+                .take(INSTALL_OUTPUT_BYTES_MAX)
+                .read_to_end(&mut text);
+            let _ = sender.send(text);
+            let _ = io::copy(&mut stderr, &mut io::sink());
         });
+    reader.map_err(|error| io_error("read", npm, &error))?;
     let polls = INSTALL_SECONDS_MAX * 1000 / INSTALL_POLL_MILLIS;
     let mut ended = Err(CliError::NotInstalled(format!(
         "npm ran longer than {INSTALL_SECONDS_MAX} s"
@@ -670,26 +738,27 @@ fn supervise_npm(mut child: Box<dyn ChildWrapper>) -> Result<ExitStatus, CliErro
                 break;
             }
         }
-        if signals.pending().next().is_some() {
+        if stopped.load(Ordering::SeqCst) {
             ended = Err(CliError::Interrupted);
             break;
         }
         thread::sleep(Duration::from_millis(INSTALL_POLL_MILLIS));
     }
-    signals.handle().close();
+    match kill_process_group(group, Signal::KILL) {
+        // Darwin refuses (EPERM) to signal a group whose only member is the exited leader.
+        Ok(()) | Err(Errno::SRCH | Errno::PERM) => {}
+        Err(error) => return Err(io_error("stop", npm, &error.into())),
+    }
     if ended.is_err() {
-        let killed = child.kill().and_then(|()| child.wait().map(|_| ()));
-        killed.map_err(|error| io_error("stop", npm, &error))?;
+        child
+            .wait()
+            .map_err(|error| io_error("stop", npm, &error))?;
     }
-    let shown = reader
-        .map_err(|error| io_error("read", npm, &error))?
-        .join();
-    let shown = shown.unwrap_or_default();
+    let left = deadline.saturating_duration_since(Instant::now());
+    let shown = shown.recv_timeout(left.max(Duration::from_secs(1)));
+    let shown = shown.map_err(|_| CliError::NotInstalled("npm's output did not end".into()))?;
     assert!(u64::try_from(shown.len()).is_ok_and(|len| len <= INSTALL_OUTPUT_BYTES_MAX));
-    if ended.as_ref().is_ok_and(|status| !status.success()) {
-        let _ = io::stderr().write_all(&shown);
-    }
-    ended
+    ended.map(|status| (status, shown))
 }
 
 fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliError> {

@@ -473,49 +473,177 @@ exit 9"#;
     );
 }
 
+fn spawn_rider(world: &World, path: &str, home: &Path, args: &[&str]) -> std::process::Child {
+    let mut command = rider(world);
+    command
+        .env("PATH", path)
+        .env("RIDER_HOME", home)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().expect("start rider")
+}
+
+fn read_pid(file: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let pid = fs::read_to_string(file).ok();
+        if let Some(pid) = pid.and_then(|text| text.trim().parse::<i32>().ok()) {
+            return pid;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("{} holds no pid", file.display());
+}
+
+fn then_it_ends_within(pid: i32, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while send_signal(pid, "0") && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let alive = send_signal(pid, "0");
+    if alive {
+        send_signal(pid, "KILL");
+    }
+    !alive
+}
+
+fn wait_within(child: &mut std::process::Child, seconds: u64) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll rider") {
+            return Some(status);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
 #[test]
-fn stopping_rider_during_the_install_stops_npm() {
+fn stopping_rider_during_the_install_with_term_hup_or_quit_stops_npm() {
     let Some(world) = World::new() else {
         return;
     };
-    let home = world.root.join("slow-home");
     let npm_dir = world.root.join("npm");
     let pid_file = world.root.join("npm-pid");
     let slow = format!("echo $$ > '{}'\nexec sleep 30", pid_file.display());
     given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), &slow);
     let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    for signal in ["TERM", "HUP", "QUIT"] {
+        let _ = fs::remove_file(&pid_file);
+        let home = world.root.join(format!("slow-home-{signal}"));
+        let mut child = spawn_rider(&world, &path, &home, &["serve"]);
+        let npm = read_pid(&pid_file);
+
+        let rider_pid = i32::try_from(child.id()).expect("a pid fits");
+        assert!(send_signal(rider_pid, signal), "signal rider");
+        let status = wait_within(&mut child, 10);
+
+        assert_eq!(status.and_then(|status| status.code()), Some(1), "{signal}");
+        assert!(
+            then_it_ends_within(npm, 10),
+            "npm outlived rider's SIG{signal}"
+        );
+    }
+}
+
+#[test]
+fn rider_serve_after_an_install_still_stops_on_sigterm() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("serve-home");
+    let npm_dir = world.root.join("npm");
+    let pid_file = world.root.join("vb-pid");
+    let serving = format!(
+        "printf '#!/bin/sh\\necho $$ > {}\\nexec sleep 30\\n' > \"$3/node_modules/.bin/vb\"",
+        pid_file.display()
+    );
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), &serving);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+    let mut child = spawn_rider(&world, &path, &home, &["serve"]);
+    let vb = read_pid(&pid_file);
+
+    let rider_pid = i32::try_from(child.id()).expect("a pid fits");
+    assert!(send_signal(rider_pid, "TERM"), "signal rider");
+    let status = wait_within(&mut child, 10);
+    send_signal(vb, "KILL");
+
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.and_then(|status| status.signal()), Some(15));
+}
+
+#[test]
+fn two_commands_on_an_empty_home_install_the_board_cli_once() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("racing-home");
+    let npm_dir = world.root.join("npm");
+    let record = world.root.join("npm-args");
+    given_a_fake_npm_in(&npm_dir, &record, "sleep 1");
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let mut first = spawn_rider(&world, &path, &home, &["vb", "one"]);
+    let mut second = spawn_rider(&world, &path, &home, &["vb", "two"]);
+    let ends = [wait_within(&mut first, 20), wait_within(&mut second, 20)];
+
+    let codes: Vec<Option<i32>> = ends
+        .iter()
+        .map(|end| end.and_then(|end| end.code()))
+        .collect();
+    assert_eq!(codes, vec![Some(3), Some(3)]);
+    let recorded = fs::read_to_string(&record).expect("read the fake npm's arguments");
+    assert_eq!(recorded.matches("ci\n--prefix\n").count(), 1, "{recorded}");
+}
+
+#[test]
+fn a_failed_install_returns_at_once_though_a_child_of_npm_keeps_its_output_open() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("lingering-home");
+    let npm_dir = world.root.join("npm");
+    let lingering = "rm -r \"$3/node_modules\"\n/bin/sleep 30 &\nexit 1";
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), lingering);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let started = Instant::now();
+    let mut child = spawn_rider(&world, &path, &home, &["vb", "x"]);
+    let status = wait_within(&mut child, 20);
+
+    assert_eq!(status.and_then(|status| status.code()), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_failed_install_shows_npms_output_without_control_bytes() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("escape-home");
+    let npm_dir = world.root.join("npm");
+    let escape = "rm -r \"$3/node_modules\"\nprintf '\\033]0;owned\\007boom\\tx\\n' >&2\nexit 1";
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), escape);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
     let mut command = rider(&world);
     command
         .env("PATH", &path)
         .env("RIDER_HOME", &home)
-        .arg("serve")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("start rider serve");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut npm = None;
-    while npm.is_none() && Instant::now() < deadline {
-        npm = fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|text| text.trim().parse::<i32>().ok());
-        thread::sleep(Duration::from_millis(50));
-    }
-    let npm = npm.expect("npm started");
+        .args(["vb", "x"]);
+    let output = run_bounded(command, None);
 
-    let rider_pid = i32::try_from(child.id()).expect("a pid fits");
-    assert!(send_signal(rider_pid, "TERM"), "signal rider");
-    let status = child.wait().expect("rider exits");
-
-    assert_eq!(status.code(), Some(1), "{status}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while send_signal(npm, "0") && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
-    }
-    let alive = send_signal(npm, "0");
-    if alive {
-        send_signal(npm, "KILL");
-    }
-    assert!(!alive, "npm outlived rider");
+    assert_eq!(output.code, Some(1), "{output:?}");
+    let shown = "?]0;owned?boom\tx\nrider: could not install the Board CLI: npm exit status: 1\n";
+    assert!(output.stderr.ends_with(shown), "{:?}", output.stderr);
 }
 
 fn send_signal(pid: i32, signal: &str) -> bool {
