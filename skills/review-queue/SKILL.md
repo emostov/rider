@@ -273,7 +273,11 @@ carries the drafted instructions and the one next action.
 ## Waiting
 
 Wait in the background, never in the foreground: `rider wait reviews --as <you>` for the
-preparation tasks, and, for an item with a `packet`, the bounded packet poll of `ship-swarm`
-step 0, item 5. Read GitHub for items with `turn=author` or `kind=respond` at each
-requeue. Advance `packet_at`, `github_at` and `head` after handling a change, so the next
-look reports only what is new.
+preparation tasks, and `rider queue wait` beside it for the owner's packet comments and the
+GitHub side. `rider queue wait` prints one line per change (a packet comment newer than
+`packet_at` on a `turn=owner` item, or a new head or a comment newer than `github_at` on a
+`turn=author` or `kind=respond` item) and exits 0, or exits 3 at its timeout. It ignores
+agents' packet replies, the owner's own GitHub comments and pending reviews, and prints a
+failed `gh` or `reviews` call on standard error without ending. Start it again at the end of
+each turn. Advance `packet_at`, `github_at` and `head` after handling a change, so the next
+wait reports only what is new.
