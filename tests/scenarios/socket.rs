@@ -720,8 +720,12 @@ fn an_agent_cannot_write_its_repositorys_git_config_hooks_or_remotes_but_still_c
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
 
     assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
-    let refused = "config refused\nconfig.worktree refused\nhooks/post-checkout refused\n\
-                   info/attributes refused\nremotes/origin refused\nown refused\n";
+    let worktree = format!("worktrees/{task}");
+    let refused = format!(
+        "config refused\nconfig.worktree refused\nhooks/post-checkout refused\n\
+         info/attributes refused\ncommondir refused\n{worktree}/config.worktree refused\n\
+         {worktree}/commondir refused\n{worktree}/gitdir refused\n.git refused\n"
+    );
     assert_eq!(
         fake_agent::git_config_writes(&world.root, &task, 0),
         refused

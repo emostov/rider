@@ -160,9 +160,26 @@ const HOME_DIRS: [&str; 4] = ["board", "wait", "roles", "run"];
 #[cfg(target_os = "macos")]
 const HOME_FILES: [&str; 2] = ["node.lock", "ship.toml"];
 #[cfg(target_os = "macos")]
-const GIT_FILES: [&str; 2] = ["config", "config.worktree"];
+const GIT_SHARED_DIRS: [&str; 3] = ["objects", "refs", "logs"];
 #[cfg(target_os = "macos")]
-const GIT_DIRS: [&str; 3] = ["hooks", "info", "remotes"];
+const GIT_SHARED_FILES: [&str; 5] = [
+    "packed-refs",
+    "packed-refs.lock",
+    "FETCH_HEAD",
+    "gc.pid",
+    "gc.log",
+];
+#[cfg(target_os = "macos")]
+const GIT_OWN_FILES: [&str; 6] = [
+    "index",
+    "index.lock",
+    "HEAD",
+    "HEAD.lock",
+    "ORIG_HEAD",
+    "COMMIT_EDITMSG",
+];
+#[cfg(target_os = "macos")]
+const GIT_LINKS: [&str; 4] = ["commondir", "gitdir", "config", "config.worktree"];
 #[cfg(target_os = "macos")]
 const PROGRAMS: [&str; 5] = ["git", "gh", "node", "npm", "sh"];
 #[cfg(target_os = "macos")]
@@ -1193,7 +1210,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
             let unreadable = |error: GitError| HarnessError::Spawn(error.to_string());
             let common = git::common_dir(dir).map_err(unreadable)?;
             let own = git::git_dir(dir).map_err(unreadable)?;
-            args.extend(confinement(&home, &vb, &[common, own])?);
+            args.extend(confinement(&home, &vb, &[dir.to_path_buf(), common, own])?);
         }
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
@@ -1249,12 +1266,19 @@ fn confinement(home: &Path, vb: &Path, repo: &[PathBuf]) -> Result<Vec<String>, 
         .iter()
         .map(|dir| resolve(dir))
         .collect::<Result<_, _>>()?;
-    let (mut literals, mut subpaths) = denied_writes(&home, &vb);
-    for dir in &repo {
+    let (mut literals, subpaths) = denied_writes(&home, &vb);
+    for dir in repo.iter().skip(1) {
         literals.extend(dir.ancestors().map(Path::to_path_buf));
-        literals.extend(GIT_FILES.map(|name| dir.join(name)));
-        subpaths.extend(GIT_DIRS.map(|name| dir.join(name)));
     }
+    let git = match repo.as_slice() {
+        [] => String::new(),
+        [worktree, common, own] => git_rules(worktree, common, own, &quote)?,
+        _ => {
+            return Err(unusable(
+                "a worktree and its two git directories".to_string(),
+            ));
+        }
+    };
     if literals.len() + subpaths.len() > DENIED_MAX {
         return Err(unusable(format!("more than {DENIED_MAX} paths to deny")));
     }
@@ -1274,7 +1298,7 @@ fn confinement(home: &Path, vb: &Path, repo: &[PathBuf]) -> Result<Vec<String>, 
          (deny lsopen)\n(deny appleevent-send)\n{network}\
          (deny network-outbound (remote unix-socket (path-literal {socket})))\n\
          (deny network-outbound (remote unix-socket (subpath {staging})))\n\
-         (deny file-write* {})\n",
+         (deny file-write* {})\n{git}",
         denied.join(" ")
     );
     assert!(denied.len() > 2 * CONTROL_FILES.len() && profile.contains(&socket));
@@ -1352,6 +1376,55 @@ fn confine_git(paths: &Paths) -> Result<(), DaemonError> {
         return Err(DaemonError::Confine("git is already confined".to_string()));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn git_rules(
+    worktree: &Path,
+    common: &Path,
+    own: &Path,
+    quote: &dyn Fn(&Path) -> Result<String, HarnessError>,
+) -> Result<String, HarnessError> {
+    assert!(worktree.is_absolute() && common.is_absolute() && own.is_absolute());
+    let rule = |kind: &str, paths: &[PathBuf]| -> Result<String, HarnessError> {
+        let quoted: Vec<String> = paths
+            .iter()
+            .map(|path| quote(path).map(|path| format!("({kind} {path})")))
+            .collect::<Result<_, _>>()?;
+        Ok(quoted.join(" "))
+    };
+    let mut allowed = vec![rule(
+        "subpath",
+        &GIT_SHARED_DIRS.map(|name| common.join(name)),
+    )?];
+    allowed.push(rule(
+        "literal",
+        &GIT_SHARED_FILES.map(|name| common.join(name)),
+    )?);
+    let own_files = if own == common {
+        allowed.push(rule("literal", &GIT_OWN_FILES.map(|name| own.join(name)))?);
+        Vec::new()
+    } else {
+        allowed.push(rule("subpath", &[own.to_path_buf()])?);
+        GIT_LINKS
+            .map(|name| own.join(name))
+            .into_iter()
+            .chain([own.to_path_buf()])
+            .collect()
+    };
+    let denied = rule("subpath", &[common.to_path_buf(), own.to_path_buf()])?;
+    let link = rule("literal", &[worktree.join(".git")])?;
+    let links = rule("literal", &own_files)?;
+    let rules = format!(
+        "(deny file-write* {denied} {link})\n(allow file-write* {})\n",
+        allowed.join(" ")
+    );
+    assert!(!rules.is_empty());
+    Ok(if links.is_empty() {
+        rules
+    } else {
+        format!("{rules}(deny file-write* {links})\n")
+    })
 }
 
 // A program that is a script inside an npm package runs the rest of its package too.

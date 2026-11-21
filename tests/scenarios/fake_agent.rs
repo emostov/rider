@@ -442,13 +442,15 @@ case "$behaviour" in
   plant-git-config)
     common=$(git rev-parse --path-format=absolute --git-common-dir)
     own=$(git rev-parse --absolute-git-dir)
-    for target in config config.worktree hooks/post-checkout info/attributes remotes/origin; do
-      if ( : >> "$common/$target" ) 2>/dev/null; then echo "$target written"; else echo "$target refused"; fi
-    done > "$world/{ARGS_DIR}/$task-$attempt.git-config"
-    if ( : >> "$own/config.worktree" ) 2>/dev/null; then echo "own written"; else echo "own refused"; fi \
-      >> "$world/{ARGS_DIR}/$task-$attempt.git-config"
-    git config core.sshCommand planted 2>/dev/null && echo "git config written" \
-      >> "$world/{ARGS_DIR}/$task-$attempt.git-config"
+    tried="$world/{ARGS_DIR}/$task-$attempt.git-config"
+    for target in "$common/config" "$common/config.worktree" "$common/hooks/post-checkout" \
+      "$common/info/attributes" "$common/commondir" "$own/config.worktree" "$own/commondir" \
+      "$own/gitdir" "$(pwd)/.git"; do
+      name=${{target#"$common"/}}
+      name=${{name#"$(pwd)"/}}
+      if ( : >> "$target" ) 2>/dev/null; then echo "$name written"; else echo "$name refused"; fi
+    done > "$tried"
+    git config core.sshCommand planted 2>/dev/null && echo "git config written" >> "$tried"
     commit || exit 1 ;;
   open-app)
     app="$world/{ARGS_DIR}/$task-$attempt.app"
