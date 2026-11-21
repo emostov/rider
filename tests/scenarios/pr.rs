@@ -120,6 +120,7 @@ fn rider_pr_pushes_a_completed_tasks_branch_and_opens_one_draft_with_its_summary
     let create = create_call(&branch, "Add one work file.", MAIN);
     let list = list_call(&branch);
     assert_eq!(gh_calls(&remote), vec![list.clone(), create, list]);
+    assert_eq!(task_label(&world, &task, "pr").as_deref(), Some(PR_URL));
 }
 
 #[test]

@@ -34,6 +34,7 @@ use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
 use crate::git::{self, GitError};
+use crate::github::PR_LABEL;
 use crate::harness::LOG_BYTES_MAX;
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::reap::{self, ReapError, Stopped};
@@ -1943,6 +1944,9 @@ fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
         return Err(CliError::BadGh(url));
     }
     assert!(!url.is_empty());
+    board
+        .set_label(id, PR_LABEL, &url)
+        .map_err(CliError::Board)?;
     say(&url);
     Ok(0)
 }

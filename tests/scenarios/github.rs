@@ -22,6 +22,7 @@ const STATES: [&str; 7] = [
     "blocked",
     "canceled",
 ];
+const PR_URL: &str = "https://github.com/example/repo/pull/7";
 const HEAD: &str = "2ae54426992ec8249006b5ea9b5531e8900062f3";
 
 fn fixture(name: &str) -> String {
@@ -33,6 +34,9 @@ fn fixture(name: &str) -> String {
 
 fn given_gh_prints(world: &World, pr_list: &str, comments: &str) {
     fs::write(world.root.join("gh-pr.json"), fixture(pr_list)).expect("write the pr fixture");
+    let listed: Value = serde_json::from_str(&fixture(pr_list)).expect("the fixture parses");
+    let viewed = listed[0].to_string();
+    fs::write(world.root.join("gh-pr-view.json"), viewed).expect("write the viewed pr");
     fs::write(world.root.join("gh-comments.json"), fixture(comments)).expect("write comments");
     let log = fixture("run-log-failed.txt");
     fs::write(world.root.join("gh-log.txt"), log).expect("write the log fixture");
@@ -46,6 +50,7 @@ case "$1 $2" in
     case " $* " in
       *" --state open "*) cat '{root}/gh-open.json' 2>/dev/null || echo '[]' ;;
       *" rider/999-orphan "*) cat '{root}/gh-orphan.json' ;;
+      *" view "*) cat '{root}/gh-pr-view.json' ;;
       *) cat '{root}/gh-pr.json' ;;
     esac ;;
   api*/permission)
@@ -98,7 +103,10 @@ fn given_a_completed_task(world: &mut World) -> String {
 }
 
 fn given_a_settled_task(world: &mut World, behaviour: Behaviour, state: &str) -> String {
-    let task = when_the_lead_creates(world, &an_implement_task(world, "Add one work file."));
+    let task = when_the_lead_creates(
+        world,
+        &an_implement_task(world, "Add one work file.").label("pr", PR_URL),
+    );
     given_the_agent_will(world, &task, &[behaviour]);
     given_a_running_daemon_with(world, &[FAST_POLL]);
     assert_eq!(when_the_tasks_settle(world, &[&task]), vec![state]);
@@ -205,7 +213,8 @@ const JOB_URL: &str = "https://github.com/example/repo/actions/runs/44868640008/
 
 fn failed_record(route: &str) -> Value {
     json!({"kind": "checks", "pr": 7, "head": HEAD, "state": "failed", "job": "test",
-        "url": JOB_URL, "route": route})
+        "url": JOB_URL, "route": route, "trust": "trusted",
+        "trust_reason": "the repository's own checks"})
 }
 
 #[test]
@@ -214,7 +223,10 @@ fn ci_pending_then_failed_posts_one_record_and_a_restart_posts_it_not_again() {
         return;
     };
     given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
-    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add one work file."));
+    let task = when_the_lead_creates(
+        &world,
+        &an_implement_task(&world, "Add one work file.").label("pr", PR_URL),
+    );
     given_a_running_daemon_with(&mut world, &[FAST_POLL, ("GH_TOKEN", "a-token")]);
     assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
     when_gh_is_called_again(&world);
@@ -293,13 +305,16 @@ fn a_change_request_queues_a_fix_and_a_question_goes_to_the_lead() {
     let mut wanted = vec![
         json!({"kind": "review", "pr": 7, "head": HEAD, "state": "COMMENTED",
             "author": "reviewer", "excerpt": "Please split the parser out of the loop.",
-            "url": url, "route": "owner", "task": id(&split)}),
+            "url": url, "route": "owner", "task": id(&split), "trust": "trusted",
+            "trust_reason": "write access"}),
         json!({"kind": "comment", "pr": 7, "head": HEAD, "author": "commenter",
             "excerpt": "Is the cap of 64 enough for a large swarm?",
-            "url": format!("{url}#issuecomment-1"), "route": "lead"}),
+            "url": format!("{url}#issuecomment-1"), "route": "lead", "trust": "untrusted",
+            "trust_reason": "no write access to the repository"}),
         json!({"kind": "review", "pr": 7, "head": HEAD, "author": "reviewer",
             "file": "src/github.rs", "line": 30, "excerpt": "This loop needs a bound.",
-            "url": format!("{url}#discussion_r1"), "route": "owner", "task": id(&fix)}),
+            "url": format!("{url}#discussion_r1"), "route": "owner", "task": id(&fix),
+            "trust": "trusted", "trust_reason": "write access"}),
     ];
     let mut records = records;
     let by_url = |record: &Value| record["url"].as_str().unwrap_or_default().to_string();
@@ -361,7 +376,10 @@ fn a_pr_is_reported_to_the_lead_while_its_task_still_works() {
         return;
     };
     given_gh_prints(&world, "pr-list-review.json", "pulls-comments-empty.json");
-    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add one work file."));
+    let task = when_the_lead_creates(
+        &world,
+        &an_implement_task(&world, "Add one work file.").label("pr", PR_URL),
+    );
     given_the_agent_will(&world, &task, &[Behaviour::Hold]);
     given_a_running_daemon_with(&mut world, &[FAST_POLL]);
     when_the_agent_has_started(&world, &task);
@@ -374,7 +392,8 @@ fn a_pr_is_reported_to_the_lead_while_its_task_still_works() {
         vec![
             json!({"kind": "comment", "pr": 7, "head": HEAD, "author": "commenter",
             "excerpt": "Is the cap of 64 enough for a large swarm?", "url": url,
-            "route": "lead"})
+            "route": "lead", "trust": "untrusted",
+            "trust_reason": "no write access to the repository"})
         ]
     );
     fake_agent::release(&world.root, &task);
@@ -430,13 +449,18 @@ fn a_merged_pr_ends_the_watch() {
     };
     given_gh_prints(&world, "pr-list-merged.json", "pulls-comments-empty.json");
     let task = given_a_completed_task(&mut world);
-    when_gh_is_called_past(&world, 0);
+    when_a_round_passes(&world);
     given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
-    let calls = gh_calls(&world);
+    let calls = gh_call_lines(&world).len();
 
-    thread::sleep(Duration::from_millis(QUIET_MILLIS));
+    when_a_round_passes(&world);
 
-    assert_eq!(gh_calls(&world), calls);
+    let since: Vec<String> = gh_call_lines(&world)
+        .into_iter()
+        .skip(calls)
+        .filter(|line| line.contains(" view ") || line.contains("--head"))
+        .collect();
+    assert_eq!(since, Vec::<String>::new());
     assert_eq!(
         task_records(&world, &task, "rider-github"),
         Vec::<Value>::new()
@@ -490,7 +514,7 @@ fn a_github_off_label_on_the_task_ends_the_watch() {
     let since: Vec<String> = gh_call_lines(&world)
         .into_iter()
         .skip(calls)
-        .filter(|line| line.contains("--head"))
+        .filter(|line| line.contains(" view ") || line.contains("--head"))
         .collect();
     assert_eq!(since, Vec::<String>::new());
     assert_eq!(
@@ -723,7 +747,8 @@ fn an_open_rider_pr_with_no_task_reaches_the_lead_in_the_project_channel() {
         channel_records(&world),
         vec![
             json!({"kind": "checks", "pr": 8, "head": HEAD, "state": "failed",
-            "job": "test", "url": url, "route": "lead"})
+            "job": "test", "url": url, "route": "lead", "trust": "trusted",
+            "trust_reason": "the repository's own checks"})
         ]
     );
     assert_eq!(

@@ -19,6 +19,7 @@ use crate::run_task::{RESUMABLE_ROLES, recorded_session};
 use crate::worktree::BRANCH_LABEL;
 
 pub const WATCH_LABEL: &str = "github";
+pub const PR_LABEL: &str = "pr";
 pub const WATCH_OFF: &str = "off";
 const PAGE_ITEMS: usize = 100;
 const PAGES_MAX: usize = ITEMS_MAX / PAGE_ITEMS;
@@ -40,7 +41,7 @@ const NEVER_GITHUB: &str = "Never reply on GitHub.";
 const UNTRUSTED_BEGIN: &str = "----- untrusted GitHub comment begins -----";
 const UNTRUSTED_END: &str = "----- untrusted GitHub comment ends -----";
 const PR_FIELDS: &str =
-    "number,url,headRefOid,state,author,isCrossRepository,statusCheckRollup,reviews,comments";
+    "number,url,headRefOid,state,isCrossRepository,statusCheckRollup,reviews,comments";
 const PRS_MAX: &str = "10";
 const OPEN_PRS_MAX: &str = "100";
 const OPEN_FIELDS: &str = "headRefName,isCrossRepository";
@@ -86,7 +87,6 @@ struct WirePr {
     url: String,
     head_ref_oid: String,
     state: String,
-    author: WireAuthor,
     is_cross_repository: bool,
     #[serde(default)]
     status_check_rollup: Vec<WireCheck>,
@@ -238,6 +238,7 @@ enum Checks {
 
 struct Watched<'a> {
     task: Option<TaskId>,
+    pr: Option<&'a str>,
     channel: &'a str,
     role: &'a str,
     repo: &'a Path,
@@ -311,7 +312,7 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
         .collect();
     let mut tasks: Vec<&ListedTask> = listing.tasks.iter().collect();
     tasks.sort_by_key(|task| Reverse(task.view.version));
-    let mut branches: Vec<&str> = Vec::new();
+    let mut branches: Vec<(&str, &str)> = Vec::new();
     let mut authors: Vec<(String, bool)> = Vec::new();
     let mut watches = 0usize;
     let mut posted = 0usize;
@@ -324,26 +325,32 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
         ) else {
             continue;
         };
-        if branches.contains(&branch) {
+        if branches.contains(&(repo, branch)) {
             continue;
         }
         if branches.len() >= TASKS_MAX {
             break;
         }
+        branches.push((repo, branch));
         let task = view.id;
         let off = label(view, WATCH_LABEL) == Some(WATCH_OFF);
+        let Some(pr) = recorded_pr(&listing.tasks, repo, branch) else {
+            continue;
+        };
         if off || seen.has(&ended_key(task)) || !git::is_safe_ref(branch) {
-            branches.push(branch);
             continue;
         }
         if watches >= WATCHES_MAX {
+            log(&format!(
+                "github watch: more than {WATCHES_MAX} pull requests to watch"
+            ));
             break;
         }
-        branches.push(branch);
         watches += 1;
         let running = matches!(view.state, TaskState::Ready | TaskState::Claimed);
         let watched = Watched {
             task: Some(task),
+            pr: Some(pr),
             channel: &listed.channel,
             role,
             repo: Path::new(repo),
@@ -373,6 +380,23 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
     Ok(posted.saturating_add(unowned))
 }
 
+fn recorded_pr<'a>(tasks: &'a [ListedTask], repo: &str, branch: &str) -> Option<&'a str> {
+    assert!(!repo.is_empty() && !branch.is_empty());
+    let on_branch = tasks.iter().map(|listed| &listed.view).filter(|view| {
+        label(view, "repo") == Some(repo) && label(view, BRANCH_LABEL) == Some(branch)
+    });
+    let url = on_branch
+        .filter_map(|view| label(view, PR_LABEL))
+        .find(|url| {
+            url.starts_with("https://")
+                && url.contains("/pull/")
+                && url.len() <= KEY_BYTES_MAX
+                && !url.contains(|c: char| c.is_whitespace() || c.is_control())
+        });
+    assert!(url.is_none_or(|url| !url.is_empty()));
+    url
+}
+
 fn watch_unowned(
     board: &dyn Board,
     tasks: &[ListedTask],
@@ -380,9 +404,9 @@ fn watch_unowned(
     authors: &mut Vec<(String, bool)>,
     log: &dyn Fn(&str),
 ) -> Result<usize, WatchError> {
-    let owned: Vec<&str> = tasks
+    let owned: Vec<(&str, &str)> = tasks
         .iter()
-        .filter_map(|t| label(&t.view, BRANCH_LABEL))
+        .filter_map(|t| Some((label(&t.view, "repo")?, label(&t.view, BRANCH_LABEL)?)))
         .collect();
     let mut repos: Vec<(&str, &str)> = Vec::new();
     for listed in tasks {
@@ -397,8 +421,8 @@ fn watch_unowned(
         }
     }
     let mut posted = 0usize;
-    for (repo, channel) in repos {
-        let repo = Path::new(repo);
+    for (repo_label, channel) in repos {
+        let repo = Path::new(repo_label);
         let args = [
             "pr",
             "list",
@@ -422,11 +446,12 @@ fn watch_unowned(
             !pr.is_cross_repository
                 && pr.head_ref_name.starts_with(RIDER_BRANCH_PREFIX)
                 && git::is_safe_ref(&pr.head_ref_name)
-                && !owned.contains(&pr.head_ref_name.as_str())
+                && !owned.contains(&(repo_label, pr.head_ref_name.as_str()))
         });
         for pr in unowned.take(WATCHES_MAX) {
             let watched = Watched {
                 task: None,
+                pr: None,
                 channel,
                 role: "",
                 repo,
@@ -456,20 +481,27 @@ fn watch_one(
     seen: &mut Seen,
     authors: &mut Vec<(String, bool)>,
 ) -> Result<usize, WatchError> {
-    let args = [
-        "pr",
-        "list",
-        "--head",
-        watched.branch,
-        "--state",
-        "all",
-        "--limit",
-        PRS_MAX,
-        "--json",
-        PR_FIELDS,
-    ];
-    let stdout = gh(watched.repo, &args)?;
-    let prs: Vec<WirePr> = parse(&stdout, "gh pr list")?;
+    let prs: Vec<WirePr> = match watched.pr {
+        Some(url) => {
+            let args = ["pr", "view", url, "--json", PR_FIELDS];
+            vec![parse(&gh(watched.repo, &args)?, "gh pr view")?]
+        }
+        None => {
+            let args = [
+                "pr",
+                "list",
+                "--head",
+                watched.branch,
+                "--state",
+                "all",
+                "--limit",
+                PRS_MAX,
+                "--json",
+                PR_FIELDS,
+            ];
+            parse(&gh(watched.repo, &args)?, "gh pr list")?
+        }
+    };
     let Some(pr) = prs.into_iter().find(|pr| !pr.is_cross_repository) else {
         return Ok(0);
     };
@@ -506,10 +538,13 @@ fn watch_one(
             fix,
             author,
         } = change;
-        let trusted = match &author {
-            None => true,
-            Some(login) => trusts(watched.repo, &pr, login, authors)?,
+        let (trusted, reason) = match &author {
+            None => (true, "the repository's own checks"),
+            Some(login) if trusts(watched.repo, login, authors)? => (true, "write access"),
+            Some(_) => (false, "no write access to the repository"),
         };
+        record["trust"] = json!(if trusted { "trusted" } else { "untrusted" });
+        record["trust_reason"] = json!(reason);
         if fix.is_some() && trusted && watched.running {
             continue;
         }
@@ -544,12 +579,7 @@ fn watch_one(
     Ok(posted)
 }
 
-fn trusts(
-    repo: &Path,
-    pr: &WirePr,
-    login: &str,
-    authors: &mut Vec<(String, bool)>,
-) -> Result<bool, WatchError> {
+fn trusts(repo: &Path, login: &str, authors: &mut Vec<(String, bool)>) -> Result<bool, WatchError> {
     let valid = !login.is_empty()
         && login.len() <= LOGIN_BYTES_MAX
         && login
@@ -557,9 +587,6 @@ fn trusts(
             .all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if !valid {
         return Ok(false);
-    }
-    if login == pr.author.login {
-        return Ok(true);
     }
     if let Some((_, trusted)) = authors.iter().find(|(known, _)| known == login) {
         return Ok(*trusted);
