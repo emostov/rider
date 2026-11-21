@@ -1374,6 +1374,16 @@ impl Board for Guarded<'_> {
         self.gate(false)?;
         self.board.post_record(id, schema, json, key)
     }
+    fn post_thread_record(
+        &self,
+        channel: &str,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError> {
+        self.gate(false)?;
+        self.board.post_thread_record(channel, schema, json, key)
+    }
     fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError> {
         self.gate(false)?;
         self.board.post_structured(id, schema, json)

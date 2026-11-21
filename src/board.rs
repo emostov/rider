@@ -310,6 +310,13 @@ pub trait Board {
         json: &str,
         key: &str,
     ) -> Result<(), BoardError>;
+    fn post_thread_record(
+        &self,
+        channel: &str,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError>;
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError>;
     fn fail(&self, id: TaskId, reason: &str) -> Result<(), BoardError>;
     fn block(&self, id: TaskId, reason: &str, kind: &str) -> Result<(), BoardError>;
@@ -397,6 +404,7 @@ enum Command<'a> {
     PostRoot {
         channel: &'a str,
         text: &'a str,
+        record: Option<(&'a str, &'a str)>,
     },
     List {
         subtree: &'a str,
@@ -545,7 +553,17 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             let limit = IDENTITY_THREADS_MAX.to_string();
             (to_strings(&["read", channel, "--limit", &limit]), None)
         }
-        Command::PostRoot { channel, text } => (to_strings(&["post", channel]), Some(text.into())),
+        Command::PostRoot {
+            channel,
+            text,
+            record,
+        } => {
+            let mut words = to_strings(&["post", channel]);
+            if let Some((schema, key)) = record {
+                words.extend(to_strings(&["--schema", schema, "--idempotency-key", key]));
+            }
+            (words, Some(text.into()))
+        }
         Command::List {
             subtree,
             state,
@@ -1589,6 +1607,7 @@ impl Board for VbCli {
         let output = self.run(&Command::PostRoot {
             channel,
             text: &marker,
+            record: None,
         })?;
         if output.code != Some(0) {
             return Err(BoardError::Exit {
@@ -1684,6 +1703,26 @@ impl Board for VbCli {
             json,
             key,
         })
+    }
+
+    fn post_thread_record(
+        &self,
+        channel: &str,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError> {
+        assert!(schema.contains('@'), "a schema is named as name@version");
+        assert!(!key.is_empty() && !json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
+        check_message(json)?;
+        let record = Some((schema, key));
+        let text = json;
+        self.read(&Command::PostRoot {
+            channel,
+            text,
+            record,
+        })
+        .map(|_| ())
     }
 
     fn create_task(&self, task: &NewTask) -> Result<TaskId, BoardError> {
@@ -1982,6 +2021,17 @@ pub mod testing {
             _: &str,
         ) -> Result<(), BoardError> {
             self.post_structured(id, schema, json)
+        }
+
+        fn post_thread_record(
+            &self,
+            channel: &str,
+            schema: &str,
+            json: &str,
+            _: &str,
+        ) -> Result<(), BoardError> {
+            self.record(format!("post_thread_record {channel} {schema} {json}"))?;
+            check_message(json)
         }
 
         fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError> {

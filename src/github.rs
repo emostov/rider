@@ -42,6 +42,10 @@ const UNTRUSTED_END: &str = "----- untrusted GitHub comment ends -----";
 const PR_FIELDS: &str =
     "number,url,headRefOid,state,author,isCrossRepository,statusCheckRollup,reviews,comments";
 const PRS_MAX: &str = "10";
+const OPEN_PRS_MAX: &str = "100";
+const OPEN_FIELDS: &str = "headRefName,isCrossRepository";
+const REPOS_MAX: usize = 16;
+const RIDER_BRANCH_PREFIX: &str = "rider/";
 const AUTHORS_MAX: usize = 64;
 const LOGIN_BYTES_MAX: usize = 39;
 const TRUSTED_PERMISSIONS: [&str; 3] = ["admin", "maintain", "write"];
@@ -66,6 +70,13 @@ impl fmt::Display for WatchError {
             WatchError::State(detail) => write!(f, "github state: {detail}"),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireOpenPr {
+    head_ref_name: String,
+    is_cross_repository: bool,
 }
 
 #[derive(Deserialize)]
@@ -226,7 +237,7 @@ enum Checks {
 }
 
 struct Watched<'a> {
-    task: TaskId,
+    task: Option<TaskId>,
     channel: &'a str,
     role: &'a str,
     repo: &'a Path,
@@ -332,7 +343,7 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
         watches += 1;
         let running = matches!(view.state, TaskState::Ready | TaskState::Claimed);
         let watched = Watched {
-            task,
+            task: Some(task),
             channel: &listed.channel,
             role,
             repo: Path::new(repo),
@@ -356,7 +367,82 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
         }
         write_seen(&state_path, &seen)?;
     }
+    let unowned = watch_unowned(board, &listing.tasks, &mut seen, &mut authors, log)?;
+    write_seen(&state_path, &seen)?;
     assert!(watches <= WATCHES_MAX && authors.len() <= AUTHORS_MAX);
+    Ok(posted.saturating_add(unowned))
+}
+
+fn watch_unowned(
+    board: &dyn Board,
+    tasks: &[ListedTask],
+    seen: &mut Seen,
+    authors: &mut Vec<(String, bool)>,
+    log: &dyn Fn(&str),
+) -> Result<usize, WatchError> {
+    let owned: Vec<&str> = tasks
+        .iter()
+        .filter_map(|t| label(&t.view, BRANCH_LABEL))
+        .collect();
+    let mut repos: Vec<(&str, &str)> = Vec::new();
+    for listed in tasks {
+        let Some(repo) = label(&listed.view, "repo").filter(|r| Path::new(r).is_absolute()) else {
+            continue;
+        };
+        if !repos.iter().any(|(known, _)| *known == repo) {
+            if repos.len() >= REPOS_MAX {
+                break;
+            }
+            repos.push((repo, &listed.channel));
+        }
+    }
+    let mut posted = 0usize;
+    for (repo, channel) in repos {
+        let repo = Path::new(repo);
+        let args = [
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            OPEN_PRS_MAX,
+            "--json",
+            OPEN_FIELDS,
+        ];
+        let open = gh(repo, &args).and_then(|out| parse::<Vec<WireOpenPr>>(&out, "gh pr list"));
+        let open = match open {
+            Ok(open) => open,
+            Err(WatchError::RateLimited) => return Err(WatchError::RateLimited),
+            Err(error) => {
+                log(&format!("github watch {}: {error}", repo.display()));
+                continue;
+            }
+        };
+        let unowned = open.iter().filter(|pr| {
+            !pr.is_cross_repository
+                && pr.head_ref_name.starts_with(RIDER_BRANCH_PREFIX)
+                && git::is_safe_ref(&pr.head_ref_name)
+                && !owned.contains(&pr.head_ref_name.as_str())
+        });
+        for pr in unowned.take(WATCHES_MAX) {
+            let watched = Watched {
+                task: None,
+                channel,
+                role: "",
+                repo,
+                branch: &pr.head_ref_name,
+                running: false,
+                dead: &[],
+                resumable: false,
+            };
+            match watch_one(board, &watched, seen, authors) {
+                Ok(count) => posted = posted.saturating_add(count),
+                Err(WatchError::RateLimited) => return Err(WatchError::RateLimited),
+                Err(error) => log(&format!("github watch {}: {error}", pr.head_ref_name)),
+            }
+        }
+    }
+    assert!(posted <= REPOS_MAX * WATCHES_MAX * (1 + 3 * ITEMS_MAX));
     Ok(posted)
 }
 
@@ -389,8 +475,10 @@ fn watch_one(
     };
     if pr.state != "OPEN" {
         seen.forget_pr(&pr.url);
-        seen.make_room(1)?;
-        remember(seen, "", ended_key(watched.task));
+        if let Some(task) = watched.task {
+            seen.make_room(1)?;
+            remember(seen, "", ended_key(task));
+        }
         return Ok(0);
     }
     let path = format!(
@@ -438,14 +526,18 @@ fn watch_one(
             }
             _ => record["route"] = json!("lead"),
         }
-        board
-            .post_record(
-                watched.task,
-                SCHEMA,
-                &record.to_string(),
-                &format!("rider-github-{}-{key}", watched.task.0),
-            )
-            .map_err(|error| WatchError::State(error.to_string()))?;
+        let json = record.to_string();
+        let posted_record = match watched.task {
+            Some(task) => {
+                let idempotency = format!("rider-github-{}-{key}", task.0);
+                board.post_record(task, SCHEMA, &json, &idempotency)
+            }
+            None => {
+                let idempotency = format!("rider-github-unowned-{key}");
+                board.post_thread_record(watched.channel, SCHEMA, &json, &idempotency)
+            }
+        };
+        posted_record.map_err(|error| WatchError::State(error.to_string()))?;
         remember(seen, &pr.url, key);
         posted = posted.saturating_add(1);
     }
@@ -524,7 +616,12 @@ fn queue_fix(
         Fix::Ci => ci_brief(watched, pr)?,
         Fix::Change(brief) => brief,
     };
-    let onto = watched.task.0.to_string();
+    let Some(owner) = watched.task else {
+        return Err(WatchError::State(
+            "a pull request with no task has no owner".into(),
+        ));
+    };
+    let onto = owner.0.to_string();
     let repo = watched.repo.to_string_lossy();
     let labels = [
         ("repo", repo.as_ref()),

@@ -42,7 +42,12 @@ fn given_gh_prints(world: &World, pr_list: &str, comments: &str) {
         r#"#!/bin/sh
 echo "$*" >> '{root}/gh-calls.log'
 case "$1 $2" in
-  pr*) cat '{root}/gh-pr.json' ;;
+  pr*)
+    case " $* " in
+      *" --state open "*) cat '{root}/gh-open.json' 2>/dev/null || echo '[]' ;;
+      *" rider/999-orphan "*) cat '{root}/gh-orphan.json' ;;
+      *) cat '{root}/gh-pr.json' ;;
+    esac ;;
   api*/permission)
     login=$(basename "$(dirname "$2")")
     cat "{root}/gh-permission-$login.json" 2>/dev/null || {{ echo 'HTTP 404' >&2; exit 1; }} ;;
@@ -641,4 +646,61 @@ fn a_full_state_file_keeps_the_fix_round_cap_of_a_watched_pr() {
     thread::sleep(Duration::from_millis(QUIET_MILLIS));
 
     assert_eq!(owned(&project_records(&world)), 2);
+}
+
+fn channel_records(world: &World) -> Vec<Value> {
+    let read = world.vb_lead(&["read", "work/demo", "--limit", "100", "--json"], None);
+    let read: Value = serde_json::from_str(&read).expect("the channel as JSON");
+    let mut stack = vec![&read];
+    let mut found = Vec::new();
+    for _ in 0..100_000 {
+        let Some(value) = stack.pop() else { break };
+        match value {
+            Value::Object(object) if object.get("schema") == Some(&json!("rider-github")) => {
+                found.push(object.get("data").cloned().unwrap_or(Value::Null));
+            }
+            Value::Object(object) => stack.extend(object.values()),
+            Value::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
+    assert!(stack.is_empty(), "the channel read is too deep to walk");
+    found
+}
+
+#[test]
+fn an_open_rider_pr_with_no_task_reaches_the_lead_in_the_project_channel() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let mut orphan: Value =
+        serde_json::from_str(&fixture("pr-list-failed.json")).expect("the fixture parses");
+    orphan[0]["number"] = json!(8);
+    orphan[0]["url"] = json!("https://github.com/example/repo/pull/8");
+    fs::write(world.root.join("gh-orphan.json"), orphan.to_string()).expect("write");
+    let open = json!([{"headRefName": "rider/999-orphan", "isCrossRepository": false},
+        {"headRefName": "feature/by-hand", "isCrossRepository": false}]);
+    fs::write(world.root.join("gh-open.json"), open.to_string()).expect("write");
+    let task = given_a_settled_task(&mut world, Behaviour::CommitThenFail, "failed");
+
+    let deadline = Instant::now() + Duration::from_secs(RECORD_SECONDS_MAX);
+    while channel_records(&world).is_empty() {
+        assert!(Instant::now() < deadline, "{}", world.daemon_log());
+        thread::sleep(Duration::from_millis(200));
+    }
+    when_gh_is_called_again(&world);
+
+    let url = "https://github.com/example/repo/actions/runs/44868640008/job/136737934594";
+    assert_eq!(
+        channel_records(&world),
+        vec![
+            json!({"kind": "checks", "pr": 8, "head": HEAD, "state": "failed",
+            "job": "test", "url": url, "route": "lead"})
+        ]
+    );
+    assert_eq!(
+        task_records(&world, &task, "rider-github"),
+        Vec::<Value>::new()
+    );
 }
