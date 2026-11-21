@@ -62,6 +62,8 @@ const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the Claude session id of its latest completed attempt on one line,
 // then the repository it ran in.
 const SESSION_FILE: &str = "session";
+const RESULT_FILE: &str = "result.json";
+pub const RESULT_FILE_BYTES_MAX: u64 = 64 * 1024;
 const SESSION_FILE_BYTES_MAX: usize = 4096;
 const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as the \
@@ -704,6 +706,13 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     Ok(session)
 }
 
+pub fn result_path(home: &Path, id: TaskId) -> PathBuf {
+    assert!(home.is_absolute());
+    let path = home.join(LOGS_DIR).join(id.0.to_string()).join(RESULT_FILE);
+    assert!(path.starts_with(home));
+    path
+}
+
 fn session_path(home: &Path, id: TaskId) -> PathBuf {
     assert!(home.is_absolute());
     let path = home
@@ -1024,10 +1033,19 @@ fn complete(
         let _ = board.reply(id, &one_line(&note));
     }
     // The record and the note below only inform; losing them must not undo finished work.
-    if let Ok(record) = serde_json::to_string(&record)
-        && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
-    {
-        let _ = board.reply(id, &record);
+    if let Ok(record) = serde_json::to_string(&record) {
+        assert!(record.len() as u64 <= RESULT_FILE_BYTES_MAX);
+        let path = result_path(&env.home, id);
+        if let Err(error) = fs::write(&path, &record) {
+            let note = format!(
+                "Rider could not record the result in {}: {error}.",
+                path.display()
+            );
+            let _ = board.reply(id, &one_line(&note));
+        }
+        if board.post_structured(id, RESULT_SCHEMA, &record).is_err() {
+            let _ = board.reply(id, &record);
+        }
     }
     if let Err(error) = worktree::release(&attempt.checkout, &attempt.brief.repo, &env.home) {
         let why = match error {

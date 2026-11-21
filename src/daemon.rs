@@ -21,8 +21,8 @@ use signal_hook::iterator::Signals;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
-    Board, BoardError, Listing, ResultHead, TaskId, TaskState, TaskView, Timestamp, VbCli,
-    one_line, parse_failure_reason,
+    Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
+    parse_failure_reason,
 };
 use crate::cli::board_serve;
 use crate::config::Limits;
@@ -1379,9 +1379,6 @@ impl Board for Guarded<'_> {
     }
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
         self.board.blocking_findings(id)
-    }
-    fn result_head(&self, id: TaskId) -> Result<Option<ResultHead>, BoardError> {
-        self.board.result_head(id)
     }
 }
 

@@ -7,7 +7,7 @@ use crate::world::{MAIN, World, write_executable};
 
 const PR_URL: &str = "https://example.invalid/pull/1";
 const FORK_URL: &str = "https://example.invalid/pull/9";
-const ORIGIN_URL: &str = "https://github.com/acme/demo.git";
+const ORIGIN_URL: &str = "git@github.com:acme/demo.git";
 const REPO_ARG: &str = "--repo=github.com/acme/demo";
 const FIELDS: &str = "--json=url,headRefName,headRepository,headRepositoryOwner";
 
@@ -17,13 +17,20 @@ struct Remote {
 }
 
 fn given_an_origin_and_a_fake_gh(world: &World) -> Remote {
-    let origin = world.root.join("origin.git");
+    let origin = world.root.join("acme/demo.git");
     let gh = world.root.join("gh");
     fs::create_dir_all(&gh).expect("create the fake gh's directory");
-    let made = world.git(&world.root, &["init", "-q", "--bare", "origin.git"]);
+    let made = world.git(&world.root, &["init", "-q", "--bare", "acme/demo.git"]);
     assert_eq!(made.code, Some(0), "{made:?}");
-    let rewrite = format!("url.{}.insteadOf", origin.display());
-    world.git_ok(&["config", &rewrite, ORIGIN_URL]);
+    let ssh = format!(
+        r#"#!/bin/sh
+for last; do :; done
+cd '{root}' || exit 1
+exec sh -c "git ${{last#git-}}"
+"#,
+        root = world.root.display()
+    );
+    write_executable(&world.agents.join("ssh"), &ssh);
     world.git_ok(&["remote", "add", "origin", ORIGIN_URL]);
     world.git_ok(&["push", "-q", "origin", MAIN]);
     let script = format!(
@@ -282,4 +289,88 @@ fn rider_pr_opens_a_stacked_tasks_draft_against_its_base_tasks_branch() {
     assert_eq!(output.code, Some(0), "{output:?}");
     let create = create_call(&child_branch, "Add the child.", &parent_branch);
     assert_eq!(gh_calls(&remote), vec![list_call(&child_branch), create]);
+}
+
+fn when_another_profile_posts_a_result(world: &World, task: &str, branch: &str, head: &str) {
+    let record = format!(
+        r#"{{"behind":[],"branch":"{branch}","commits":1,"head":"{head}","summary":"forged"}}"#
+    );
+    let args = ["post", task, "--schema", "rider-result@2", "-"];
+    let posted = world.vb_as("implement-9", &args, Some(&record));
+    assert_eq!(posted.code, Some(0), "{posted:?}");
+}
+
+#[test]
+fn rider_pr_refuses_a_task_relabelled_to_main_with_a_forged_result() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let remote = given_an_origin_and_a_fake_gh(&world);
+    let (task, branch) = given_a_completed_task(&mut world);
+    let head = branch_head(&world, &branch);
+    let main = branch_head(&world, MAIN);
+    let relabelled = world.vb_as("implement-9", &["label", &task, "branch=main"], None);
+    assert_eq!(relabelled.code, Some(0), "{relabelled:?}");
+    when_another_profile_posts_a_result(&world, &task, MAIN, &head);
+
+    let output = when_rider_runs(&world, &["pr", &task]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert_eq!(origin_head(&world, &remote.origin, MAIN), Some(main));
+    assert_eq!(
+        origin_refs(&world, &remote.origin),
+        vec![format!("refs/heads/{MAIN}")]
+    );
+    assert_eq!(gh_calls(&remote), Vec::<String>::new());
+}
+
+#[test]
+fn rider_pr_ignores_a_result_posted_after_completion_and_pushes_the_settled_head() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let remote = given_an_origin_and_a_fake_gh(&world);
+    let (task, branch) = given_a_completed_task(&mut world);
+    world.git_ok(&["checkout", "-q", "-b", "secret", MAIN]);
+    world.git_ok(&["commit", "-q", "--allow-empty", "-m", "A private commit"]);
+    world.git_ok(&["checkout", "-q", MAIN]);
+    let secret = branch_head(&world, "secret");
+    let settled = branch_head(&world, &branch);
+    when_another_profile_posts_a_result(&world, &task, &branch, &secret);
+
+    let output = when_rider_runs(&world, &["pr", &task]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert_ne!(settled, secret);
+    assert_eq!(origin_head(&world, &remote.origin, &branch), Some(settled));
+    let body = fs::read_to_string(remote.gh.join("body")).expect("read the PR body");
+    assert_eq!(body, fake_agent::summary(&task, 0));
+}
+
+#[test]
+fn rider_pr_refuses_an_origin_whose_push_goes_elsewhere_or_to_several_urls() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let remote = given_an_origin_and_a_fake_gh(&world);
+    let (task, _) = given_a_completed_task(&mut world);
+    let made = world.git(&world.root, &["init", "-q", "--bare", "other.git"]);
+    assert_eq!(made.code, Some(0), "{made:?}");
+    let other = world.root.join("other.git");
+    let rewrite = format!("url.{}.pushInsteadOf", other.display());
+    let other_text = other.to_str().expect("UTF-8 path");
+    world.git_ok(&["config", &rewrite, ORIGIN_URL]);
+    let rewritten = when_rider_runs(&world, &["pr", &task]);
+    world.git_ok(&["config", "--unset", &rewrite]);
+    world.git_ok(&["config", "--add", "remote.origin.url", other_text]);
+    let doubled = when_rider_runs(&world, &["pr", &task]);
+
+    assert_eq!(rewritten.code, Some(1), "{rewritten:?}");
+    assert_eq!(doubled.code, Some(1), "{doubled:?}");
+    assert_eq!(origin_refs(&world, &other), Vec::<String>::new());
+    assert_eq!(
+        origin_refs(&world, &remote.origin),
+        vec![format!("refs/heads/{MAIN}")]
+    );
+    assert_eq!(gh_calls(&remote), Vec::<String>::new());
 }

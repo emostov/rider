@@ -75,7 +75,6 @@ pub const LISTING_PAGES_MAX: usize = 16;
 pub const REPLIES_MAX: usize = 10_000;
 /// The schema a reviewer posts each finding under.
 const FINDING_SCHEMA: &str = "rider-finding";
-const RESULT_SCHEMA: &str = "rider-result";
 /// The reasons a fenced write gives when its claim is over or was never held.
 const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
 /// The reasons `vb` gives when it could not reach the board at all.
@@ -286,14 +285,6 @@ pub trait Board {
     ) -> Result<Listing, BoardError>;
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
-    fn result_head(&self, id: TaskId) -> Result<Option<ResultHead>, BoardError>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResultHead {
-    pub branch: Option<String>,
-    pub head: String,
-    pub summary: String,
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -951,38 +942,6 @@ pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
     Ok(blocking)
 }
 
-#[derive(Deserialize)]
-struct WireResult {
-    #[serde(deserialize_with = "nullable")]
-    branch: Option<String>,
-    head: String,
-    summary: String,
-}
-
-pub fn parse_result_head(json: &str) -> Result<Option<ResultHead>, BoardError> {
-    let thread: WireReplies = parse(json)?;
-    if thread.replies.len() > REPLIES_MAX {
-        return Err(BoardError::Parse(format!(
-            "a thread of {} replies, over {REPLIES_MAX}",
-            thread.replies.len()
-        )));
-    }
-    let mut blocks = thread.replies.iter().flat_map(|reply| &reply.blocks);
-    let newest = blocks.rfind(|block| block.schema == RESULT_SCHEMA);
-    let Some(block) = newest else {
-        return Ok(None);
-    };
-    let wire = WireResult::deserialize(&block.data);
-    let wire = wire.map_err(|error| BoardError::Parse(format!("a rider-result: {error}")))?;
-    let head = ResultHead {
-        branch: wire.branch,
-        head: wire.head,
-        summary: wire.summary,
-    };
-    assert!(head.head.len() < OUTPUT_BYTES_MAX && head.summary.len() < OUTPUT_BYTES_MAX);
-    Ok(Some(head))
-}
-
 /// The claimed task from the output of a successful `vb tasks claim --json`.
 /// `None` when the board printed a null task.
 pub fn parse_claim(json: &str) -> Result<Option<TaskId>, BoardError> {
@@ -1562,18 +1521,6 @@ impl Board for VbCli {
         }
         parse_blocking_findings(&json)
     }
-
-    fn result_head(&self, id: TaskId) -> Result<Option<ResultHead>, BoardError> {
-        let json = self.read(&Command::Read { id })?;
-        let view = parse_task_view(&json)?;
-        if view.id != id {
-            return Err(BoardError::Parse(format!(
-                "asked for {id:?}, read {:?}",
-                view.id
-            )));
-        }
-        parse_result_head(&json)
-    }
 }
 
 impl VbCli {
@@ -1815,10 +1762,6 @@ pub mod testing {
 
         fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
             self.read_task(id).map(|_| 0)
-        }
-
-        fn result_head(&self, id: TaskId) -> Result<Option<super::ResultHead>, BoardError> {
-            self.read_task(id).map(|_| None)
         }
     }
 }

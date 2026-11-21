@@ -849,13 +849,33 @@ pub fn is_plain_branch(name: &str) -> bool {
     plain
 }
 
-pub fn config_value(repo: &Path, key: &str) -> Result<Option<String>, GitError> {
+// insteadOf, pushInsteadOf, pushurl and a repeated url each send a push somewhere other than,
+// or beyond, the one configured URL.
+pub fn origin_url(repo: &Path) -> Result<Option<String>, GitError> {
     assert!(repo.is_absolute(), "git runs in absolute directories");
-    assert!(!key.starts_with('-') && key.contains('.'));
-    let args = ["config", "--get", "--end-of-options", key].map(OsStr::new);
-    let value = query(repo, &args)?;
-    assert!(value.as_ref().is_none_or(|value| !value.contains('\n')));
-    Ok(value)
+    let queries: [&[&str]; 3] = [
+        &["config", "--get-all", "remote.origin.url"],
+        &["remote", "get-url", "--all", "origin"],
+        &["remote", "get-url", "--push", "--all", "origin"],
+    ];
+    let mut urls: Vec<String> = Vec::with_capacity(queries.len());
+    for query in queries {
+        let args: Vec<&OsStr> = query.iter().map(OsStr::new).collect();
+        let output = run(repo, &args)?;
+        if output.code != Some(0) {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(&output.stdout);
+        let text = text.map_err(|_| parse_error(&args, &output.stdout))?;
+        let mut lines = text.lines();
+        match (lines.next(), lines.next()) {
+            (Some(url), None) if !url.is_empty() => urls.push(url.to_string()),
+            _ => return Ok(None),
+        }
+    }
+    assert_eq!(urls.len(), queries.len());
+    let one = urls.windows(2).all(|pair| pair[0] == pair[1]);
+    Ok(one.then(|| urls.swap_remove(0)))
 }
 
 pub fn remote_branch(repo: &Path, branch: &str) -> Result<Option<String>, GitError> {
