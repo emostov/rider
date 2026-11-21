@@ -73,6 +73,8 @@ pub const TASKS_PAGE_MAX: usize = 200;
 pub const LISTING_PAGES_MAX: usize = 16;
 /// Upper bound on the replies one thread read takes.
 pub const REPLIES_MAX: usize = 10_000;
+/// The profile prefix of a lead, as the ride-swarm skill names it.
+pub const LEAD_PREFIX: &str = "lead-";
 /// The schema a reviewer posts each finding under.
 const FINDING_SCHEMA: &str = "rider-finding";
 /// The reasons a fenced write gives when its claim is over or was never held.
@@ -143,6 +145,25 @@ pub struct Listing {
     pub cursor: Cursor,
     /// The listed tasks past `TASKS_MAX`, which the listing does not return.
     pub left_out: usize,
+}
+
+/// A reply in a task's thread that amends its brief: one by the owner or a lead profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Amendment {
+    pub id: Cursor,
+    /// The lead's profile, or `None` for the owner.
+    pub profile: Option<String>,
+    pub text: String,
+}
+
+/// A task's thread as rider reads it while the task's agent works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    pub state: TaskState,
+    /// The board's cursor when the thread was read: every later reply has a larger id.
+    pub cursor: Cursor,
+    /// At most `REPLIES_MAX`, oldest first.
+    pub amendments: Vec<Amendment>,
 }
 
 #[derive(Debug)]
@@ -285,6 +306,8 @@ pub trait Board {
     ) -> Result<Listing, BoardError>;
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
+    /// Task `id`'s state, the board's cursor, and the replies in its thread that amend it.
+    fn thread(&self, id: TaskId) -> Result<Thread, BoardError>;
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -663,6 +686,28 @@ struct WireRead {
     message: WireMessage,
 }
 
+/// `vb read <id> --json` read for the replies that amend the task.
+#[derive(Deserialize)]
+struct WireTaskThread {
+    message: WireMessage,
+    replies: Vec<WireTextReply>,
+    cursor: String,
+}
+
+#[derive(Deserialize)]
+struct WireTextReply {
+    id: String,
+    text: String,
+    by: WireBy,
+}
+
+/// Who wrote a message: `profile` is null for the owner.
+#[derive(Deserialize)]
+struct WireBy {
+    #[serde(deserialize_with = "nullable")]
+    profile: Option<String>,
+}
+
 /// The replies of `vb read <id> --json`, each with its structured blocks.
 #[derive(Deserialize)]
 struct WireReplies {
@@ -940,6 +985,45 @@ pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
     }
     assert!(blocking <= OUTPUT_BYTES_MAX);
     Ok(blocking)
+}
+
+/// Task `id`'s thread from the output of `vb read <id> --json`.
+pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
+    let thread: WireTaskThread = parse(json)?;
+    if thread.replies.len() > REPLIES_MAX {
+        let count = thread.replies.len();
+        return Err(BoardError::Parse(format!(
+            "a thread of {count} replies, over {REPLIES_MAX}"
+        )));
+    }
+    let view = view_from_wire(thread.message)?;
+    if view.id != id {
+        return Err(BoardError::Parse(format!(
+            "asked for {id:?}, read {:?}",
+            view.id
+        )));
+    }
+    let cursor = Cursor(parse_id_text(&thread.cursor)?.0);
+    let mut amendments: Vec<Amendment> = Vec::new();
+    for reply in thread.replies {
+        let by_lead = reply
+            .by
+            .profile
+            .as_deref()
+            .is_some_and(|p| p.starts_with(LEAD_PREFIX));
+        if reply.by.profile.is_some() && !by_lead {
+            continue;
+        }
+        let id = Cursor(parse_id_text(&reply.id)?.0);
+        let (profile, text) = (reply.by.profile, reply.text);
+        amendments.push(Amendment { id, profile, text });
+    }
+    assert!(amendments.len() <= REPLIES_MAX);
+    Ok(Thread {
+        state: view.state,
+        cursor,
+        amendments,
+    })
 }
 
 /// The claimed task from the output of a successful `vb tasks claim --json`.
@@ -1521,6 +1605,10 @@ impl Board for VbCli {
         }
         parse_blocking_findings(&json)
     }
+
+    fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
+        parse_thread(id, &self.read(&Command::Read { id })?)
+    }
 }
 
 impl VbCli {
@@ -1594,7 +1682,7 @@ pub mod testing {
     use std::collections::VecDeque;
 
     use super::{
-        Board, BoardError, ListedTask, Listing, TaskId, TaskState, TaskView, check_message,
+        Board, BoardError, ListedTask, Listing, TaskId, TaskState, TaskView, Thread, check_message,
     };
     use crate::feed::Cursor;
 
@@ -1762,6 +1850,17 @@ pub mod testing {
 
         fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
             self.read_task(id).map(|_| 0)
+        }
+
+        fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
+            let view = self.read_task(id)?;
+            let (state, cursor) = (view.state, view.version);
+            let amendments = Vec::new();
+            Ok(Thread {
+                state,
+                cursor,
+                amendments,
+            })
         }
     }
 }

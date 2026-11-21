@@ -385,3 +385,64 @@ fn an_onto_task_whose_branch_has_too_many_tasks_to_check_is_blocked_naming_the_o
     );
     assert_eq!(agent_runs(&world), vec![]);
 }
+
+#[test]
+fn a_lead_reply_posted_while_the_agent_runs_resumes_its_session_and_changes_the_result() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    world.vb_lead(
+        &["reply", &task, "-"],
+        Some("Decision blue: use the blue name."),
+    );
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(task_result(&world, &task), Some(fake_agent::heard("blue")));
+    let session = fake_agent::session(&task, 0);
+    let mut resumed = fake_agent::options(&world.root, &task, 0);
+    resumed.extend(["--resume".to_string(), session]);
+    assert_eq!(fake_agent::options(&world.root, &task, 1), resumed);
+    let prompt = agent_prompt(&world, &task, 1);
+    assert!(
+        prompt.contains("Decision blue: use the blue name."),
+        "{prompt}"
+    );
+    let replies = task_replies(&world, &task);
+    let noted = replies.iter().filter_map(|reply| reply["text"].as_str());
+    let noted: Vec<&str> = noted.filter(|text| text.contains("posted while")).collect();
+    assert_eq!(noted.len(), 1, "{replies:?}");
+}
+
+#[test]
+fn a_reply_from_another_worker_is_not_delivered_to_the_running_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    let note = world.vb_as(
+        "implement-9-other",
+        &["reply", &task, "-"],
+        Some("Decision red."),
+    );
+    assert_eq!(note.code, Some(0), "{note:?}");
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(
+        task_result(&world, &task),
+        Some(fake_agent::summary(&task, 0))
+    );
+    assert_eq!(agent_runs_for(&world, &task).len(), 1);
+}

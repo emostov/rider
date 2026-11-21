@@ -100,6 +100,9 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    /// Reports `heard(decision)` for the first `Decision <word>` in its prompt, committing
+    /// nothing; `heard("none")` when its prompt holds none.
+    ReportDecision,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -153,6 +156,7 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::ReportDecision => "report-decision",
         }
     }
 }
@@ -191,6 +195,11 @@ pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
 /// The line a `HoldTalking` agent prints before it holds.
 pub fn hold_line(task: &str) -> String {
     format!(r#"{{"type":"fake","text":"holding task {task}"}}"#)
+}
+
+/// The final message of a `ReportDecision` agent whose prompt held `Decision <decision>`.
+pub fn heard(decision: &str) -> String {
+    format!("Fake agent heard Decision {decision}.")
 }
 
 /// The final message a fake agent reports; it becomes the task's result.
@@ -308,6 +317,11 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  report-decision)
+    for arg in "$@"; do prompt="$arg"; done
+    heard=$(printf '%s\n' "$prompt" | grep -o 'Decision [a-z0-9]*' | head -n 1)
+    [ -n "$heard" ] || heard="Decision none"
+    summary="Fake agent heard $heard." ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'

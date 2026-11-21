@@ -147,13 +147,22 @@ impl SessionId {
     }
 }
 
-/// The command line that runs `spec` on `prompt` in `dir`, starting from a fork of session
-/// `resume` when given (Claude only); the prompt is last, after `--`.
+/// How a Claude agent picks up an earlier session.
+#[derive(Debug, Clone, Copy)]
+pub enum Resume<'a> {
+    /// Starts a new session from a copy of another task's, which stays as it was.
+    Fork(&'a SessionId),
+    /// Goes on in the attempt's own session.
+    InPlace(&'a SessionId),
+}
+
+/// The command line that runs `spec` on `prompt` in `dir`, picking up a session when `resume`
+/// says so (Claude only); the prompt is last, after `--`.
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,
     dir: &Path,
-    resume: Option<&SessionId>,
+    resume: Option<Resume>,
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
     assert!(
@@ -200,13 +209,15 @@ pub fn command_for(
         ),
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
-    if let Some(session) = resume {
+    match resume {
         // Without `--fork-session` Claude appends to the resumed session in place.
-        args.extend([
+        Some(Resume::Fork(session)) => args.extend([
             "--resume".to_string(),
             session.0.clone(),
             "--fork-session".to_string(),
-        ]);
+        ]),
+        Some(Resume::InPlace(session)) => args.extend(["--resume".to_string(), session.0.clone()]),
+        None => {}
     }
     args.push("--".to_string());
     args.push(prompt.to_string());
