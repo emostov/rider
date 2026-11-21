@@ -926,6 +926,31 @@ exec '{}' "$@"
     crate::world::write_executable(&world.vb, &script);
 }
 
+/// Given the first `vb <verb> <task>` run whose arguments also contain `word` reports that it
+/// could not reach the board, as `vb` does when the board is down, and runs nothing.
+pub fn given_vb_cannot_reach_the_board_once(world: &World, verb: &str, task: &str, word: &str) {
+    assert!(task.bytes().all(|b| b.is_ascii_digit()) && !task.is_empty());
+    assert!(!word.contains(['\'', ' ']) && !verb.contains(['\'', ' ']));
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let root = world.root.display();
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1 $2" = '{verb} {task}' ]; then
+  case " $* " in *" {word}"*)
+    if mkdir '{root}/unreachable-{verb}-{task}' 2>/dev/null; then
+      echo '{{"status":"error","reason":"network_error","message":"fetch failed"}}' >&2
+      exit 1
+    fi;;
+  esac
+fi
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
 /// Given every `vb` call that names the board's identity channel fails, and no other.
 pub fn given_vb_fails_the_identity_read(world: &World) {
     let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
