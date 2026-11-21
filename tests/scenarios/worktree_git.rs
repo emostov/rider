@@ -857,12 +857,11 @@ fn a_commit_another_local_branch_also_holds_is_not_the_agents_own() {
         git_in(world, dir, &["branch", "sibling"]);
     });
 
-    then_the_task_failed_because(
-        &world,
-        &task,
-        &state,
-        "the branch has no commits of its own",
-    );
+    assert_eq!(state, "failed");
+    let text = task_text(&world, &task);
+    let reason = "the branch has no commits of its own";
+    assert!(text.contains(reason), "no {reason:?} in {text}");
+    then_the_worktree_is_removed(&world, &task);
 }
 
 #[test]
