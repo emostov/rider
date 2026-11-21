@@ -1182,6 +1182,7 @@ fn complete(
     let end = result.char_indices().nth(SUMMARY_CHARS_MAX);
     let summary = &result[..end.map_or(result.len(), |(index, _)| index)];
     assert!(!summary.trim().is_empty() && summary.chars().count() <= SUMMARY_CHARS_MAX);
+    let recorded = record_session(attempt, &env.home);
     // The fenced write goes first: a retry writes nothing twice, and a lost claim nothing.
     board.complete(id, summary)?;
     // `vb tasks complete` has no precondition on the thread, so a reply posted during the
@@ -1219,7 +1220,7 @@ fn complete(
         head: &work.head,
         summary,
     };
-    if let Err(error) = record_session(attempt, &env.home) {
+    if let Err(error) = recorded {
         let note = format!("Rider could not record the agent's session: {error}.");
         let _ = board.reply(id, &one_line(&note));
     }
