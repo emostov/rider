@@ -42,9 +42,9 @@ test with no behaviour stated. Rename it to the behaviour it asserts.
 
 ## Test below the highest level that reaches the behaviour
 
-A unit test of internals for behaviour a higher-level test, such as an integration or
-end-to-end test, can exercise. Move the assertions up; keep a unit test only for what a
-higher level cannot reach on demand, such as pure-logic edge cases or injected faults.
+A unit test of internals, or a test that calls internal functions directly. Move the
+assertions up to a black-box test that runs the program the way a user does; keep a unit test
+only when the repository's `AGENTS.md` requires one.
 
 ## Redundant test
 

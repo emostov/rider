@@ -72,13 +72,23 @@ fn each_roles_agent_gets_a_short_prompt_with_its_rules_and_no_way_to_settle_its_
 
     assert_eq!((states, exit), (vec!["completed".to_string(); 4], Some(0)));
     let restack = [
+        "Do not write unit tests, and do not add tests that call internal functions",
         "the task has the labels `onto` and `restack=1`",
         "Without\n  `restack=1`, never rebase",
     ];
     then_the_prompt_has(&agent_prompt(&world, &built, 0), "implement", &restack);
     let ancestor = r#"git merge-base --is-ancestor "$start" HEAD"#;
     let reviewer = ["`start` label", START, LEFTOVERS[0], LEFTOVERS[1], ancestor];
-    then_the_prompt_has(&agent_prompt(&world, &review, 0), "review", &reviewer);
+    let unit_tests = "A new unit test, or a test that calls internal functions directly";
+    let review_rules = [
+        reviewer[0],
+        reviewer[1],
+        reviewer[2],
+        reviewer[3],
+        reviewer[4],
+        unit_tests,
+    ];
+    then_the_prompt_has(&agent_prompt(&world, &review, 0), "review", &review_rules);
     then_the_prompt_has(&agent_prompt(&world, &security, 0), "security", &reviewer);
     let tester = [
         "The `of=<id>` label on\n   your task names the task under test.",
@@ -95,6 +105,7 @@ fn each_roles_agent_gets_a_short_prompt_with_its_rules_and_no_way_to_settle_its_
     then_the_prompt_has(&agent_prompt(&world, &qa, 0), "qa", &tester);
     let slop = fs::read_to_string(world.home.join("prompts/slop-rules.md")).expect("slop rules");
     assert!(slop.contains("`AGENTS.md` wins"));
+    assert!(slop.contains("only when the repository's `AGENTS.md` requires one"));
     assert!(slop.lines().count() < SLOP_RULES_LINES_MAX);
 }
 
