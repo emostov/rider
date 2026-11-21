@@ -215,9 +215,13 @@ the protection. The agent's shell may still load the owner's shell profile.
 The risk that remains, which you state to the owner when they opt a repository in: an
 untrusted task still runs as the owner's user with the owner's `HOME`, because the agent CLI
 logs in from it. An agent that the PR's text talks into reading files could read the owner's
-credentials there (`gh`'s login, SSH keys, the keychain) and write files under the Rider
-home, the reviewed-head record among them, until Rider runs agents in a sandbox that denies
-those paths. A task's `untrusted` label is board state an untrusted worker could change on
+credentials there (`gh`'s login, SSH keys, the keychain). The empty `GH_CONFIG_DIR` may not
+hide `gh`'s login: on macOS `gh` keeps its token in the keychain and may still find it. On
+macOS the daemon runs agents in a best-effort sandbox that denies writes to the reviewed
+repository, other tasks' worktrees and scratch directories, the pinned PR files and the
+reviewed-head records. On Linux, or when the daemon itself runs inside a sandbox (its log
+then says agents run unconfined), nothing denies those writes, and `rider queue reviewed`
+refuses an agent only by its `BOARD_TASK` variable, which the agent can unset. A task's `untrusted` label is board state an untrusted worker could change on
 a task that waits on it. This is why only a PR the owner named or a review requested from the
 owner directly is ever prepared, and why only you create tasks: one an untrusted worker
 created is cancelled, never run.

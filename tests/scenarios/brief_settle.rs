@@ -636,3 +636,26 @@ fn a_reply_posted_while_rider_completes_the_task_is_noted_as_undelivered() {
         1
     );
 }
+
+#[test]
+fn a_worker_set_rerun_of_label_does_not_stop_the_leads_reply_reaching_the_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    let labelled = world.vb_as("implement-9-other", &["label", &task, "rerun_of=1"], None);
+    assert_eq!(labelled.code, Some(0), "{labelled:?}");
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    when_the_lead_replies(&world, &task, "Decision blue: use the blue name.");
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(
+        task_result(&world, &task),
+        Some(fake_agent::heard(&["blue"]))
+    );
+}

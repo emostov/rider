@@ -39,6 +39,8 @@ pub const TRIED_WRITES: &str = "agents.json.new cursor.new board.json.new node/p
      board wait roles run node.lock ship.toml prs/7-head/patch.diff prs/7-head/probe queue/reviewed/7 \
      queue/reviewed/probe";
 pub const REPO_WRITES: &str = ".git/config .git/hooks/pre-commit probe";
+pub const OTHER_TASK_WRITES: &str = "worktrees/repo/99/CLAUDE.md worktrees/repo/99/.git \
+     worktrees/repo/100 untrusted/99/work/CLAUDE.md untrusted/100";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,6 +658,9 @@ case "$behaviour" in
     for name in {REPO_WRITES}; do
       if ( : >> "$world/repo/$name" ) 2>/dev/null; then echo "$name written"; else echo "$name refused"; fi
     done > "$world/{ARGS_DIR}/$task-$attempt.repo-writes"
+    for name in {OTHER_TASK_WRITES} untrusted/$task/work/probe; do
+      if ( : >> "$world/rider-home/$name" ) 2>/dev/null; then echo "$name written"; else echo "$name refused"; fi
+    done > "$world/{ARGS_DIR}/$task-$attempt.other-writes"
     commit || exit 1 ;;
   stream-error)
     if [ "$harness" = codex ]; then
@@ -833,6 +838,13 @@ pub fn git_config_writes(world: &Path, task: &str, attempt: u32) -> String {
         .join(ARGS_DIR)
         .join(format!("{task}-{attempt}.git-config"));
     fs::read_to_string(&path).expect("read what the agent wrote to git's directory")
+}
+
+pub fn tried_other_task_writes(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.other-writes"));
+    fs::read_to_string(&path).expect("read what the agent tried to write in other tasks' dirs")
 }
 
 pub fn tried_repo_writes(world: &Path, task: &str, attempt: u32) -> String {

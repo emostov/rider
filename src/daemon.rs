@@ -49,6 +49,8 @@ use crate::queue_files::PRS_DIR;
 use crate::queue_wait::QUEUE_DIR;
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
+#[cfg(target_os = "macos")]
+use crate::run_task::UNTRUSTED_DIR;
 use crate::run_task::{
     Attempt, Env, IdentityUnknown, Judgement, Prepared, RunError, board_identity_at_start,
     judge_attempt, launch_agent, prepare_attempt, release_canceled_idle, release_if_canceled,
@@ -58,6 +60,8 @@ use crate::settle::Verdict;
 #[cfg(target_os = "macos")]
 use crate::socket::SOCKET_FILE;
 use crate::socket::{self, Socket, SocketPath};
+#[cfg(target_os = "macos")]
+use crate::worktree::WORKTREES_DIR;
 
 /// Upper bound on the events waiting for the core; sources block when it is full.
 pub const EVENT_QUEUE_MAX: usize = 1024;
@@ -1257,8 +1261,13 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
         let unreadable = |error: GitError| HarnessError::Spawn(error.to_string());
         if confine && cmd.untrusted {
             let common = git::common_dir(&repo).map_err(unreadable)?;
-            let dirs = [repo.clone(), common];
-            args.extend(confinement(&home, &vb, Confined::Untrusted(dirs))?);
+            let scratch = dir.parent().unwrap_or(dir).to_path_buf();
+            let repo = [repo.clone(), common];
+            args.extend(confinement(
+                &home,
+                &vb,
+                Confined::Untrusted { repo, scratch },
+            )?);
         } else if confine {
             let common = git::common_dir(dir).map_err(unreadable)?;
             let own = git::git_dir(dir).map_err(unreadable)?;
@@ -1303,7 +1312,10 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
 
 enum Confined {
     DaemonGit,
-    Untrusted([PathBuf; 2]),
+    Untrusted {
+        repo: [PathBuf; 2],
+        scratch: PathBuf,
+    },
     Worktree([PathBuf; 3]),
 }
 
@@ -1312,10 +1324,10 @@ enum Confined {
 #[cfg(target_os = "macos")]
 fn confinement(home: &Path, vb: &Path, confined: Confined) -> Result<Vec<String>, HarnessError> {
     let offline = matches!(confined, Confined::DaemonGit);
-    let (repo, untouchable): (&[PathBuf], &[PathBuf]) = match &confined {
-        Confined::Worktree(dirs) => (dirs, &[]),
-        Confined::Untrusted(dirs) => (&[], dirs),
-        Confined::DaemonGit => (&[], &[]),
+    let (repo, untouchable, scratch): (&[PathBuf], &[PathBuf], _) = match &confined {
+        Confined::Worktree(dirs) => (dirs, &[], None),
+        Confined::Untrusted { repo, scratch } => (&[], repo, Some(scratch)),
+        Confined::DaemonGit => (&[], &[], None),
     };
     let unusable = |why: String| HarnessError::Spawn(format!("cannot confine: {why}"));
     let resolve = |path: &Path| {
@@ -1346,9 +1358,18 @@ fn confinement(home: &Path, vb: &Path, confined: Confined) -> Result<Vec<String>
         literals.extend(dir.ancestors().skip(1).map(Path::to_path_buf));
         subpaths.insert(dir);
     }
-    let git = match repo.as_slice() {
-        [] => String::new(),
-        [worktree, common, own] => git_rules(worktree, common, own, &quote)?,
+    let scratch = scratch.map(|scratch| resolve(scratch)).transpose()?;
+    if let Some(scratch) = &scratch {
+        let untrusted = home.join(UNTRUSTED_DIR);
+        if scratch.parent() != Some(untrusted.as_path()) {
+            return Err(unusable(format!("{} is not a scratch", scratch.display())));
+        }
+        subpaths.extend([home.join(WORKTREES_DIR), untrusted]);
+    }
+    let git = match (repo.as_slice(), &scratch) {
+        ([], Some(scratch)) => format!("(allow file-write* (subpath {}))\n", quote(scratch)?),
+        ([], None) => String::new(),
+        ([worktree, common, own], None) => git_rules(worktree, common, own, &quote)?,
         _ => {
             return Err(unusable(
                 "a worktree and its two git directories".to_string(),
@@ -1557,8 +1578,12 @@ fn confines_agents(log: &Log) -> bool {
 #[cfg(not(target_os = "macos"))]
 fn confinement(home: &Path, vb: &Path, confined: Confined) -> Result<Vec<String>, HarnessError> {
     assert!(home.is_absolute() && !vb.as_os_str().is_empty());
-    if let Confined::Worktree(dirs) = confined {
-        assert!(dirs.iter().all(|dir| dir.is_absolute()));
+    match confined {
+        Confined::Worktree(dirs) => assert!(dirs.iter().all(|dir| dir.is_absolute())),
+        Confined::Untrusted { repo, scratch } => {
+            assert!(repo.iter().all(|dir| dir.is_absolute()) && scratch.is_absolute());
+        }
+        Confined::DaemonGit => {}
     }
     Ok(Vec::new())
 }

@@ -32,7 +32,7 @@ use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
 pub const DELIVERY_ROUNDS_MAX: u8 = 3;
-const UNTRUSTED_DIR: &str = "untrusted";
+pub const UNTRUSTED_DIR: &str = "untrusted";
 const UNTRUSTED_MARK: &str = "untrusted";
 const NO_WORKTREE_HEAD: &str = "none";
 const UNTRUSTED_NOTE: &str = "This task is untrusted: you work in a scratch directory that is \

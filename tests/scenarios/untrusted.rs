@@ -286,6 +286,9 @@ fn an_untrusted_agent_runs_in_the_sandbox_and_cannot_write_the_daemons_files() {
     let task = when_the_lead_creates(&world, &task);
     given_the_agent_will(&world, &task, &[Behaviour::TryWrites]);
     given_pinned_pr_files_and_a_reviewed_head(&world);
+    for dir in ["worktrees/repo/99", "untrusted/99/work"] {
+        fs::create_dir_all(world.home.join(dir)).expect("create another task's directory");
+    }
     given_a_running_daemon(&mut world);
 
     let states = when_the_tasks_settle(&world, &[&task]);
@@ -305,6 +308,14 @@ fn an_untrusted_agent_runs_in_the_sandbox_and_cannot_write_the_daemons_files() {
         .map(|name| format!("{name} refused\n"))
         .collect();
     assert_eq!(fake_agent::tried_repo_writes(&world.root, &task, 0), repo);
+    let others: String = (fake_agent::OTHER_TASK_WRITES.split_whitespace())
+        .map(|name| format!("{name} refused\n"))
+        .chain([format!("untrusted/{task}/work/probe written\n")])
+        .collect();
+    assert_eq!(
+        fake_agent::tried_other_task_writes(&world.root, &task, 0),
+        others
+    );
     let scratch = world.home.join("untrusted").join(&task).join("work");
     assert_eq!(agent_runs_for(&world, &task)[0].dir, scratch);
 }

@@ -17,6 +17,7 @@ use serde::de::{DeserializeOwned, Deserializer, IgnoredAny};
 
 use crate::core::TASKS_MAX;
 use crate::feed::Cursor;
+use crate::roles::{LEAD_PREFIX, LEAD_PROFILE};
 
 /// A task's ID on the board. The board prints IDs as decimal strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1152,11 +1153,14 @@ pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     let cursor = Cursor(parse_id_text(&thread.cursor)?.0);
     let mut amendments: Vec<Amendment> = Vec::new();
     let mut others: Vec<Amendment> = Vec::new();
-    let made_by_rider = view.labels.iter().any(|(key, _)| key == RERUN_OF_LABEL);
+    // The board names a profile's actor `<owner>+<profile>`.
+    let made_by_lead = (creator.strip_prefix(owner.as_str()))
+        .and_then(|rest| rest.strip_prefix('+'))
+        .is_some_and(|profile| profile == LEAD_PROFILE || profile.starts_with(LEAD_PREFIX));
     for reply in thread.replies {
         let by = &reply.by;
         // The board verifies `actor` and `principal`; a profile is only a name its login picks.
-        let by_creator = by.actor == creator && !made_by_rider;
+        let by_creator = by.actor == creator && made_by_lead;
         let amends = by.principal == owner && (by.actor == owner || by_creator);
         let id = Cursor(parse_id_text(&reply.id)?.0);
         let (profile, text) = (reply.by.profile, reply.text);

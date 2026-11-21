@@ -18,7 +18,7 @@ const BRANCH_PREFIX: &str = "rider/";
 const HEADS_PREFIX: &str = "refs/heads/";
 // A branch label must still be a safe ref once `HEADS_PREFIX` makes it a full ref.
 const BRANCH_BYTES_MAX: usize = REF_BYTES_MAX - HEADS_PREFIX.len();
-const WORKTREES_DIR: &str = "worktrees";
+pub const WORKTREES_DIR: &str = "worktrees";
 pub const TASK_DIRS_MAX: usize = 1024;
 const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
