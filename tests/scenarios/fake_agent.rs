@@ -15,13 +15,21 @@ const BEHAVIOURS_DIR: &str = "agent-behaviours";
 const RELEASES_DIR: &str = "agent-releases";
 const ARGS_DIR: &str = "agent-args";
 const HEADS_DIR: &str = "agent-heads";
+const STREAMS_DIR: &str = "agent-streams";
+const LEFTOVERS_DIR: &str = "agent-leftovers";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
+/// The line a `ComplainThenExitNonZero` agent prints on stderr.
+pub const STDERR_LINE: &str = "fake agent complains on stderr";
 /// How long the one line a `LongLine` agent prints is, in bytes.
 pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
+/// How long the process a `CommitLeavingOrphan` or `CommitLeavingEscapee` agent leaves lives.
+pub const LEFTOVER_SECONDS: u64 = 30;
+/// How many bytes a `CommitFlooding` agent prints after its report.
+pub const FLOOD_BYTES: u64 = 65 * 1024 * 1024;
 pub const PR_REF: &str = "refs/rider/pr/412";
 
 /// What a fake agent does in one attempt.
@@ -126,6 +134,18 @@ pub enum Behaviour {
     ReportHugeUsage,
     /// Commits like `Commit` when run as `claude`, then prints the harness's recorded fixture.
     ReplayRecorded,
+    /// Commits like `Commit`, then prints the text given by `stream` as its whole output
+    /// stream and exits 0.
+    CommitReplaying,
+    /// Commits and reports like `Commit`, then exits leaving a process in its group that
+    /// holds its output open for `LEFTOVER_SECONDS`.
+    CommitLeavingOrphan,
+    /// Like `CommitLeavingOrphan`, but the process it leaves is in a process group of its own.
+    CommitLeavingEscapee,
+    /// Commits and reports like `Commit`, then prints `FLOOD_BYTES` bytes and exits 0.
+    CommitFlooding,
+    /// Prints `STDERR_LINE` on stderr and exits `FAIL_EXIT_CODE`.
+    ComplainThenExitNonZero,
     /// Prints a stream in its harness's shape with `STREAM_MESSAGES`, a failed tool call and
     /// `STREAM_ERROR` as the run's error, then exits `FAIL_EXIT_CODE`.
     StreamError,
@@ -223,6 +243,11 @@ impl Behaviour {
             Behaviour::CommitRepeatingUsage => "commit-repeating-usage",
             Behaviour::ReportHugeUsage => "report-huge-usage",
             Behaviour::ReplayRecorded => "replay-recorded",
+            Behaviour::CommitReplaying => "commit-replaying",
+            Behaviour::CommitLeavingOrphan => "commit-leaving-orphan",
+            Behaviour::CommitLeavingEscapee => "commit-leaving-escapee",
+            Behaviour::CommitFlooding => "commit-flooding",
+            Behaviour::ComplainThenExitNonZero => "complain-then-exit-non-zero",
             Behaviour::StreamError => "stream-error",
             Behaviour::StreamForged => "stream-forged",
             Behaviour::StreamThenStderr => "stream-then-stderr",
@@ -316,6 +341,7 @@ fn script() -> String {
             )
         });
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/harness");
+    let (leftover, flood) = (LEFTOVER_SECONDS, FLOOD_BYTES);
     let ([said0, said1], error) = (STREAM_MESSAGES, STREAM_ERROR);
     let (command, tool_error, stderr_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR, STDERR_ERROR);
     format!(
@@ -333,6 +359,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+echo "$#" > "$world/{ARGS_DIR}/$task-$attempt.argc"
 [ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
@@ -394,6 +421,7 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  complain-then-exit-non-zero) echo "{STDERR_LINE}" >&2; exit {fail} ;;
   review-nothing) exit 0 ;;
   review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
   content-filter-stop)
@@ -471,6 +499,21 @@ case "$behaviour" in
     mv "$stops.new" "$stops"
     hold
     commit || exit 1 ;;
+  commit-replaying) commit || exit 1; cat "$world/{STREAMS_DIR}/$task"; exit 0 ;;
+  commit-leaving-orphan)
+    commit || exit 1; report
+    sleep {leftover} & echo $! > "$world/{LEFTOVERS_DIR}/$task"; exit 0 ;;
+  commit-leaving-escapee)
+    commit || exit 1; report
+    pidfile="$world/{LEFTOVERS_DIR}/$task"
+    perl -e 'setpgrp(0, 0); open(my $f, ">", $ARGV[1]) or exit 1; print $f "$$\n";
+      close($f); exec "sleep", $ARGV[0]' {leftover} "$pidfile" &
+    step=0
+    until [ -s "$pidfile" ]; do
+      step=$((step + 1)); [ "$step" -le {steps} ] || exit 1; sleep 0.1
+    done
+    exit 0 ;;
+  commit-flooding) commit || exit 1; report; yes | head -c {flood}; exit 0 ;;
   stream-error)
     if [ "$harness" = codex ]; then
       echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
@@ -549,7 +592,14 @@ pub fn install(world: &Path, agents: &Path) {
     for name in ["claude", "codex"] {
         write_executable(&agents.join(name), &text);
     }
-    for dir in [BEHAVIOURS_DIR, RELEASES_DIR, ARGS_DIR, HEADS_DIR] {
+    for dir in [
+        BEHAVIOURS_DIR,
+        RELEASES_DIR,
+        ARGS_DIR,
+        HEADS_DIR,
+        STREAMS_DIR,
+        LEFTOVERS_DIR,
+    ] {
         fs::create_dir_all(world.join(dir)).expect("create an agent directory");
     }
     assert!(agents.join("claude").is_file() && agents.join("codex").is_file());
@@ -564,10 +614,35 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
     assert!(path.is_file());
 }
 
+/// Makes a `CommitReplaying` agent of `task` print `text` as its output stream.
+pub fn stream(world: &Path, task: &str, text: &[u8]) {
+    assert!(!task.is_empty());
+    let path = world.join(STREAMS_DIR).join(task);
+    fs::write(&path, text).expect("write an agent's stream");
+    assert!(path.is_file());
+}
+
+/// The pid of the process a `CommitLeavingOrphan` or `CommitLeavingEscapee` agent of `task`
+/// left running.
+pub fn leftover(world: &Path, task: &str) -> u32 {
+    let path = world.join(LEFTOVERS_DIR).join(task);
+    let text = fs::read_to_string(&path).expect("read a leftover's pid");
+    let pid = text.trim().parse().expect("a leftover's pid");
+    assert!(pid > 1);
+    pid
+}
+
 /// What attempt `attempt` of `task`, started as `codex review`, read from its standard input.
 pub fn stdin(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.stdin"));
     fs::read_to_string(&path).expect("read an agent's standard input")
+}
+
+/// How many arguments attempt `attempt` of `task` was started with.
+pub fn arg_count(world: &Path, task: &str, attempt: u32) -> usize {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.argc"));
+    let text = fs::read_to_string(&path).expect("read an agent's argument count");
+    text.trim().parse().expect("an argument count")
 }
 
 /// The arguments attempt `attempt` of `task` was started with, one per line.

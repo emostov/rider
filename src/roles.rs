@@ -33,6 +33,7 @@ pub struct RoleSpec {
     /// A file name under `prompts/`, or an absolute path to the user's own prompt.
     pub prompt_file: &'static str,
     pub skills: &'static [&'static str],
+    pub enabled: bool,
 }
 
 /// The roles one repository overrides, each merged over the role of the same label.
@@ -65,6 +66,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 12,
         prompt_file: "implement.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "light",
@@ -80,6 +82,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 12,
         prompt_file: "implement.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "review",
@@ -95,6 +98,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 8,
         prompt_file: "review.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "native-review",
@@ -110,6 +114,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 8,
         prompt_file: "native-review.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "security",
@@ -125,6 +130,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 2,
         prompt_file: "security.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "qa",
@@ -140,6 +146,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 2,
         prompt_file: "qa.md",
         skills: &[],
+        enabled: true,
     },
 ];
 
@@ -154,6 +161,7 @@ const _: () = {
         assert!(ROLES[index].pool_slots <= ROLES[index].slots);
         assert!(ROLES[index].commits_expected || ROLES[index].needs_of);
         assert!(ROLES[index].skills.is_empty());
+        assert!(ROLES[index].enabled);
         index += 1;
     }
 };

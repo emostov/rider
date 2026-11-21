@@ -63,6 +63,8 @@ Text that begins with `-` is read by `vb` as an option. So:
    the code it touches; run a test only to prove a finding, never the whole suite. Write
    failing cases outside the worktree. A finding needs evidence: a command, an input, or a line of code
    that shows it. Do not report style preferences.
+   A new unit test, or a test that calls internal functions directly, is a finding: name the
+   black-box test that should replace it.
 6. Post each finding as its own structured reply. `severity` is `blocking` only when the
    failure is reachable in normal operation, leaks processes, files or claims, or is a security
    hole; a leak or a security hole is always `blocking`. Any other failure that needs a rare

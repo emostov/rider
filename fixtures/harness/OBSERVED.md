@@ -8,7 +8,8 @@ All runs: exit 0, `ok.txt` committed, final message `DONE`.
 ## Claude Code
 
 ```
-claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-skip-permissions "<prompt>"
+claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-skip-permissions \
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}' -- "<prompt>"
 ```
 
 - Run with cwd set to the worktree. There is no working-directory flag in use.
@@ -32,7 +33,8 @@ claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-sk
 ## Codex
 
 ```
-codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox -C <DIR> "<prompt>"
+codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox \
+  --disable plugins --disable apps -C <DIR> -- "<prompt>"
 ```
 
 - Flags match the brief. `--skip-git-repo-check` also exists but was not needed.
@@ -107,6 +109,29 @@ codex review -c model="gpt-6.2-sol" -c sandbox_mode="danger-full-access" -c appr
 - Posting: with a prompt that tells it to, it ran `vb post "$BOARD_TASK" --schema
   rider-finding@1 -` itself on a scratch `vb serve` board and the record was accepted, so a
   worker on this harness posts findings and its result with `vb` as a `codex exec` review does.
+
+## MCP servers
+
+Observed on 2026-11-20 with Claude Code 2.1.x and codex-cli 0.170.0, prompt `Reply with the single word DONE.`, in a fresh empty git repo.
+
+- Claude: `claude --help` lists `--mcp-config <configs...>` ("Load MCP servers from JSON files or strings") and `--strict-mcp-config` ("Only use MCP servers from --mcp-config, ignoring all other MCP configurations"). The inline string `'{"mcpServers":{}}'` is accepted; no file is needed. `--mcp-config` takes several values, so the next argument must be an option or `--`. Built-in tools stay. Measured with `--model claude-haiku-5-5`:
+
+  | | init `tools` | init `mcp_servers` | first request input tokens |
+  | --- | --- | --- | --- |
+  | user's MCP setup | 333 | 27 | 41,036 |
+  | `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` | 27 | 0 | 29,666 |
+
+- Codex: `-c mcp_servers={}` does not remove servers. `codex -c 'mcp_servers={}' mcp list` still lists every server, because the override is merged into the config table instead of replacing it. Plugins and apps add servers of their own; `--disable plugins --disable apps` (the `-c features.<name>=false` shorthand) removes those: `codex --disable plugins --disable apps mcp list` lists only the servers declared under `[mcp_servers.*]` in `~/.codex/config.toml`. Turn input tokens for `codex exec`: 19,938 before, 17,281 after. `--ignore-user-config` also drops the model provider, so it is not used.
+
+  Re-checked on 2026-11-21 with codex-cli 0.170.0 and a scratch `CODEX_HOME` whose `config.toml` declares `[mcp_servers.alpha]` and `[mcp_servers.beta]`: `codex mcp list` and `codex -c 'mcp_servers={}' mcp list` show both `enabled`; `codex -c 'mcp_servers.alpha.enabled=false' mcp list` shows `alpha` `disabled` and `beta` `enabled`. Naming a server the configuration lacks (`-c 'mcp_servers.gamma.enabled=false'`) fails: `failed to load bootstrap configuration ... invalid transport in mcp_servers.gamma`. So Rider reads the server names from `$CODEX_HOME/config.toml` (`~/.codex/config.toml` when unset) and passes `-c mcp_servers.<name>.enabled=false` for each, to `codex exec` and to `codex review`, which takes `-c` the same way.
+
+  Re-checked on 2026-11-21 with codex-cli 0.170.0, `codex mcp list` only, in a linked worktree (`git worktree add --detach`) of a repository whose branch commits `.codex/config.toml` declaring a `command` server and a `url` server:
+  - With `[projects."<repo>"] trust_level = "trusted"` in the user's config (the path as `pwd -P` prints it), the worktree inherits the trust and both project servers are listed `enabled`. Without the trust entry they are not loaded.
+  - `-c 'projects."<repo or worktree>".trust_level="untrusted"'` does not stop them loading.
+  - `-c mcp_servers.<name>.enabled=false` turns a project server off when the project is trusted, but fails (`invalid transport`) when it is not, since no loaded layer declares the name. Adding a stand-in transport of the server's own kind holds either way: `-c mcp_servers.<name>.command="true"` for a `command` server, `-c mcp_servers.<name>.url="http://127.0.0.1:1/"` for a `url` server; giving a `url` server a `command` fails with `url is not supported for stdio`. So Rider reads `<worktree>/.codex/config.toml` after preparing the worktree and passes both settings for each server it declares.
+  - An empty `CODEX_HOME` is treated as unset: Codex warns `codex_home: <HOME>/.codex` and reads that, so Rider does too.
+  - `codex review --help` lists `--disable <FEATURE>`; `codex review` takes `--disable plugins --disable apps` as `codex exec` does.
+  - A `toml` parse error's text quotes the offending line, so Rider reports only the file and the line number.
 
 ## tact
 

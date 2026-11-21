@@ -53,6 +53,10 @@ Post milestones, not heartbeats: a reply is a finished step with its command and
    (the brief's proof command).
 3. Do the work. Change only the paths the brief says the task owns. If the work needs a file
    outside them, or the brief is unclear or wrong, ask (see below). Do not guess.
+   Pin behaviour from outside: add or change a black-box test (a scenario, integration or
+   end-to-end test that runs the program the way a user does) before changing the behaviour,
+   and see it fail. Do not write unit tests, and do not add tests that call internal functions
+   directly, unless the repository's `AGENTS.md` requires them.
 4. After each meaningful step, reply with what you did, the command you ran, and its result.
 5. Run the brief's proof command. Fix the work until it passes. Then run each scenario the
    task added or changed one at a time (`cargo test --test scenarios <name>`) and

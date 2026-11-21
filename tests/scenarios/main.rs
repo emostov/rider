@@ -1,6 +1,8 @@
 //! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
+mod agent_process;
+mod agent_stream;
 mod board_feed;
 mod brief_settle;
 mod codex_review;
@@ -15,6 +17,7 @@ mod queue;
 mod queue_unclaimed;
 mod review_pr;
 mod run_task;
+mod shipped_prompts;
 mod skills;
 mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
@@ -35,6 +38,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use fake_agent::{Behaviour, Run};
+use shipped_prompts::shipped_schema;
 use steps::*;
 use world::{MAIN, PROJECT, World};
 
@@ -60,6 +64,17 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
         "summary": fake_agent::summary(&task, 0),
         "behind": [],
     });
+    let schema = shipped_schema("rider-result@3.json");
+    let fields: Vec<&String> = record.as_object().expect("an object").keys().collect();
+    let mut required: Vec<&str> = (schema["required"].as_array().expect("required fields"))
+        .iter()
+        .map(|field| field.as_str().expect("a field name"))
+        .collect();
+    required.sort_unstable();
+    assert_eq!(required, fields);
+    for field in fields {
+        assert!(schema["properties"][field].is_object(), "{field}");
+    }
     assert_eq!(task_records(&world, &task, "rider-result"), vec![record]);
 }
 
@@ -387,6 +402,7 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
         .role("review");
     let review = when_the_lead_creates(&world, &review);
     given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+    given_the_users_codex_config_declares_mcp_servers(&world, &["beta", "alpha"]);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
 
@@ -398,6 +414,21 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
     let runs = agent_runs_for(&world, &review);
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].dir, worktree_dir(&world, &review));
+    let dir = worktree_dir(&world, &review).display().to_string();
+    let options = ["exec", "-c", "mcp_servers.alpha.enabled=false"]
+        .into_iter()
+        .chain(["-c", "mcp_servers.beta.enabled=false"])
+        .chain(["--model", "gpt-6.1-sol", "--json"])
+        .chain(["--dangerously-bypass-approvals-and-sandbox"])
+        .chain(["--disable", "plugins", "--disable", "apps", "-C", &dir]);
+    let expected: Vec<String> = options.map(String::from).collect();
+    assert_eq!(fake_agent::options(&world.root, &review, 0), expected);
+    let count = fake_agent::arg_count(&world.root, &review, 0);
+    assert_eq!(
+        count,
+        expected.len() + 2,
+        "one prompt argument follows `--`"
+    );
     assert_eq!(task_label(&world, &review, "branch"), None);
     assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
     then_the_worktree_is_removed(&world, &review);
@@ -1111,6 +1142,69 @@ fn a_task_labelled_with_the_removed_polish_role_is_left_unclaimed_as_an_unknown_
 }
 
 #[test]
+fn a_task_of_a_role_turned_off_in_rider_toml_is_blocked_unclaimed_naming_the_setting() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nenabled = false\n");
+    let new = an_implement_task(&world, "Add the work.").role("light");
+    let task = when_the_lead_creates(&world, &new);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = "Change the `role` label from \"light\": the role is turned off by \
+                  `enabled = false` under [roles.light] in rider.toml.";
+    let block = Some(("invalid_brief".to_string(), reason.to_string()));
+    assert_eq!(task_block(&world, &task), block);
+    assert_eq!(task_epoch(&world, &task), 0);
+    assert_eq!(agent_runs(&world), vec![]);
+}
+
+#[test]
+fn rider_config_shows_a_built_in_role_turned_off() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.security]\nenabled = false\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let default = include_str!("rider-config-default.toml");
+    let header = "[roles.security]\n";
+    let expected = default.replacen(header, &format!("{header}enabled = false\n"), 1);
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn a_rider_toml_role_named_like_the_lead_is_refused_naming_the_role() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    for label in ["lead", "lead-x"] {
+        let toml = format!(
+            r#"[roles.{label}]
+harness = "claude"
+model = "claude-lead-model"
+title = "{label}"
+model_name = "Lead Model"
+model_slug = "lead-model"
+prompt = "implement"
+commits = true
+"#
+        );
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{output:?}");
+        let field = format!("roles.{label} is reserved");
+        assert!(output.stderr.contains(&field), "{output:?}");
+    }
+}
+
+#[test]
 fn rider_config_for_a_repository_prints_its_merged_role_table() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
@@ -1776,6 +1870,9 @@ fn claude_options(session: Option<&str>) -> Vec<String> {
         "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
+        "--strict-mcp-config",
+        "--mcp-config",
+        r#"{"mcpServers":{}}"#,
     ]
     .map(String::from)
     .into();

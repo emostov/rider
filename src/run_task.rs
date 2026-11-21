@@ -406,17 +406,18 @@ impl Attempt {
             Harness::Codex | Harness::CodexReview => None,
         };
         let dir = &self.checkout.dir;
+        let servers = harness::codex_mcp_overrides(&self.brief.role.harness, dir).ok()?;
         let (cmd, how) = match &session {
             Some(session) => {
                 let resume = Some(Resume::InPlace(session));
-                let cmd = command_for(self.brief.role, &render(new), dir, resume);
+                let cmd = command_for(self.brief.role, &render(new), dir, resume, &servers);
                 (cmd, "resuming the agent's session")
             }
             None => {
                 let mut all = self.delivery().delivered.clone();
                 all.extend_from_slice(new);
                 let prompt = format!("{}\n\n{RETRY_NOTE}\n\n{}", self.prompt, render(&all));
-                let cmd = command_for(self.brief.role, &prompt, dir, None);
+                let cmd = command_for(self.brief.role, &prompt, dir, None, &servers);
                 (cmd, "running the agent again in its worktree")
             }
         };
@@ -873,15 +874,31 @@ fn prepare(
     });
     let resume = session.and_then(Result::ok);
     let id = brief.id.0.to_string();
+    let cannot = |error: HarnessError| {
+        let reason = format!(
+            "Rider cannot build the agent's command: {}.",
+            harness_reason(&error)
+        );
+        Block::new("rider_error", reason)
+    };
+    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
+        Ok(checkout) => checkout,
+        Err(WorktreeError::Board(error)) if error.call_failed() => {
+            return Err(Unprepared::CallFailed(error));
+        }
+        Err(error) => return Err(worktree_block(&error).into()),
+    };
+    assert!(checkout.dir == dir);
+    let servers = harness::codex_mcp_overrides(&brief.role.harness, &dir).map_err(cannot)?;
     let command = |resume: Option<&SessionId>| {
-        let cmd = command_for(brief.role, &prompt, &dir, resume.map(Resume::Fork));
-        let mut cmd = cmd.map_err(|error| {
-            let reason = format!(
-                "Rider cannot build the agent's command: {}.",
-                harness_reason(&error)
-            );
-            Block::new("rider_error", reason)
-        })?;
+        let cmd = command_for(
+            brief.role,
+            &prompt,
+            &dir,
+            resume.map(Resume::Fork),
+            &servers,
+        );
+        let mut cmd = cmd.map_err(cannot)?;
         cmd.env.extend([
             ("BOARD_TASK".to_string(), id.clone()),
             ("BOARD_PROFILE".to_string(), env.profile.clone()),
@@ -897,14 +914,6 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
-        Ok(checkout) => checkout,
-        Err(WorktreeError::Board(error)) if error.call_failed() => {
-            return Err(Unprepared::CallFailed(error));
-        }
-        Err(error) => return Err(worktree_block(&error).into()),
-    };
-    assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
     assert!(log.is_absolute());
     let start = start.filter(|value| git::commit_exists(&checkout.dir, value).unwrap_or(false));
@@ -1129,7 +1138,8 @@ fn harness_reason(error: &HarnessError) -> String {
         HarnessError::Spawn(_)
         | HarnessError::Log(_)
         | HarnessError::Wait(_)
-        | HarnessError::ReadersExhausted => error.to_string(),
+        | HarnessError::ReadersExhausted
+        | HarnessError::CodexConfig(_) => error.to_string(),
     }
 }
 

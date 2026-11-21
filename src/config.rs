@@ -32,6 +32,7 @@ pub const REPOS_MAX: usize = 64;
 /// Upper bound on the skills one role runs.
 pub const SKILLS_MAX: usize = 8;
 const SKILL_LEN_MAX: usize = 64;
+const LEAD: &str = "lead";
 const MISSING: &str = "is missing for a role that is not built in";
 const _: () = assert!(AGENTS_MAX < 100);
 
@@ -162,6 +163,8 @@ enum HarnessName {
 #[serde(deny_unknown_fields)]
 struct RoleShape {
     #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     harness: Option<HarnessName>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -195,6 +198,7 @@ impl RoleShape {
         let prompt = spec.prompt_file.strip_suffix(PROMPT_SUFFIX);
         assert!(prompt.is_some(), "built-in prompts are .md files");
         RoleShape {
+            enabled: None,
             harness: Some(harness),
             model: Some(spec.model.to_string()),
             title: Some(spec.title.to_string()),
@@ -211,6 +215,7 @@ impl RoleShape {
 
     fn overlay(&mut self, over: RoleShape) {
         let RoleShape {
+            enabled,
             harness,
             model,
             title,
@@ -223,6 +228,7 @@ impl RoleShape {
             slots,
             skills,
         } = over;
+        self.enabled = enabled.or(self.enabled);
         self.harness = harness.or(self.harness);
         self.model = model.or(self.model.take());
         self.title = title.or(self.title.take());
@@ -459,6 +465,10 @@ fn role_spec(
             problem.into(),
         ));
     }
+    if label == LEAD || label.starts_with(&format!("{LEAD}-")) {
+        let problem = format!("is reserved: profiles beginning `{LEAD}-` belong to the lead");
+        return Err(field_error(path, format!("{prefix}roles.{label}"), problem));
+    }
     let harness = match role.harness.ok_or_else(|| missing("harness"))? {
         HarnessName::Claude => Harness::Claude,
         HarnessName::Codex => Harness::Codex,
@@ -516,6 +526,7 @@ fn role_spec(
         pool_slots,
         prompt_file: String::leak(prompt_file),
         skills,
+        enabled: role.enabled.unwrap_or(true),
     })
 }
 

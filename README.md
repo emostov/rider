@@ -12,7 +12,7 @@ Rider runs one agent per task, each in its own git worktree, with a model picked
 - **Ship many features at once.** Say `ride a swarm to <goal>`: a feature, a milestone or a
   list of GitHub issues. One lead plans it; agents build it in parallel.
 - **The right model for each job.** Opus builds, Sonnet takes small edits, Codex reviews and
-  Mythos checks security. Change any role or add your own.
+  Mythos checks security. Change any role, turn one off, or add your own.
 - **Every PR reviewed by other models.** Two Codex reviews, one fix, then a Mythos security
   pass, before anything merges.
 - **From goal to merged PR.** Rider opens draft PRs, gets CI green and answers review threads.
