@@ -1,6 +1,7 @@
 //! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
+mod agent_stream;
 mod board_feed;
 mod brief_settle;
 #[expect(
@@ -10,6 +11,7 @@ mod brief_settle;
 mod fake_agent;
 mod harness_cli;
 mod run_task;
+mod shipped_prompts;
 mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
@@ -29,6 +31,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use fake_agent::{Behaviour, Run};
+use shipped_prompts::shipped_schema;
 use steps::*;
 use world::{MAIN, PROJECT, World};
 
@@ -54,6 +57,17 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
         "summary": fake_agent::summary(&task, 0),
         "behind": [],
     });
+    let schema = shipped_schema("rider-result@2.json");
+    let fields: Vec<&String> = record.as_object().expect("an object").keys().collect();
+    let mut required: Vec<&str> = (schema["required"].as_array().expect("required fields"))
+        .iter()
+        .map(|field| field.as_str().expect("a field name"))
+        .collect();
+    required.sort_unstable();
+    assert_eq!(required, fields);
+    for field in fields {
+        assert!(schema["properties"][field].is_object(), "{field}");
+    }
     assert_eq!(task_records(&world, &task, "rider-result"), vec![record]);
 }
 
@@ -233,6 +247,12 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
     let runs = agent_runs_for(&world, &review);
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].dir, worktree_dir(&world, &review));
+    let dir = worktree_dir(&world, &review).display().to_string();
+    let options = ["exec", "--model", "gpt-6.1-sol", "--json"]
+        .into_iter()
+        .chain(["--dangerously-bypass-approvals-and-sandbox", "-C", &dir]);
+    let expected: Vec<String> = options.map(String::from).collect();
+    assert_eq!(fake_agent::options(&world.root, &review, 0), expected);
     assert_eq!(task_label(&world, &review, "branch"), None);
     assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
     then_the_worktree_is_removed(&world, &review);

@@ -15,6 +15,7 @@ const BEHAVIOURS_DIR: &str = "agent-behaviours";
 const RELEASES_DIR: &str = "agent-releases";
 const ARGS_DIR: &str = "agent-args";
 const HEADS_DIR: &str = "agent-heads";
+const STREAMS_DIR: &str = "agent-streams";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
@@ -100,6 +101,9 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    /// Commits like `Commit`, then prints the text given by `stream` as its whole output
+    /// stream and exits 0.
+    CommitReplaying,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -153,6 +157,7 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::CommitReplaying => "commit-replaying",
         }
     }
 }
@@ -308,6 +313,7 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  commit-replaying) commit || exit 1; cat "$world/{STREAMS_DIR}/$task"; exit 0 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
@@ -338,7 +344,13 @@ pub fn install(world: &Path, agents: &Path) {
     for name in ["claude", "codex"] {
         write_executable(&agents.join(name), &text);
     }
-    for dir in [BEHAVIOURS_DIR, RELEASES_DIR, ARGS_DIR, HEADS_DIR] {
+    for dir in [
+        BEHAVIOURS_DIR,
+        RELEASES_DIR,
+        ARGS_DIR,
+        HEADS_DIR,
+        STREAMS_DIR,
+    ] {
         fs::create_dir_all(world.join(dir)).expect("create an agent directory");
     }
     assert!(agents.join("claude").is_file() && agents.join("codex").is_file());
@@ -350,6 +362,14 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
     let words: Vec<&str> = plan.iter().map(|b| b.word()).collect();
     let path = world.join(BEHAVIOURS_DIR).join(task);
     fs::write(&path, format!("{}\n", words.join("\n"))).expect("write an agent's plan");
+    assert!(path.is_file());
+}
+
+/// Makes a `CommitReplaying` agent of `task` print `text` as its output stream.
+pub fn stream(world: &Path, task: &str, text: &[u8]) {
+    assert!(!task.is_empty());
+    let path = world.join(STREAMS_DIR).join(task);
+    fs::write(&path, text).expect("write an agent's stream");
     assert!(path.is_file());
 }
 
