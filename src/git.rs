@@ -53,15 +53,22 @@ static CONFINED: OnceLock<Confined> = OnceLock::new();
 const WORKTREE_LIST: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
 // An agent can write the repository's config, so the settings that make git run a command
 // are overridden where Rider never needs them: `-c` outranks every config file.
-const SAFE_CONFIG: [&str; 7] = [
+const SAFE_CONFIG: [&str; 12] = [
     "core.fsmonitor=false",
     "core.sshCommand=ssh",
+    "credential.helper=",
+    "core.askPass=",
     "core.hooksPath=/dev/null",
     "core.pager=cat",
     "core.editor=false",
     "log.showSignature=false",
     "gpg.program=false",
+    "gpg.ssh.program=false",
+    "gpg.x509.program=false",
+    "push.gpgSign=false",
 ];
+const ASKPASS: [&str; 2] = ["GIT_ASKPASS", "SSH_ASKPASS"];
+const REFUSING: &str = "/usr/bin/false";
 
 struct Confined {
     git: PathBuf,
@@ -346,6 +353,9 @@ pub fn hardened() -> Process {
         command.env_remove(name);
     }
     command.env("GIT_NO_LAZY_FETCH", "1");
+    for name in ASKPASS {
+        command.env(name, REFUSING);
+    }
     assert!(command.get_args().count() >= 2 * SAFE_CONFIG.len());
     command
 }
@@ -368,6 +378,9 @@ fn isolated(program: &str) -> Process {
     let mut command = Process::new(resolve(program));
     for name in ENV_REMOVED {
         command.env_remove(name);
+    }
+    for name in ASKPASS {
+        command.env(name, REFUSING);
     }
     command
         .env("GIT_TERMINAL_PROMPT", "0")
