@@ -656,22 +656,78 @@ fn an_unknown_field_in_rider_toml_stops_the_daemon_naming_the_field() {
 }
 
 #[test]
-fn a_user_prompt_at_a_built_in_prompts_path_is_refused_naming_the_path() {
-    let Some(world) = given_a_board_and_a_repository() else {
+fn a_user_prompt_under_an_old_prompts_directory_is_used_and_left_as_it_is() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let prompts = world.home.join("prompts");
     fs::create_dir_all(&prompts).expect("create the prompts directory");
-    fs::write(prompts.join("review.md"), "My own review prompt.\n").expect("write a prompt");
-    given_a_rider_toml(&world, "[roles.review]\nprompt = \"prompts/review.md\"\n");
+    fs::write(prompts.join("implement.md"), "My own implement prompt.\n").expect("write it");
+    given_a_rider_toml(
+        &world,
+        "[roles.implement]\nprompt = \"prompts/implement.md\"\n",
+    );
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
 
-    let output = when_rider_runs(&world, &["daemon"]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
 
-    assert_eq!(output.code, Some(1), "{output:?}");
-    assert!(output.stderr.contains("roles.review.prompt"), "{output:?}");
-    assert!(output.stderr.contains("prompts/review.md"), "{output:?}");
-    let kept = fs::read_to_string(prompts.join("review.md")).expect("read the prompt");
-    assert_eq!(kept, "My own review prompt.\n");
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(
+        sent.starts_with("My own implement prompt.\n\n# Task "),
+        "{sent}"
+    );
+    let kept = fs::read_to_string(prompts.join("implement.md")).expect("read the prompt");
+    assert_eq!(kept, "My own implement prompt.\n");
+}
+
+#[test]
+fn a_worker_gets_its_built_in_prompt_from_the_binary_and_rider_writes_no_prompt_files() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let built_in = include_str!("../../prompts/implement.md").trim_end();
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(sent.starts_with(&format!("{built_in}\n\n")), "{sent}");
+    assert!(!world.home.join("prompts").exists());
+}
+
+#[test]
+fn the_implement_prompt_carries_the_slop_rules_and_names_no_rules_file() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let rules = include_str!("../../prompts/slop-rules.md").trim_end();
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(sent.contains(rules), "{sent}");
+    assert!(!sent.contains("prompts/slop-rules.md"), "{sent}");
+}
+
+#[test]
+fn rider_daemon_registers_its_schemas_on_a_fresh_board_before_claiming() {
+    let Some(mut world) = given_a_fresh_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert_eq!(
+        rider_schemas_on_the_board(&world),
+        rider_schemas_in_the_source()
+    );
+    assert_eq!(task_records(&world, &task, "rider-result").len(), 1);
 }
 
 #[test]

@@ -15,6 +15,7 @@ use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
 use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
+use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES_PROMPT};
 use crate::core::TASKS_MAX;
 use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
@@ -72,7 +73,6 @@ static BOARD_IDENTITY: Mutex<Option<(String, BoardIdentity)>> = Mutex::new(None)
 /// Where rider keeps its files, and how its agents reach the board.
 pub struct Env {
     pub home: PathBuf,
-    pub prompts: PathBuf,
     pub profile: String,
     pub board_url: String,
     /// Failed attempts after which a task is blocked instead of run again.
@@ -588,7 +588,7 @@ fn prepare(
     let dir = worktree::dir_for(&brief, &env.home);
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
     let retry = fs::symlink_metadata(&dir).is_ok();
-    let prompt = build_prompt(env, &brief, retry)?;
+    let prompt = build_prompt(&brief, retry)?;
     let session = brief.resume.then(|| resume_session(&brief, &env.home));
     let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
         (Ok(_), Some(onto)) => format!("Resuming the Claude session of task #{}.", onto.0),
@@ -747,8 +747,27 @@ fn log_path(home: &Path, id: TaskId, attempt: u16) -> PathBuf {
     path
 }
 
-fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> {
-    let path = env.prompts.join(brief.role.prompt_file);
+fn role_prompt(prompt_file: &str) -> Result<String, Block> {
+    let built_in = |name: &str| {
+        let found = PROMPTS.iter().find(|(found, _)| *found == name);
+        found.map(|(_, text)| text.trim_end())
+    };
+    match built_in(prompt_file) {
+        Some(text) if prompt_file == IMPLEMENT_PROMPT => {
+            let rules = built_in(SLOP_RULES_PROMPT);
+            assert!(rules.is_some(), "the slop rules are built in");
+            Ok(format!("{text}\n\n{}", rules.unwrap_or_default()))
+        }
+        Some(text) => Ok(text.to_string()),
+        None => read_prompt_file(Path::new(prompt_file)),
+    }
+}
+
+fn read_prompt_file(path: &Path) -> Result<String, Block> {
+    assert!(
+        path.is_absolute(),
+        "a prompt not built in is an absolute path"
+    );
     let unreadable = |error: io::Error| {
         let reason = format!(
             "Rider cannot read its prompt file {}: {error}.",
@@ -756,7 +775,7 @@ fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> 
         );
         Block::new("rider_error", reason)
     };
-    let file = File::open(&path).map_err(unreadable)?;
+    let file = File::open(path).map_err(unreadable)?;
     let mut role_prompt = String::new();
     let mut bounded = file.take(PROMPT_FILE_BYTES_MAX + 1);
     bounded
@@ -769,7 +788,14 @@ fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> 
         );
         return Err(Block::new("rider_error", reason));
     }
-    let role_prompt = role_prompt.trim_end();
+    role_prompt.truncate(role_prompt.trim_end().len());
+    assert!(!role_prompt.ends_with(char::is_whitespace));
+    Ok(role_prompt)
+}
+
+fn build_prompt(brief: &Brief, retry: bool) -> Result<String, Block> {
+    let role_prompt = role_prompt(brief.role.prompt_file)?;
+    let role_prompt = role_prompt.as_str();
     let mut prompt = format!("{role_prompt}\n\n# Task {}\n\n{}", brief.id.0, brief.text);
     if retry {
         prompt.push_str("\n\n");
@@ -1243,24 +1269,22 @@ mod tests {
 
     const ID: TaskId = TaskId(7);
     const BRANCH: &str = "rider/7-extract-token-store";
-    const ROLE_PROMPT: &str = "You implement one task.\n";
     const TEXT: &str = "Extract token store\nMove the store into its own module.";
     const DONE_STREAM: &str =
         r#"{"type":"result","subtype":"success","is_error":false,"result":"Extracted the store."}"#;
     const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as \
          the last attempt left them, uncommitted changes included.";
 
+    fn implement_prompt() -> String {
+        role_prompt(IMPLEMENT_PROMPT).unwrap_or_else(|_| panic!("the implement prompt is built in"))
+    }
+
     type Launch<'a> = dyn Fn(&CommandLine, &Path, &Path) -> Result<Exit, HarnessError> + 'a;
 
     fn setup(name: &str) -> (Fixture, Env) {
         let fixture = Fixture::new(name);
-        let prompts = fixture.root.join("prompts");
-        fs::create_dir_all(&prompts).unwrap();
-        fs::write(prompts.join("implement.md"), ROLE_PROMPT).unwrap();
-        fs::write(prompts.join("review.md"), "You review one task.\n").unwrap();
         let env = Env {
             home: fixture.home.clone(),
-            prompts,
             profile: "implement-1-opus-5-5".to_string(),
             board_url: "http://127.0.0.1:4100".to_string(),
             attempts: ATTEMPTS_DEFAULT,
@@ -1434,27 +1458,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_prompt_file_blocks_as_a_rider_error_before_any_worktree() {
-        let (fixture, env) = setup("run-prompt");
-        let path = env.prompts.join("implement.md");
-        fs::remove_file(&path).unwrap();
-        let board = FakeBoard::new(vec![task(&fixture, &[])]);
-        assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
-        let error = fs::File::open(&path).unwrap_err();
-        let reason = format!(
-            "Rider cannot read its prompt file {}: {error}.",
-            path.display()
-        );
-        assert_eq!(calls(&board), vec![format!("block 7 rider_error {reason}")]);
-        assert!(!worktree(&env).exists());
-    }
-
-    #[test]
     fn task_text_too_large_for_a_prompt_blocks_before_any_worktree() {
         let (fixture, env) = setup("run-huge");
         let mut huge = task(&fixture, &[]);
         huge.text = format!("Extract token store\n{}", "x".repeat(PROMPT_BYTES_MAX));
-        let bytes = format!("You implement one task.\n\n# Task 7\n\n{}", huge.text).len();
+        let bytes = format!("{}\n\n# Task 7\n\n{}", implement_prompt(), huge.text).len();
         let board = FakeBoard::new(vec![huge]);
         assert_eq!(run(&env, &board, &never), Verdict::LeaveBlocked);
         let reason = format!(
@@ -1494,7 +1502,7 @@ mod tests {
         let (cmd, dir, log) = seen.take().unwrap();
         assert_eq!(dir, worktree(&env));
         assert_eq!(log, env.home.join("logs").join("7").join("1.jsonl"));
-        let prompt = format!("You implement one task.\n\n# Task 7\n\n{TEXT}");
+        let prompt = format!("{}\n\n# Task 7\n\n{TEXT}", implement_prompt());
         assert_eq!(cmd.args.last(), Some(&prompt));
         let board_env = [
             ("BOARD_TASK", "7"),
@@ -1716,7 +1724,7 @@ mod tests {
         run(&env, &board, &idle);
         let board = FakeBoard::new(vec![task(&fixture, &[("attempt", "1")])]);
         run(&env, &board, &idle);
-        let first = format!("You implement one task.\n\n# Task 7\n\n{TEXT}");
+        let first = format!("{}\n\n# Task 7\n\n{TEXT}", implement_prompt());
         let second = format!("{first}\n\n{RETRY_NOTE}");
         assert_eq!(*prompts.borrow(), vec![first, second]);
     }

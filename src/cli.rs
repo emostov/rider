@@ -37,18 +37,19 @@ const ENVIRONMENT: &str = r#"environment:
 pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
-/// Every role's prompt file and the files they read, once each, built into the binary.
+/// The built-in prompt that carries the slop rules after its own text.
+pub const IMPLEMENT_PROMPT: &str = "implement.md";
+pub const SLOP_RULES_PROMPT: &str = "slop-rules.md";
+/// Every role's prompt and the slop rules, once each, built into the binary.
 pub const PROMPTS: [(&str, &str); 5] = [
-    ("implement.md", include_str!("../prompts/implement.md")),
+    (IMPLEMENT_PROMPT, include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
     ("security.md", include_str!("../prompts/security.md")),
-    ("slop-rules.md", include_str!("../prompts/slop-rules.md")),
+    (SLOP_RULES_PROMPT, include_str!("../prompts/slop-rules.md")),
     ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
-/// The directory under the Rider home that holds the built-in worker prompts.
-pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
 const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
@@ -261,10 +262,6 @@ impl Config {
     fn vb_dir(&self) -> PathBuf {
         self.home.join(VB_DIR)
     }
-
-    fn prompts(&self) -> PathBuf {
-        self.home.join(PROMPTS_DIR)
-    }
 }
 
 /// An environment variable rider cannot use.
@@ -400,26 +397,6 @@ impl From<ConfigError> for CliError {
     }
 }
 
-/// Writes every role's prompt under the prompts directory, replacing what is there.
-pub fn write_prompts(config: &Config) -> Result<(), CliError> {
-    let dir = config.prompts();
-    let io = |action, path: &Path| {
-        let path = path.to_path_buf();
-        move |error: io::Error| CliError::Io {
-            action,
-            path,
-            message: error.to_string(),
-        }
-    };
-    fs::create_dir_all(&dir).map_err(io("create", &dir))?;
-    for (name, text) in PROMPTS.iter() {
-        assert!(!name.contains('/') && !text.is_empty());
-        let path = dir.join(name);
-        fs::write(&path, text).map_err(io("write", &path))?;
-    }
-    Ok(())
-}
-
 /// Runs `command` and returns the exit code rider should end with.
 pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
     assert!(config.home.is_absolute());
@@ -540,14 +517,12 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
     let (table, limits) = settings(config)?;
-    write_prompts(config)?;
     let paths = Paths {
         home: config.home.clone(),
-        prompts: config.prompts(),
         vb: config.vb_dir().join("vb"),
         board_url: config.board_url.clone(),
     };
-    assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
+    assert!(paths.vb.is_absolute() && paths.home.is_absolute());
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
 }
 
@@ -1330,19 +1305,6 @@ mod tests {
     }
 
     #[test]
-    fn writes_the_embedded_prompts_over_what_is_there() {
-        let home = scratch("prompts");
-        let dir = home.join("prompts");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("review.md"), "stale").unwrap();
-        write_prompts(&config_at(&home)).unwrap();
-        for (name, text) in PROMPTS.iter() {
-            assert_eq!(fs::read_to_string(dir.join(name)).unwrap(), *text);
-        }
-        fs::remove_dir_all(&home).unwrap();
-    }
-
-    #[test]
     fn serve_runs_vb_in_the_foreground_and_returns_its_exit_code() {
         let home = scratch("serve");
         let bin = home.join("node/node_modules/.bin");
@@ -1361,7 +1323,6 @@ mod tests {
             fs::read_to_string(&record).unwrap(),
             format!("serve\n--dir\n{}\n--no-open\n", board.display())
         );
-        assert!(!home.join("prompts").exists(), "serve copies no prompts");
         fs::remove_dir_all(&home).unwrap();
     }
 }
