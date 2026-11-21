@@ -1158,3 +1158,82 @@ fn a_blocked_task_canceled_after_its_agent_exits_has_its_worktree_removed() {
         "branch {branch} is kept"
     );
 }
+
+fn given_a_failed_tasks_kept_worktree(world: &mut World) -> (String, std::path::PathBuf) {
+    let task = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
+    given_the_agent_will(world, &task, &[Behaviour::LeaveUncommitted]);
+    let (states, _) = when_the_daemon_runs_until_settled(world, &[&task]);
+    assert_eq!(states, vec!["failed".to_string()]);
+    let dir = worktree_dir(world, &task);
+    fs::remove_file(dir.join(format!("uncommitted-{task}.txt"))).expect("remove the file");
+    (task, dir)
+}
+
+#[test]
+fn a_failed_tasks_untracked_file_is_kept_when_status_hides_untracked_files() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo.clone();
+    git_in(
+        &world,
+        &repo,
+        &["config", "status.showUntrackedFiles", "no"],
+    );
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(states, vec!["failed".to_string()]);
+    let left = worktree_dir(&world, &task).join(format!("uncommitted-{task}.txt"));
+    assert_eq!(
+        fs::read_to_string(left).ok(),
+        Some("left behind\n".to_string())
+    );
+    let why = "it has modified or untracked files";
+    then_a_reply_holds(&world, &task, why);
+}
+
+#[test]
+fn rider_clean_yes_keeps_a_worktree_holding_a_per_worktree_ref() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let (task, dir) = given_a_failed_tasks_kept_worktree(&mut world);
+    let commit = git_in(&world, &dir, &["commit-tree", "HEAD^{tree}", "-m", "Kept."]);
+    git_in(&world, &dir, &["update-ref", "refs/worktree/keep", &commit]);
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    let kept = format!("kept #{task} {}: it holds per-worktree refs", dir.display());
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
+}
+
+#[test]
+fn rider_clean_yes_does_not_follow_a_symlink_at_an_ended_tasks_path() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let open = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &open, &[Behaviour::Block]);
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&open]);
+    assert_eq!(states, vec!["blocked".to_string()]);
+    let branch = task_label(&world, &open, "branch").expect("the task has a branch label");
+    let ended = when_the_lead_creates(&world, &an_implement_task(&world, "Other work."));
+    world.vb_lead(&["tasks", "cancel", &ended, "superseded", "--json"], None);
+    world.vb_lead(&["label", &ended, &format!("branch={branch}")], None);
+    let target = worktree_dir(&world, &open);
+    let link = worktree_dir(&world, &ended);
+    std::os::unix::fs::symlink(&target, &link).expect("plant the symlink");
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    assert!(
+        target.is_dir(),
+        "the open task's worktree is kept: {output:?}"
+    );
+    let kept = format!("kept #{ended} {}: it is a symlink", link.display());
+    assert!(output.stdout.lines().any(|line| line == kept), "{output:?}");
+}

@@ -18,8 +18,8 @@ use fs4::{FileExt, TryLockError};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, Listing, TaskId, TaskState, VbCli};
-use crate::brief::parse_brief;
+use crate::board::{self, Board, BoardError, Listing, TaskId, TaskState, TaskView, VbCli};
+use crate::brief::{Brief, parse_brief};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
@@ -586,6 +586,22 @@ fn running_tasks(config: &Config) -> Result<Vec<TaskId>, CliError> {
     Ok(tasks)
 }
 
+fn release_reported(board: &dyn Board, home: &Path, brief: &Brief, view: &TaskView, dir: &Path) {
+    assert!(brief.id == view.id && dir.is_absolute());
+    let (id, shown) = (view.id, dir.display());
+    let Err(error) = worktree::release_ended(brief, view, home) else {
+        println!("removed #{} {shown}", id.0);
+        return;
+    };
+    let why = match error {
+        WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
+        other => other.to_string(),
+    };
+    println!("kept #{} {shown}: {why}", id.0);
+    let note = format!("Kept the worktree at {shown}: {why}.");
+    let _ = board.reply(id, &note.replace('\n', " "));
+}
+
 fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
     let board = VbCli {
         vb: config.vb_dir().join("vb"),
@@ -593,7 +609,10 @@ fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
         profile: CLEAN_PROFILE.to_string(),
     };
     let identity = board_identity(&config.board_url, &board).map_err(CliError::Board)?;
-    let running = running_tasks(config)?;
+    let has_agent = |id: TaskId| -> Result<bool, CliError> {
+        let pid = daemon::pid_file(&config.home, id).exists();
+        Ok(pid || running_tasks(config)?.contains(&id))
+    };
     let dirs = worktree::task_dirs(&config.home).map_err(CliError::Worktree)?;
     assert!(dirs.len() <= worktree::TASK_DIRS_MAX * worktree::TASK_DIRS_MAX);
     for (dir, id) in dirs {
@@ -606,17 +625,14 @@ fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
                 continue;
             }
         }
-        if running.contains(&id) || daemon::pid_file(&config.home, id).exists() {
+        if has_agent(id)? {
             println!("kept #{} {shown}: its task has a running agent", id.0);
             continue;
         }
         let view = match board.read_task(id) {
             Ok(view) => view,
             Err(error) => {
-                say(&format!(
-                    "skipped {shown}: task #{} could not be read: {error}",
-                    id.0
-                ));
+                say(&format!("skipped {shown}: reading #{}: {error}", id.0));
                 continue;
             }
         };
@@ -646,18 +662,11 @@ fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
             println!("#{} {state} {shown}", id.0);
             continue;
         }
-        match worktree::release_ended(&brief, &view, &config.home) {
-            Ok(()) => println!("removed #{} {shown}", id.0),
-            Err(error) => {
-                let why = match error {
-                    WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
-                    other => other.to_string(),
-                };
-                println!("kept #{} {shown}: {why}", id.0);
-                let note = format!("Kept the worktree at {shown}: {why}.");
-                let _ = board.reply(id, &note.replace('\n', " "));
-            }
+        if has_agent(id)? {
+            println!("kept #{} {shown}: its task has a running agent", id.0);
+            continue;
         }
+        release_reported(&board, &config.home, &brief, &view, &dir);
     }
     Ok(0)
 }

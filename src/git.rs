@@ -775,6 +775,41 @@ fn parse_worktree_branches(stdout: &[u8]) -> Result<Vec<(PathBuf, String)>, GitE
 }
 
 /// Each worktree of `repo` on a local branch, the main checkout included, with that branch.
+pub fn worktree_dirs(repo: &Path) -> Result<Vec<PathBuf>, GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    let args = WORKTREE_LIST.map(OsStr::new);
+    let stdout = run_ok(repo, &args)?;
+    let fields = stdout.split(|&byte| byte == 0);
+    let dirs: Vec<PathBuf> = (fields.take(WORKTREES_MAX * WORKTREE_FIELDS_MAX))
+        .filter_map(|field| field.strip_prefix(WORKTREE_FIELD))
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+        .collect();
+    if dirs.len() > WORKTREES_MAX || dirs.iter().any(|dir| !dir.is_absolute()) {
+        return Err(parse_error(&args, &stdout));
+    }
+    assert!(stdout.len() <= OUTPUT_BYTES_MAX);
+    Ok(dirs)
+}
+
+// A linked worktree's own refs go with it: those under refs/worktree, refs/bisect and
+// refs/rewritten.
+pub fn has_per_worktree_refs(dir: &Path) -> Result<bool, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let words = [
+        "for-each-ref",
+        "--count=1",
+        "--format=%(refname)",
+        "--",
+        "refs/worktree",
+        "refs/bisect",
+        "refs/rewritten",
+    ];
+    let args = words.map(OsStr::new);
+    let stdout = run_ok(dir, &args)?;
+    assert!(stdout.len() <= OUTPUT_BYTES_MAX);
+    Ok(!stdout.is_empty())
+}
+
 pub fn worktree_branches(repo: &Path) -> Result<Vec<(PathBuf, String)>, GitError> {
     assert!(repo.is_absolute(), "git runs in absolute directories");
     let args = WORKTREE_LIST.map(OsStr::new);

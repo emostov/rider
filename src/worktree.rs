@@ -547,12 +547,22 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
     };
     let root = fs::canonicalize(home.join(WORKTREES_DIR));
     let root = root.map_err(|_| refuse("rider's worktrees directory is missing"))?;
+    let link = fs::symlink_metadata(&checkout.dir).map_err(|_| refuse("it does not exist"))?;
+    if link.file_type().is_symlink() {
+        return Err(refuse("it is a symlink"));
+    }
     let dir = fs::canonicalize(&checkout.dir).map_err(|_| refuse("it does not exist"))?;
     if dir == root || !dir.starts_with(&root) {
         return Err(refuse("it is outside rider's worktrees"));
     }
     if !is_checkout_of(&dir, repo)? {
         return Err(refuse("it is not a checkout of the repository"));
+    }
+    let listed = git::worktree_dirs(repo)?;
+    if !listed.iter().any(|listed| same_dir(listed, &dir)) {
+        return Err(refuse(
+            "git does not list it as a worktree of the repository",
+        ));
     }
     let git_dir = git::git_dir(&dir)?;
     if same_dir(&git_dir, &git::common_dir(&dir)?) {
@@ -571,23 +581,32 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
     if checkout.branch.is_none() && git::head(&dir)? != checkout.start_head {
         return Err(refuse("moved from its start"));
     }
-    // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
-    if git::has_hidden_index_entries(&dir)? {
-        return Err(refuse(
-            "a tracked file is marked assume-unchanged or skip-worktree",
-        ));
-    }
-    if !git::keeps_refs_in_files(&dir)? {
-        return Err(refuse(
-            "its repository does not keep refs in files, so its HEAD reflog cannot be checked",
-        ));
-    }
-    if git::head_reflog_only_commit_count(&dir)? != 0 {
-        return Err(refuse("commits only its HEAD reflog reaches"));
+    if let Some(reason) = work_lost_by_removal(&dir)? {
+        return Err(refuse(reason));
     }
     git::remove_worktree(repo, &dir)?;
     assert!(dir.starts_with(&root) && dir != root);
     Ok(())
+}
+
+fn work_lost_by_removal(dir: &Path) -> Result<Option<&'static str>, WorktreeError> {
+    assert!(dir.is_absolute());
+    let reason = if !git::is_clean(dir)? {
+        Some("it has modified or untracked files")
+    } else if git::has_hidden_index_entries(dir)? {
+        Some("a tracked file is marked assume-unchanged or skip-worktree")
+    } else if git::has_per_worktree_refs(dir)? {
+        Some("it holds per-worktree refs")
+    } else if !git::keeps_refs_in_files(dir)? {
+        Some("its repository does not keep refs in files, so its HEAD reflog cannot be checked")
+    // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
+    } else if git::head_reflog_only_commit_count(dir)? != 0 {
+        Some("commits only its HEAD reflog reaches")
+    } else {
+        None
+    };
+    assert!(reason.is_none_or(|reason| !reason.is_empty()));
+    Ok(reason)
 }
 
 fn entries(dir: &Path) -> Result<Vec<PathBuf>, WorktreeError> {
