@@ -756,3 +756,44 @@ fn an_open_rider_pr_with_no_task_reaches_the_lead_in_the_project_channel() {
         Vec::<Value>::new()
     );
 }
+
+#[test]
+fn a_change_request_from_the_prs_author_without_write_access_only_reaches_the_lead() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let mut comments: Value =
+        serde_json::from_str(&fixture("pulls-comments.json")).expect("the fixture parses");
+    comments[0]["user"]["login"] = json!("owner");
+    let path = world.root.join("gh-comments.json");
+    fs::write(path, comments.to_string()).expect("write the comments");
+    let task = given_a_completed_task(&mut world);
+
+    let records = when_records_reach(&world, &task, 1);
+
+    let routes: Vec<(&Value, &Value)> = records
+        .iter()
+        .map(|record| (&record["route"], &record["trust"]))
+        .collect();
+    assert_eq!(routes, vec![(&json!("lead"), &json!("untrusted"))]);
+    then_no_fix_was_queued(&world, &task);
+}
+
+#[test]
+fn a_closed_pr_on_the_same_branch_does_not_end_the_recorded_prs_watch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
+    fs::write(
+        world.root.join("gh-pr.json"),
+        fixture("pr-list-merged.json"),
+    )
+    .expect("write");
+    let task = given_a_settled_task(&mut world, Behaviour::CommitThenFail, "failed");
+
+    let records = when_records_reach(&world, &task, 1);
+
+    assert_eq!(records, vec![failed_record("lead")]);
+}
