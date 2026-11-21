@@ -68,6 +68,27 @@ fn given_gh_grants(world: &World, login: &str, permission: &str) {
     fs::write(path, fixture(permission)).expect("write the permission fixture");
 }
 
+fn gh_call_lines(world: &World) -> Vec<String> {
+    let log = fs::read_to_string(world.root.join("gh-calls.log")).unwrap_or_default();
+    log.lines().map(str::to_string).collect()
+}
+
+fn when_a_round_passes(world: &World) {
+    let rounds = |world: &World| {
+        let lines = gh_call_lines(world);
+        lines
+            .iter()
+            .filter(|line| line.contains("--state open"))
+            .count()
+    };
+    let before = rounds(world);
+    let deadline = Instant::now() + Duration::from_secs(RECORD_SECONDS_MAX);
+    while rounds(world) < before + 2 {
+        assert!(Instant::now() < deadline, "{}", world.daemon_log());
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn gh_calls(world: &World) -> usize {
     fs::read_to_string(world.root.join("gh-calls.log")).map_or(0, |log| log.lines().count())
 }
@@ -461,12 +482,17 @@ fn a_github_off_label_on_the_task_ends_the_watch() {
     when_gh_is_called_past(&world, 0);
 
     world.vb_lead(&["label", &task, "github=off"], None);
+    when_a_round_passes(&world);
     given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
-    thread::sleep(Duration::from_millis(QUIET_MILLIS));
-    let calls = gh_calls(&world);
-    thread::sleep(Duration::from_millis(QUIET_MILLIS));
+    let calls = gh_call_lines(&world).len();
+    when_a_round_passes(&world);
 
-    assert_eq!(gh_calls(&world), calls);
+    let since: Vec<String> = gh_call_lines(&world)
+        .into_iter()
+        .skip(calls)
+        .filter(|line| line.contains("--head"))
+        .collect();
+    assert_eq!(since, Vec::<String>::new());
     assert_eq!(
         task_records(&world, &task, "rider-github"),
         Vec::<Value>::new()
@@ -482,6 +508,7 @@ fn a_ci_failure_whose_owner_session_is_malformed_goes_to_the_lead() {
     let task = given_a_completed_task(&mut world);
     let session = world.home.join("logs").join(&task).join("session");
     fs::write(&session, "not a session\n").expect("overwrite the recorded session");
+    when_a_round_passes(&world);
 
     given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
     let records = when_records_reach(&world, &task, 1);
