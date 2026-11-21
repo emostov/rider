@@ -1,7 +1,10 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
-use crate::fake_agent;
+use crate::fake_agent::{self, Behaviour, PR_REF};
 use crate::steps::*;
+use crate::world::{MAIN, World};
 
 const TOKENS: [(&str, &str); 3] = [
     ("GH_TOKEN", "gh-secret"),
@@ -84,11 +87,15 @@ fn an_untrusted_task_sees_only_the_allowed_variables() {
             .iter()
             .all(|(name, _)| trusted_names.iter().any(|seen| seen == name))
     );
-    let expected = [
+    let mut expected: Vec<String> = [
         "BOARD_PROFILE",
         "BOARD_TASK",
         "BOARD_URL",
         "GH_CONFIG_DIR",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_TERMINAL_PROMPT",
         "HOME",
         "PATH",
         "PWD",
@@ -97,6 +104,79 @@ fn an_untrusted_task_sees_only_the_allowed_variables() {
         "RIDER_AGENT_VB_DIR",
         "SHLVL",
         "_",
-    ];
+    ]
+    .map(String::from)
+    .into();
+    for index in 0..12 {
+        expected.push(format!("GIT_CONFIG_KEY_{index}"));
+        expected.push(format!("GIT_CONFIG_VALUE_{index}"));
+    }
+    expected.sort();
     assert_eq!(fake_agent::env_names(&world.root, &untrusted, 0), expected);
+}
+
+const HOOKS: [&str; 3] = ["pre-commit", "pre-merge-commit", "post-merge"];
+
+fn given_tracked_hooks_and_a_fetched_pr(world: &World) -> PathBuf {
+    let log = world.root.join("hooks.log");
+    let hooks = world.repo.join(".githooks");
+    fs::create_dir_all(&hooks).expect("create the hooks directory");
+    for hook in HOOKS {
+        let script = format!("#!/bin/sh\necho \"{hook} $(pwd)\" >> '{}'\n", log.display());
+        let path = hooks.join(hook);
+        fs::write(&path, script).expect("write a hook");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod a hook");
+    }
+    world.git_ok(&["add", ".githooks"]);
+    world.git_ok(&["commit", "-q", "--no-verify", "-m", "Track the hooks"]);
+    world.git_ok(&["config", "core.hooksPath", ".githooks"]);
+    world.git_ok(&["checkout", "-q", "--detach"]);
+    fs::write(world.repo.join("pr.txt"), "the pull request\n").expect("write the PR's file");
+    world.git_ok(&["add", "pr.txt"]);
+    world.git_ok(&[
+        "commit",
+        "-q",
+        "--no-verify",
+        "-m",
+        "Add the pull request's file",
+    ]);
+    world.git_ok(&["update-ref", PR_REF, "HEAD"]);
+    world.git_ok(&["checkout", "-q", MAIN]);
+    fs::write(world.repo.join("main.txt"), "main moved on\n").expect("write main's file");
+    world.git_ok(&["add", "main.txt"]);
+    world.git_ok(&["commit", "-q", "--no-verify", "-m", "Move main on"]);
+    assert!(!log.exists());
+    log
+}
+
+#[test]
+fn an_untrusted_merge_and_commit_run_none_of_the_repositorys_tracked_hooks() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let log = given_tracked_hooks_and_a_fetched_pr(&world);
+    let merge = NewTask::new("Merge the pull request onto main.")
+        .label("repo", world.repo_label())
+        .label("from", MAIN)
+        .label("untrusted", "1")
+        .role("light");
+    let merge = when_the_lead_creates(&world, &merge);
+    given_the_agent_will(&world, &merge, &[Behaviour::MergePr]);
+    let synthesis = NewTask::new("Write the review file.")
+        .label("repo", world.repo_label())
+        .label("base", &merge)
+        .label("untrusted", "1")
+        .needs(&merge)
+        .role("implement");
+    let synthesis = when_the_lead_creates(&world, &synthesis);
+    let trusted = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let tasks = [merge.as_str(), synthesis.as_str(), trusted.as_str()];
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &tasks);
+
+    assert_eq!(states, vec!["completed"; 3]);
+    let ran = fs::read_to_string(&log).expect("the trusted commit ran its hook");
+    let trusted_dir = worktree_dir(&world, &trusted);
+    let expected = format!("pre-commit {}\n", trusted_dir.display());
+    assert_eq!(ran, expected);
 }

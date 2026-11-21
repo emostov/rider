@@ -33,6 +33,22 @@ use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError
 
 pub const DELIVERY_ROUNDS_MAX: u8 = 3;
 const UNTRUSTED_DIR: &str = "untrusted";
+// Git runs a tracked `core.hooksPath` and any configured command from the merged tree, so
+// every config key that names a command is forced off through git's environment config.
+const UNTRUSTED_GIT_CONFIG: [(&str, &str); 12] = [
+    ("core.hooksPath", "/dev/null"),
+    ("core.fsmonitor", "false"),
+    ("core.pager", "cat"),
+    ("core.editor", "true"),
+    ("sequence.editor", "true"),
+    ("core.askPass", ""),
+    ("credential.helper", ""),
+    ("diff.external", ""),
+    ("commit.gpgSign", "false"),
+    ("tag.gpgSign", "false"),
+    ("protocol.ext.allow", "never"),
+    ("submodule.recurse", "false"),
+];
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
 /// The failed attempts after which a task is blocked, unless the configuration sets them.
@@ -813,6 +829,7 @@ fn prepare(
             cmd.untrusted = true;
             let dir = gh_config.to_string_lossy().into_owned();
             cmd.env.push(("GH_CONFIG_DIR".to_string(), dir));
+            cmd.env.extend(untrusted_git_env());
         }
         assert_eq!(cmd.untrusted, brief.untrusted);
         Ok::<CommandLine, Block>(cmd)
@@ -936,6 +953,24 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);
     Ok(session)
+}
+
+fn untrusted_git_env() -> Vec<(String, String)> {
+    let mut env = vec![
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        (
+            "GIT_CONFIG_COUNT".to_string(),
+            UNTRUSTED_GIT_CONFIG.len().to_string(),
+        ),
+    ];
+    for (index, (key, value)) in UNTRUSTED_GIT_CONFIG.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{index}"), key.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), value.to_string()));
+    }
+    assert_eq!(env.len(), 4 + 2 * UNTRUSTED_GIT_CONFIG.len());
+    env
 }
 
 fn harness_name(harness: Harness) -> &'static str {
