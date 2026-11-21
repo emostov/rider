@@ -3,14 +3,14 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-#[cfg(target_os = "macos")]
 use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
@@ -25,11 +25,19 @@ const READ_SECONDS_MAX: u64 = 30;
 const READS_MAX: usize = 1 << 20;
 const LOG_LINES: usize = 8 * 1024;
 const LOG_LINE_BYTES: usize = 1024;
-const STREAM_LINE_BYTES_MAX: usize = 512 * 1024;
 const DAEMON_STARTS: usize = 20;
 const WATCH_POLLS_MAX: u64 = u64::MAX;
 const SEAT_PROBES_MAX: usize = 1000;
 const SEAT_PROBE_MILLIS: u64 = 50;
+const DAEMON_IDLE_SECONDS: u64 = 5;
+const REQUEST_BYTES_MAX: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const SOCKET_PATH_BYTES_MAX: usize = 107;
+#[cfg(not(target_os = "linux"))]
+const SOCKET_PATH_BYTES_MAX: usize = 103;
+const SOCKET_SUFFIX_BYTES: usize = "/rider.sock".len();
+const FOLLOWER_LINES_MAX: usize = 1 << 16;
+const SEAT_FREE_SECONDS: u64 = 5;
 
 #[test]
 fn a_client_flooding_bad_requests_without_reading_never_holds_up_rider_status() {
@@ -145,7 +153,7 @@ fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
             assert_eq!(down.code, Some(0), "{down:?}");
             assert_eq!(then_the_daemon_exits(&mut world), Some(0));
             left.extend(
-                ["rider.sock", ".bind"]
+                ["rider.sock", ".b"]
                     .into_iter()
                     .filter(|name| fs::symlink_metadata(world.home.join(name)).is_ok()),
             );
@@ -161,6 +169,312 @@ fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
         "left behind by a daemon that stopped"
     );
 }
+
+#[test]
+fn an_oversized_request_gets_its_bad_request_reply_before_the_connection_ends() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    let mut client = given_a_client_on_the_socket(&world);
+
+    client
+        .write_all(&vec![b'x'; REQUEST_BYTES_MAX + 1])
+        .expect("send the oversized request");
+    let data = then_the_client_reads_to_its_end(&client);
+
+    let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+    let first: Value = serde_json::from_str(text.lines().next().unwrap_or_default())
+        .unwrap_or_else(|_| panic!("no reply line before the end: {text:?}"));
+    assert_eq!(first["error"]["code"], json!("bad_request"), "{first}");
+}
+
+#[test]
+fn idle_connections_in_every_seat_are_closed_so_rider_status_answers() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::HoldTalking]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+    let mut follow = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    follow.args(["logs", "-f", &task]).stdout(Stdio::piped());
+    let mut follower = follow.spawn().expect("start rider logs -f");
+    let lines = crate::lines_of(follower.stdout.take().expect("rider logs -f output"));
+    let first = lines.recv_timeout(Duration::from_secs(READ_SECONDS_MAX));
+    let opened = Instant::now();
+    let idle: Vec<UnixStream> = (1..CLIENTS_MAX)
+        .map(|_| given_a_client_on_the_socket(&world))
+        .collect();
+
+    let closed: Vec<Vec<u8>> = idle.iter().map(then_the_client_reads_to_its_end).collect();
+    let closed_after = opened.elapsed();
+    drop(idle);
+    let answered = when_rider_status_shows_within(&world, "board up", SEAT_FREE_SECONDS);
+    let following = follower.try_wait().expect("poll rider logs -f");
+    world.release_agent(&task);
+    let deadline = Instant::now() + Duration::from_secs(READ_SECONDS_MAX);
+    let rest: Vec<String> = (0..FOLLOWER_LINES_MAX)
+        .map_while(|_| {
+            lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+        })
+        .collect();
+    let followed = then_the_child_exits_within(&mut follower, READ_SECONDS_MAX);
+
+    assert!(
+        closed_after >= Duration::from_secs(DAEMON_IDLE_SECONDS),
+        "the idle connections were closed after {closed_after:?}"
+    );
+    assert!(
+        answered,
+        "rider status stayed busy after the idle clients went"
+    );
+    assert_eq!(first, Ok(fake_agent::hold_line(&task)));
+    assert_eq!(following, None, "rider logs -f ended while it followed");
+    assert_eq!(closed, vec![Vec::<u8>::new(); CLIENTS_MAX - 1]);
+    assert_eq!(followed, Some(0));
+    let summary = fake_agent::summary(&task, 0);
+    assert!(rest.iter().any(|line| line.contains(&summary)), "{rest:?}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_log_read_slowly_past_the_idle_cutoff_reaches_rider_logs_whole() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = 7;
+    given_a_log_larger_than_every_buffer(&world, task);
+    given_a_running_daemon(&mut world);
+
+    let mut logs = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    logs.args(["logs", "-f", &task.to_string()])
+        .stdout(Stdio::piped());
+    let mut reader = logs.spawn().expect("start rider logs -f");
+    let mut output = reader.stdout.take().expect("rider logs -f output");
+    thread::sleep(Duration::from_secs(DAEMON_IDLE_SECONDS + 1));
+    let read = thread::spawn(move || {
+        let mut data = Vec::new();
+        output.read_to_end(&mut data).map(|_| data.len())
+    });
+    let exit = then_the_child_exits_within(&mut reader, READ_SECONDS_MAX);
+
+    assert_eq!(exit, Some(0));
+    let read = read
+        .join()
+        .expect("the reader ends")
+        .expect("read the output");
+    assert_eq!(read, LOG_LINES * LOG_LINE_BYTES);
+}
+
+#[test]
+fn a_home_too_long_for_a_socket_address_fails_naming_the_limit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let longest = given_a_home_whose_socket_path_is(&mut world, SOCKET_PATH_BYTES_MAX);
+    let fits = when_rider_runs(&world, &["status"]);
+    let too_long = given_a_home_whose_socket_path_is(&mut world, SOCKET_PATH_BYTES_MAX + 1);
+
+    let up = when_rider_runs(&world, &["up"]);
+    let status = when_rider_runs(&world, &["status"]);
+
+    assert_eq!(fits.code, Some(1), "{fits:?}");
+    assert!(
+        fits.stderr.contains("the daemon is not running"),
+        "{fits:?}"
+    );
+    assert_eq!(up.code, Some(1), "{up:?}");
+    assert!(up.stderr.contains("byte limit for a socket path"), "{up:?}");
+    assert!(
+        status.stderr.contains("byte limit for a socket path"),
+        "{status:?}"
+    );
+    assert_eq!(entries(&too_long), Vec::<String>::new());
+    assert_ne!(longest, too_long);
+}
+
+#[test]
+fn a_direct_daemon_with_a_home_too_long_for_a_socket_address_creates_nothing() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let home = given_a_home_whose_socket_path_is(&mut world, SOCKET_PATH_BYTES_MAX + 1);
+
+    let daemon = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(daemon.code, Some(1), "{daemon:?}");
+    assert!(
+        daemon.stderr.contains("byte limit for a socket path"),
+        "{daemon:?}"
+    );
+    assert_eq!(entries(&home), Vec::<String>::new());
+}
+
+fn given_a_home_whose_socket_path_is(world: &mut World, bytes: usize) -> PathBuf {
+    let parent = world.root.clone();
+    let home = bytes - SOCKET_SUFFIX_BYTES;
+    let used = parent.as_os_str().len() + 1;
+    assert!(used < home, "the temporary directory is too long");
+    world.home = parent.join("h".repeat(home - used));
+    assert_eq!(world.home.join("rider.sock").as_os_str().len(), bytes);
+    world.home.clone()
+}
+
+fn entries(dir: &Path) -> Vec<String> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    read.map(|entry| {
+        let entry = entry.expect("read a directory entry");
+        entry.file_name().to_string_lossy().into_owned()
+    })
+    .collect()
+}
+
+fn then_the_child_exits_within(child: &mut Child, seconds: u64) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            return status.code();
+        }
+        thread::sleep(Duration::from_millis(SEAT_PROBE_MILLIS));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("the child did not exit within {seconds} seconds");
+}
+
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn given_a_client_on_the_socket(world: &World) -> UnixStream {
+    UnixStream::connect(world.home.join("rider.sock")).expect("connect to the daemon socket")
+}
+
+fn given_a_log_larger_than_every_buffer(world: &World, task: u64) {
+    let dir = world.home.join("logs").join(task.to_string());
+    fs::create_dir_all(&dir).expect("create the task's log directory");
+    let line = format!("{}\n", "x".repeat(LOG_LINE_BYTES - 1));
+    fs::write(dir.join("1.jsonl"), line.repeat(LOG_LINES)).expect("write the log");
+}
+
+fn when_a_seat_frees_within(world: &World, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let request = format!("{}\n", json!({"v": 1, "id": 1, "cmd": "status"}));
+    for _ in 0..SEAT_PROBES_MAX {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let mut probe = given_a_client_on_the_socket(world);
+        // A refused client may find the daemon's end closed before its request goes.
+        let _ = probe.write_all(request.as_bytes());
+        let reply = then_the_client_reads_a_line(&probe);
+        if reply["ok"] == json!(true) {
+            return true;
+        }
+        assert_eq!(reply["error"]["code"], json!("busy"), "{reply}");
+        thread::sleep(Duration::from_millis(SEAT_PROBE_MILLIS));
+    }
+    false
+}
+
+fn when_the_client_floods_bad_requests_without_reading(client: &mut UnixStream) {
+    client
+        .set_write_timeout(Some(Duration::from_millis(FLOOD_WRITE_MILLIS)))
+        .expect("set a write timeout");
+    let _ = client.write_all(&b"{}\n".repeat(FLOOD_LINES));
+}
+
+fn when_the_client_asks_for_status_without_reading(client: &mut UnixStream) -> u64 {
+    client
+        .set_write_timeout(Some(Duration::from_secs(LAG_STALL_SECONDS)))
+        .expect("set a write timeout");
+    for id in 1..=LAG_REQUESTS_MAX {
+        let request = format!("{}\n", json!({"v": 1, "id": id, "cmd": "status"}));
+        match client.write_all(request.as_bytes()) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                ) =>
+            {
+                return id - 1;
+            }
+            Err(error) => panic!("sending request {id} failed: {error}"),
+        }
+    }
+    panic!("the daemon read all {LAG_REQUESTS_MAX} requests from a client that never read");
+}
+
+fn then_the_client_reads_a_line(client: &UnixStream) -> Value {
+    client
+        .set_read_timeout(Some(Duration::from_secs(READ_SECONDS_MAX)))
+        .expect("set a read timeout");
+    let mut line = String::new();
+    BufReader::new(client)
+        .read_line(&mut line)
+        .expect("read a line from the daemon");
+    serde_json::from_str(&line).expect("the line is JSON")
+}
+
+fn then_the_client_reads_to_its_end(mut client: &UnixStream) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(READ_SECONDS_MAX);
+    let mut data = Vec::new();
+    let mut buffer = vec![0; 64 * 1024];
+    for _ in 0..READS_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let bytes = data.len();
+        assert!(!left.is_zero(), "no end of stream in time: {bytes} bytes");
+        // macOS refuses the timeout with EINVAL once the daemon has closed its end; a read
+        // then returns at once, so the error is safe to ignore.
+        let _ = client.set_read_timeout(Some(left));
+        match client.read(&mut buffer) {
+            Ok(0) => return data,
+            Ok(read) => data.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            // Linux resets a connection the daemon closes with the client's requests unread.
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => return data,
+            Err(error) => panic!("reading to the end failed after {bytes} bytes: {error}"),
+        }
+    }
+    panic!("no end of stream within {READS_MAX} reads");
+}
+
+fn first_mode_other_than_0600(path: &Path, done: &AtomicBool) -> Option<u32> {
+    for _ in 0..WATCH_POLLS_MAX {
+        if done.load(Ordering::SeqCst) {
+            return None;
+        }
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.file_type().is_socket() && mode != 0o600 {
+            return Some(mode);
+        }
+    }
+    None
+}
+
+const STREAM_LINE_BYTES_MAX: usize = 512 * 1024;
 
 #[test]
 fn rider_logs_shows_control_characters_in_an_agents_output_escaped() {
@@ -304,7 +618,7 @@ fn a_file_left_in_the_sockets_staging_directory_does_not_stop_the_daemon_startin
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let staging = world.home.join(".bind");
+    let staging = world.home.join(".b");
     fs::create_dir_all(&staging).expect("create the staging directory");
     fs::write(staging.join("left"), "").expect("leave a file there");
 
@@ -319,129 +633,4 @@ fn given_a_log(world: &World, task: &str, text: &str) {
     let dir = world.home.join("logs").join(task);
     fs::create_dir_all(&dir).expect("create the task's log directory");
     fs::write(dir.join("1.jsonl"), text).expect("write the log");
-}
-
-struct StopOnDrop<'a>(&'a AtomicBool);
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-fn given_a_client_on_the_socket(world: &World) -> UnixStream {
-    UnixStream::connect(world.home.join("rider.sock")).expect("connect to the daemon socket")
-}
-
-fn given_a_log_larger_than_every_buffer(world: &World, task: u64) {
-    let dir = world.home.join("logs").join(task.to_string());
-    fs::create_dir_all(&dir).expect("create the task's log directory");
-    let line = format!("{}\n", "x".repeat(LOG_LINE_BYTES - 1));
-    fs::write(dir.join("1.jsonl"), line.repeat(LOG_LINES)).expect("write the log");
-}
-
-fn when_a_seat_frees_within(world: &World, seconds: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    let request = format!("{}\n", json!({"v": 1, "id": 1, "cmd": "status"}));
-    for _ in 0..SEAT_PROBES_MAX {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        let mut probe = given_a_client_on_the_socket(world);
-        // A refused client may find the daemon's end closed before its request goes.
-        let _ = probe.write_all(request.as_bytes());
-        let reply = then_the_client_reads_a_line(&probe);
-        if reply["ok"] == json!(true) {
-            return true;
-        }
-        assert_eq!(reply["error"]["code"], json!("busy"), "{reply}");
-        thread::sleep(Duration::from_millis(SEAT_PROBE_MILLIS));
-    }
-    false
-}
-
-fn when_the_client_floods_bad_requests_without_reading(client: &mut UnixStream) {
-    client
-        .set_write_timeout(Some(Duration::from_millis(FLOOD_WRITE_MILLIS)))
-        .expect("set a write timeout");
-    let _ = client.write_all(&b"{}\n".repeat(FLOOD_LINES));
-}
-
-fn when_the_client_asks_for_status_without_reading(client: &mut UnixStream) -> u64 {
-    client
-        .set_write_timeout(Some(Duration::from_secs(LAG_STALL_SECONDS)))
-        .expect("set a write timeout");
-    for id in 1..=LAG_REQUESTS_MAX {
-        let request = format!("{}\n", json!({"v": 1, "id": id, "cmd": "status"}));
-        match client.write_all(request.as_bytes()) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::WouldBlock
-                        | ErrorKind::TimedOut
-                        | ErrorKind::ConnectionReset
-                        | ErrorKind::BrokenPipe
-                ) =>
-            {
-                return id - 1;
-            }
-            Err(error) => panic!("sending request {id} failed: {error}"),
-        }
-    }
-    panic!("the daemon read all {LAG_REQUESTS_MAX} requests from a client that never read");
-}
-
-fn then_the_client_reads_a_line(client: &UnixStream) -> Value {
-    client
-        .set_read_timeout(Some(Duration::from_secs(READ_SECONDS_MAX)))
-        .expect("set a read timeout");
-    let mut line = String::new();
-    BufReader::new(client)
-        .read_line(&mut line)
-        .expect("read a line from the daemon");
-    serde_json::from_str(&line).expect("the line is JSON")
-}
-
-fn then_the_client_reads_to_its_end(mut client: &UnixStream) -> Vec<u8> {
-    let deadline = Instant::now() + Duration::from_secs(READ_SECONDS_MAX);
-    let mut data = Vec::new();
-    let mut buffer = vec![0; 64 * 1024];
-    for _ in 0..READS_MAX {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let bytes = data.len();
-        assert!(!left.is_zero(), "no end of stream in time: {bytes} bytes");
-        // macOS refuses the timeout with EINVAL once the daemon has closed its end; a read
-        // then returns at once, so the error is safe to ignore.
-        let _ = client.set_read_timeout(Some(left));
-        match client.read(&mut buffer) {
-            Ok(0) => return data,
-            Ok(read) => data.extend_from_slice(&buffer[..read]),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
-            // Linux resets a connection the daemon closes with the client's requests unread.
-            Err(error) if error.kind() == ErrorKind::ConnectionReset => return data,
-            Err(error) => panic!("reading to the end failed after {bytes} bytes: {error}"),
-        }
-    }
-    panic!("no end of stream within {READS_MAX} reads");
-}
-
-fn first_mode_other_than_0600(path: &Path, done: &AtomicBool) -> Option<u32> {
-    for _ in 0..WATCH_POLLS_MAX {
-        if done.load(Ordering::SeqCst) {
-            return None;
-        }
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            continue;
-        };
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.file_type().is_socket() && mode != 0o600 {
-            return Some(mode);
-        }
-    }
-    None
 }

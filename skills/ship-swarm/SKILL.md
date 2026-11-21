@@ -5,7 +5,7 @@ description: Use when the user asks to ship the stack or a branch the swarm buil
 
 # Ship a swarm's branch
 
-Rider stops at reviewed local branches and never pushes. A project usually culminates in
+Rider stops at reviewed local branches and pushes only when the lead runs `rider pr`. A project usually culminates in
 one PR, or a stack of PRs: one PR per branch, each based on its parent branch (the lowest
 on the base branch). This skill takes them to green pull requests with no open review
 threads. **This session stays the lead** of `ride-swarm`. `<ride>` is the `ride-swarm`
@@ -23,8 +23,8 @@ skill's directory; read `<ride>/lead.md` for how to create tasks (the plan file,
   create, and never use a bare `--force`.
 - Git work with judgment in it is a board task for a worker: a restack, a rebase with
   conflicts, splitting or squashing commits, and code changes beyond the small mechanical edit
-  `lead.md` allows the lead. Quick steps (pushing a
-  finished branch, `gh pr create`) you run yourself. Rider has no built-in ship command.
+  `lead.md` allows the lead. Quick steps you run yourself:
+  `rider pr <task id>` pushes a completed task's branch and opens its draft PR.
 - Never leave a review on a PR: no `gh pr review`, no review comments. Reviewer findings
   stay on the board. Replying to a human's review thread, and resolving it once its fix is
   pushed, is fine.

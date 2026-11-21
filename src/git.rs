@@ -7,6 +7,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,7 @@ const POLLS_MAX: u64 = GIT_DEADLINE.as_secs() * 1000 / POLL_MILLIS + 1;
 const READERS_JOIN_WAIT: Duration = Duration::from_secs(2);
 const READERS_JOIN_POLLS_MAX: u64 = READERS_JOIN_WAIT.as_secs() * 1000 / POLL_MILLIS + 1;
 const WORKTREE_FIELDS_MAX: usize = 8;
-const ARGS_MAX: usize = 12;
+const ARGS_MAX: usize = 16;
 const COMMIT_HEX_LENS: [usize; 2] = [40, 64];
 const ORIGIN_PREFIX: &str = "origin/";
 const HEADS_PREFIX: &str = "refs/heads/";
@@ -44,28 +45,25 @@ pub const ENV_REMOVED: [&str; 8] = [
     "GIT_NAMESPACE",
     "GIT_PREFIX",
 ];
+const GIT: &str = "git";
+const GH: &str = "gh";
+static CONFINED: OnceLock<Confined> = OnceLock::new();
 const WORKTREE_LIST: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
-// An agent can write the repository's config, so every setting that makes git run a command
-// is overridden: `-c` outranks every config file.
-const SAFE_CONFIG: [&str; 7] = [
+// An agent can write the repository's config, so the settings that make git run a command
+// are overridden where Rider never needs them: `-c` outranks every config file.
+const SAFE_CONFIG: [&str; 6] = [
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
     "core.pager=cat",
-    "core.sshCommand=false",
     "core.editor=false",
     "log.showSignature=false",
     "gpg.program=false",
 ];
-const FILTER_COMMANDS: [&str; 3] = ["clean", "smudge", "process"];
-const FILTER_KEYS_MAX: usize = 64;
-const FILTER_KEYS: [&str; 6] = [
-    "config",
-    "--null",
-    "--name-only",
-    "--get-regexp",
-    "--",
-    r"^filter\..*\.(clean|smudge|process)$",
-];
+
+struct Confined {
+    git: PathBuf,
+    sandbox: Vec<String>,
+}
 
 #[derive(Debug)]
 pub enum GitError {
@@ -98,19 +96,19 @@ impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GitError::Spawn(message) => {
-                write!(f, "git could not be started: {}", board::one_line(message))
+                write!(f, "could not start {}", board::one_line(message))
             }
             GitError::Exit { args, stderr } if stderr.trim().is_empty() => {
-                write!(f, "git {args} failed")
+                write!(f, "{args} failed")
             }
             GitError::Exit { args, stderr } => {
-                write!(f, "git {args} failed: {}", board::one_line(stderr))
+                write!(f, "{args} failed: {}", board::one_line(stderr))
             }
             GitError::OutputTooLarge { args } => {
-                write!(f, "git {args} printed more than {OUTPUT_BYTES_MAX} bytes")
+                write!(f, "{args} printed more than {OUTPUT_BYTES_MAX} bytes")
             }
             GitError::TimedOut { args, seconds } => {
-                write!(f, "git {args} did not finish within {seconds} seconds")
+                write!(f, "{args} did not finish within {seconds} seconds")
             }
             GitError::Io(message) => {
                 write!(f, "reading from git failed: {}", board::one_line(message))
@@ -118,7 +116,7 @@ impl fmt::Display for GitError {
             GitError::Parse { args, stdout } => {
                 write!(
                     f,
-                    "git {args} printed output rider cannot use: {}",
+                    "{args} printed output rider cannot use: {}",
                     board::one_line(stdout)
                 )
             }
@@ -158,15 +156,15 @@ pub fn is_commit_id(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn shown(args: &[&OsStr]) -> String {
+fn shown(program: &str, args: &[&OsStr]) -> String {
     assert!(!args.is_empty() && args.len() <= ARGS_MAX);
     let words: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let line = words.join(" ");
+    let line = format!("{program} {}", words.join(" "));
     assert!(
-        line.len() >= args.len() - 1,
+        line.len() >= program.len() + args.len(),
         "one separator between each word"
     );
     line
@@ -177,7 +175,7 @@ fn read_bounded(stream: impl Read, args: &str) -> Result<Vec<u8>, GitError> {
     let limit = u64::try_from(OUTPUT_BYTES_MAX + 1).unwrap_or(u64::MAX);
     let mut bytes: Vec<u8> = Vec::new();
     let read = stream.take(limit).read_to_end(&mut bytes);
-    read.map_err(|error| GitError::Io(format!("reading git {args}: {error}")))?;
+    read.map_err(|error| GitError::Io(format!("reading {args}: {error}")))?;
     if bytes.len() > OUTPUT_BYTES_MAX {
         let args = args.to_string();
         return Err(GitError::OutputTooLarge { args });
@@ -207,7 +205,7 @@ fn finish_reader(reader: Reader) -> Result<Vec<u8>, GitError> {
 /// Starts a reader on each of `child`'s output streams: stdout first, then stderr.
 fn start_readers(child: &mut dyn ChildWrapper, args: &str) -> Result<[Reader; 2], GitError> {
     assert!(!args.is_empty());
-    let missing = |name: &str| GitError::Spawn(format!("git {args}: no {name}"));
+    let missing = |name: &str| GitError::Spawn(format!("{args}: no {name}"));
     let stdout = child.stdout().take().ok_or_else(|| missing("stdout"))?;
     let stderr = child.stderr().take().ok_or_else(|| missing("stderr"))?;
     let readers = [start_reader(stdout, args)?, start_reader(stderr, args)?];
@@ -270,7 +268,7 @@ fn end(
         thread::sleep(POLL_INTERVAL);
     }
     // A reader still open here is held by a process that left the group; it is detached.
-    killed.map_err(|error| GitError::Io(format!("ending git {args}: {error}")))
+    killed.map_err(|error| GitError::Io(format!("ending {args}: {error}")))
 }
 
 /// Reads both streams of `child` until it exits and they close, or until `limit` passes.
@@ -311,26 +309,50 @@ fn collect(child: &mut dyn ChildWrapper, args: &str, limit: Duration) -> Result<
     Ok(output)
 }
 
+pub fn confine(git: PathBuf, sandbox: Vec<String>) -> bool {
+    assert!(git.is_absolute() && !sandbox.is_empty());
+    CONFINED.set(Confined { git, sandbox }).is_ok()
+}
+
 pub fn hardened() -> Process {
-    let mut command = Process::new("git");
+    let mut command = match CONFINED.get() {
+        Some(confined) => {
+            let mut command = Process::new(&confined.sandbox[0]);
+            command.args(&confined.sandbox[1..]).arg(&confined.git);
+            command
+        }
+        None => Process::new(GIT),
+    };
     for setting in SAFE_CONFIG {
         command.arg("-c").arg(setting);
     }
     for name in ENV_REMOVED {
         command.env_remove(name);
     }
-    assert!(command.get_args().count() == 2 * SAFE_CONFIG.len());
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    assert!(command.get_args().count() >= 2 * SAFE_CONFIG.len());
     command
 }
 
-fn command(dir: &Path, args: &[&OsStr], filters: &[String]) -> Process {
+fn command(dir: &Path, args: &[&OsStr]) -> Process {
     assert!(!args.is_empty(), "every git run names a command");
-    assert!(args.len() <= ARGS_MAX && filters.len() <= FILTER_KEYS_MAX);
+    assert!(args.len() <= ARGS_MAX);
     let mut command = hardened();
-    for key in filters {
-        command.arg("-c").arg(format!("{key}=false"));
-    }
     command.arg("-C").arg(dir).args(args);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn isolated(program: &str) -> Process {
+    assert!(program == GH);
+    let mut command = Process::new(program);
+    for name in ENV_REMOVED {
+        command.env_remove(name);
+    }
     command
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -351,7 +373,7 @@ fn spawn_and_collect(
     let spawned = CommandWrap::from(process)
         .wrap(ProcessGroup::leader())
         .spawn();
-    let mut child = spawned.map_err(|error| GitError::Spawn(format!("git {line}: {error}")))?;
+    let mut child = spawned.map_err(|error| GitError::Spawn(format!("{line}: {error}")))?;
     let writer = match (input, child.stdin().take()) {
         (Some(bytes), Some(mut stdin)) => {
             // Written from its own thread so git can't block on a full stdout meanwhile.
@@ -360,14 +382,14 @@ fn spawn_and_collect(
                 Ok(handle) => Some(handle),
                 Err(error) => {
                     let _ = board::kill_group(child.as_mut());
-                    return Err(GitError::Spawn(format!("git {line}: {error}")));
+                    return Err(GitError::Spawn(format!("{line}: {error}")));
                 }
             }
         }
         (None, None) => None,
         (Some(_), None) | (None, Some(_)) => {
             let _ = board::kill_group(child.as_mut());
-            return Err(GitError::Spawn(format!("git {line}: stdin is not set up")));
+            return Err(GitError::Spawn(format!("{line}: stdin is not set up")));
         }
     };
     assert!(child.stdin().is_none());
@@ -377,7 +399,7 @@ fn spawn_and_collect(
     match (output, written) {
         // A git that exits without reading all its input reports its own failure.
         (Ok(done), Some(Ok(Err(_)) | Err(_))) if done.code == Some(0) => {
-            Err(GitError::Io(format!("writing to git {line}")))
+            Err(GitError::Io(format!("writing to {line}")))
         }
         (output, _) => output,
     }
@@ -389,39 +411,12 @@ fn run(dir: &Path, args: &[&OsStr]) -> Result<Output, GitError> {
 
 fn run_fed(dir: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Output, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
-    let line = shown(args);
-    let filters = filter_keys(dir)?;
-    let mut process = command(dir, args, &filters);
+    let line = shown(GIT, args);
+    let mut process = command(dir, args);
     if input.is_some() {
         process.stdin(Stdio::piped());
     }
     spawn_and_collect(process, &line, GIT_DEADLINE, input)
-}
-
-// Filter drivers have names of the config's choosing, so each one it defines is found first.
-fn filter_keys(dir: &Path) -> Result<Vec<String>, GitError> {
-    let args = FILTER_KEYS.map(OsStr::new);
-    let output = spawn_and_collect(command(dir, &args, &[]), &shown(&args), GIT_DEADLINE, None)?;
-    match output.code {
-        Some(0) => {}
-        Some(1) if output.stdout.is_empty() => return Ok(Vec::new()),
-        _ => return Err(exit_error(&args, &output)),
-    }
-    let mut keys = Vec::new();
-    for key in output
-        .stdout
-        .split(|&byte| byte == 0)
-        .filter(|key| !key.is_empty())
-    {
-        let key = std::str::from_utf8(key).map_err(|_| parse_error(&args, &output.stdout))?;
-        let command = key.rsplit('.').next().unwrap_or_default();
-        if keys.len() == FILTER_KEYS_MAX || !FILTER_COMMANDS.contains(&command) {
-            return Err(parse_error(&args, &output.stdout));
-        }
-        keys.push(key.to_string());
-    }
-    assert!(keys.len() <= FILTER_KEYS_MAX);
-    Ok(keys)
 }
 
 fn exit_error(args: &[&OsStr], output: &Output) -> GitError {
@@ -429,7 +424,7 @@ fn exit_error(args: &[&OsStr], output: &Output) -> GitError {
     assert!(output.stderr.len() <= OUTPUT_BYTES_MAX);
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     GitError::Exit {
-        args: shown(args),
+        args: shown(GIT, args),
         stderr,
     }
 }
@@ -439,7 +434,7 @@ fn parse_error(args: &[&OsStr], stdout: &[u8]) -> GitError {
     let stdout = String::from_utf8_lossy(stdout).into_owned();
     assert!(!args.is_empty());
     GitError::Parse {
-        args: shown(args),
+        args: shown(GIT, args),
         stdout,
     }
 }
@@ -897,6 +892,143 @@ pub fn remove_worktree(repo: &Path, dir: &Path) -> Result<(), GitError> {
     run_ok(repo, &args).map(|_| ())
 }
 
+pub fn is_plain_branch(name: &str) -> bool {
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || b"-_./".contains(&b);
+    let plain = is_safe_ref(name)
+        && name.bytes().all(allowed)
+        && !name.starts_with(['.', '/'])
+        && !name.ends_with(['.', '/'])
+        && !name.ends_with(".lock")
+        && !name.contains("//")
+        && !name.contains("/.");
+    assert!(!plain || !name.contains(['*', ':', '^', '~', '?', '[', '\\', '@']));
+    assert!(!plain || is_safe_ref(name));
+    plain
+}
+
+// insteadOf, pushInsteadOf, pushurl and a repeated url each send a push somewhere other than,
+// or beyond, the one configured URL.
+pub fn origin_url(repo: &Path) -> Result<Option<String>, GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    let queries: [&[&str]; 3] = [
+        &["config", "--get-all", "remote.origin.url"],
+        &["remote", "get-url", "--all", "origin"],
+        &["remote", "get-url", "--push", "--all", "origin"],
+    ];
+    let mut urls: Vec<String> = Vec::with_capacity(queries.len());
+    for query in queries {
+        let args: Vec<&OsStr> = query.iter().map(OsStr::new).collect();
+        let output = run(repo, &args)?;
+        if output.code != Some(0) {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(&output.stdout);
+        let text = text.map_err(|_| parse_error(&args, &output.stdout))?;
+        let mut lines = text.lines();
+        match (lines.next(), lines.next()) {
+            (Some(url), None) if !url.is_empty() => urls.push(url.to_string()),
+            _ => return Ok(None),
+        }
+    }
+    assert_eq!(urls.len(), queries.len());
+    let one = urls.windows(2).all(|pair| pair[0] == pair[1]);
+    Ok(one.then(|| urls.swap_remove(0)))
+}
+
+pub fn remote_branch(repo: &Path, branch: &str) -> Result<Option<String>, GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    assert!(is_plain_branch(branch));
+    let full = format!("{HEADS_PREFIX}{branch}");
+    let args = ["ls-remote", "--heads", "origin", &full].map(OsStr::new);
+    let stdout = run_ok(repo, &args)?;
+    let text = std::str::from_utf8(&stdout).map_err(|_| parse_error(&args, &stdout))?;
+    let mut found = None;
+    for line in text.lines() {
+        let Some((commit, name)) = line.split_once('\t') else {
+            return Err(parse_error(&args, &stdout));
+        };
+        if name != full {
+            continue;
+        }
+        if !is_commit_id(commit) || found.is_some() {
+            return Err(parse_error(&args, &stdout));
+        }
+        found = Some(commit.to_string());
+    }
+    assert!(found.as_deref().is_none_or(is_commit_id));
+    Ok(found)
+}
+
+pub fn tracking_branch(repo: &Path, branch: &str) -> Result<Option<String>, GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    assert!(is_plain_branch(branch));
+    let full = format!("refs/remotes/{ORIGIN_PREFIX}{branch}");
+    let args = [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        &full,
+    ]
+    .map(OsStr::new);
+    let Some(commit) = query(repo, &args)? else {
+        return Ok(None);
+    };
+    if !is_commit_id(&commit) {
+        return Err(parse_error(&args, commit.as_bytes()));
+    }
+    Ok(Some(commit))
+}
+
+// Push configuration would otherwise add tags, submodule pushes or push options.
+pub fn push_commit(repo: &Path, commit: &str, branch: &str) -> Result<(), GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    assert!(is_commit_id(commit) && is_plain_branch(branch));
+    let refspec = format!("{commit}:{HEADS_PREFIX}{branch}");
+    let args = [
+        "-c",
+        "push.default=nothing",
+        "-c",
+        "push.followTags=false",
+        "-c",
+        "push.recurseSubmodules=no",
+        "-c",
+        "push.pushOption=",
+        "push",
+        "--quiet",
+        "--no-follow-tags",
+        "--recurse-submodules=no",
+        "origin",
+        &refspec,
+    ];
+    assert!(!refspec.starts_with('+'));
+    run_ok(repo, &args.map(OsStr::new)).map(|_| ())
+}
+
+pub fn gh(repo: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Vec<u8>, GitError> {
+    assert!(repo.is_absolute(), "gh runs in absolute directories");
+    assert!(!args.is_empty() && args.len() <= ARGS_MAX);
+    let line = shown(GH, args);
+    let mut process = isolated(GH);
+    process
+        .current_dir(repo)
+        .args(args)
+        .env_remove("GH_REPO")
+        .env_remove("GH_HOST")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    if input.is_some() {
+        process.stdin(Stdio::piped());
+    }
+    let output = spawn_and_collect(process, &line, GIT_DEADLINE, input)?;
+    if output.code != Some(0) {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(GitError::Exit { args: line, stderr });
+    }
+    assert!(output.stdout.len() <= OUTPUT_BYTES_MAX);
+    Ok(output.stdout)
+}
+
 #[cfg(test)]
 pub mod testing {
     //! Real repositories in temporary directories, for tests in this crate.
@@ -912,10 +1044,10 @@ pub mod testing {
     // Config from the environment outranks repository config and may sign commits or run hooks.
     fn test_git(dir: &Path, args: &[&str]) -> Output {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-        let mut process = command(dir, &args, &[]);
+        let mut process = command(dir, &args);
         process.env_remove("GIT_CONFIG_COUNT");
         process.env_remove("GIT_CONFIG_PARAMETERS");
-        spawn_and_collect(process, &shown(&args), super::GIT_DEADLINE, None).unwrap()
+        spawn_and_collect(process, &shown("git", &args), super::GIT_DEADLINE, None).unwrap()
     }
 
     /// Runs `git -C <dir> <args>`, asserts it succeeded, and returns its trimmed stdout.

@@ -372,7 +372,7 @@ fn a_blocked_then_unblocked_attempt_keeps_the_log_of_each_run() {
     );
     assert_eq!(
         task_logs(&world, &task),
-        vec!["1-2.jsonl", "1.jsonl", "session"]
+        vec!["1-2.jsonl", "1.jsonl", "result.json", "session"]
     );
 }
 
@@ -663,7 +663,7 @@ fn an_attempt_run_past_its_log_bound_reuses_its_last_log() {
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
 
     assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
-    names.push("session".to_string());
+    names.extend(["result.json".to_string(), "session".to_string()]);
     names.sort();
     assert_eq!(task_logs(&world, &task), names);
     let last = std::fs::read_to_string(dir.join("1-16.jsonl")).expect("the last log");
