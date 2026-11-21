@@ -1407,6 +1407,7 @@ struct Finished {
     head: String,
     title: String,
     summary: String,
+    base: Option<String>,
 }
 
 struct GitHub {
@@ -1445,13 +1446,11 @@ fn label<'a>(view: &'a TaskView, key: &str) -> Option<&'a str> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettledRecord {
-    #[expect(dead_code, reason = "named so a changed record shape fails to parse")]
-    behind: Vec<u64>,
+    repo: String,
     branch: Option<String>,
-    #[expect(dead_code, reason = "named so a changed record shape fails to parse")]
-    commits: u64,
     head: String,
     summary: String,
+    base: Option<String>,
 }
 
 fn settled(home: &Path, id: TaskId) -> Result<SettledRecord, CliError> {
@@ -1491,9 +1490,12 @@ fn finished(view: &TaskView, home: &Path) -> Result<Finished, CliError> {
         return Err(refuse("is not completed"));
     }
     let record = settled(home, id)?;
-    let repo = label(view, "repo").map(PathBuf::from);
-    let repo = repo.filter(|repo| repo.is_absolute());
-    let repo = repo.ok_or_else(|| refuse("has no repo label holding an absolute path"))?;
+    let repo = PathBuf::from(record.repo);
+    if !repo.is_absolute() {
+        return Err(refuse(
+            "has a recorded repository that is not an absolute path",
+        ));
+    }
     let branch = record.branch.filter(|branch| git::is_plain_branch(branch));
     let branch = branch.ok_or_else(|| refuse("has no result branch naming one branch"))?;
     if label(view, "branch") != Some(branch.as_str()) {
@@ -1517,47 +1519,53 @@ fn finished(view: &TaskView, home: &Path) -> Result<Finished, CliError> {
         head: record.head,
         title,
         summary: record.summary,
+        base: record.base,
     })
 }
 
 struct Chain {
     root: TaskId,
-    base: Option<String>,
+    base: String,
 }
 
-fn chain(board: &dyn Board, view: &TaskView) -> Result<Chain, CliError> {
+fn chain(
+    board: &dyn Board,
+    view: &TaskView,
+    home: &Path,
+    task: &Finished,
+) -> Result<Chain, CliError> {
     let refuse = |why| CliError::NotPushable { id: view.id, why };
-    let id_of = |task: &TaskView, key| label(task, key).map(|text| parse_task_id(text).ok());
-    let mut root = view.clone();
+    let mut root = view.id;
     let mut steps = 0_usize;
-    while let Some(onto) = id_of(&root, "onto") {
-        let onto = onto.ok_or_else(|| refuse("has a bad onto"))?;
+    let mut current = view.clone();
+    while let Some(onto) = label(&current, "onto") {
+        let onto = parse_task_id(onto).map_err(|_| refuse("has a bad onto"))?;
         steps += 1;
         if steps > BASE_CHAIN_MAX {
             return Err(refuse("has an onto chain longer than rider pr follows"));
         }
-        root = board.read_task(onto).map_err(CliError::Board)?;
+        current = board.read_task(onto).map_err(CliError::Board)?;
+        root = current.id;
     }
-    let base = match (id_of(&root, "base"), label(&root, "from")) {
-        (Some(Some(base)), _) => {
-            let parent = board.read_task(base).map_err(CliError::Board)?;
-            let branch = label(&parent, "branch").filter(|branch| git::is_plain_branch(branch));
-            let branch =
-                branch.ok_or_else(|| refuse("has a base task without one plain branch"))?;
-            Some(branch.to_string())
+    let base = match &task.base {
+        Some(base) => base.clone(),
+        None if root != view.id => {
+            let settled = settled(home, root)?;
+            if Path::new(&settled.repo) != task.repo {
+                return Err(refuse("has an onto chain in another repository"));
+            }
+            settled
+                .base
+                .ok_or_else(|| refuse("has an onto chain without a recorded base"))?
         }
-        (Some(None), _) => return Err(refuse("has a bad base")),
-        (None, Some(from)) if git::is_plain_branch(from) => Some(from.to_string()),
-        (None, Some(_)) => return Err(refuse("has a from label that is not one plain branch")),
-        (None, None) => None,
+        None => return Err(refuse("has no base branch Rider recorded")),
     };
-    let chain = Chain {
-        root: root.id,
-        base,
-    };
+    if !git::is_plain_branch(&base) {
+        return Err(refuse("has a recorded base that is not one plain branch"));
+    }
     assert!(steps <= BASE_CHAIN_MAX);
-    assert!(chain.base.as_deref().is_none_or(git::is_plain_branch));
-    Ok(chain)
+    assert!(git::is_plain_branch(&base));
+    Ok(Chain { root, base })
 }
 
 fn github(repo: &Path, id: TaskId) -> Result<GitHub, CliError> {
@@ -1635,11 +1643,11 @@ fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
     };
     let view = board.read_task(id).map_err(CliError::Board)?;
     let task = finished(&view, config.home())?;
-    let Chain { root, base } = chain(&board, &view)?;
+    let Chain { root, base } = chain(&board, &view, config.home(), &task)?;
     let own = format!("rider/{}-", root.0);
     let default = git::default_branch(&task.repo).map_err(CliError::Git)?;
     if !task.branch.starts_with(&own)
-        || base.as_ref() == Some(&task.branch)
+        || base == task.branch
         || default.as_ref() == Some(&task.branch)
     {
         let why = "has a branch that is not the one Rider made for it";
@@ -1680,12 +1688,20 @@ fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
         None => {
             let title = format!("--title={}", task.title);
             let head = format!("--head={}:{}", hub.owner, task.branch);
-            let base = base.map(|base| format!("--base={base}"));
-            let mut create = vec!["pr", "create", &repo_arg, "--draft", &head, &title];
-            create.extend(base.as_deref());
-            create.extend(["--body-file", "-"]);
+            let base = format!("--base={base}");
+            let create = [
+                "pr",
+                "create",
+                &repo_arg,
+                "--draft",
+                &head,
+                &title,
+                &base,
+                "--body-file",
+                "-",
+            ];
             let body = Some(task.summary.into_bytes());
-            let args: Vec<&OsStr> = create.iter().map(OsStr::new).collect();
+            let args = create.map(OsStr::new);
             let created = git::gh(&task.repo, &args, body).map_err(CliError::Git)?;
             String::from_utf8_lossy(&created).trim().to_string()
         }

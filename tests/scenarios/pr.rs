@@ -374,3 +374,59 @@ fn rider_pr_refuses_an_origin_whose_push_goes_elsewhere_or_to_several_urls() {
     );
     assert_eq!(gh_calls(&remote), Vec::<String>::new());
 }
+
+#[test]
+fn rider_pr_ignores_a_repo_label_changed_after_completion() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let remote = given_an_origin_and_a_fake_gh(&world);
+    let (task, branch) = given_a_completed_task(&mut world);
+    let other = world.root.join("other/demo.git");
+    let made = world.git(&world.root, &["init", "-q", "--bare", "other/demo.git"]);
+    assert_eq!(made.code, Some(0), "{made:?}");
+    let repo = world.repo.to_str().expect("UTF-8 path");
+    let cloned = world.git(&world.root, &["clone", "-q", repo, "clone2"]);
+    assert_eq!(cloned.code, Some(0), "{cloned:?}");
+    let clone = world.root.join("clone2");
+    let tracked = format!("origin/{branch}");
+    for args in [
+        &["branch", &branch, &tracked][..],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:other/demo.git",
+        ],
+    ] {
+        let done = world.git(&clone, args);
+        assert_eq!(done.code, Some(0), "{args:?}: {done:?}");
+    }
+    let label = format!("repo={}", clone.display());
+    let relabelled = world.vb_as("implement-9", &["label", &task, &label], None);
+    assert_eq!(relabelled.code, Some(0), "{relabelled:?}");
+
+    let output = when_rider_runs(&world, &["pr", &task]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert_eq!(origin_refs(&world, &other), Vec::<String>::new());
+    let refs = vec![format!("refs/heads/{MAIN}"), format!("refs/heads/{branch}")];
+    assert_eq!(origin_refs(&world, &remote.origin), refs);
+}
+
+#[test]
+fn rider_pr_opens_the_draft_against_the_base_the_daemon_used_not_a_relabelled_one() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let remote = given_an_origin_and_a_fake_gh(&world);
+    let (task, branch) = given_a_completed_task(&mut world);
+    let relabelled = world.vb_as("implement-9", &["label", &task, "from=release-1.0"], None);
+    assert_eq!(relabelled.code, Some(0), "{relabelled:?}");
+
+    let output = when_rider_runs(&world, &["pr", &task]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let create = create_call(&branch, "Add one work file.", MAIN);
+    assert_eq!(gh_calls(&remote), vec![list_call(&branch), create]);
+}

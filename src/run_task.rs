@@ -156,6 +156,15 @@ struct ResultRecord<'a> {
     summary: &'a str,
 }
 
+#[derive(Serialize)]
+struct Settlement<'a> {
+    repo: &'a str,
+    branch: Option<&'a str>,
+    head: &'a str,
+    summary: &'a str,
+    base: Option<&'a str>,
+}
+
 struct Evidence {
     clean: bool,
     on_branch: bool,
@@ -1233,19 +1242,30 @@ fn complete(
         let _ = board.reply(id, &one_line(&note));
     }
     // The record and the note below only inform; losing them must not undo finished work.
-    if let Ok(record) = serde_json::to_string(&record) {
-        assert!(record.len() as u64 <= RESULT_FILE_BYTES_MAX);
-        let path = result_path(&env.home, id);
-        if let Err(error) = fs::write(&path, &record) {
-            let note = format!(
-                "Rider could not record the result in {}: {error}.",
-                path.display()
-            );
-            let _ = board.reply(id, &one_line(&note));
-        }
-        if board.post_structured(id, RESULT_SCHEMA, &record).is_err() {
-            let _ = board.reply(id, &record);
-        }
+    let settlement = attempt.brief.repo.to_str().map(|repo| Settlement {
+        repo,
+        branch: record.branch,
+        head: record.head,
+        summary: record.summary,
+        base: attempt.checkout.base.as_deref(),
+    });
+    let path = result_path(&env.home, id);
+    let written = match settlement.map(|settlement| serde_json::to_string(&settlement)) {
+        Some(Ok(json)) => fs::write(&path, json).map_err(|error| error.to_string()),
+        Some(Err(error)) => Err(error.to_string()),
+        None => Err("the repository path is not UTF-8".to_string()),
+    };
+    if let Err(error) = written {
+        let note = format!(
+            "Rider could not record the result in {}: {error}.",
+            path.display()
+        );
+        let _ = board.reply(id, &one_line(&note));
+    }
+    if let Ok(record) = serde_json::to_string(&record)
+        && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
+    {
+        let _ = board.reply(id, &record);
     }
     if let Err(error) = worktree::release(&attempt.checkout, &attempt.brief.repo, &env.home) {
         let why = match error {
