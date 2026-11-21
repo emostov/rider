@@ -24,8 +24,7 @@ use crate::core::{
 /// The socket's file name under the Rider home.
 pub const SOCKET_FILE: &str = "rider.sock";
 /// The directory under the Rider home the socket is bound in before it is moved into place.
-const BIND_DIR: &str = ".bind";
-/// The socket's file name inside `BIND_DIR`.
+pub const BIND_DIR: &str = ".bind";
 const BIND_FILE: &str = "s";
 /// The protocol version a request names in `v`.
 pub const VERSION: u64 = 1;
@@ -151,10 +150,15 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
     // Bound inside a directory only the owner can enter, the socket takes connections only
     // once it is 0600 and renamed into place, whatever the umask. The bound path is short,
     // since a socket's path is limited to about 100 bytes.
-    let private = home.join(BIND_DIR);
+    let staging = home.join(BIND_DIR);
+    let private = staging.join(std::process::id().to_string());
     let bound = private.join(BIND_FILE);
     assert!(bound.starts_with(home) && bound != path);
-    // A daemon that died while binding leaves the directory behind.
+    match fs::DirBuilder::new().mode(0o700).create(&staging) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        Ok(()) | Err(_) => {}
+    }
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
     for removed in [fs::remove_file(&bound), fs::remove_dir(&private)] {
         match removed {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
@@ -162,11 +166,11 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
         }
     }
     fs::DirBuilder::new().mode(0o700).create(&private)?;
-    fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
     let listener = UnixListener::bind(&bound)?;
     fs::set_permissions(&bound, fs::Permissions::from_mode(0o600))?;
     fs::rename(&bound, path)?;
     fs::remove_dir(&private)?;
+    let _ = fs::remove_dir(&staging);
     let clients = Arc::new(Mutex::new(Clients::default()));
     let shared = Arc::clone(&clients);
     thread::Builder::new()

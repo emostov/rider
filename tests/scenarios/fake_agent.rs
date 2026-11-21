@@ -23,7 +23,8 @@ pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
 pub const PR_REF: &str = "refs/rider/pr/412";
-pub const TRIED_WRITES: &str = "agents.json.new cursor.new board.json.new node/probe";
+pub const TRIED_WRITES: &str =
+    "agents.json.new cursor.new board.json.new node/probe .bind/probe rider.toml prompts";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

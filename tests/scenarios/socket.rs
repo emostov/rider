@@ -298,6 +298,22 @@ fn a_detached_child_of_an_agent_cannot_signal_the_daemon() {
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
 
+#[test]
+fn a_file_left_in_the_sockets_staging_directory_does_not_stop_the_daemon_starting() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let staging = world.home.join(".bind");
+    fs::create_dir_all(&staging).expect("create the staging directory");
+    fs::write(staging.join("left"), "").expect("leave a file there");
+
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_rider_runs(&world, &["status"]).code, Some(0));
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
 fn given_a_log(world: &World, task: &str, text: &str) {
     let dir = world.home.join("logs").join(task);
     fs::create_dir_all(&dir).expect("create the task's log directory");

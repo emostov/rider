@@ -27,6 +27,8 @@ use crate::board::{
     parse_failure_reason, register_schemas,
 };
 use crate::cli::board_serve;
+#[cfg(target_os = "macos")]
+use crate::config::FILE_NAME as CONFIG_FILE;
 use crate::config::Limits;
 use crate::core::{
     self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, AgentRecord, Call, Config, Event, LEASE_MILLIS,
@@ -144,6 +146,12 @@ exec "$@""#;
 
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+#[cfg(target_os = "macos")]
+const PROGRAMS: [&str; 4] = ["git", "node", "npm", "sh"];
+#[cfg(target_os = "macos")]
+const PATH_DIRS_MAX: usize = 256;
+#[cfg(target_os = "macos")]
+const PROMPTS_DIR: &str = "prompts";
 #[cfg(target_os = "macos")]
 const SANDBOX_REFUSED_EXIT: i32 = 71;
 #[cfg(target_os = "macos")]
@@ -1218,7 +1226,9 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
     }
     let vb = fs::canonicalize(vb)
         .map_err(|error| unusable(format!("resolve {}: {error}", vb.display())))?;
-    let mut denied = Vec::with_capacity(HOME_DEPTH_MAX + 2 * CONTROL_FILES.len() + 4);
+    let programs = daemon_programs();
+    let capacity = HOME_DEPTH_MAX + 2 * CONTROL_FILES.len() + PROGRAMS.len() + 10;
+    let mut denied = Vec::with_capacity(capacity);
     for dir in home.ancestors() {
         denied.push(format!("(literal {})", quote(dir)?));
     }
@@ -1227,8 +1237,25 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
         denied.push(format!("(literal {})", quote(&home.join(name))?));
         denied.push(format!("(literal {})", quote(&home.join(staged))?));
     }
-    denied.push(format!("(literal {})", quote(&vb)?));
-    for name in [AGENTS_DIR, LOGS_DIR, NODE_DIR] {
+    let staged_config = format!("{CONFIG_FILE}{STAGED_SUFFIX}");
+    for file in [
+        vb.as_path(),
+        &home.join(CONFIG_FILE),
+        &home.join(staged_config),
+    ] {
+        denied.push(format!("(literal {})", quote(file)?));
+    }
+    for program in &programs {
+        denied.push(format!("(literal {})", quote(program)?));
+    }
+    let staging = quote(&home.join(socket::BIND_DIR))?;
+    for name in [
+        AGENTS_DIR,
+        LOGS_DIR,
+        NODE_DIR,
+        PROMPTS_DIR,
+        socket::BIND_DIR,
+    ] {
         denied.push(format!("(subpath {})", quote(&home.join(name))?));
     }
     let socket = quote(&home.join(SOCKET_FILE))?;
@@ -1236,9 +1263,11 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
         "(version 1)\n(allow default)\n\
          (deny signal)\n(allow signal (target same-sandbox))\n\
          (deny network-outbound (remote unix-socket (path-literal {socket})))\n\
+         (deny network-outbound (remote unix-socket (subpath {staging})))\n\
          (deny file-write* {})\n",
         denied.join(" ")
     );
+    assert!(denied.len() <= capacity);
     assert!(denied.len() > 2 * CONTROL_FILES.len() && profile.contains(&socket));
     Ok(vec![
         SANDBOX_EXEC.to_string(),
@@ -1246,6 +1275,26 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
         profile,
         "--".to_string(),
     ])
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_programs() -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::env::current_exe().into_iter().collect();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).take(PATH_DIRS_MAX).collect();
+    for program in PROGRAMS {
+        let first = dirs
+            .iter()
+            .map(|dir| dir.join(program))
+            .find(|file| file.is_file());
+        found.extend(first);
+    }
+    let found: Vec<PathBuf> = found
+        .iter()
+        .filter_map(|file| fs::canonicalize(file).ok())
+        .collect();
+    assert!(found.len() <= PROGRAMS.len() + 1);
+    found
 }
 
 // sandbox-exec exits 71, printing `sandbox_apply: Operation not permitted`, when the process
