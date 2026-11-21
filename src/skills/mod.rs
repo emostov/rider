@@ -6,8 +6,12 @@ use std::path::PathBuf;
 pub use install::{InstallDir, Outcome, Report, install, resolve, update_recorded};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SKILLS: [&str; 2] = ["ride-swarm", "ship-swarm"];
-pub const FILES: [(&str, &str); 6] = [
+pub const SKILLS: [&str; 3] = ["review-queue", "ride-swarm", "ship-swarm"];
+pub const FILES: [(&str, &str); 8] = [
+    (
+        "review-queue/SKILL.md",
+        include_str!("../../skills/review-queue/SKILL.md"),
+    ),
     (
         "ride-swarm/SKILL.md",
         include_str!("../../skills/ride-swarm/SKILL.md"),
@@ -15,6 +19,10 @@ pub const FILES: [(&str, &str); 6] = [
     (
         "ride-swarm/lead.md",
         include_str!("../../skills/ride-swarm/lead.md"),
+    ),
+    (
+        "ride-swarm/schemas/rider-draft@1.json",
+        include_str!("../../skills/ride-swarm/schemas/rider-draft@1.json"),
     ),
     (
         "ride-swarm/schemas/rider-finding.json",

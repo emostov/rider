@@ -37,6 +37,8 @@ use crate::feed::{
 use crate::git::{self, GitError};
 use crate::harness::{LOG_BYTES_MAX, open_private};
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
+use crate::queue_files::{self, FilesError};
+use crate::queue_wait::{self, WaitError};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
 use crate::run_task::{RESULT_FILE_BYTES_MAX, result_path};
@@ -144,6 +146,42 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// What `rider queue` does instead of printing the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum QueueAction {
+    /// Block until a packet comment, a new PR head or a PR comment differs from the labels.
+    ///
+    /// Exits 3, printing nothing, when the timeout passes first.
+    Wait {
+        /// The most minutes to wait.
+        #[arg(
+            long,
+            value_name = "MINUTES",
+            default_value_t = WAIT_MINUTES_DEFAULT,
+            value_parser = clap::value_parser!(u32).range(1..=i64::from(WAIT_MINUTES_MAX)),
+        )]
+        timeout: u32,
+    },
+    /// Print the PR head the queue item's preparation reviewed; with COMMIT, record it.
+    Reviewed {
+        #[arg(value_name = "ITEM", value_parser = parse_task_id)]
+        item: TaskId,
+        #[arg(value_name = "COMMIT", value_parser = parse_commit)]
+        commit: Option<String>,
+    },
+    /// Write a pull request's diff and changed files, as plain files, for an untrusted review.
+    Files {
+        #[arg(value_name = "ITEM", value_parser = parse_task_id)]
+        item: TaskId,
+        #[arg(value_name = "PR", value_parser = parse_pull)]
+        pull: (String, u64),
+        #[arg(value_name = "BASE", value_parser = parse_commit)]
+        base: String,
+        #[arg(value_name = "HEAD", value_parser = parse_commit)]
+        head: String,
+    },
+}
+
 /// One command to run.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -166,10 +204,13 @@ pub enum Command {
     /// Print every agent the daemon runs.
     Agents,
     /// Print the owner's review queue, then the work the daemon runs.
+    #[command(args_conflicts_with_subcommands = true)]
     Queue {
         /// Print the items with every label as JSON.
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        action: Option<QueueAction>,
     },
     /// Print the newest attempt's log of a task; -f follows it until the agent exits.
     Logs {
@@ -270,6 +311,8 @@ pub enum UsageError {
     BadTaskId(String),
     EmptyUrl,
     BadName(String),
+    BadCommit(String),
+    BadPull(String),
 }
 
 impl fmt::Display for UsageError {
@@ -282,6 +325,12 @@ impl fmt::Display for UsageError {
                 )
             }
             UsageError::EmptyUrl => write!(f, "a board URL is empty"),
+            UsageError::BadCommit(text) => {
+                write!(f, "{text:?} is not a commit id: use all 40 hex digits")
+            }
+            UsageError::BadPull(text) => {
+                write!(f, "{text:?} is not a pull request: use <owner>/<name>#<n>")
+            }
             UsageError::BadName(text) => write!(
                 f,
                 "{text:?} is not a name: use at most {NAME_CHARS_MAX} letters, digits, - or _"
@@ -310,6 +359,18 @@ fn parse_name(text: &str) -> Result<String, UsageError> {
     }
     assert!(!text.contains('/') && !text.contains('.'));
     Ok(text.to_string())
+}
+
+fn parse_commit(text: &str) -> Result<String, UsageError> {
+    if git::is_commit_id(text) {
+        return Ok(text.to_string());
+    }
+    Err(UsageError::BadCommit(text.to_string()))
+}
+
+fn parse_pull(text: &str) -> Result<(String, u64), UsageError> {
+    let parsed = queue_wait::parse_pr(text).map(|(repo, number)| (repo.to_string(), number));
+    parsed.ok_or_else(|| UsageError::BadPull(text.to_string()))
 }
 
 fn parse_task_id(text: &str) -> Result<TaskId, UsageError> {
@@ -471,6 +532,8 @@ pub enum CliError {
     /// `npm install` of the Board CLI failed or left no `vb`.
     NotInstalled(String),
     Queue(QueueError),
+    QueueWait(WaitError),
+    QueueFiles(FilesError),
     Skills(SkillsError),
     /// `rider skills install` left these skill directories as they were.
     SkillsRefused(usize),
@@ -514,6 +577,8 @@ impl fmt::Display for CliError {
             ),
             CliError::NotInstalled(why) => write!(f, "could not install the Board CLI: {why}"),
             CliError::Queue(error) => write!(f, "{error}"),
+            CliError::QueueWait(error) => write!(f, "{error}"),
+            CliError::QueueFiles(error) => write!(f, "{error}"),
             CliError::Skills(error) => write!(f, "{error}"),
             CliError::SkillsRefused(count) => {
                 write!(f, "{count} skills were not installed; see the lines above")
@@ -547,7 +612,30 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Down { now } => down(config, *now),
         Command::Status => status(config),
         Command::Agents => agents(config),
-        Command::Queue { json } => queue(config, *json),
+        Command::Queue { json, action: None } => queue(config, *json),
+        Command::Queue {
+            action: Some(QueueAction::Wait { timeout }),
+            ..
+        } => queue_wait(config, *timeout),
+        Command::Queue {
+            action: Some(QueueAction::Reviewed { item, commit }),
+            ..
+        } => queue_reviewed(config, *item, commit.as_deref()),
+        Command::Queue {
+            action:
+                Some(QueueAction::Files {
+                    item,
+                    pull,
+                    base,
+                    head,
+                }),
+            ..
+        } => {
+            let (repo, number) = pull;
+            let fetched = queue_files::fetch(&config.home, *item, repo, *number, base, head);
+            say(&fetched.map_err(CliError::QueueFiles)?.display().to_string());
+            Ok(0)
+        }
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
@@ -1282,7 +1370,8 @@ fn task_row(task: &serde_json::Value) -> String {
     )
 }
 
-fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
+// The queue's board client, or `None` after printing the hint when no repository opted in.
+fn queue_board(config: &Config) -> Result<Option<VbCli>, CliError> {
     let repos = queue::opted_in(&config.home).map_err(CliError::Queue)?;
     if repos.is_empty() {
         let path = config.home.join(STAND_IN_FILE);
@@ -1291,12 +1380,65 @@ fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
             path.display()
         ));
         say("[repo.\"/path/to/checkout\"]\nqueue = true");
-        return Ok(1);
+        return Ok(None);
     }
-    let board = VbCli {
+    Ok(Some(VbCli {
         vb: config.vb_dir().join("vb"),
         url: config.board_url.clone(),
         profile: QUEUE_PROFILE.to_string(),
+    }))
+}
+
+fn queue_wait(config: &Config, minutes: u32) -> Result<u8, CliError> {
+    assert!(minutes <= WAIT_MINUTES_MAX);
+    let deadline = Instant::now() + Duration::from_secs(u64::from(minutes) * 60);
+    let Some(board) = queue_board(config)? else {
+        return Ok(1);
+    };
+    let listing = open_tasks(&board, QUEUE_CHANNEL).map_err(CliError::Board)?;
+    if listing.tasks.len().saturating_add(listing.left_out) > QUEUE_ITEMS_MAX {
+        return Err(CliError::Queue(QueueError::TooManyItems));
+    }
+    let watches = queue_wait::watches(&config.home, &listing.tasks);
+    let watches = watches.map_err(CliError::QueueWait)?;
+    let outcome = queue_wait::wait(&queue_wait::Cli, &watches, deadline);
+    for warning in &outcome.warnings {
+        eprintln!("rider: {warning}");
+    }
+    if let Some(error) = outcome.error {
+        return Err(CliError::QueueWait(error));
+    }
+    if outcome.lines.is_empty() {
+        return Ok(3);
+    }
+    outcome.lines.iter().for_each(|line| say(line));
+    Ok(0)
+}
+
+fn queue_reviewed(config: &Config, item: TaskId, commit: Option<&str>) -> Result<u8, CliError> {
+    assert!(config.home.is_absolute());
+    if let Some(commit) = commit {
+        queue_wait::record_head(&config.home, item, commit).map_err(CliError::QueueWait)?;
+        return Ok(0);
+    }
+    match queue_wait::recorded_head(&config.home, item).map_err(CliError::QueueWait)? {
+        Some(head) => {
+            say(&head);
+            Ok(0)
+        }
+        None => {
+            eprintln!(
+                "rider: no reviewed head is recorded for queue item #{}",
+                item.0
+            );
+            Ok(1)
+        }
+    }
+}
+
+fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
+    let Some(board) = queue_board(config)? else {
+        return Ok(1);
     };
     let listings = thread::scope(|scope| {
         let reads: Vec<_> = [QUEUE_CHANNEL, DECISIONS]

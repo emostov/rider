@@ -39,6 +39,9 @@ pub enum Behaviour {
     Commit,
     /// Reports success having committed nothing.
     CommitNothing,
+    /// As a Codex that fails before its thread starts for a reason other than the session,
+    /// such as an expired login: prints an error to stderr and exits 1.
+    FailBeforeThread,
     /// Records its worktree's `HEAD` commit and branch, then acts like `CommitNothing`.
     RecordHead,
     /// Writes `uncommitted-<task>.txt` without committing it and reports success.
@@ -78,6 +81,8 @@ pub enum Behaviour {
     RefuseResumeThenHold,
     /// Switches to a new branch `elsewhere`, then commits like `Commit`.
     WanderBranch,
+    /// Like `RefuseResume`, but started without a session to resume it commits nothing.
+    RefuseResumeThenNothing,
     /// Detaches its worktree's `HEAD`, then commits like `Commit`.
     Detach,
     /// Commits like `Commit`, then exits `FAIL_EXIT_CODE`.
@@ -200,6 +205,7 @@ impl Behaviour {
         match self {
             Behaviour::Commit => "commit",
             Behaviour::CommitNothing => "commit-nothing",
+            Behaviour::FailBeforeThread => "fail-before-thread",
             Behaviour::RecordHead => "record-head",
             Behaviour::LeaveUncommitted => "leave-uncommitted",
             Behaviour::Block => "block",
@@ -217,6 +223,7 @@ impl Behaviour {
             Behaviour::RebaseOntoMain => "rebase-onto-main",
             Behaviour::RefuseResumeThenHold => "refuse-resume-then-hold",
             Behaviour::WanderBranch => "wander-branch",
+            Behaviour::RefuseResumeThenNothing => "refuse-resume-then-nothing",
             Behaviour::Detach => "detach",
             Behaviour::CommitThenFail => "commit-then-fail",
             Behaviour::CommitThenBisect => "commit-then-bisect",
@@ -285,8 +292,9 @@ pub fn work_subject(task: &str, attempt: u32) -> String {
     format!("Work for task {task} attempt {attempt}")
 }
 
-/// The session id a fake `claude` reports in attempt `attempt` of `task`, unless it continues a
-/// session in place: started with `--resume <id>` and no `--fork-session`, it reports `<id>`.
+/// The session id a fake agent reports in attempt `attempt` of `task`, unless it continues a
+/// session in place: `claude --resume <id>` without `--fork-session`, or `codex exec resume`
+/// with `<id>` first after `--`, reports `<id>`.
 pub fn session(task: &str, attempt: u32) -> String {
     format!("fake-{task}-{attempt}")
 }
@@ -346,7 +354,7 @@ fn script() -> String {
     let (command, tool_error, stderr_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR, STDERR_ERROR);
     format!(
         r#"#!/bin/sh
-world="${WORLD_VAR}"
+world="${{{WORLD_VAR}:-$(dirname "$(dirname "$(command -v "$0")")")}}"
 task="$BOARD_TASK"
 harness=$(basename "$0")
 [ "$harness" = codex ] && [ "$1" = review ] && harness=codex-review
@@ -362,6 +370,8 @@ printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
 echo "$#" > "$world/{ARGS_DIR}/$task-$attempt.argc"
 [ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
+env | grep -E '^(GH|GITHUB)_' | sort > "$world/{ARGS_DIR}/$task-$attempt.gh-env"
+env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -376,6 +386,9 @@ for arg in "$@"; do
   previous="$arg"
   printf '%s\n' "$arg" >> "$options"
 done
+if [ "$harness" = codex ] && [ "$2" = resume ]; then
+  resumed=$(printf '%s\n' "$@" | sed -n '/^--$/{{n;p;q;}}')
+fi
 [ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
 extra=""
@@ -386,7 +399,7 @@ report() {{
     printf 'OpenAI Codex v0.0.0\n--------\ncodex\n%s\n' "$summary" >&2
     echo "$summary"
   elif [ "$harness" = codex ]; then
-    echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
+    echo '{{"type":"thread.started","thread_id":"'"$session"'"}}'
     echo '{{"type":"turn.started"}}'
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
     echo '{{"type":"item.completed",'"$item"'}}'
@@ -413,6 +426,9 @@ commit() {{
 case "$behaviour" in
   commit) commit || exit 1 ;;
   commit-nothing) ;;
+  fail-before-thread)
+    echo "Error: not logged in" >&2
+    exit 1 ;;
   record-head)
     head="$world/{HEADS_DIR}/$task-$attempt"
     git rev-parse HEAD > "$head" && (git symbolic-ref -q HEAD || true) >> "$head" || exit 1 ;;
@@ -475,8 +491,12 @@ case "$behaviour" in
     n=0
     while [ $n -lt {lines} ]; do printf -- '-é%s %s\n' $n "$pad"; n=$((n + 1)); done
     exit {fail} ;;
-  refuse-resume|refuse-resume-slowly|refuse-resume-then-hold)
+  refuse-resume|refuse-resume-slowly|refuse-resume-then-hold|refuse-resume-then-nothing)
     [ "$behaviour" = refuse-resume-slowly ] && sleep {slow}
+    if [ -n "$resumed" ] && [ "$harness" = codex ]; then
+      echo "Error: thread/resume: thread/resume failed: no rollout found for thread id $resumed" >&2
+      exit 1
+    fi
     if [ -n "$resumed" ]; then
       echo "No conversation found with session ID: $resumed" >&2
       refused='"subtype":"error_during_execution","is_error":true,"num_turns":0'
@@ -484,7 +504,7 @@ case "$behaviour" in
       [ "$behaviour" = refuse-resume-then-hold ] && hold
       exit 1
     fi
-    commit || exit 1 ;;
+    [ "$behaviour" = refuse-resume-then-nothing ] || commit || exit 1 ;;
   hold-then-nothing) hold ;;
   orphan-stops)
     stops="$world/{HEADS_DIR}/$task-stops"
@@ -657,6 +677,22 @@ pub fn git_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
         .join(ARGS_DIR)
         .join(format!("{task}-{attempt}.git-env"));
     let text = fs::read_to_string(&path).expect("read an agent's git environment");
+    text.lines().map(str::to_string).collect()
+}
+
+/// The names of every variable attempt `attempt` of `task` was started with.
+pub fn env_names(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.env"));
+    let text = fs::read_to_string(&path).expect("read an agent's environment");
+    text.lines().map(str::to_string).collect()
+}
+
+/// The `GH_*` and `GITHUB_*` variables, as `NAME=value`, attempt `attempt` of `task` saw.
+pub fn gh_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.gh-env"));
+    let text = fs::read_to_string(&path).expect("read an agent's GitHub environment");
     text.lines().map(str::to_string).collect()
 }
 

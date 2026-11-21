@@ -14,7 +14,10 @@ mod fake_agent;
 mod harness_cli;
 mod pr;
 mod queue;
+mod queue_files;
 mod queue_unclaimed;
+mod queue_wait;
+mod resume_review;
 mod review_pr;
 mod run_task;
 mod shipped_prompts;
@@ -22,6 +25,7 @@ mod skills;
 mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
+mod untrusted;
 mod worktree_git;
 mod world;
 
@@ -1581,6 +1585,31 @@ fn a_daemon_log_that_is_a_fifo_is_refused_and_the_daemon_exits() {
 }
 
 #[test]
+fn a_fix_resumes_a_session_recorded_before_the_harness_word_as_claudes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&built]);
+    assert_eq!(states, vec!["completed"]);
+    let path = world.home.join("logs").join(&built).join("session");
+    let recorded = fs::read_to_string(&path).expect("read the recorded session");
+    let old = recorded.strip_prefix("claude ").expect("a Claude session");
+    fs::write(&path, old).expect("write the session in the earlier shape");
+    let fix = a_fix(&world, "Fix the work.", &built, &built, true);
+    let fix = when_the_lead_creates(&world, &fix);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&fix]);
+
+    assert_eq!(states, vec!["completed"]);
+    let session = fake_agent::session(&built, 0);
+    assert_eq!(
+        fake_agent::options(&world.root, &fix, 0),
+        claude_options(Some(&session))
+    );
+}
+
+#[test]
 fn a_fix_task_with_resume_continues_the_claude_session_of_its_onto_task() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
@@ -1792,7 +1821,7 @@ fn a_session_recorded_for_another_repository_is_not_resumed() {
 }
 
 #[test]
-fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
+fn a_resumed_fix_of_a_codex_implement_role_starts_fresh_and_says_why() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -1813,7 +1842,19 @@ fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
     let runs = agent_runs_for(&world, &fix);
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].harness, "codex");
-    assert_eq!(agent_model(&world, &fix, 0), "gpt-test-implement");
+    let args = fake_agent::args(&world.root, &fix, 0);
+    assert!(
+        args.starts_with("exec\n--model\ngpt-test-implement\n"),
+        "{args}"
+    );
+    let note = "Starting a fresh session despite `resume=1`: Codex continues a session in \
+                place, so only a review resumes one, and role implement is not review.";
+    let replies = task_replies(&world, &fix);
+    let texts: Vec<&str> = replies
+        .iter()
+        .filter_map(|reply| reply["text"].as_str())
+        .collect();
+    assert!(texts.contains(&note), "{texts:?}");
 }
 
 /// An implement task whose agent will `behave`, given its role only then, so a running

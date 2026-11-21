@@ -32,6 +32,13 @@ use crate::settle::{Outcome, Verdict, judge};
 use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError};
 
 pub const DELIVERY_ROUNDS_MAX: u8 = 3;
+const UNTRUSTED_DIR: &str = "untrusted";
+const UNTRUSTED_MARK: &str = "untrusted";
+const NO_WORKTREE_HEAD: &str = "none";
+const UNTRUSTED_NOTE: &str = "This task is untrusted: you work in a scratch directory that is \
+                              not a git repository, and Rider gives you no worktree. Read the \
+                              pull request as plain files there; commit nothing. Your final \
+                              message is the task's result.";
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
 /// The failed attempts after which a task is blocked, unless the configuration sets them.
@@ -83,13 +90,14 @@ const RESULT_SCHEMA: &str = "rider-result@3";
 const OF_CHAIN_MAX: usize = 16;
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
-// Beside a task's logs: the Claude session id of its latest completed attempt on one line,
-// then the repository it ran in.
+// Beside a task's logs: the harness and session id of its latest completed attempt on one
+// line, then the repository it ran in.
 const SESSION_FILE: &str = "session";
 const RESULT_FILE: &str = "result.json";
 pub const RESULT_FILE_BYTES_MAX: u64 = 64 * 1024;
 const SESSION_FILE_BYTES_MAX: usize = 4096;
-const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
+const HARNESS_WORD_BYTES_MAX: usize = 6;
+const RESUMABLE_ROLES: [&str; 3] = ["implement", "light", "review"];
 const DELIVERY_NOTE: &str = "These replies were posted in your task's thread while you worked. \
                              They amend the brief, and the latest wins.";
 const COMMIT_ASK: &str = "Act on them, commit, and end with a new final message.";
@@ -388,7 +396,7 @@ impl Attempt {
 
     fn delivery_command(&self, new: &[Amendment]) -> Option<(CommandLine, &'static str)> {
         assert!(!new.is_empty() && new.len() <= REPLIES_MAX);
-        let ask = if self.brief.role.commits_expected {
+        let ask = if self.brief.role.commits_expected && !self.brief.untrusted {
             COMMIT_ASK
         } else {
             REPORT_ASK
@@ -402,7 +410,7 @@ impl Attempt {
             text
         };
         let session = match self.brief.role.harness {
-            Harness::Claude => harness::session_id(&self.log()),
+            Harness::Claude => harness::session_id(Harness::Claude, &self.log()),
             Harness::Codex | Harness::CodexReview => None,
         };
         let dir = &self.checkout.dir;
@@ -423,6 +431,7 @@ impl Attempt {
         };
         let mut cmd = cmd.ok()?;
         cmd.env.clone_from(&self.cmd.env);
+        cmd.untrusted = self.cmd.untrusted;
         let prompt = match &cmd.io {
             Io::Stream => cmd.args.last(),
             Io::PromptOnStdin(prompt) => Some(prompt),
@@ -434,8 +443,9 @@ impl Attempt {
     fn launch_first(&self, launch: &Launch) -> Result<Exit, HarnessError> {
         assert!(self.fresh_log.get().is_none(), "an attempt launches once");
         let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
-        let refused =
-            !matches!(launched, Ok(Exit::Code(0))) && harness::ended_before_any_turn(&self.log);
+        let harness = self.brief.role.harness;
+        let refused = !matches!(launched, Ok(Exit::Code(0)))
+            && harness::ended_before_any_turn(harness, &self.log);
         let stopped = self.stopped.load(Ordering::SeqCst);
         match self.fallback.as_ref().filter(|_| refused && !stopped) {
             Some(fresh) => {
@@ -601,8 +611,9 @@ pub fn judge_attempt(
         && attempt.fresh_log.get().is_some()
     {
         let note = format!(
-            "Claude could not resume session {} before doing any work, so the attempt ran \
+            "{} could not resume session {} before doing any work, so the attempt ran \
              again starting fresh.",
+            harness_name(attempt.brief.role.harness),
             fresh.session.as_str()
         );
         // The note only informs; losing it must not stop the attempt.
@@ -756,7 +767,7 @@ fn unneeded_on_branch(
     board: &dyn Board,
 ) -> Result<Option<BriefError>, RunError> {
     assert!(brief.id == view.id);
-    let Some(onto) = brief.onto else {
+    let Some(onto) = brief.onto.filter(|_| brief.role.commits_expected) else {
         return Ok(None);
     };
     let listing = board.list_open(SUBTREE)?;
@@ -862,18 +873,62 @@ fn prepare(
     identity: &BoardIdentity,
 ) -> Result<Attempt, Unprepared> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
-    let dir = worktree::dir_for(&brief, &env.home);
+    let id = brief.id.0.to_string();
+    let untrusted_dir = env.home.join(UNTRUSTED_DIR).join(&id);
+    let dir = match brief.untrusted {
+        true => untrusted_dir.join("work"),
+        false => worktree::dir_for(&brief, &env.home),
+    };
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
-    let retry = fs::symlink_metadata(&dir).is_ok();
+    let retry = !brief.untrusted && fs::symlink_metadata(&dir).is_ok();
     let prompt = build_prompt(&brief, retry)?;
     let session = brief.resume.then(|| resume_session(&brief, &env.home));
     let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
-        (Ok(_), Some(onto)) => format!("Resuming the Claude session of task #{}.", onto.0),
+        (Ok(_), Some(onto)) => format!(
+            "Resuming the {} session of task #{}.",
+            harness_name(brief.role.harness),
+            onto.0
+        ),
         (Ok(_), None) => panic!("a session is only resumed from an `onto` task"),
         (Err(why), _) => format!("Starting a fresh session despite `resume=1`: {why}."),
     });
     let resume = session.and_then(Result::ok);
-    let id = brief.id.0.to_string();
+    let gh_config = untrusted_dir.join("gh-config");
+    if brief.untrusted {
+        // Each start gets an empty directory: the agent CLI reads instructions and settings
+        // from its working directory, and a retry must not find what an earlier one copied.
+        if let Err(error) = fs::remove_dir_all(&untrusted_dir)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            let reason = format!("Rider cannot empty {}: {error}.", untrusted_dir.display());
+            return Err(Block::new("rider_error", reason).into());
+        }
+        for made in [&gh_config, &dir] {
+            fs::create_dir_all(made).map_err(|error| {
+                let reason = format!("Rider cannot create {}: {error}.", made.display());
+                Block::new("rider_error", reason)
+            })?;
+        }
+    }
+    let checkout = if brief.untrusted {
+        let start_head = NO_WORKTREE_HEAD.to_string();
+        let (branch, base) = (None, None);
+        Checkout {
+            dir: dir.clone(),
+            branch,
+            start_head,
+            base,
+        }
+    } else {
+        match worktree::prepare(&brief, board, &env.home, identity) {
+            Ok(checkout) => checkout,
+            Err(WorktreeError::Board(error)) if error.call_failed() => {
+                return Err(Unprepared::CallFailed(error));
+            }
+            Err(error) => return Err(worktree_block(&error).into()),
+        }
+    };
+    assert!(checkout.dir == dir);
     let cannot = |error: HarnessError| {
         let reason = format!(
             "Rider cannot build the agent's command: {}.",
@@ -881,14 +936,6 @@ fn prepare(
         );
         Block::new("rider_error", reason)
     };
-    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
-        Ok(checkout) => checkout,
-        Err(WorktreeError::Board(error)) if error.call_failed() => {
-            return Err(Unprepared::CallFailed(error));
-        }
-        Err(error) => return Err(worktree_block(&error).into()),
-    };
-    assert!(checkout.dir == dir);
     let servers = harness::codex_mcp_overrides(&brief.role.harness, &dir).map_err(cannot)?;
     let command = |resume: Option<&SessionId>| {
         let cmd = command_for(
@@ -904,6 +951,22 @@ fn prepare(
             ("BOARD_PROFILE".to_string(), env.profile.clone()),
             ("BOARD_URL".to_string(), env.board_url.clone()),
         ]);
+        if brief.untrusted {
+            cmd.untrusted = true;
+            let dir = gh_config.to_string_lossy().into_owned();
+            cmd.env.push(("GH_CONFIG_DIR".to_string(), dir));
+            let ceiling = untrusted_dir.to_string_lossy().into_owned();
+            cmd.env.extend([
+                ("GIT_CEILING_DIRECTORIES".to_string(), ceiling),
+                ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+                (
+                    "GIT_CONFIG_KEY_0".to_string(),
+                    "safe.bareRepository".to_string(),
+                ),
+                ("GIT_CONFIG_VALUE_0".to_string(), "explicit".to_string()),
+            ]);
+        }
+        assert_eq!(cmd.untrusted, brief.untrusted);
         Ok::<CommandLine, Block>(cmd)
     };
     let cmd = command(resume.as_ref())?;
@@ -918,7 +981,7 @@ fn prepare(
     assert!(log.is_absolute());
     let start = start.filter(|value| git::commit_exists(&checkout.dir, value).unwrap_or(false));
     let reference = start.unwrap_or(&checkout.start_head).to_string();
-    assert!(git::is_commit_id(&reference));
+    assert!(brief.untrusted || git::is_commit_id(&reference));
     Ok(Attempt {
         brief,
         failed,
@@ -952,14 +1015,8 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     assert!(brief.resume && home.is_absolute());
     if !RESUMABLE_ROLES.contains(&brief.role.label) {
         return Err(format!(
-            "role {} is not implement or light",
+            "role {} is not implement, light or review",
             brief.role.label
-        ));
-    }
-    if brief.role.harness != Harness::Claude {
-        return Err(format!(
-            "role {} runs {:?}, and only Claude resumes a session",
-            brief.role.label, brief.role.harness
         ));
     }
     let onto = brief.onto.ok_or("the task has no `onto` label")?;
@@ -973,7 +1030,7 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "task #{} has no completed Claude attempt with a recorded session",
+                "task #{} has no completed attempt with a recorded session",
                 onto.0
             ));
         }
@@ -989,7 +1046,42 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     let (session, repo) = text.split_once('\n').ok_or_else(malformed)?;
     let repo = repo.strip_suffix('\n').filter(|repo| !repo.is_empty());
     let repo = Path::new(repo.ok_or_else(malformed)?);
+    // Sessions recorded before the harness word was written are Claude's.
+    let (harness, session) = session.split_once(' ').unwrap_or(("claude", session));
+    let harness = match harness {
+        "claude" => Harness::Claude,
+        "codex" => Harness::Codex,
+        _ => return Err(malformed()),
+    };
+    let (session, untrusted) = match session.split_once(' ') {
+        None => (session, false),
+        Some((session, UNTRUSTED_MARK)) => (session, true),
+        Some(_) => return Err(malformed()),
+    };
     let session = SessionId::parse(session).ok_or_else(malformed)?;
+    if untrusted && !brief.untrusted {
+        return Err(format!(
+            "task #{}'s session was recorded by an untrusted task, and this task is not \
+             untrusted",
+            onto.0
+        ));
+    }
+    if harness != brief.role.harness {
+        return Err(format!(
+            "task #{}'s session was recorded by {}, and role {} runs {}",
+            onto.0,
+            harness_name(harness),
+            brief.role.label,
+            harness_name(brief.role.harness)
+        ));
+    }
+    if harness == Harness::Codex && brief.role.label != "review" {
+        return Err(format!(
+            "Codex continues a session in place, so only a review resumes one, and role {} \
+             is not review",
+            brief.role.label
+        ));
+    }
     if repo != brief.repo {
         return Err(format!(
             "task #{}'s session was recorded in repository {}, not this task's {}",
@@ -1000,6 +1092,14 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);
     Ok(session)
+}
+
+fn harness_name(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Claude => "Claude",
+        Harness::Codex => "Codex",
+        Harness::CodexReview => "Codex review",
+    }
 }
 
 pub fn result_path(home: &Path, id: TaskId) -> PathBuf {
@@ -1021,12 +1121,25 @@ fn session_path(home: &Path, id: TaskId) -> PathBuf {
 
 fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     let path = session_path(home, attempt.brief.id);
-    let session = match attempt.brief.role.harness {
-        Harness::Claude => harness::session_id(&attempt.log()),
-        Harness::Codex | Harness::CodexReview => None,
+    let harness = attempt.brief.role.harness;
+    let session = harness::session_id(harness, &attempt.log());
+    let word = match harness {
+        Harness::Claude => "claude",
+        Harness::Codex | Harness::CodexReview => "codex",
     };
+    assert!(word.len() <= HARNESS_WORD_BYTES_MAX);
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
-    let fits = |repo: &&str| repo.len() < SESSION_FILE_BYTES_MAX - SESSION_BYTES_MAX - 2;
+    let room = SESSION_FILE_BYTES_MAX
+        - HARNESS_WORD_BYTES_MAX
+        - SESSION_BYTES_MAX
+        - UNTRUSTED_MARK.len()
+        - 4;
+    let mark = if attempt.brief.untrusted {
+        format!(" {UNTRUSTED_MARK}")
+    } else {
+        String::new()
+    };
+    let fits = |repo: &&str| repo.len() < room;
     let repo = attempt
         .brief
         .repo
@@ -1034,7 +1147,10 @@ fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
         .filter(|repo| !repo.contains('\n'))
         .filter(fits);
     let written = match (&session, repo) {
-        (Some(session), Some(repo)) => fs::write(&path, format!("{}\n{repo}\n", session.as_str())),
+        (Some(session), Some(repo)) => fs::write(
+            &path,
+            format!("{word} {}{mark}\n{repo}\n", session.as_str()),
+        ),
         (None, _) | (_, None) => match fs::remove_file(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             other => other,
@@ -1106,6 +1222,10 @@ fn build_prompt(brief: &Brief, retry: bool) -> Result<String, Block> {
     if retry {
         prompt.push_str("\n\n");
         prompt.push_str(RETRY_NOTE);
+    }
+    if brief.untrusted {
+        prompt.push_str("\n\n");
+        prompt.push_str(UNTRUSTED_NOTE);
     }
     if !brief.role.skills.is_empty() {
         let names: Vec<String> = brief
@@ -1251,7 +1371,7 @@ fn inspect(
         head_moved: evidence.head_moved,
         keeps_start: evidence.keeps_start,
         own_commits: evidence.work.commits,
-        commits_expected: attempt.brief.role.commits_expected,
+        commits_expected: attempt.brief.role.commits_expected && !attempt.brief.untrusted,
         last_message: last_message.as_deref(),
     };
     let verdict = judge(&outcome);
@@ -1264,6 +1384,18 @@ fn inspect(
 
 // For a task on a branch, the work is the branch's own commit, not wherever HEAD points.
 fn evidence(attempt: &Attempt) -> Result<Evidence, String> {
+    if attempt.brief.untrusted {
+        let head = NO_WORKTREE_HEAD.to_string();
+        let work = Work { head, commits: 0 };
+        assert!(attempt.checkout.branch.is_none());
+        return Ok(Evidence {
+            clean: true,
+            on_branch: true,
+            head_moved: false,
+            keeps_start: true,
+            work,
+        });
+    }
     let checkout = &attempt.checkout;
     let dir = checkout.dir.as_path();
     // A branch is measured from where the task began; a detached checkout from this attempt.
@@ -1389,6 +1521,17 @@ fn complete(
         && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
     {
         let _ = board.reply(id, &record);
+    }
+    if attempt.brief.untrusted {
+        let scratch = env
+            .home
+            .join(UNTRUSTED_DIR)
+            .join(attempt.brief.id.0.to_string());
+        if let Err(error) = fs::remove_dir_all(&scratch) {
+            let note = format!("Kept the scratch directory {}: {error}.", scratch.display());
+            let _ = board.reply(id, &one_line(&note));
+        }
+        return Ok(());
     }
     if let Err(error) = worktree::release(&attempt.checkout, &attempt.brief.repo, &env.home) {
         let why = match error {

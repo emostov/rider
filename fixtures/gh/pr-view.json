@@ -1,0 +1,52 @@
+{
+ "comments": [
+  {
+   "id": "IC_kwDODKw3uc8AAAABoB4mUQ",
+   "author": {
+    "login": "cli-triage"
+   },
+   "authorAssociation": "NONE",
+   "body": "<redacted>",
+   "createdAt": "2026-11-18T14:21:22Z",
+   "includesCreatedEdit": false,
+   "isMinimized": false,
+   "minimizedReason": "",
+   "reactionGroups": [],
+   "url": "<redacted>",
+   "viewerDidAuthor": false
+  }
+ ],
+ "headRefOid": "38bf936dc1042605ced44bbe6cc794deb1d218fa",
+ "reviews": [
+  {
+   "id": "PRR_kwDODKw3uc8AAAABYyKRuQ",
+   "author": {
+    "login": "copilot-pull-request-reviewer"
+   },
+   "authorAssociation": "CONTRIBUTOR",
+   "body": "<redacted>",
+   "submittedAt": "2026-11-18T14:05:03Z",
+   "includesCreatedEdit": false,
+   "reactionGroups": [],
+   "state": "COMMENTED",
+   "commit": {
+    "oid": "38bf936dc1042605ced44bbe6cc794deb1d218fa"
+   }
+  },
+  {
+   "id": "PRR_kwDODKw3uc8AAAABZTm-SQ",
+   "author": {
+    "login": "maintainer"
+   },
+   "authorAssociation": "MEMBER",
+   "body": "<redacted>",
+   "submittedAt": "2026-11-20T13:14:08Z",
+   "includesCreatedEdit": false,
+   "reactionGroups": [],
+   "state": "APPROVED",
+   "commit": {
+    "oid": "38bf936dc1042605ced44bbe6cc794deb1d218fa"
+   }
+  }
+ ]
+}

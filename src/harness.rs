@@ -40,6 +40,11 @@ const CODEX_CONFIG_BYTES_MAX: u64 = 1024 * 1024;
 const MCP_SETTINGS_MAX: usize = 3 * MCP_SERVERS_MAX;
 const ARGS_MAX: usize = 28 + 2 * MCP_SETTINGS_MAX;
 const OPEN_TRIES_MAX: usize = 2;
+const UNTRUSTED_ENV_ALLOWED: [&str; 10] = [
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG", "LC_ALL", "LC_CTYPE",
+];
+const CODEX_REFUSAL_BYTES_MAX: usize = 64 * 1024;
+const CODEX_NO_ROLLOUT: &str = "no rollout found for thread id";
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
@@ -82,6 +87,7 @@ pub struct CommandLine {
     pub args: Vec<String>,
     /// Set on top of the inherited environment.
     pub env: Vec<(String, String)>,
+    pub untrusted: bool,
     pub io: Io,
 }
 
@@ -172,7 +178,7 @@ impl fmt::Display for HarnessError {
 /// Upper bound on a session id's length.
 pub const SESSION_BYTES_MAX: usize = 128;
 
-/// A Claude Code session id: ASCII letters, digits, and `-`, never starting with `-`.
+/// A Claude session or Codex thread id: ASCII letters, digits, and `-`, never starting with `-`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionId(String);
 
@@ -309,10 +315,6 @@ pub fn command_for(
     mcp_overrides: &[String],
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
-    assert!(
-        resume.is_none() || spec.harness == Harness::Claude,
-        "only Claude sessions are resumed"
-    );
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
     assert!(mcp_overrides.len() <= MCP_SETTINGS_MAX);
     assert!(
@@ -333,7 +335,7 @@ pub fn command_for(
     let model = spec.model;
     let model_setting = format!("model={model:?}");
     let review_model_setting = format!("review_model={model:?}");
-    let (program, head, io) = match spec.harness {
+    let (program, mut args, io) = match spec.harness {
         Harness::Claude => (
             "claude",
             vec![
@@ -347,8 +349,6 @@ pub fn command_for(
                 "--strict-mcp-config",
                 "--mcp-config",
                 r#"{"mcpServers":{}}"#,
-                "--",
-                prompt,
             ],
             Io::Stream,
         ),
@@ -364,10 +364,6 @@ pub fn command_for(
                 "plugins",
                 "--disable",
                 "apps",
-                "-C",
-                &dir,
-                "--",
-                prompt,
             ],
             Io::Stream,
         ),
@@ -395,24 +391,29 @@ pub fn command_for(
             Io::PromptOnStdin(prompt.to_string()),
         ),
     };
-    let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
     // `-c mcp_servers={}` merges into the user's table instead of replacing it, so each
     // declared server is turned off by name.
-    let off = (mcp_overrides.iter()).flat_map(|setting| ["-c".to_string(), setting.clone()]);
+    let off = (mcp_overrides.iter()).flat_map(|setting| ["-c", setting.as_str()]);
     args.splice(1..1, off);
-    match resume {
+    match (spec.harness, resume) {
         // Without `--fork-session` Claude appends to the resumed session in place.
-        Some(Resume::Fork(session)) => {
-            let at = args.len() - 2;
-            let fork = [session.0.clone(), "--fork-session".to_string()];
-            args.splice(at..at, ["--resume".to_string()].into_iter().chain(fork));
+        (Harness::Claude, Some(Resume::Fork(session))) => {
+            args.extend(["--resume", &session.0, "--fork-session", "--", prompt]);
         }
-        Some(Resume::InPlace(session)) => {
-            let at = args.len() - 2;
-            args.splice(at..at, ["--resume".to_string(), session.0.clone()]);
+        (Harness::Claude, Some(Resume::InPlace(session))) => {
+            args.extend(["--resume", &session.0, "--", prompt]);
         }
-        None => {}
+        (Harness::Claude, None) => args.extend(["--", prompt]),
+        // `codex exec resume` has no `-C` and no fork: it runs in the child's working
+        // directory and continues the session in place.
+        (Harness::Codex, Some(Resume::Fork(session) | Resume::InPlace(session))) => {
+            args.insert(1, "resume");
+            args.extend(["--", &session.0, prompt]);
+        }
+        (Harness::Codex, None) => args.extend(["-C", &dir, "--", prompt]),
+        (Harness::CodexReview, _) => {}
     }
+    let args: Vec<String> = args.into_iter().map(String::from).collect();
     assert!(args.len() <= ARGS_MAX);
     assert!(args.iter().any(|a| a == model || *a == model_setting));
     let program = program.to_string();
@@ -421,6 +422,7 @@ pub fn command_for(
         program,
         args,
         env,
+        untrusted: false,
         io,
     })
 }
@@ -728,6 +730,14 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
     assert!(cmd.args.len() <= ARGS_MAX && cmd.env.len() <= ENV_MAX);
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
     let mut process = Command::new(&cmd.program);
+    if cmd.untrusted {
+        process.env_clear();
+        for name in UNTRUSTED_ENV_ALLOWED {
+            if let Some(value) = env::var_os(name) {
+                process.env(name, value);
+            }
+        }
+    }
     process
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(key, value)| (key, value)))
@@ -951,6 +961,8 @@ struct SessionLine {
 enum CodexEvent {
     #[serde(rename = "item.started")]
     ItemStarted { item: Option<Field<CodexItem>> },
+    #[serde(rename = "thread.started")]
+    ThreadStarted { thread_id: Option<Field<String>> },
     #[serde(rename = "item.completed")]
     ItemCompleted { item: Option<Field<CodexItem>> },
     #[serde(rename = "turn.failed")]
@@ -1077,22 +1089,47 @@ pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
     Some(text)
 }
 
-/// The session id of the first Claude event that carries one, or `None` when there is none.
-pub fn session_id(log: &Path) -> Option<SessionId> {
+/// The session id of the first event that carries one: a Claude event's `session_id`, or
+/// Codex's `thread.started` `thread_id`. `None` when there is none.
+pub fn session_id(harness: Harness, log: &Path) -> Option<SessionId> {
     let mut found: Option<Option<SessionId>> = None;
-    let _ = scan(log, |line: SessionLine| {
+    let mut first = |id: Option<String>| {
         if found.is_none() {
-            found = valid(line.session_id).map(|id| SessionId::parse(&id));
+            found = id.map(|id| SessionId::parse(&id));
         }
-    });
+    };
+    let _ = match harness {
+        Harness::Claude => scan(log, |line: SessionLine| first(valid(line.session_id))),
+        Harness::Codex => scan(log, |event| {
+            if let CodexEvent::ThreadStarted { thread_id } = event {
+                first(valid(thread_id));
+            }
+        }),
+        Harness::CodexReview => false,
+    };
     let id = found.flatten();
     assert!(id.as_ref().is_none_or(|id| !id.0.is_empty()));
     id
 }
 
-/// Whether the Claude stream at `log` shows a run that ended in error before its first turn,
-/// as when `--resume` names a session Claude cannot open; false when the log is unreadable.
-pub fn ended_before_any_turn(log: &Path) -> bool {
+/// Whether the stream at `log` shows a run that ended before its first turn, as when a resume
+/// names a session the harness cannot open; false when the log is unreadable.
+pub fn ended_before_any_turn(harness: Harness, log: &Path) -> bool {
+    if harness == Harness::Codex {
+        // A refused `codex exec resume` prints only this error to stderr: no thread starts.
+        let mut started = false;
+        let read = scan(log, |event| {
+            started |= matches!(event, CodexEvent::ThreadStarted { .. });
+        });
+        let mut head = String::new();
+        let text = File::open(log).and_then(|file| {
+            let bound = u64::try_from(CODEX_REFUSAL_BYTES_MAX).unwrap_or(u64::MAX);
+            file.take(bound).read_to_string(&mut head)
+        });
+        let refused = text.is_ok() && head.contains(CODEX_NO_ROLLOUT);
+        assert!(head.len() <= CODEX_REFUSAL_BYTES_MAX);
+        return read && !started && refused;
+    }
     let mut results = 0u64;
     let mut refused = false;
     let mut turned = false;
@@ -1125,6 +1162,7 @@ pub fn stopped_by_content_filter(harness: &Harness, log: &Path) -> bool {
                 }
                 CodexEvent::TurnCompleted { .. } => stopped = false,
                 CodexEvent::ItemStarted { .. }
+                | CodexEvent::ThreadStarted { .. }
                 | CodexEvent::ItemCompleted { .. }
                 | CodexEvent::Error { .. }
                 | CodexEvent::Other => {}
@@ -1245,7 +1283,8 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
         Harness::Codex => scan(log, |event| match event {
             CodexEvent::TurnFailed { .. } | CodexEvent::Error { .. } => last_turn_failed = true,
             CodexEvent::TurnCompleted { .. } => last_turn_failed = false,
-            CodexEvent::ItemStarted { .. }
+            CodexEvent::ThreadStarted { .. }
+            | CodexEvent::ItemStarted { .. }
             | CodexEvent::ItemCompleted { .. }
             | CodexEvent::Other => {}
         }),
@@ -1545,7 +1584,9 @@ impl Account {
             }
             CodexEvent::Error { message } => self.error = piece(valid(message)),
             CodexEvent::TurnCompleted { .. } => self.error = None,
-            CodexEvent::ItemStarted { .. } | CodexEvent::Other => {}
+            CodexEvent::ItemStarted { .. }
+            | CodexEvent::ThreadStarted { .. }
+            | CodexEvent::Other => {}
         }
     }
 }
