@@ -152,8 +152,11 @@ one, and posts each change to that task's thread as a `rider-github@1` record; w
 `branch` label is the PR's branch. When that owner is an implement or light task with a recorded
 session, the daemon routes a change straight to it: it queues one fix task `onto` the owner with
 `resume=1` (the failing job, its URL and log tail, or the quoted comment with its file, line and
-URL) and posts the record with `route: owner` and the fix in `task`. Leave those to the swarm.
-A record with `route: lead` is yours:
+URL) and posts the record with `route: owner` and the fix in `task`. Workers never push, so
+each `route: owner` record leaves you one step: when its fix task settles, read its result. If
+it completed with commits, push the branch (`git -C <repo> push origin <branch>`) and wait for
+the next `checks` record; if it failed, blocked, or committed nothing, handle the record as a
+`route: lead` one. A record with `route: lead` is yours:
 
 - `checks`, `state: passed`: CI is green on `head`; go on to review or merge.
 - `checks`, `state: failed`: `job` failed, its log at `url`, and no owner could take it (no
@@ -164,7 +167,8 @@ A record with `route: lead` is yours:
 
 Agents never reply on GitHub.
 
-The watch ends when the PR is merged or closed, or when you label the owning task `github=off` (`vb label <task> github=off`). If `<cap>` (`ci.cap_minutes`, or the longest
+The watch ends when the PR is merged or closed, or when you label the owning task
+`github=off` (`vb label <task> github=off`). If `<cap>` (`ci.cap_minutes`, or the longest
 the workflows normally run, doubled) passes with no `checks` record for the head, read
 `gh pr checks <n> --json name,bucket,link` once:
 
