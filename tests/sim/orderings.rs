@@ -4,8 +4,8 @@
 use rider::board::{Claim, ListedTask, TaskId, TaskState, TaskView, Timestamp};
 use rider::core::{
     Action, CLIENTS_MAX, Call, ClientId, Config, ErrorCode, Event, LEASE_MILLIS, Phase, Reply,
-    Request, RunId, SETTLE_PAUSE_MILLIS, SETTLE_TRIES_MAX, Settlement, State, StopReason,
-    TASKS_MAX, UNTRACKED_MAX, Untracked, step,
+    Request, RunId, SETTLE_PAUSE_MILLIS, SETTLE_TRIES_MAX, STOP_MILLIS_MAX, Settlement, State,
+    StopReason, TASKS_MAX, UNTRACKED_MAX, Untracked, step,
 };
 use rider::daemon::EVENT_QUEUE_MAX;
 use rider::feed::{BoardEvent, Cursor, EventKind};
@@ -483,4 +483,106 @@ fn a_failed_startup_renewal_is_retried_when_the_board_returns() {
     let resumed =
         (back.iter()).any(|action| matches!(action, Action::Resume { task: t, .. } if *t == task));
     assert!(resumed, "the board returned, and the core sent {back:?}");
+}
+
+/// A run of `built` on a branch has sent its closing write when its renewal finds the claim
+/// lost, and a fix `onto` `target` is then ready; returns the run and what the fix was answered.
+fn settling_after_a_lost_renewal(
+    script: &mut Script,
+    built: TaskId,
+    fix: TaskId,
+    target: TaskId,
+) -> (RunId, Vec<Action>) {
+    let run = script.ready(built);
+    assert_eq!(
+        script.claimed(run),
+        vec![Action::Prepare { run, task: built }]
+    );
+    let branch = Some(format!("rider/{}-work", built.0));
+    let role = ROLE.to_string();
+    let spawned = script.step(Event::Prepared { run, branch, role });
+    assert!(matches!(spawned.as_slice(), [Action::Spawn { .. }]));
+    assert_eq!(script.judged_complete(run, built), vec![settle(run, built)]);
+    script.cursor += 1;
+    script.step(Event::Feed(BoardEvent {
+        cursor: Cursor(script.cursor),
+        kind: EventKind::TaskCompleted,
+        task: built,
+        channel: "work/sim".to_string(),
+        labels: role_labels(),
+        state: Some(TaskState::Completed),
+        actor: None,
+    }));
+    assert_eq!(script.step(Event::ClaimLost(run)), Vec::new());
+    let mut labels = role_labels();
+    labels.push(("onto".to_string(), target.0.to_string()));
+    let waiting = script.feed(fix, EventKind::TaskCreated, labels);
+    assert_eq!(script.phase(run), Some(Phase::Abandoning));
+    (run, waiting)
+}
+
+#[test]
+fn a_claim_lost_while_settling_keeps_the_branch_until_the_worktree_is_released() {
+    let (built, fix) = (TaskId(1), TaskId(2));
+    let mut script = Script::new();
+    let (run, waiting) = settling_after_a_lost_renewal(&mut script, built, fix, built);
+
+    let settled = script.step(Event::Settled(run));
+
+    assert_eq!(waiting, Vec::new());
+    assert!(
+        matches!(settled.as_slice(), [Action::Claim { task, .. }] if *task == fix),
+        "the fix was answered {settled:?} once the worktree was released"
+    );
+}
+
+#[test]
+fn a_fix_onto_an_earlier_task_waits_while_a_run_that_lost_its_claim_is_still_closing() {
+    let (earlier, built, fix) = (TaskId(1), TaskId(2), TaskId(3));
+    let mut script = Script::new();
+    let (run, waiting) = settling_after_a_lost_renewal(&mut script, built, fix, earlier);
+
+    let settled = script.step(Event::Settled(run));
+
+    assert_eq!(waiting, Vec::new());
+    assert!(
+        matches!(settled.as_slice(), [Action::Claim { task, .. }] if *task == fix),
+        "the fix was answered {settled:?} once the worktree was released"
+    );
+}
+
+#[test]
+fn a_closing_write_that_fails_after_a_lost_renewal_ends_the_run() {
+    let mut script = Script::new();
+    let (run, _) = settling_after_a_lost_renewal(&mut script, TaskId(1), TaskId(2), TaskId(9));
+
+    script.step(Event::BoardFailed(Call::Settle(run)));
+
+    assert_eq!(script.phase(run), None);
+}
+
+#[test]
+fn a_closing_write_that_never_answers_after_a_lost_renewal_ends_the_run_at_the_stop_limit() {
+    let mut script = Script::new();
+    let (run, _) = settling_after_a_lost_renewal(&mut script, TaskId(1), TaskId(2), TaskId(9));
+
+    script.tick_after(STOP_MILLIS_MAX - 1);
+    let before = script.phase(run);
+    script.tick_after(1);
+
+    assert_eq!(before, Some(Phase::Abandoning));
+    assert_eq!(script.phase(run), None);
+}
+
+#[test]
+fn a_closing_write_that_finds_the_claim_lost_ends_the_run_at_once() {
+    let task = TaskId(1);
+    let mut script = Script::new();
+    let run = script.running(task);
+    assert_eq!(script.judged_complete(run, task), vec![settle(run, task)]);
+
+    let lost = script.step(Event::CloseLost(run));
+
+    assert!(!writes(&lost, run), "the lost run was answered {lost:?}");
+    assert_eq!(script.phase(run), None);
 }

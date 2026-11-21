@@ -22,6 +22,7 @@ pub const FAIL_EXIT_CODE: i32 = 3;
 pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
+pub const PR_REF: &str = "refs/rider/pr/412";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,9 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    ReportDecision,
+    HoldAttempt,
+    MergePr,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -164,6 +168,9 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::ReportDecision => "report-decision",
+            Behaviour::HoldAttempt => "hold-attempt",
+            Behaviour::MergePr => "merge-pr",
         }
     }
 }
@@ -212,6 +219,14 @@ pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
 /// The line a `HoldTalking` agent prints before it holds.
 pub fn hold_line(task: &str) -> String {
     format!(r#"{{"type":"fake","text":"holding task {task}"}}"#)
+}
+
+pub fn heard(decisions: &[&str]) -> String {
+    let heard: Vec<String> = decisions
+        .iter()
+        .map(|word| format!("Decision {word}"))
+        .collect();
+    format!("Fake agent heard {}.", heard.join(", "))
 }
 
 /// The final message a fake agent reports; it becomes the task's result.
@@ -344,6 +359,21 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  hold-attempt)
+    step=0
+    while [ ! -e "$world/{RELEASES_DIR}/$task-$attempt" ]; do
+      step=$((step + 1))
+      [ "$step" -le {steps} ] || exit 1
+      sleep 0.1
+    done
+    commit || exit 1 ;;
+  report-decision)
+    for arg in "$@"; do prompt="$arg"; done
+    heard=$(printf '%s\n' "$prompt" | grep -o 'Decision [a-z0-9]*' | paste -s -d '#' - \
+      | sed 's/#/, /g')
+    [ -n "$heard" ] || heard="Decision none"
+    summary="Fake agent heard $heard." ;;
+  merge-pr) git merge -q --no-edit {PR_REF} || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
@@ -431,6 +461,12 @@ pub fn release(world: &Path, task: &str) {
     assert!(!task.is_empty());
     let path = world.join(RELEASES_DIR).join(task);
     fs::write(&path, "").expect("release an agent");
+    assert!(path.exists());
+}
+
+pub fn release_attempt(world: &Path, task: &str, attempt: u32) {
+    let path = world.join(RELEASES_DIR).join(format!("{task}-{attempt}"));
+    fs::write(&path, "").expect("release an agent's attempt");
     assert!(path.exists());
 }
 

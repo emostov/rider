@@ -162,6 +162,21 @@ pub struct Listing {
     pub left_out: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Amendment {
+    pub id: Cursor,
+    pub profile: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    pub state: TaskState,
+    pub epoch: u64,
+    pub cursor: Cursor,
+    pub amendments: Vec<Amendment>,
+}
+
 #[derive(Debug)]
 pub enum BoardError {
     Spawn(String),
@@ -302,6 +317,7 @@ pub trait Board {
     ) -> Result<Listing, BoardError>;
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
+    fn thread(&self, id: TaskId) -> Result<Thread, BoardError>;
     fn schema_ids(&self) -> Result<Vec<String>, BoardError>;
     fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError>;
     /// Creates a task in `channel` that waits for `needs`, or returns the one an earlier call
@@ -757,6 +773,44 @@ struct WireRead {
     message: WireMessage,
 }
 
+#[derive(Deserialize)]
+struct WireTaskThread {
+    message: WireMessage,
+    replies: Vec<WireTextReply>,
+    cursor: String,
+}
+
+#[derive(Deserialize)]
+struct WireThreadAuthors {
+    message: WireAuthoredTask,
+}
+
+#[derive(Deserialize)]
+struct WireAuthoredTask {
+    by: WireBy,
+    task: WireOwnedTask,
+}
+
+#[derive(Deserialize)]
+struct WireOwnedTask {
+    owner: String,
+}
+
+#[derive(Deserialize)]
+struct WireTextReply {
+    id: String,
+    text: String,
+    by: WireBy,
+}
+
+#[derive(Deserialize)]
+struct WireBy {
+    actor: String,
+    principal: String,
+    #[serde(deserialize_with = "nullable")]
+    profile: Option<String>,
+}
+
 /// The replies of `vb read <id> --json`, each with its structured blocks.
 #[derive(Deserialize)]
 struct WireReplies {
@@ -1048,6 +1102,50 @@ pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
     }
     assert!(blocking <= OUTPUT_BYTES_MAX);
     Ok(blocking)
+}
+
+pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
+    let thread: WireTaskThread = parse(json)?;
+    let authors: WireThreadAuthors = parse(json)?;
+    let (owner, creator) = (authors.message.task.owner, authors.message.by.actor);
+    if owner.is_empty() || creator.is_empty() {
+        return Err(BoardError::Parse(
+            "a task without its owner or creator".into(),
+        ));
+    }
+    if thread.replies.len() > REPLIES_MAX {
+        let count = thread.replies.len();
+        return Err(BoardError::Parse(format!(
+            "a thread of {count} replies, over {REPLIES_MAX}"
+        )));
+    }
+    let view = view_from_wire(thread.message)?;
+    if view.id != id {
+        return Err(BoardError::Parse(format!(
+            "asked for {id:?}, read {:?}",
+            view.id
+        )));
+    }
+    let cursor = Cursor(parse_id_text(&thread.cursor)?.0);
+    let mut amendments: Vec<Amendment> = Vec::new();
+    for reply in thread.replies {
+        let by = &reply.by;
+        // The board verifies `actor` and `principal`; a profile is only a name its login picks.
+        let amends = by.principal == owner && (by.actor == owner || by.actor == creator);
+        if !amends {
+            continue;
+        }
+        let id = Cursor(parse_id_text(&reply.id)?.0);
+        let (profile, text) = (reply.by.profile, reply.text);
+        amendments.push(Amendment { id, profile, text });
+    }
+    assert!(amendments.len() <= REPLIES_MAX);
+    Ok(Thread {
+        state: view.state,
+        epoch: view.epoch,
+        cursor,
+        amendments,
+    })
 }
 
 /// The claimed task from the output of a successful `vb tasks claim --json`.
@@ -1625,6 +1723,10 @@ impl Board for VbCli {
         parse_blocking_findings(&json)
     }
 
+    fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
+        parse_thread(id, &self.read(&Command::Read { id })?)
+    }
+
     fn schema_ids(&self) -> Result<Vec<String>, BoardError> {
         let listed: WireSchemas = parse(&self.read(&Command::Schemas)?)?;
         if listed.schemas.len() > SCHEMAS_LISTED_MAX {
@@ -1740,7 +1842,7 @@ pub mod testing {
     use std::collections::VecDeque;
 
     use super::{
-        Board, BoardError, ListedTask, Listing, TaskId, TaskState, TaskView, check_message,
+        Board, BoardError, ListedTask, Listing, TaskId, TaskState, TaskView, Thread, check_message,
     };
     use crate::feed::Cursor;
 
@@ -1929,6 +2031,18 @@ pub mod testing {
 
         fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
             self.read_task(id).map(|_| 0)
+        }
+
+        fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
+            let view = self.read_task(id)?;
+            let (state, epoch, cursor) = (view.state, view.epoch, view.version);
+            let amendments = Vec::new();
+            Ok(Thread {
+                state,
+                epoch,
+                cursor,
+                amendments,
+            })
         }
     }
 }
