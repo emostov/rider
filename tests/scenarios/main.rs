@@ -6,6 +6,7 @@
     reason = "behaviours and readers for the scenarios still to come"
 )]
 mod fake_agent;
+mod skills;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
 mod world;
