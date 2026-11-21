@@ -160,6 +160,13 @@ pub enum QueueAction {
         )]
         timeout: u32,
     },
+    /// Print the PR head the queue item's preparation reviewed; with COMMIT, record it.
+    Reviewed {
+        #[arg(value_name = "ITEM", value_parser = parse_task_id)]
+        item: TaskId,
+        #[arg(value_name = "COMMIT", value_parser = parse_commit)]
+        commit: Option<String>,
+    },
 }
 
 /// One command to run.
@@ -291,6 +298,7 @@ pub enum UsageError {
     BadTaskId(String),
     EmptyUrl,
     BadName(String),
+    BadCommit(String),
 }
 
 impl fmt::Display for UsageError {
@@ -303,6 +311,9 @@ impl fmt::Display for UsageError {
                 )
             }
             UsageError::EmptyUrl => write!(f, "a board URL is empty"),
+            UsageError::BadCommit(text) => {
+                write!(f, "{text:?} is not a commit id: use all 40 hex digits")
+            }
             UsageError::BadName(text) => write!(
                 f,
                 "{text:?} is not a name: use at most {NAME_CHARS_MAX} letters, digits, - or _"
@@ -331,6 +342,13 @@ fn parse_name(text: &str) -> Result<String, UsageError> {
     }
     assert!(!text.contains('/') && !text.contains('.'));
     Ok(text.to_string())
+}
+
+fn parse_commit(text: &str) -> Result<String, UsageError> {
+    if git::is_commit_id(text) {
+        return Ok(text.to_string());
+    }
+    Err(UsageError::BadCommit(text.to_string()))
 }
 
 fn parse_task_id(text: &str) -> Result<TaskId, UsageError> {
@@ -575,6 +593,10 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             action: Some(QueueAction::Wait { timeout }),
             ..
         } => queue_wait(config, *timeout),
+        Command::Queue {
+            action: Some(QueueAction::Reviewed { item, commit }),
+            ..
+        } => queue_reviewed(config, *item, commit.as_deref()),
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
@@ -1190,7 +1212,8 @@ fn queue_wait(config: &Config, minutes: u32) -> Result<u8, CliError> {
     if listing.tasks.len().saturating_add(listing.left_out) > QUEUE_ITEMS_MAX {
         return Err(CliError::Queue(QueueError::TooManyItems));
     }
-    let watches = queue_wait::watches(&listing.tasks).map_err(CliError::QueueWait)?;
+    let watches = queue_wait::watches(&config.home, &listing.tasks);
+    let watches = watches.map_err(CliError::QueueWait)?;
     let outcome = queue_wait::wait(&queue_wait::Cli, &watches, deadline);
     for warning in &outcome.warnings {
         eprintln!("rider: {warning}");
@@ -1203,6 +1226,27 @@ fn queue_wait(config: &Config, minutes: u32) -> Result<u8, CliError> {
     }
     outcome.lines.iter().for_each(|line| say(line));
     Ok(0)
+}
+
+fn queue_reviewed(config: &Config, item: TaskId, commit: Option<&str>) -> Result<u8, CliError> {
+    assert!(config.home.is_absolute());
+    if let Some(commit) = commit {
+        queue_wait::record_head(&config.home, item, commit).map_err(CliError::QueueWait)?;
+        return Ok(0);
+    }
+    match queue_wait::recorded_head(&config.home, item).map_err(CliError::QueueWait)? {
+        Some(head) => {
+            say(&head);
+            Ok(0)
+        }
+        None => {
+            eprintln!(
+                "rider: no reviewed head is recorded for queue item #{}",
+                item.0
+            );
+            Ok(1)
+        }
+    }
 }
 
 fn queue(config: &Config, json: bool) -> Result<u8, CliError> {

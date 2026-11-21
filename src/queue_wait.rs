@@ -1,5 +1,8 @@
+use std::env;
 use std::fmt;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::sync_channel;
 use std::thread;
@@ -26,6 +29,8 @@ const COMMENTS_MAX: usize = 4096;
 const SLUG_BYTES_MAX: usize = 64;
 const LABEL_SHOWN_CHARS_MAX: usize = 48;
 const WARNINGS_MAX: usize = 16;
+const REVIEWED_DIR: &str = "queue/reviewed";
+const RECORD_BYTES_MAX: u64 = 64;
 const LOGIN_BYTES_MAX: usize = 64;
 const CALLS_IN_FLIGHT_MAX: usize = 16;
 
@@ -52,6 +57,11 @@ pub enum WaitError {
         key: &'static str,
         value: String,
     },
+    Record {
+        path: PathBuf,
+        problem: String,
+    },
+    AgentRecord,
     TooManyItems,
     TooManyPolls,
     PollPanicked,
@@ -60,7 +70,11 @@ pub enum WaitError {
 impl WaitError {
     fn is_malformed(&self) -> bool {
         match self {
-            WaitError::TooLarge(_) | WaitError::Field { .. } | WaitError::Label { .. } => true,
+            WaitError::TooLarge(_)
+            | WaitError::Field { .. }
+            | WaitError::Label { .. }
+            | WaitError::Record { .. }
+            | WaitError::AgentRecord => true,
             WaitError::Spawn { .. }
             | WaitError::Exit { .. }
             | WaitError::TimedOut(_)
@@ -103,6 +117,12 @@ impl fmt::Display for WaitError {
                     "queue task #{}: label {key}={value:?} is malformed",
                     task.0
                 )
+            }
+            WaitError::Record { path, problem } => {
+                write!(f, "the reviewed head in {}: {problem}", path.display())
+            }
+            WaitError::AgentRecord => {
+                write!(f, "an agent's task may not record a reviewed head")
             }
             WaitError::TooManyItems => {
                 write!(f, "the queue holds more than {QUEUE_ITEMS_MAX} items")
@@ -271,7 +291,57 @@ fn parse_slug(slug: &str) -> Option<&str> {
     valid.then_some(slug)
 }
 
-pub fn watches(tasks: &[ListedTask]) -> Result<Vec<Watch>, WaitError> {
+fn record_path(home: &Path, item: TaskId) -> PathBuf {
+    assert!(home.is_absolute());
+    let path = home.join(REVIEWED_DIR).join(item.0.to_string());
+    assert!(path.starts_with(home));
+    path
+}
+
+pub fn recorded_head(home: &Path, item: TaskId) -> Result<Option<String>, WaitError> {
+    let path = record_path(home, item);
+    let problem = |problem: String| WaitError::Record {
+        path: path.clone(),
+        problem,
+    };
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(problem(error.to_string())),
+    };
+    let mut text = String::new();
+    let read = file.take(RECORD_BYTES_MAX).read_to_string(&mut text);
+    read.map_err(|error| problem(error.to_string()))?;
+    let head = text
+        .strip_suffix('\n')
+        .filter(|head| git::is_commit_id(head));
+    let head = head.ok_or_else(|| problem("is not one commit id".to_string()))?;
+    assert!(head.len() as u64 <= RECORD_BYTES_MAX);
+    Ok(Some(head.to_string()))
+}
+
+pub fn record_head(home: &Path, item: TaskId, head: &str) -> Result<(), WaitError> {
+    assert!(git::is_commit_id(head));
+    if env::var_os("BOARD_TASK").is_some() {
+        return Err(WaitError::AgentRecord);
+    }
+    let path = record_path(home, item);
+    let problem = |error: std::io::Error| WaitError::Record {
+        path: path.clone(),
+        problem: error.to_string(),
+    };
+    let dir = path
+        .parent()
+        .ok_or_else(|| problem(ErrorKind::NotFound.into()))?;
+    fs::create_dir_all(dir).map_err(problem)?;
+    let partial = dir.join(format!(".{}.partial", item.0));
+    fs::write(&partial, format!("{head}\n")).map_err(problem)?;
+    fs::rename(&partial, &path).map_err(problem)?;
+    assert_eq!(recorded_head(home, item)?.as_deref(), Some(head));
+    Ok(())
+}
+
+pub fn watches(home: &Path, tasks: &[ListedTask]) -> Result<Vec<Watch>, WaitError> {
     if tasks.len() > QUEUE_ITEMS_MAX {
         return Err(WaitError::TooManyItems);
     }
@@ -292,7 +362,8 @@ pub fn watches(tasks: &[ListedTask]) -> Result<Vec<Watch>, WaitError> {
         }
         let kind = label(task, "kind");
         let comments = turn == Some("author") || kind == Some("respond");
-        let head = checked(task, "head", commit)?;
+        let label = checked(task, "head", commit)?;
+        let head = recorded_head(home, task.view.id)?.or(label);
         let owner_review = turn == Some("owner") && kind == Some("review") && head.is_some();
         if comments || owner_review {
             let after = checked(task, "github_at", time)?;

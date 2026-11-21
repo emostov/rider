@@ -437,3 +437,53 @@ fn rider_queue_wait_stops_a_gh_whose_child_holds_its_output_and_exits_3_at_the_t
     assert!(took < Duration::from_secs(70), "{took:?}");
     assert_eq!(stderr, "rider: gh did not finish within 30 seconds\n");
 }
+
+#[test]
+fn rider_queue_wait_compares_the_live_head_with_the_recorded_head_not_the_label() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_fake_reviews_and_gh(&world, REVIEWS_SHOW, GH_PR_VIEW);
+    let labels = [("kind", "review"), ("turn", "owner"), ("head", PR_HEAD)];
+    let item = given_a_queue_item(&world, 412, &labels);
+    let recorded = when_rider_runs(&world, &["queue", "reviewed", &item, OLD_HEAD]);
+    assert_eq!(recorded.code, Some(0), "{recorded:?}");
+
+    let (output, _) = when_the_queue_is_waited_on(&world);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let line = format!("acme/widgets#412: head moved to {PR_HEAD}\n");
+    assert_eq!(output.stdout, line);
+}
+
+#[test]
+fn rider_queue_reviewed_records_and_prints_the_reviewed_head_but_never_for_an_agent() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let missing = when_rider_runs(&world, &["queue", "reviewed", "7"]);
+    let recorded = when_rider_runs(&world, &["queue", "reviewed", "7", PR_HEAD]);
+    let printed = when_rider_runs(&world, &["queue", "reviewed", "7"]);
+    let mut agent = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    agent
+        .args(["queue", "reviewed", "7", OLD_HEAD])
+        .env("BOARD_TASK", "9");
+    let refused = crate::world::run_bounded(agent, None);
+    let after = when_rider_runs(&world, &["queue", "reviewed", "7"]);
+
+    assert_eq!(missing.code, Some(1), "{missing:?}");
+    assert_eq!(
+        missing.stderr,
+        "rider: no reviewed head is recorded for queue item #7\n"
+    );
+    assert_eq!(recorded.code, Some(0), "{recorded:?}");
+    assert_eq!(
+        (printed.code, printed.stdout),
+        (Some(0), format!("{PR_HEAD}\n"))
+    );
+    assert_eq!(refused.code, Some(1), "{refused:?}");
+    let line = "rider: an agent's task may not record a reviewed head\n";
+    assert_eq!(refused.stderr, line);
+    assert_eq!(after.stdout, format!("{PR_HEAD}\n"));
+}
