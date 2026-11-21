@@ -1831,13 +1831,14 @@ fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
             }
         }
     }
-    clear_agents(home, log);
+    clear_agents(home, &recovery.unaccounted, log);
     assert!(groups.len() <= LEFTOVERS_MAX);
     recovery.unaccounted
 }
 
-// Removes the agents file and every pid and ack file, which name no agent of this daemon.
-fn clear_agents(home: &Path, log: &Log) {
+// Removes the agents file and every pid and ack file, which name no agent of this daemon, but
+// the pid file of an unaccounted task, which the next start needs while that agent may live.
+fn clear_agents(home: &Path, unaccounted: &Unaccounted, log: &Log) {
     let agents = home.join(AGENTS_FILE);
     if let Err(error) = fs::remove_file(&agents)
         && error.kind() != io::ErrorKind::NotFound
@@ -1849,9 +1850,16 @@ fn clear_agents(home: &Path, log: &Log) {
     };
     for entry in entries.take(AGENT_FILES_MAX).flatten() {
         let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "pid" || extension == "ack")
+        let task = path
+            .file_stem()
+            .and_then(|stem| stem.to_str()?.parse::<u64>().ok());
+        let kept = match unaccounted {
+            Unaccounted::Every => true,
+            Unaccounted::Tasks(tasks) => task.is_some_and(|task| tasks.contains(&TaskId(task))),
+        };
+        let extension = path.extension();
+        if extension.is_some_and(|extension| extension == "ack")
+            || (extension.is_some_and(|extension| extension == "pid") && !kept)
         {
             let _ = fs::remove_file(&path);
         }

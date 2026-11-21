@@ -483,3 +483,42 @@ fn a_failed_startup_renewal_is_retried_when_the_board_returns() {
         (back.iter()).any(|action| matches!(action, Action::Resume { task: t, .. } if *t == task));
     assert!(resumed, "the board returned, and the core sent {back:?}");
 }
+
+#[test]
+fn a_claim_lost_while_settling_keeps_the_branch_until_the_worktree_is_released() {
+    let (built, fix) = (TaskId(1), TaskId(2));
+    let mut script = Script::new();
+    let run = script.ready(built);
+    assert_eq!(
+        script.claimed(run),
+        vec![Action::Prepare { run, task: built }]
+    );
+    let branch = Some("rider/1-work".to_string());
+    let role = ROLE.to_string();
+    let spawned = script.step(Event::Prepared { run, branch, role });
+    assert!(matches!(spawned.as_slice(), [Action::Spawn { .. }]));
+    assert_eq!(script.judged_complete(run, built), vec![settle(run, built)]);
+
+    script.cursor += 1;
+    script.step(Event::Feed(BoardEvent {
+        cursor: Cursor(script.cursor),
+        kind: EventKind::TaskCompleted,
+        task: built,
+        channel: "work/sim".to_string(),
+        labels: role_labels(),
+        state: Some(TaskState::Completed),
+        actor: None,
+    }));
+    let lost = script.step(Event::ClaimLost(run));
+    let mut labels = role_labels();
+    labels.push(("onto".to_string(), built.0.to_string()));
+    let waiting = script.feed(fix, EventKind::TaskCreated, labels);
+    let settled = script.step(Event::Settled(run));
+
+    assert_eq!(lost, Vec::new());
+    assert_eq!(waiting, Vec::new());
+    assert!(
+        matches!(settled.as_slice(), [Action::Claim { task, .. }] if *task == fix),
+        "the fix was answered {settled:?} once the worktree was released"
+    );
+}

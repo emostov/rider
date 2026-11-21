@@ -1337,6 +1337,11 @@ fn board_failed(state: &mut State, call: Call) {
         // Whether the board granted it is unknown; an unrenewed claim lapses within the lease.
         Call::Claim(_) if entry.phase == Phase::Claiming => remove_run(state, index),
         Call::Renew(_) => entry.renewing = false,
+        Call::Settle(_) | Call::Release(_)
+            if entry.settling && entry.phase == Phase::Abandoning =>
+        {
+            remove_run(state, index);
+        }
         Call::Settle(_) | Call::Release(_) if entry.settling => {
             entry.settling = false;
             entry.settle_tries = entry.settle_tries.saturating_add(1);
@@ -1582,7 +1587,11 @@ fn abandon(state: &mut State, index: usize, actions: &mut Vec<Action>) {
     let entry = &mut state.runs[index];
     assert!(index < AGENTS_MAX as usize);
     if !entry.agent_alive {
-        remove_run(state, index);
+        if entry.phase == Phase::Settling && entry.settling {
+            set_phase(entry, Phase::Abandoning, now);
+        } else {
+            remove_run(state, index);
+        }
         return;
     }
     let already_stopping = matches!(entry.phase, Phase::Stopping(_) | Phase::Abandoning);
@@ -1932,6 +1941,7 @@ fn phase_expired(state: &mut State, index: usize, actions: &mut Vec<Action>) {
         }
         // The closing write is abandoned, as when its tries run out.
         Phase::Settling => give_up_claim(state, index),
+        Phase::Abandoning if !entry.agent_alive => remove_run(state, index),
         // Only an observed exit ends the agent; past the tries it is lost, not gone.
         Phase::Stopping(_) | Phase::Abandoning if entry.stop_tries < STOP_TRIES_MAX => {
             entry.stop_tries = entry.stop_tries.saturating_add(1);

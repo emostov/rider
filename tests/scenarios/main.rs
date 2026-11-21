@@ -2376,6 +2376,7 @@ const LOG_POLL_MILLIS: u64 = 50;
 /// The board's shortest lease, with time for it to notice the lapse.
 const LEASE_LAPSE_SECONDS_MAX: u64 = 90;
 const LEASE_POLL_MILLIS: u64 = 500;
+const RESUME_SECONDS: u64 = 3;
 
 #[test]
 fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_worktree() {
@@ -2408,6 +2409,87 @@ fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_work
     assert_eq!(task_label(&world, &task, "attempt"), None);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn an_onto_task_completes_after_a_daemon_crash_between_complete_and_worktree_release() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
+    let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
+    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_a_running_daemon(&mut world);
+    when_the_file_exists(&world, &posted);
+    when_the_daemon_crashes(&mut world);
+    fs::write(&release, "").expect("release the held post");
+    assert_eq!(task_state(&world, &built), "completed");
+
+    given_a_running_daemon(&mut world);
+    let states = when_the_tasks_settle(&world, &[&fix]);
+
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["completed"], "{}", world.daemon_log());
+    assert_eq!(agent_runs_for(&world, &fix).len(), 1);
+    then_the_worktree_is_removed(&world, &built);
+}
+
+#[test]
+fn a_second_restart_within_the_lease_leaves_an_unidentified_live_agent_s_task_alone() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::Commit]);
+    given_a_running_daemon(&mut world);
+    let leftover = when_the_agent_has_started(&world, &task);
+    when_agents_json_names(&world, leftover.pid);
+    when_the_daemon_crashes(&mut world);
+    fs::remove_file(world.home.join("agents.json")).expect("remove agents.json");
+    let ack = world.home.join("agents").join(format!("{task}.ack"));
+    fs::remove_file(&ack).expect("remove the acknowledgement");
+    let left = format!("leaving #{task} to its lease");
+
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows(&world, &left);
+    when_the_daemon_crashes(&mut world);
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows_twice(&world, &left);
+    thread::sleep(Duration::from_secs(RESUME_SECONDS));
+
+    let runs = agent_runs_for(&world, &task);
+    assert!(is_alive(leftover.pid), "the leftover agent was stopped");
+    world.release_agent(&task);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(runs.len(), 1, "{}", world.daemon_log());
+    assert!(when_the_process_ends_within(leftover.pid, 10));
+}
+
+/// Waits until the daemon's log contains `text` at least twice.
+fn when_the_daemon_log_shows_twice(world: &World, text: &str) {
+    let log = world.home.join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while fs::read_to_string(&log)
+        .unwrap_or_default()
+        .matches(text)
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon log never showed {text} twice:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(LOG_POLL_MILLIS));
+    }
 }
 
 #[test]

@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use crate::board::{Board, BoardError, LABELS_MAX, TaskId, TaskView};
+use crate::board::{Board, BoardError, LABELS_MAX, TaskId, TaskState, TaskView};
 use crate::brief::Brief;
 use crate::git::{self, GitError, REF_BYTES_MAX};
 
@@ -485,6 +485,17 @@ pub fn prepare(
         return reuse(brief, board, dir, identity);
     }
     let plan = plan(brief, board)?;
+    if let Plan::Onto { task, branch } = &plan
+        && git::worktree_branches(&brief.repo)?.contains(branch)
+        && board.read_task(*task)?.state == TaskState::Completed
+    {
+        let left = Checkout {
+            dir: dir.with_file_name(task.0.to_string()),
+            branch: Some(branch.clone()),
+            start_head: String::new(),
+        };
+        let _ = release(&left, &brief.repo, home);
+    }
     let branch = add(&brief.repo, &dir, plan)?;
     let path = record_path(&dir)?;
     fs::write(&path, &identity.0).map_err(|error| WorktreeError::BoardRecord {
