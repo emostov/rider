@@ -83,3 +83,19 @@ are prepared to have changed. The daemon never pushes or merges; work stays on l
 named `rider/<task id>-<slug>` until you ship it.
 
 Maintaining Rider? See [MAINTAINERS.md](MAINTAINERS.md).
+
+## How it's built
+
+- **A deterministic simulator.** The daemon's decisions are one pure function,
+  `step(state, event) -> actions`, with no I/O. A seeded simulator (`tests/sim/`) drives it
+  through thousands of runs with a fake board, agents and clock, injecting crashes, lost
+  claims, board outages and clock jumps, and checks the design's invariants after every
+  step. A failing seed replays exactly: `SIM_SEED=<n> cargo test --test sim`.
+- **Elements of TigerStyle.** At least two assertions per function, every loop and
+  collection bounded by a named constant, no recursion, no `unsafe`, no async runtime:
+  threads, bounded channels and back pressure. See [AGENTS.md](./AGENTS.md).
+- **Black-box scenario tests.** `tests/scenarios/` runs the real `rider` binary against a
+  real board in a scratch directory, with fake agents, so behaviour is pinned from the
+  outside and the code can be rewritten with confidence.
+- **Built by its own swarm.** Rider's changes are planned on the board and carried out by
+  Rider's own agents, each reviewed by a different model than the one that wrote it.
