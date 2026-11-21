@@ -1104,3 +1104,26 @@ fn rider_clean_yes_keeps_an_open_tasks_worktree_and_says_why() {
     let kept = format!("kept #{task} {}: its task is blocked", dir.display());
     assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
 }
+
+#[test]
+fn rider_clean_yes_keeps_a_canceled_tasks_worktree_while_its_agent_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::HoldIgnoringTerm]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=30000,tick=1000")]);
+    when_the_agent_has_started(&world, &task);
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    let dir = worktree_dir(&world, &task);
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    let kept = format!(
+        "kept #{task} {}: its task has a running agent",
+        dir.display()
+    );
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
+    world.release_agent(&task);
+}

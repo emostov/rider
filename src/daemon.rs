@@ -440,7 +440,7 @@ impl Shared {
     }
 }
 
-fn pid_file(home: &Path, task: TaskId) -> PathBuf {
+pub fn pid_file(home: &Path, task: TaskId) -> PathBuf {
     let path = home.join(AGENTS_DIR).join(format!("{}.pid", task.0));
     assert!(path.starts_with(home));
     path

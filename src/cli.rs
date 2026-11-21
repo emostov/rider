@@ -566,6 +566,26 @@ fn say_updates(report: &Report) {
     }
 }
 
+fn running_tasks(config: &Config) -> Result<Vec<TaskId>, CliError> {
+    let mut client = match Client::connect(&config.home) {
+        Ok(client) => client,
+        Err(ClientError::NotRunning(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(CliError::Client(error)),
+    };
+    let data = client.send("agents", &[]).map_err(CliError::Client)?;
+    let malformed = || CliError::Client(ClientError::Malformed(data.to_string()));
+    let rows = data.as_array().ok_or_else(malformed)?;
+    let mut tasks = Vec::with_capacity(rows.len());
+    for row in rows.iter().take(usize::from(roles::AGENTS_MAX)) {
+        tasks.push(TaskId(row["task"].as_u64().ok_or_else(malformed)?));
+    }
+    if rows.len() > tasks.len() {
+        return Err(malformed());
+    }
+    assert!(tasks.len() <= usize::from(roles::AGENTS_MAX));
+    Ok(tasks)
+}
+
 fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
     let board = VbCli {
         vb: config.vb_dir().join("vb"),
@@ -573,6 +593,7 @@ fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
         profile: CLEAN_PROFILE.to_string(),
     };
     let identity = board_identity(&config.board_url, &board).map_err(CliError::Board)?;
+    let running = running_tasks(config)?;
     let dirs = worktree::task_dirs(&config.home).map_err(CliError::Worktree)?;
     assert!(dirs.len() <= worktree::TASK_DIRS_MAX * worktree::TASK_DIRS_MAX);
     for (dir, id) in dirs {
@@ -584,6 +605,10 @@ fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
                 say(&format!("skipped {shown}: {error}"));
                 continue;
             }
+        }
+        if running.contains(&id) || daemon::pid_file(&config.home, id).exists() {
+            println!("kept #{} {shown}: its task has a running agent", id.0);
+            continue;
         }
         let view = match board.read_task(id) {
             Ok(view) => view,
