@@ -31,6 +31,13 @@ from it, or whose process group's leader does, which covers an agent running `ri
 group whose parent has exited), nor an agent that signals the daemon directly. Keeping agents
 from stopping the daemon needs a separate user or a sandbox.
 
+## Agent sandbox
+
+On macOS agents run under a best-effort `sandbox-exec` sandbox that blocks the obvious ways to
+reach Rider's socket, control files and programs. It is defence in depth, not a security
+boundary: a determined agent running as the owner's user can still escape it. Linux agents are
+not confined.
+
 ## Troubleshooting
 
 `rider vb` runs the Board CLI under `<rider home>/node/node_modules/.bin` on the local board
@@ -40,6 +47,10 @@ from stopping the daemon needs a separate user or a sandbox.
   `daemon.log` says why: an error in `rider.toml` names the field and the file.
 - **`rider daemon` exits saying `daemon.lock` is held.** Another daemon runs on the same
   home, and the error names its pid. One daemon serves every project, so use that one.
+- **On macOS `daemon.log` says `agents run unconfined: the daemon runs in a sandbox`.** The
+  daemon was started inside a sandbox (as in a Rider agent running Rider's own scenarios), and
+  macOS does not let a sandboxed process confine an agent again, so its agents run without
+  Rider's confinement. Start `rider up` from a terminal that is not sandboxed to confine them.
 - **`rider vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
   its first task.
 - **A failed task's log reply is cut short.** The reply keeps within the board's message

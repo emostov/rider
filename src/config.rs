@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
 use crate::roles::{
-    AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RepoRoles, RoleSpec,
+    AGENTS_MAX, BUILDERS_DEFAULT, Harness, LEAD_PREFIX, LEAD_PROFILE, PROFILE_LEN_MAX, ROLES,
+    RepoRoles, RoleSpec,
 };
 use crate::run_task::{ATTEMPTS_DEFAULT, ATTEMPTS_MAX};
 
@@ -32,7 +33,6 @@ pub const REPOS_MAX: usize = 64;
 /// Upper bound on the skills one role runs.
 pub const SKILLS_MAX: usize = 8;
 const SKILL_LEN_MAX: usize = 64;
-const LEAD: &str = "lead";
 const MISSING: &str = "is missing for a role that is not built in";
 const _: () = assert!(AGENTS_MAX < 100);
 
@@ -465,9 +465,13 @@ fn role_spec(
             problem.into(),
         ));
     }
-    if label == LEAD || label.starts_with(&format!("{LEAD}-")) {
-        let problem = format!("is reserved: profiles beginning `{LEAD}-` belong to the lead");
-        return Err(field_error(path, format!("{prefix}roles.{label}"), problem));
+    if label == LEAD_PROFILE || label.starts_with(LEAD_PREFIX) {
+        let problem = "is reserved for the lead's board profile";
+        return Err(field_error(
+            path,
+            format!("{prefix}roles.{label}"),
+            problem.into(),
+        ));
     }
     let harness = match role.harness.ok_or_else(|| missing("harness"))? {
         HarnessName::Claude => Harness::Claude,

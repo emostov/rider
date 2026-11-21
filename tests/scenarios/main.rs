@@ -1062,6 +1062,36 @@ fn a_repository_table_giving_implement_a_skill_puts_it_in_only_that_repositorys_
 }
 
 #[test]
+fn rider_config_refuses_a_role_named_lead_or_beginning_lead_dash() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompt = world.root.join("lead-prompt.md");
+    fs::write(&prompt, "You lead.\n").expect("write a prompt");
+    for label in ["lead", "lead-two"] {
+        let toml = format!(
+            r#"[roles.{label}]
+harness = "claude"
+model = "m"
+title = "Lead"
+model_name = "M"
+model_slug = "x"
+prompt = "{}"
+commits = true
+"#,
+            prompt.display()
+        );
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{output:?}");
+        let problem = format!("roles.{label} is reserved for the lead's board profile");
+        assert!(output.stderr.contains(&problem), "{output:?}");
+    }
+}
+
+#[test]
 fn an_unknown_key_in_a_repository_role_table_stops_the_daemon_naming_it() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
@@ -2983,12 +3013,11 @@ fn rider_kill_of_a_task_the_owner_canceled_writes_nothing_to_the_task() {
 
     assert_eq!(kill.code, Some(0), "{kill:?}");
     assert!(when_the_process_ends_within(run.pid, 10));
-    thread::sleep(Duration::from_secs(2));
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert_eq!(task_state(&world, &task), "canceled");
     assert_eq!(task_replies(&world, &task), replies);
     assert_eq!(task_labels(&world, &task), labels);
-    when_the_daemon_is_sent_sigterm(&world);
-    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
 
 const LOG_POLL_MILLIS: u64 = 50;
@@ -3169,6 +3198,7 @@ fn a_second_restart_within_the_lease_leaves_an_unidentified_live_agent_s_task_al
 
 #[test]
 fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_be_read() {
+    const AGENT_FILES_MAX: usize = 256;
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -3179,7 +3209,10 @@ fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_b
     when_agents_json_names(&world, leftover.pid);
     when_the_daemon_crashes(&mut world);
     fs::write(world.home.join("agents.json"), "{").expect("corrupt agents.json");
-    fs::write(world.home.join("agents").join("bad.pid"), "1").expect("add a bad pid file");
+    for n in 0..=AGENT_FILES_MAX {
+        let stray = world.home.join("agents").join(format!("stray-{n}.txt"));
+        fs::write(stray, "").expect("add a stray file");
+    }
     let left = "leaving every held claim to its lease";
 
     given_a_running_daemon(&mut world);
@@ -3196,6 +3229,42 @@ fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_b
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert_eq!(runs.len(), 1, "{}", world.daemon_log());
     assert!(when_the_process_ends_within(leftover.pid, 10));
+}
+
+#[test]
+fn a_restart_removes_a_pid_file_naming_no_task_and_a_stale_left_file_naming_no_group() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let agents = world.home.join("agents");
+    fs::create_dir_all(&agents).expect("make the agents directory");
+    fs::write(agents.join("bad.pid"), "1").expect("add a pid file naming no task");
+    let stale = fs::File::create(agents.join("123.left")).expect("add a stale left file");
+    let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+    stale.set_modified(old).expect("age the left file");
+    fs::write(agents.join("124.left"), "").expect("add a fresh left file");
+
+    given_a_running_daemon(&mut world);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+
+    let mut left: Vec<String> = fs::read_dir(&agents)
+        .expect("list the agents directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["124.left".to_string()]);
+    let log = world.daemon_log();
+    assert!(
+        !log.contains("leaving every held claim to its lease"),
+        "{log}"
+    );
 }
 
 fn when_the_daemon_log_shows_twice(world: &World, text: &str) {

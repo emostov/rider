@@ -1,11 +1,12 @@
 //! The command line: parse the arguments, read the environment once, and run one command.
 
+use std::borrow::Cow;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ use crate::board::{
 };
 use crate::brief::{Brief, parse_brief};
 use crate::config::{self, ConfigFileError, Limits};
-use crate::daemon::{self, DaemonError, Paths};
+use crate::daemon::{self, DaemonError, NODE_DIR, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
@@ -41,7 +42,7 @@ use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FI
 use crate::queue_files::{self, FilesError};
 use crate::queue_wait::{self, WaitError};
 use crate::reap::{self, ReapError, Stopped};
-use crate::roles::{self, RoleSpec};
+use crate::roles::{self, LEAD_PREFIX, LEAD_PROFILE, RoleSpec};
 use crate::run_task::{RESULT_FILE_BYTES_MAX, board_identity, result_path};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
 use crate::socket::{self, Client, ClientError, SocketPath};
@@ -75,7 +76,6 @@ pub const PROMPTS: [(&str, &str); 6] = [
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
 const BOARD_DIR: &str = "board";
-const NODE_DIR: &str = "node";
 /// The Board CLI rider installs under its home when it finds none there, every package locked.
 const BOARD_PACKAGE: [(&str, &str); 2] = [
     ("package.json", include_str!("../board-cli/package.json")),
@@ -117,8 +117,6 @@ const QUEUE_PROFILE: &str = "rider-queue";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
 const CLEAN_PROFILE: &str = "rider-clean";
-const LEAD_PROFILE: &str = "lead";
-const LEAD_PREFIX: &str = "lead-";
 const PR_PROFILE: &str = "rider-pr";
 const PR_TITLE_CHARS_MAX: usize = 200;
 const PR_LIST_MAX: usize = 20;
@@ -883,7 +881,7 @@ fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
         fs::write(&path, text).map_err(|error| io_error("write", &path, &error))?;
     }
     eprintln!("rider: installing the Board CLI into {}", prefix.display());
-    let mut npm = Process::new("npm");
+    let mut npm = Process::new(git::resolve("npm"));
     npm.env_clear()
         .args(["ci", "--prefix"])
         .arg(&prefix)
@@ -1385,7 +1383,7 @@ fn logs(config: &Config, id: TaskId, follow: bool) -> Result<u8, CliError> {
                 for _ in 0..LOG_LINES_MAX {
                     match client.next_line().map_err(CliError::Client)? {
                         // A closed standard output ends nothing the daemon does.
-                        Some(line) => drop(writeln!(io::stdout().lock(), "{line}")),
+                        Some(line) => drop(writeln!(io::stdout().lock(), "{}", printable(&line))),
                         None => return Ok(0),
                     }
                 }
@@ -1405,10 +1403,25 @@ fn logs(config: &Config, id: TaskId, follow: bool) -> Result<u8, CliError> {
         message: error.to_string(),
     };
     let file = fs::File::open(&path).map_err(io)?;
+    let mut reader = BufReader::new(file.take(LOG_BYTES_MAX));
     let mut stdout = io::stdout().lock();
-    io::copy(&mut file.take(LOG_BYTES_MAX), &mut stdout).map_err(io)?;
-    stdout.flush().map_err(io)?;
-    Ok(0)
+    let mut line = Vec::new();
+    for _ in 0..LOG_LINES_MAX {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).map_err(io)? == 0 {
+            stdout.flush().map_err(io)?;
+            return Ok(0);
+        }
+        let (body, end) = match line.strip_suffix(b"\n") {
+            Some(body) => (body, "\n"),
+            None => (&line[..], ""),
+        };
+        let text = String::from_utf8_lossy(body);
+        write!(stdout, "{}{end}", printable(&text)).map_err(io)?;
+    }
+    Err(CliError::Client(ClientError::Malformed(format!(
+        "more than {LOG_LINES_MAX} lines"
+    ))))
 }
 
 fn kill(config: &Config, id: TaskId) -> Result<u8, CliError> {
@@ -1437,8 +1450,12 @@ fn status(config: &Config) -> Result<u8, CliError> {
     projects.dedup();
     for project in projects {
         match spent.iter().find(|entry| name(entry) == project) {
-            Some(entry) => println!("{project} spent {}", usage_text(&entry["usage"])),
-            None => println!("{project}"),
+            Some(entry) => println!(
+                "{} spent {}",
+                printable(&project),
+                usage_text(&entry["usage"])
+            ),
+            None => println!("{}", printable(&project)),
         }
         let usage_of = |id: &serde_json::Value| {
             let entry = used.iter().find(|entry| entry["id"] == *id);
@@ -1675,8 +1692,25 @@ fn status_line(data: &serde_json::Value) -> String {
     line
 }
 
-fn text(value: &serde_json::Value) -> &str {
-    value.as_str().unwrap_or("-")
+fn text(value: &serde_json::Value) -> Cow<'_, str> {
+    printable(value.as_str().unwrap_or("-"))
+}
+
+fn printable(text: &str) -> Cow<'_, str> {
+    let shown = |c: &char| !queue::hidden(*c);
+    if text.chars().all(|c| shown(&c)) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if shown(&c) {
+            escaped.push(c);
+        } else {
+            escaped.extend(c.escape_default());
+        }
+    }
+    assert!(escaped.chars().all(|c| shown(&c)));
+    Cow::Owned(escaped)
 }
 
 fn age(value: &serde_json::Value) -> String {

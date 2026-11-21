@@ -153,7 +153,7 @@ fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
             assert_eq!(down.code, Some(0), "{down:?}");
             assert_eq!(then_the_daemon_exits(&mut world), Some(0));
             left.extend(
-                ["rider.sock", ".bind"]
+                ["rider.sock", ".b"]
                     .into_iter()
                     .filter(|name| fs::symlink_metadata(world.home.join(name)).is_ok()),
             );
@@ -783,4 +783,244 @@ fn rider_up_refuses_a_home_under_a_directory_whose_acl_lets_others_change_it() {
     let parent = format!("another user can change {}", world.root.display());
     assert!(up.stderr.contains(&parent), "{up:?}");
     assert!(!world.home.join("rider.sock").exists());
+}
+
+const STREAM_LINE_BYTES_MAX: usize = 512 * 1024;
+
+#[test]
+fn rider_logs_shows_control_characters_in_an_agents_output_escaped() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = "7";
+    given_a_log(
+        &world,
+        task,
+        "plain\tline\n\u{1b}[2Jcleared\u{9b}31m\rback\nbidi \u{202e}gnp.exe\u{200b}\n",
+    );
+    given_a_running_daemon(&mut world);
+
+    let printed = when_rider_runs(&world, &["logs", task]);
+    let followed = when_rider_runs(&world, &["logs", "-f", task]);
+
+    let shown = "plain\\tline\n\\u{1b}[2Jcleared\\u{9b}31m\\rback\n\
+                 bidi \\u{202e}gnp.exe\\u{200b}\n";
+    assert_eq!(
+        (printed.code, printed.stdout.as_str()),
+        (Some(0), shown),
+        "{printed:?}"
+    );
+    assert_eq!(
+        (followed.code, followed.stdout.as_str()),
+        (Some(0), shown),
+        "{followed:?}"
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn rider_logs_follow_splits_a_line_too_long_for_one_stream_line_between_characters() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = "7";
+    let line = format!("a{}", "\u{e9}".repeat(STREAM_LINE_BYTES_MAX));
+    given_a_log(&world, task, &format!("{line}\n"));
+    given_a_running_daemon(&mut world);
+
+    let followed = when_rider_runs(&world, &["logs", "-f", task]);
+
+    assert_eq!(followed.code, Some(0), "{}", followed.stderr);
+    assert!(
+        followed.stdout.lines().count() > 1,
+        "the line was not split"
+    );
+    assert!(
+        followed.stdout.replace('\n', "") == line,
+        "the split line changed"
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_detached_child_of_an_agent_is_refused_the_socket_and_cannot_stop_rider() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::StopRiderDetached]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    let (code, output) = fake_agent::detached_stop(&world.root, &task, 0);
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    assert_ne!(code, "0", "{output}");
+    assert!(output.contains("Operation not permitted"), "{output}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_cannot_write_the_daemons_staging_files_or_its_board_cli_install() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::TryWrites]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    let expected: String = (fake_agent::TRIED_WRITES.split(' '))
+        .map(|name| format!("{name} refused\n"))
+        .collect();
+    assert_eq!(fake_agent::tried_writes(&world.root, &task, 0), expected);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_daemon_started_inside_a_sandbox_runs_its_agents_unconfined_and_says_so() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_a_running_daemon_in_a_sandbox(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    let note = "agents run unconfined: the daemon runs in a sandbox";
+    let log = fs::read_to_string(world.home.join("daemon.log")).expect("read daemon.log");
+    assert!(log.contains(note), "{log}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_detached_child_of_an_agent_cannot_signal_the_daemon() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::SignalDaemonDetached]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    let (code, output) = fake_agent::detached_signal(&world.root, &task, 0);
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    assert_ne!(code, "0", "{output}");
+    assert!(output.contains("Operation not permitted"), "{output}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_file_left_in_the_sockets_staging_directory_does_not_stop_the_daemon_starting() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let staging = world.home.join(".b");
+    fs::create_dir_all(&staging).expect("create the staging directory");
+    fs::write(staging.join("left"), "").expect("leave a file there");
+
+    given_a_running_daemon(&mut world);
+
+    assert_eq!(when_rider_runs(&world, &["status"]).code, Some(0));
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+fn given_a_log(world: &World, task: &str, text: &str) {
+    let dir = world.home.join("logs").join(task);
+    fs::create_dir_all(&dir).expect("create the task's log directory");
+    fs::write(dir.join("1.jsonl"), text).expect("write the log");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn filters_an_agent_plants_in_its_repository_and_a_nested_one_never_run_outside_its_sandbox() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantFilters]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(exit, Some(0), "{}", world.daemon_log());
+    assert_eq!(states.len(), 1);
+    let escaped = [fake_agent::ESCAPE_EQUALS, fake_agent::ESCAPE_NESTED]
+        .map(|marker| fake_agent::escaped(&world.root, marker));
+    assert_eq!(escaped, [false, false]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_promisor_remote_an_agent_plants_never_runs_its_uploadpack_outside_its_sandbox() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nattempts = 1\n");
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantPromisor]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(exit, Some(0), "{}", world.daemon_log());
+    assert_eq!(states.len(), 1);
+    assert!(!fake_agent::escaped(
+        &world.root,
+        fake_agent::ESCAPE_PROMISOR
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_cannot_open_an_app_it_wrote_to_leave_its_sandbox() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::OpenApp]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let (code, output) = fake_agent::opened(&world.root, &task, 0);
+    assert_ne!(code, "0", "{output}");
+    assert!(!fake_agent::escaped(&world.root, fake_agent::ESCAPE_OPEN));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_cannot_write_its_repositorys_git_config_hooks_or_remotes_but_still_commits() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantGitConfig]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let worktree = format!("worktrees/{task}");
+    let refused = format!(
+        "config refused\nconfig.worktree refused\nhooks/post-checkout refused\n\
+         info/attributes refused\ncommondir refused\n{worktree}/config.worktree refused\n\
+         {worktree}/commondir refused\n{worktree}/gitdir refused\n.git refused\n"
+    );
+    assert_eq!(
+        fake_agent::git_config_writes(&world.root, &task, 0),
+        refused
+    );
 }

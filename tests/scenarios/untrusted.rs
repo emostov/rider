@@ -101,6 +101,7 @@ fn an_untrusted_task_sees_only_the_allowed_variables() {
         "PWD",
         "RIDER_AGENT_ACK_FILE",
         "RIDER_AGENT_PID_FILE",
+        "RIDER_AGENT_STOP_FILE",
         "RIDER_AGENT_VB_DIR",
         "SHLVL",
         "_",
@@ -273,4 +274,32 @@ fn a_mythos_rerun_of_an_untrusted_review_stays_untrusted() {
     assert_eq!(runs.len(), 1);
     let scratch = world.home.join("untrusted").join(rerun).join("work");
     assert_eq!(runs[0].dir, scratch);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_untrusted_agent_runs_in_the_sandbox_and_cannot_write_the_daemons_files() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = an_untrusted_task(&world, "Review the pull request.", "review");
+    let task = when_the_lead_creates(&world, &task);
+    given_the_agent_will(&world, &task, &[Behaviour::TryWrites]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(
+        states,
+        ["failed"],
+        "the untrusted agent has no repository to commit to"
+    );
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let expected: String = (fake_agent::TRIED_WRITES.split(' '))
+        .map(|name| format!("{name} refused\n"))
+        .collect();
+    assert_eq!(fake_agent::tried_writes(&world.root, &task, 0), expected);
+    let scratch = world.home.join("untrusted").join(&task).join("work");
+    assert_eq!(agent_runs_for(&world, &task)[0].dir, scratch);
 }

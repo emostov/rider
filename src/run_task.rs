@@ -444,6 +444,10 @@ impl Attempt {
 
     fn launch_first(&self, launch: &Launch) -> Result<Exit, HarnessError> {
         assert!(self.fresh_log.get().is_none(), "an attempt launches once");
+        if self.stopped.load(Ordering::SeqCst) {
+            let stopped = "the attempt was stopped before its agent started".to_string();
+            return Err(HarnessError::Spawn(stopped));
+        }
         let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
         let harness = self.brief.role.harness;
         let refused = !matches!(launched, Ok(Exit::Code(0)))

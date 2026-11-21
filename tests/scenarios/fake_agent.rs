@@ -31,6 +31,12 @@ pub const LEFTOVER_SECONDS: u64 = 30;
 /// How many bytes a `CommitFlooding` agent prints after its report.
 pub const FLOOD_BYTES: u64 = 65 * 1024 * 1024;
 pub const PR_REF: &str = "refs/rider/pr/412";
+pub const ESCAPE_EQUALS: &str = "escape-equals";
+pub const ESCAPE_NESTED: &str = "escape-nested";
+pub const ESCAPE_PROMISOR: &str = "escape-promisor";
+pub const ESCAPE_OPEN: &str = "escape-open";
+pub const TRIED_WRITES: &str = "agents.json.new cursor.new board.json.new node/probe .b/probe rider.toml prompts ../tools/probe \
+     board wait roles run node.lock ship.toml";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +157,16 @@ pub enum Behaviour {
     CommitFlooding,
     /// Prints `STDERR_LINE` on stderr and exits `FAIL_EXIT_CODE`.
     ComplainThenExitNonZero,
+    /// Runs `rider down --now` in a child of its own process group, waits for that child to
+    /// record its exit code and output, then commits like `Commit`.
+    StopRiderDetached,
+    TryWrites,
+    SignalDaemonDetached,
+    PlantFsmonitor,
+    PlantFilters,
+    PlantPromisor,
+    OpenApp,
+    PlantGitConfig,
     /// Prints a stream in its harness's shape with `STREAM_MESSAGES`, a failed tool call and
     /// `STREAM_ERROR` as the run's error, then exits `FAIL_EXIT_CODE`.
     StreamError,
@@ -255,6 +271,14 @@ impl Behaviour {
             Behaviour::CommitLeavingEscapee => "commit-leaving-escapee",
             Behaviour::CommitFlooding => "commit-flooding",
             Behaviour::ComplainThenExitNonZero => "complain-then-exit-non-zero",
+            Behaviour::StopRiderDetached => "stop-rider-detached",
+            Behaviour::TryWrites => "try-writes",
+            Behaviour::SignalDaemonDetached => "signal-daemon-detached",
+            Behaviour::PlantFsmonitor => "plant-fsmonitor",
+            Behaviour::PlantFilters => "plant-filters",
+            Behaviour::PlantPromisor => "plant-promisor",
+            Behaviour::OpenApp => "open-app",
+            Behaviour::PlantGitConfig => "plant-git-config",
             Behaviour::StreamError => "stream-error",
             Behaviour::StreamForged => "stream-forged",
             Behaviour::StreamThenStderr => "stream-then-stderr",
@@ -350,6 +374,11 @@ fn script() -> String {
         });
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/harness");
     let (leftover, flood) = (LEFTOVER_SECONDS, FLOOD_BYTES);
+    let rider = env!("CARGO_BIN_EXE_rider");
+    assert!(
+        !rider.contains('\''),
+        "the rider binary's path is quoted in the script"
+    );
     let ([said0, said1], error) = (STREAM_MESSAGES, STREAM_ERROR);
     let (command, tool_error, stderr_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR, STDERR_ERROR);
     format!(
@@ -534,6 +563,95 @@ case "$behaviour" in
     done
     exit 0 ;;
   commit-flooding) commit || exit 1; report; yes | head -c {flood}; exit 0 ;;
+  stop-rider-detached)
+    stopped="$world/{ARGS_DIR}/$task-$attempt.stop"
+    set -m
+    ( '{rider}' down --now > "$stopped.out" 2>&1; echo "$?" > "$stopped.code" ) &
+    set +m
+    step=0
+    while [ ! -s "$stopped.code" ]; do
+      step=$((step + 1))
+      [ "$step" -le {steps} ] || exit 1
+      sleep 0.1
+    done
+    commit || exit 1 ;;
+  plant-filters)
+    escaped="$world/rider-home/agents"
+    printf 'hi\n' > f.txt
+    printf '* filter=a=b\n' > .gitattributes
+    git init -q sub && printf 'hi\n' > sub/g.txt && printf '* filter=evil\n' > sub/.git/info/attributes \
+      && git -C sub add g.txt && git -C sub commit -q -m Sub || exit 1
+    git add f.txt .gitattributes sub 2>/dev/null && git commit -q -m Filtered || exit 1
+    git config 'filter.a=b.clean' "sh -c ': > $escaped/{ESCAPE_EQUALS}; cat'" \
+      && git -C sub config filter.evil.clean "sh -c ': > $escaped/{ESCAPE_NESTED}; cat'" || exit 1
+    sleep 1
+    printf 'hi\n' > f.txt
+    printf 'hi\n' > sub/g.txt ;;
+  plant-promisor)
+    escaped="$world/rider-home/agents"
+    commit || exit 1
+    git config extensions.partialClone evil && git config remote.evil.promisor true \
+      && git config remote.evil.url "$(pwd)" \
+      && git config remote.evil.uploadpack \
+        "sh -c ': > $escaped/{ESCAPE_PROMISOR}; git-upload-pack \"\$@\"' sh" || exit 1
+    absent=$( {{
+      printf 'tree 1234567890123456789012345678901234567890\nparent %s\n' "$(git rev-parse HEAD)"
+      printf 'author t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\nx\n'
+    }} | git hash-object -t commit -w --stdin --literally) && git update-ref HEAD "$absent" || exit 1 ;;
+  plant-git-config)
+    common=$(git rev-parse --path-format=absolute --git-common-dir)
+    own=$(git rev-parse --absolute-git-dir)
+    tried="$world/{ARGS_DIR}/$task-$attempt.git-config"
+    for target in "$common/config" "$common/config.worktree" "$common/hooks/post-checkout" \
+      "$common/info/attributes" "$common/commondir" "$own/config.worktree" "$own/commondir" \
+      "$own/gitdir" "$(pwd)/.git"; do
+      name=${{target#"$common"/}}
+      name=${{name#"$(pwd)"/}}
+      if ( : >> "$target" ) 2>/dev/null; then echo "$name written"; else echo "$name refused"; fi
+    done > "$tried"
+    git config core.sshCommand planted 2>/dev/null && echo "git config written" >> "$tried"
+    commit || exit 1 ;;
+  open-app)
+    app="$world/{ARGS_DIR}/$task-$attempt.app"
+    mkdir -p "$app/Contents/MacOS"
+    {{
+      printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n'
+      printf '<key>CFBundleExecutable</key><string>esc</string>\n'
+      printf '<key>LSBackgroundOnly</key><true/></dict></plist>\n'
+    }} > "$app/Contents/Info.plist"
+    printf '#!/bin/sh\n: > "%s"\n' "$world/rider-home/agents/{ESCAPE_OPEN}" > "$app/Contents/MacOS/esc"
+    chmod +x "$app/Contents/MacOS/esc"
+    /usr/bin/open -g -j -n "$app" > "$app.out" 2>&1; echo "$?" > "$app.code"
+    sleep 2
+    commit || exit 1 ;;
+  plant-fsmonitor)
+    planted="$world/{ARGS_DIR}/$task-$attempt.fsmonitor"
+    printf '#!/bin/sh\n: > "%s.ran"\n' "$planted" > "$planted"
+    chmod +x "$planted"
+    commit || exit 1
+    git config core.fsmonitor "$planted" 2>/dev/null || : ;;
+  signal-daemon-detached)
+    signalled="$world/{ARGS_DIR}/$task-$attempt.signal"
+    daemon=$(awk '{{print $2}}' "$world/rider-home/daemon.lock")
+    set -m
+    ( kill -TERM "$daemon" > "$signalled.out" 2>&1; echo "$?" > "$signalled.code" ) &
+    set +m
+    step=0
+    while [ ! -s "$signalled.code" ]; do
+      step=$((step + 1))
+      [ "$step" -le {steps} ] || exit 1
+      sleep 0.1
+    done
+    commit || exit 1 ;;
+  try-writes)
+    for name in {TRIED_WRITES}; do
+      if ( : > "$world/rider-home/$name" ) 2>/dev/null; then
+        rm -f "$world/rider-home/$name"; echo "$name written"
+      else
+        echo "$name refused"
+      fi
+    done > "$world/{ARGS_DIR}/$task-$attempt.writes"
+    commit || exit 1 ;;
   stream-error)
     if [ "$harness" = codex ]; then
       echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
@@ -669,6 +787,67 @@ pub fn arg_count(world: &Path, task: &str, attempt: u32) -> usize {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+pub fn detached_signal(world: &Path, task: &str, attempt: u32) -> (String, String) {
+    let read = |end: &str| {
+        let path = world
+            .join(ARGS_DIR)
+            .join(format!("{task}-{attempt}.signal.{end}"));
+        fs::read_to_string(&path).expect("read what the detached signal recorded")
+    };
+    let (code, output) = (read("code"), read("out"));
+    (code.trim().to_string(), output)
+}
+
+pub fn fsmonitor_ran(world: &Path, task: &str, attempt: u32) -> bool {
+    let planted = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.fsmonitor"));
+    assert!(planted.exists(), "the agent planted its fsmonitor");
+    planted.with_extension("fsmonitor.ran").exists()
+}
+
+pub fn escaped(world: &Path, marker: &str) -> bool {
+    world.join("rider-home/agents").join(marker).exists()
+}
+
+pub fn opened(world: &Path, task: &str, attempt: u32) -> (String, String) {
+    let read = |end: &str| {
+        let path = world
+            .join(ARGS_DIR)
+            .join(format!("{task}-{attempt}.app.{end}"));
+        fs::read_to_string(&path).expect("read what open recorded")
+    };
+    let (code, output) = (read("code"), read("out"));
+    (code.trim().to_string(), output)
+}
+
+pub fn git_config_writes(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.git-config"));
+    fs::read_to_string(&path).expect("read what the agent wrote to git's directory")
+}
+
+pub fn tried_writes(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.writes"));
+    fs::read_to_string(&path).expect("read what the agent tried to write")
+}
+
+/// The exit code and output of the `rider down --now` that attempt `attempt` of `task` started
+/// in a detached child, once the child has recorded them.
+pub fn detached_stop(world: &Path, task: &str, attempt: u32) -> (String, String) {
+    let read = |end: &str| {
+        let path = world
+            .join(ARGS_DIR)
+            .join(format!("{task}-{attempt}.stop.{end}"));
+        fs::read_to_string(&path).expect("read what the detached stop recorded")
+    };
+    let (code, output) = (read("code"), read("out"));
+    (code.trim().to_string(), output)
 }
 
 /// The names of the `GIT_*` variables attempt `attempt` of `task` was started with.

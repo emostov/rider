@@ -520,9 +520,10 @@ pub fn prepare(
             && held
                 .parent()
                 .is_some_and(|parent| parent.is_absolute() && same_dir(parent, project))
-            && let Some(owner) = held
-                .file_name()
-                .and_then(|name| name.to_str()?.parse().ok())
+            && let Some(owner) = held.file_name().and_then(|name| {
+                let name = name.to_str()?;
+                name.parse::<u64>().ok().filter(|id| id.to_string() == name)
+            })
             && recorded_board(&held).ok().flatten().as_deref() == Some(identity.0.as_str())
             && board.read_task(TaskId(owner))?.state == TaskState::Completed
         {

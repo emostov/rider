@@ -1236,7 +1236,7 @@ pub fn parse_failure_reason(stderr: &str) -> Option<String> {
         "output is bounded before it is parsed"
     );
     let failure: WireFailure = parse(stderr).ok()?;
-    if failure.status.as_deref() == Some("ok") {
+    if failure.status.as_deref() != Some("error") || failure.reason.is_empty() {
         return None;
     }
     Some(failure.reason)

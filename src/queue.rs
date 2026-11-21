@@ -21,6 +21,7 @@ const VALUE_CHARS_MAX: usize = 24;
 const THREADS_SHOWN_MAX: u32 = 9;
 const DAYS_SHOWN_MAX: u64 = 99;
 const PR_URL: &str = "https://github.com/";
+const CARD_PREFIX: &str = "| ";
 const HEADER: &str = "  #  KIND     TURN    STATE       AGE  NEXT           PR";
 const RANK_WIDTH: usize = 3;
 const STATE_WIDTH: usize = 10;
@@ -307,7 +308,10 @@ fn pr_key(task: &ListedTask) -> Result<PrKey, Invalid> {
     let (repo, number) = value.split_once('#').ok_or_else(bad)?;
     let (owner, name) = repo.split_once('/').ok_or_else(bad)?;
     let part = |part: &str| {
-        !part.is_empty() && (part.bytes()).all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        let dots = part == "." || part == "..";
+        !part.is_empty()
+            && !dots
+            && (part.bytes()).all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     };
     let digits = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
     let number = number
@@ -437,19 +441,26 @@ fn entries(tasks: &[ListedTask]) -> Vec<Entry<'_>> {
             },
         })
         .collect();
-    for entry in &mut entries {
-        let task = entry.task;
-        let Some(pr) = label(task, "pr").filter(|_| task.view.channel == QUEUE_CHANNEL) else {
+    let keys: Vec<Option<(String, u64)>> = (entries.iter())
+        .map(|entry| {
+            let pr = entry.item.as_ref().ok().and_then(|item| item.pr.as_ref());
+            pr.map(|pr| (pr.repo.to_ascii_lowercase(), pr.number))
+        })
+        .collect();
+    for at in 0..entries.len() {
+        let Some(key) = &keys[at] else {
             continue;
         };
-        let first = (tasks.iter())
-            .filter(|other| other.view.channel == QUEUE_CHANNEL && other.view.id.0 < task.view.id.0)
-            .filter(|other| label(other, "pr") == Some(pr))
-            .map(|other| other.view.id)
+        let task = entries[at].task;
+        let first = (0..entries.len())
+            .filter(|&other| keys[other].as_ref() == Some(key))
+            .map(|other| entries[other].task.view.id)
+            .filter(|id| id.0 < task.view.id.0)
             .min_by_key(|id| id.0);
         if let Some(first) = first {
+            let pr = label(task, "pr").unwrap_or_default();
             let value = pr.chars().take(VALUE_CHARS_MAX).collect();
-            entry.item = Err(Invalid::DuplicatePr { value, first });
+            entries[at].item = Err(Invalid::DuplicatePr { value, first });
         }
     }
     assert_eq!(entries.len(), tasks.len());
@@ -580,8 +591,11 @@ fn render(
         lines.push(String::new());
         let card = entries[first].task.view.text.lines().take(CARD_LINES_MAX);
         lines.extend(card.map(|line| {
-            let clean = line.chars().map(|c| if c.is_control() { '?' } else { c });
-            clean.take(COLUMNS_MAX).collect::<String>()
+            let clean = line.chars().map(|c| if hidden(c) { '?' } else { c });
+            CARD_PREFIX
+                .chars()
+                .chain(clean.take(COLUMNS_MAX - CARD_PREFIX.len()))
+                .collect::<String>()
         }));
     }
     assert!(!lines.is_empty() && json.len() == entries.len());
@@ -589,6 +603,21 @@ fn render(
         lines,
         json: Value::Array(json),
     }
+}
+
+pub fn hidden(c: char) -> bool {
+    let format = matches!(
+        c,
+        '\u{ad}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+    );
+    c.is_control() || format
 }
 
 fn row(entry: &Entry, item: &Item, place: Place, now: u64) -> String {

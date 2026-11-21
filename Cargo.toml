@@ -25,10 +25,15 @@ path = "src/lib.rs"
 name = "rider"
 path = "src/main.rs"
 
-# A stand-in agent for the harness tests; it is not part of rider.
+# A stand-in agent for the harness tests; it is not part of rider. Only the tests enable
+# `fake-agent` (through the dev-dependency on this package), so `cargo install` skips it.
 [[bin]]
 name = "fake_agent"
 path = "tests/bin/fake_agent.rs"
+required-features = ["fake-agent"]
+
+[features]
+fake-agent = []
 
 [dependencies]
 clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
@@ -44,5 +49,6 @@ sysinfo = { version = "0.40.4", default-features = false, features = ["system"] 
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "display", "serde"] }
 
 [dev-dependencies]
+swarm-rider = { path = ".", features = ["fake-agent"] }
 fastrand = "2"
 tempfile = { version = "3.27.0", default-features = false }

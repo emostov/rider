@@ -50,6 +50,8 @@ pub const BUILDERS_DEFAULT: u8 = 4;
 const _: () = assert!(BUILDERS_DEFAULT > 0 && BUILDERS_DEFAULT <= AGENTS_MAX);
 /// The longest profile name the board accepts.
 pub const PROFILE_LEN_MAX: usize = 32;
+pub const LEAD_PROFILE: &str = "lead";
+pub const LEAD_PREFIX: &str = "lead-";
 
 pub const ROLES: [RoleSpec; 6] = [
     RoleSpec {

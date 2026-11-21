@@ -7,6 +7,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -47,7 +48,33 @@ pub const ENV_REMOVED: [&str; 8] = [
 const PSEUDO_REFS: [&str; 2] = ["ORIG_HEAD", "REBASE_HEAD"];
 const GIT: &str = "git";
 const GH: &str = "gh";
+pub const PATH_DIRS_MAX: usize = 256;
+const NOT_ON_PATH: &str = "/nonexistent";
+static CONFINED: OnceLock<Confined> = OnceLock::new();
 const WORKTREE_LIST: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
+// An agent can write the repository's config, so the settings that make git run a command
+// are overridden where Rider never needs them: `-c` outranks every config file.
+const SAFE_CONFIG: [&str; 12] = [
+    "core.fsmonitor=false",
+    "core.sshCommand=ssh",
+    "credential.helper=",
+    "core.askPass=",
+    "core.hooksPath=/dev/null",
+    "core.pager=cat",
+    "core.editor=false",
+    "log.showSignature=false",
+    "gpg.program=false",
+    "gpg.ssh.program=false",
+    "gpg.x509.program=false",
+    "push.gpgSign=false",
+];
+const ASKPASS: [&str; 2] = ["GIT_ASKPASS", "SSH_ASKPASS"];
+const REFUSING: &str = "/usr/bin/false";
+
+struct Confined {
+    git: PathBuf,
+    sandbox: Vec<String>,
+}
 
 #[derive(Debug)]
 pub enum GitError {
@@ -293,19 +320,68 @@ fn collect(child: &mut dyn ChildWrapper, args: &str, limit: Duration) -> Result<
     Ok(output)
 }
 
+pub fn resolve(program: &str) -> PathBuf {
+    assert!(!program.is_empty() && !program.contains('/'));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path)
+        .take(PATH_DIRS_MAX)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|file| file.is_file());
+    let found = found.unwrap_or_else(|| Path::new(NOT_ON_PATH).join(program));
+    assert!(found.is_absolute());
+    found
+}
+
+pub fn confine(git: PathBuf, sandbox: Vec<String>) -> bool {
+    assert!(git.is_absolute() && !sandbox.is_empty());
+    CONFINED.set(Confined { git, sandbox }).is_ok()
+}
+
+pub fn hardened() -> Process {
+    let mut command = match CONFINED.get() {
+        Some(confined) => {
+            let mut command = Process::new(&confined.sandbox[0]);
+            command.args(&confined.sandbox[1..]).arg(&confined.git);
+            command
+        }
+        None => Process::new(resolve(GIT)),
+    };
+    for setting in SAFE_CONFIG {
+        command.arg("-c").arg(setting);
+    }
+    for name in ENV_REMOVED {
+        command.env_remove(name);
+    }
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    for name in ASKPASS {
+        command.env(name, REFUSING);
+    }
+    assert!(command.get_args().count() >= 2 * SAFE_CONFIG.len());
+    command
+}
+
 fn command(dir: &Path, args: &[&OsStr]) -> Process {
     assert!(!args.is_empty(), "every git run names a command");
     assert!(args.len() <= ARGS_MAX);
-    let mut command = isolated(GIT);
+    let mut command = hardened();
     command.arg("-C").arg(dir).args(args);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     command
 }
 
 fn isolated(program: &str) -> Process {
-    assert!(program == GIT || program == GH);
-    let mut command = Process::new(program);
+    assert!(program == GH);
+    let mut command = Process::new(resolve(program));
     for name in ENV_REMOVED {
         command.env_remove(name);
+    }
+    for name in ASKPASS {
+        command.env(name, REFUSING);
     }
     command
         .env("GIT_TERMINAL_PROMPT", "0")

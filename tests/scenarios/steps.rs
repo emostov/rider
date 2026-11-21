@@ -561,6 +561,18 @@ pub fn given_a_running_daemon(world: &mut World) {
 /// Given a running `rider daemon` with `env` added to the world's environment.
 pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
     when_the_daemon_is_started(world, env);
+    then_the_daemon_follows_the_board(world);
+}
+
+#[cfg(target_os = "macos")]
+pub fn given_a_running_daemon_in_a_sandbox(world: &mut World) {
+    let profile = "(version 1)\n(allow default)\n";
+    let sandbox = ["/usr/bin/sandbox-exec", "-p", profile, "--"];
+    start_daemon(world, &[], &sandbox);
+    then_the_daemon_follows_the_board(world);
+}
+
+fn then_the_daemon_follows_the_board(world: &World) {
     let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
     while !world.daemon_log().contains(DAEMON_STARTED) {
         assert!(
@@ -574,13 +586,23 @@ pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
 
 /// When `rider daemon` is spawned with `env` added, not waiting for it to start following.
 pub fn when_the_daemon_is_started(world: &mut World, env: &[(&str, &str)]) {
+    start_daemon(world, env, &[]);
+}
+
+fn start_daemon(world: &mut World, env: &[(&str, &str)], wrapper: &[&str]) {
     assert!(world.daemon.is_none(), "one daemon per world");
     let log =
         fs::File::create(world.root.join("daemon-output.log")).expect("create the daemon output");
     let err = log.try_clone().expect("share the daemon output");
-    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    let rider = env!("CARGO_BIN_EXE_rider");
+    let (program, args) = match wrapper.split_first() {
+        Some((program, args)) => (*program, [args, &[rider]].concat()),
+        None => (rider, Vec::new()),
+    };
+    let mut command = world.command(Path::new(program));
     command.envs(env.iter().copied());
     let child = command
+        .args(args)
         .arg("daemon")
         .stdout(log)
         .stderr(err)

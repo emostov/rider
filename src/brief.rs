@@ -3,7 +3,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, Stdio};
+use std::process::Stdio;
 
 use crate::board::{LABELS_MAX, TaskId, TaskView};
 use crate::git;
@@ -334,11 +334,7 @@ fn check_git_repo(repo: &Path) -> Result<(), BriefError> {
         let reason = format!("{shown:?} is not a directory");
         return Err(BriefError::RepoNotAGitRepo(reason));
     }
-    let mut git = Process::new("git");
-    for name in git::ENV_REMOVED {
-        git.env_remove(name);
-    }
-    let status = git
+    let status = git::hardened()
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--git-dir"])

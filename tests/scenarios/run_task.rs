@@ -648,8 +648,16 @@ fn an_agent_cli_missing_from_path_fails_its_attempt_replying_with_the_error() {
     assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
     assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
     let text = task_text(&world, &task);
-    assert!(text.contains("agent exited 127"), "{text}");
-    assert!(text.contains("claude: not found"), "{text}");
+    let (exit, error) = if cfg!(target_os = "macos") {
+        (
+            "agent exited 71",
+            "execvp() of 'claude' failed: No such file or directory",
+        )
+    } else {
+        ("agent exited 127", "claude: not found")
+    };
+    assert!(text.contains(exit), "{text}");
+    assert!(text.contains(error), "{text}");
 }
 
 #[test]

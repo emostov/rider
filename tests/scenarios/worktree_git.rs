@@ -823,20 +823,17 @@ fn a_finished_worktree_with_a_cherry_pick_stopped_after_its_first_commit_is_kept
 }
 
 #[test]
-fn a_hook_printing_past_git_output_bound_blocks_the_task_and_its_process_group_is_killed() {
+fn a_git_call_printing_past_its_output_bound_blocks_the_task_and_its_process_group_is_killed() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let hooks = world.root.join("hooks");
-    fs::create_dir_all(&hooks).expect("create the hooks directory");
     let pid_file = world.root.join("sleeper.pid");
-    let hook = format!(
-        "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nhead -c 4194305 /dev/zero\nexec sleep 60\n",
+    let git = format!(
+        "#!/bin/sh\ncase \" $* \" in *\" worktree add \"*)\n  sleep 60 &\n  echo $! > '{}'\n  \
+         head -c 4194305 /dev/zero\n  exec sleep 60 ;;\nesac\nexec /usr/bin/git \"$@\"\n",
         pid_file.display()
     );
-    crate::world::write_executable(&hooks.join("post-checkout"), &hook);
-    let hooks_path = hooks.to_str().expect("UTF-8 path");
-    world.git_ok(&["config", "core.hooksPath", hooks_path]);
+    crate::world::write_executable(&world.tools.join("git"), &git);
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_a_running_daemon(&mut world);
 
@@ -849,11 +846,11 @@ fn a_hook_printing_past_git_output_bound_blocks_the_task_and_its_process_group_i
         block.1.contains("printed more than 4194304 bytes"),
         "{block:?}"
     );
-    let pid = fs::read_to_string(&pid_file).expect("the hook wrote its sleeper's pid");
+    let pid = fs::read_to_string(&pid_file).expect("git wrote its sleeper's pid");
     let pid: u32 = pid.trim().parse().expect("a pid");
     assert!(
         when_the_process_ends_within(pid, 10),
-        "the hook's background sleep {pid} outlived the git call"
+        "git's background sleep {pid} outlived the git call"
     );
 }
 
@@ -1288,4 +1285,18 @@ fn a_finished_worktree_whose_orig_head_alone_names_a_commit_is_kept() {
     });
 
     then_the_worktree_is_kept_because(&world, &task, "commits only its ORIG_HEAD reaches");
+}
+
+#[test]
+fn rider_never_runs_an_fsmonitor_an_agent_planted_in_the_repository_config() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantFsmonitor]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert!(!fake_agent::fsmonitor_ran(&world.root, &task, 0));
 }

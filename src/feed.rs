@@ -180,8 +180,6 @@ pub struct FeedReader {
     ending_since: Option<Instant>,
     /// When the group was killed; the child is reaped and what it wrote is still being read.
     killed: Option<Instant>,
-    /// The group was killed and nothing is left in it, so dropping the feed signals nothing.
-    group_gone: bool,
     ended: bool,
 }
 
@@ -243,7 +241,6 @@ impl FeedReader {
             exited: false,
             ending_since: None,
             killed: None,
-            group_gone: false,
             ended: false,
         })
     }
@@ -255,10 +252,6 @@ impl FeedReader {
         if self.ended {
             return Err(FeedError::Ended);
         }
-        assert!(
-            !self.group_gone || self.killed.is_some(),
-            "only a kill empties the group"
-        );
         assert!(self.killed.is_none() || self.ending_since.is_some());
         for _ in 0..POLLS_MAX {
             // The exit is checked before every read, so a descendant that keeps stdout busy
@@ -330,7 +323,9 @@ impl FeedReader {
             "only a kill reaps the child"
         );
         let killed = kill_group(self.child.as_mut());
-        *group = None;
+        if killed.is_ok() || matches!(self.child.try_wait(), Ok(Some(_))) {
+            *group = None;
+        }
         killed
     }
 
@@ -338,13 +333,9 @@ impl FeedReader {
     fn kill(&mut self) -> Result<(), FeedError> {
         assert!(self.killed.is_none(), "the group is killed once");
         assert!(!self.ended);
-        assert!(
-            !self.group_gone,
-            "the group is not gone before it is killed"
-        );
         self.killed = Some(Instant::now());
         let killed = self.kill_group();
-        self.group_gone = killed.is_ok();
+        assert!(killed.is_err() || lock(&self.group).is_none());
         killed.map_err(|error| FeedError::Kill(error.to_string()))
     }
 
@@ -367,8 +358,9 @@ impl FeedReader {
 
 impl Drop for FeedReader {
     fn drop(&mut self) {
-        // A group that is gone is not signalled again: its id may already name another group.
-        if !self.group_gone {
+        // A reaped leader's id may already name another group: only a group whose leader is
+        // still unreaped is signalled here.
+        if lock(&self.group).is_some() {
             // Nothing more can be done about a group that cannot be signalled.
             let _ = self.kill_group();
         }

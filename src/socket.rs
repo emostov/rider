@@ -28,9 +28,7 @@ use crate::harness::Usage;
 /// The socket's file name under the Rider home.
 pub const SOCKET_FILE: &str = "rider.sock";
 /// The directory under the Rider home the socket is bound in before it is moved into place.
-const BIND_DIR: &str = ".bind";
-/// The socket's file name inside `BIND_DIR`.
-const BIND_FILE: &str = "s";
+pub const BIND_DIR: &str = ".b";
 /// The protocol version a request names in `v`.
 pub const VERSION: u64 = 1;
 /// Upper bound on one request line; a longer one is refused and the connection closed.
@@ -164,22 +162,23 @@ pub fn listen(path: &SocketPath, logs: PathBuf, sink: Sink) -> io::Result<Socket
     // Bound inside a directory only the owner can enter, the socket takes connections only
     // once it is 0600 and renamed into place, whatever the umask. The bound path is short,
     // since a socket's path is limited to about 100 bytes.
-    let private = home.join(BIND_DIR);
-    let bound = private.join(BIND_FILE);
+    let staging = home.join(BIND_DIR);
+    let bound = staging.join(std::process::id().to_string());
     assert!(bound.starts_with(home) && bound != path);
-    // A daemon that died while binding leaves the directory behind.
-    for removed in [fs::remove_file(&bound), fs::remove_dir(&private)] {
-        match removed {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            Ok(()) | Err(_) => {}
-        }
+    assert!(bound.as_os_str().len() <= path.as_os_str().len());
+    match fs::DirBuilder::new().mode(0o700).create(&staging) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        Ok(()) | Err(_) => {}
     }
-    fs::DirBuilder::new().mode(0o700).create(&private)?;
-    fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+    match fs::remove_file(&bound) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Ok(()) | Err(_) => {}
+    }
     let listener = UnixListener::bind(&bound)?;
     fs::set_permissions(&bound, fs::Permissions::from_mode(0o600))?;
     fs::rename(&bound, path)?;
-    fs::remove_dir(&private)?;
+    let _ = fs::remove_dir(&staging);
     let clients = Arc::new(Mutex::new(Clients::default()));
     let shared = Arc::clone(&clients);
     thread::Builder::new()
@@ -650,7 +649,13 @@ fn write_log_lines(stream: &mut UnixStream, id: u64, pending: &mut Vec<u8>, all:
         let (line, used) = match rest.iter().position(|byte| *byte == b'\n') {
             Some(end) if end <= LOG_LINE_BYTES_MAX => (&rest[..end], end + 1),
             _ if rest.len() > LOG_LINE_BYTES_MAX => {
-                (&rest[..LOG_LINE_BYTES_MAX], LOG_LINE_BYTES_MAX)
+                let starts_char = |at: &usize| rest[*at] & 0xc0 != 0x80;
+                let boundary = (0..4)
+                    .map(|back| LOG_LINE_BYTES_MAX - back)
+                    .find(starts_char);
+                let cut = boundary.unwrap_or(LOG_LINE_BYTES_MAX);
+                assert!(cut > 0 && cut <= LOG_LINE_BYTES_MAX);
+                (&rest[..cut], cut)
             }
             _ if all => (rest, rest.len()),
             _ => break,

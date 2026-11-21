@@ -430,3 +430,85 @@ fn rider_pr_opens_the_draft_against_the_base_the_daemon_used_not_a_relabelled_on
     let create = create_call(&branch, "Add one work file.", MAIN);
     assert_eq!(gh_calls(&remote), vec![list_call(&branch), create]);
 }
+
+#[test]
+fn rider_pr_never_runs_an_ssh_command_planted_in_the_repository_config() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let remote = given_an_origin_and_a_fake_gh(&world);
+    let (task, branch) = given_a_completed_task(&mut world);
+    let ran = world.root.join("planted-ran");
+    let planted = world.root.join("planted.sh");
+    write_executable(
+        &planted,
+        &format!("#!/bin/sh\n: > '{}'\nexec ssh \"$@\"\n", ran.display()),
+    );
+    let planted = planted.to_str().expect("UTF-8 path");
+    world.git_ok(&["config", "core.sshCommand", planted]);
+
+    let published = when_rider_runs(&world, &["pr", &task]);
+
+    assert_eq!(published.code, Some(0), "{published:?}");
+    let head = branch_head(&world, &branch);
+    assert_eq!(origin_head(&world, &remote.origin, &branch), Some(head));
+    assert!(!ran.exists(), "rider pr ran the planted ssh command");
+}
+
+const PROXY: &str = r#"
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen()
+print(s.getsockname()[1], flush=True)
+for _ in range(64):
+    c, _ = s.accept()
+    c.recv(65536)
+    c.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+              b"Proxy-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\n\r\n")
+    c.close()
+"#;
+
+#[test]
+fn rider_pr_never_runs_a_credential_helper_planted_in_the_repository_config() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let (task, _) = given_a_completed_task(&mut world);
+    let mut proxy = std::process::Command::new("python3")
+        .args(["-c", PROXY])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("start a proxy that asks for credentials");
+    let mut port = String::new();
+    let stdout = proxy.stdout.take().expect("the proxy's output");
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut port)
+        .expect("read the proxy's port");
+    let ran = world.root.join("helper-ran");
+    let helper = world.root.join("helper.sh");
+    write_executable(&helper, &format!("#!/bin/sh\n: > '{}'\n", ran.display()));
+    world.git_ok(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.invalid/acme/demo.git",
+    ]);
+    world.git_ok(&[
+        "config",
+        "http.proxy",
+        &format!("http://127.0.0.1:{}", port.trim()),
+    ]);
+    world.git_ok(&[
+        "config",
+        "credential.helper",
+        helper.to_str().expect("UTF-8 path"),
+    ]);
+
+    let published = when_rider_runs(&world, &["pr", &task]);
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+    assert_ne!(published.code, Some(0), "{published:?}");
+    assert!(!ran.exists(), "rider pr ran the planted credential helper");
+}
