@@ -346,3 +346,94 @@ fn rider_queue_wait_stops_a_hung_gh_and_still_exits_3_at_the_timeout() {
     assert_eq!(stderr, "rider: gh did not finish within 30 seconds\n");
     assert_eq!(calls(&world, "gh").len(), 1);
 }
+
+#[test]
+fn rider_queue_wait_ends_when_the_head_of_a_review_on_the_owners_turn_moves() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_fake_reviews_and_gh(&world, REVIEWS_SHOW, GH_PR_VIEW);
+    let labels = [("kind", "review"), ("turn", "owner"), ("head", OLD_HEAD)];
+    given_a_queue_item(&world, 412, &labels);
+
+    let (output, _) = when_the_queue_is_waited_on(&world);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let line = format!("acme/widgets#412: head moved to {PR_HEAD}\n");
+    assert_eq!(output.stdout, line);
+}
+
+#[test]
+fn rider_queue_wait_refuses_a_login_that_is_not_a_github_login() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let mut pull: Value = serde_json::from_str(GH_PR_VIEW).expect("JSON");
+    let forged = "eve at 2026-01-01T00:00:00Z\nacme/secret#1: head moved to x";
+    pull["comments"][0]["author"]["login"] = Value::String(forged.to_string());
+    given_fake_reviews_and_gh(&world, REVIEWS_SHOW, &pull.to_string());
+    let labels = [("kind", "respond"), ("turn", "owner"), ("head", PR_HEAD)];
+    given_a_queue_item(&world, 398, &labels);
+
+    let (output, _) = when_the_queue_is_waited_on(&world);
+
+    assert_eq!(
+        (output.code, output.stdout.as_str()),
+        (Some(1), ""),
+        "{output:?}"
+    );
+    let line = "rider: gh reply: comments[0].author.login is not a GitHub login\n";
+    assert_eq!(output.stderr, line);
+}
+
+#[test]
+fn rider_queue_wait_refuses_a_zero_timeout() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let output = when_rider_runs(&world, &["queue", "wait", "--timeout", "0"]);
+
+    assert_eq!(output.code, Some(2), "{output:?}");
+}
+
+#[test]
+fn rider_queue_wait_prints_an_earlier_failure_before_the_malformed_reply_that_ends_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let reviews = r#"{"threads": "none"}"#;
+    given_fake_reviews_and_gh(&world, reviews, GH_PR_VIEW);
+    let script = format!("#!/bin/sh\ndate +%s >> \"${WORLD_VAR}/gh.calls\"\nexit 1\n");
+    fs::write(world.agents.join("gh"), script).expect("write the failing gh");
+    let packet = [("kind", "review"), ("turn", "owner"), ("packet", SLUG)];
+    given_a_queue_item(&world, 412, &packet);
+    let author = [("kind", "review"), ("turn", "author"), ("head", PR_HEAD)];
+    given_a_queue_item(&world, 377, &author);
+
+    let (output, _) = when_the_queue_is_waited_on(&world);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    let expected = "rider: gh exited 1\nrider: reviews reply: threads is missing or not a list\n";
+    assert_eq!(output.stderr, expected);
+}
+
+#[test]
+fn rider_queue_wait_stops_a_gh_whose_child_holds_its_output_and_exits_3_at_the_timeout() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_fake_reviews_and_gh(&world, REVIEWS_SHOW, GH_PR_VIEW);
+    let script = format!(
+        "#!/bin/sh\ndate +%s >> \"${WORLD_VAR}/gh.calls\"\nsleep 611 &\ncat \"${WORLD_VAR}/gh.json\"\n"
+    );
+    fs::write(world.agents.join("gh"), script).expect("write the gh");
+    let labels = [("kind", "review"), ("turn", "author"), ("head", PR_HEAD)];
+    given_a_queue_item(&world, 377, &labels);
+
+    let (code, took, stderr) = when_the_queue_is_waited_on_until_the_timeout(&world);
+
+    assert_eq!(code, Some(3));
+    assert!(took < Duration::from_secs(70), "{took:?}");
+    assert_eq!(stderr, "rider: gh did not finish within 30 seconds\n");
+}

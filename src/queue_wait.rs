@@ -1,11 +1,12 @@
 use std::fmt;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use process_wrap::std::{CommandWrap, ProcessGroup};
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use serde_json::Value;
 
 use crate::board::{ListedTask, TaskId};
@@ -25,6 +26,8 @@ const COMMENTS_MAX: usize = 4096;
 const SLUG_BYTES_MAX: usize = 64;
 const LABEL_SHOWN_CHARS_MAX: usize = 48;
 const WARNINGS_MAX: usize = 16;
+const LOGIN_BYTES_MAX: usize = 64;
+const CALLS_IN_FLIGHT_MAX: usize = 16;
 
 #[derive(Debug)]
 pub enum WaitError {
@@ -37,6 +40,7 @@ pub enum WaitError {
         code: Option<i32>,
     },
     TimedOut(&'static str),
+    Stopped(&'static str),
     TooLarge(&'static str),
     Field {
         program: &'static str,
@@ -60,6 +64,7 @@ impl WaitError {
             WaitError::Spawn { .. }
             | WaitError::Exit { .. }
             | WaitError::TimedOut(_)
+            | WaitError::Stopped(_)
             | WaitError::TooManyItems
             | WaitError::TooManyPolls
             | WaitError::PollPanicked => false,
@@ -83,6 +88,7 @@ impl fmt::Display for WaitError {
                     "{program} did not finish within {CALL_SECONDS_MAX} seconds"
                 )
             }
+            WaitError::Stopped(program) => write!(f, "{program} was stopped at the deadline"),
             WaitError::TooLarge(program) => {
                 write!(f, "{program} printed more than {REPLY_BYTES_MAX} bytes")
             }
@@ -121,6 +127,7 @@ pub enum Watch {
         number: u64,
         head: Option<String>,
         after: Option<Timestamp>,
+        comments: bool,
     },
 }
 
@@ -162,27 +169,47 @@ fn run(program: &'static str, args: &[&str], deadline: Instant) -> Result<Vec<u8
         .spawn();
     let mut child = wrapped.map_err(spawn_error)?;
     let stdout = child.stdout().take();
-    let reader = thread::spawn(move || {
+    let (send, receive) = sync_channel(1);
+    let reader = thread::Builder::new().spawn(move || {
         let mut out = Vec::new();
         let bound = u64::try_from(REPLY_BYTES_MAX)
             .unwrap_or(u64::MAX)
             .saturating_add(1);
         let read = stdout.map(|stdout| stdout.take(bound).read_to_end(&mut out));
-        read.unwrap_or(Ok(0)).map(|_| out)
+        let _ = send.send(read.unwrap_or(Ok(0)).map(|_| out));
     });
-    let limit = deadline.min(Instant::now() + Duration::from_secs(CALL_SECONDS_MAX));
+    let call_limit = Instant::now() + Duration::from_secs(CALL_SECONDS_MAX);
+    let limit = deadline.min(call_limit);
+    let stopped = || {
+        if limit < call_limit {
+            WaitError::Stopped(program)
+        } else {
+            WaitError::TimedOut(program)
+        }
+    };
+    let stop = |child: &mut Box<dyn ChildWrapper>| {
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(stopped())
+    };
+    if reader.is_err() {
+        let _ = stop(&mut child);
+        return Err(WaitError::PollPanicked);
+    }
+    // A process the child started may hold standard output after the child exits, so the
+    // read, not only the exit, is bounded by the limit.
+    let Ok(out) = receive.recv_timeout(limit.saturating_duration_since(Instant::now())) else {
+        return stop(&mut child);
+    };
     let status = loop {
         if let Some(status) = child.try_wait().map_err(spawn_error)? {
             break status;
         }
         if Instant::now() >= limit {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(WaitError::TimedOut(program));
+            return stop(&mut child);
         }
         thread::sleep(Duration::from_millis(CALL_POLL_MILLIS));
     };
-    let out = reader.join().map_err(|_| WaitError::PollPanicked)?;
     let out = out.map_err(spawn_error)?;
     if out.len() > REPLY_BYTES_MAX {
         return Err(WaitError::TooLarge(program));
@@ -263,8 +290,11 @@ pub fn watches(tasks: &[ListedTask]) -> Result<Vec<Watch>, WaitError> {
             let (pr, slug) = (pr.clone(), slug.to_string());
             watches.push(Watch::Packet { pr, slug, after });
         }
-        if turn == Some("author") || label(task, "kind") == Some("respond") {
-            let head = checked(task, "head", commit)?;
+        let kind = label(task, "kind");
+        let comments = turn == Some("author") || kind == Some("respond");
+        let head = checked(task, "head", commit)?;
+        let owner_review = turn == Some("owner") && kind == Some("review") && head.is_some();
+        if comments || owner_review {
             let after = checked(task, "github_at", time)?;
             let repo = repo.to_string();
             watches.push(Watch::Pull {
@@ -273,6 +303,7 @@ pub fn watches(tasks: &[ListedTask]) -> Result<Vec<Watch>, WaitError> {
                 number,
                 head,
                 after,
+                comments,
             });
         }
     }
@@ -341,6 +372,12 @@ fn newest_packet_comment(reply: &[u8]) -> Result<Option<Timestamp>, WaitError> {
     Ok(newest)
 }
 
+fn is_login(login: &str) -> bool {
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || b"-_[]".contains(&b);
+    let valid = !login.is_empty() && login.len() <= LOGIN_BYTES_MAX;
+    valid && login.bytes().all(allowed)
+}
+
 struct PullState {
     head: String,
     newest: Option<(Timestamp, String)>,
@@ -364,8 +401,11 @@ fn pull_state(reply: &[u8]) -> Result<PullState, WaitError> {
             }
             let at = time(program, &entry[at_key], format!("{name}[{i}].{at_key}"))?;
             let login = entry["author"]["login"].as_str();
-            let login_field = || field(program, format!("{name}[{i}].author.login"), "is not text");
-            let login = login.ok_or_else(login_field)?;
+            let login_name = format!("{name}[{i}].author.login");
+            let login_field = || field(program, login_name, "is not a GitHub login");
+            let login = login
+                .filter(|login| is_login(login))
+                .ok_or_else(login_field)?;
             if newest.as_ref().is_none_or(|(newest, _)| at > *newest) {
                 newest = Some((at, login.to_string()));
             }
@@ -396,12 +436,16 @@ fn check(
             number,
             head,
             after,
+            comments,
         } => {
             let live = pull_state(&sources.pull(repo, *number, deadline)?)?;
             if head.as_ref().is_some_and(|head| *head != live.head) {
                 lines.push(format!("{pr}: head moved to {}", live.head));
             }
-            if let Some((at, login)) = live.newest.filter(|(at, _)| newer(*at, *after)) {
+            let newest = live
+                .newest
+                .filter(|(at, _)| *comments && newer(*at, *after));
+            if let Some((at, login)) = newest {
                 lines.push(format!("{pr}: comment by {login} at {at}"));
             }
         }
@@ -420,15 +464,19 @@ fn poll(
         Watch::Packet { .. } => due.0,
         Watch::Pull { .. } => due.1,
     };
-    let results = thread::scope(|scope| {
-        let checks: Vec<_> = (watches.iter().filter(is_due))
-            .map(|watch| scope.spawn(move || check(sources, watch, deadline)))
-            .collect();
-        let joined = checks
-            .into_iter()
-            .map(|check| check.join().unwrap_or(Err(WaitError::PollPanicked)));
-        joined.collect::<Vec<_>>()
-    });
+    let due: Vec<&Watch> = watches.iter().filter(is_due).collect();
+    let mut results = Vec::with_capacity(due.len());
+    for batch in due.chunks(CALLS_IN_FLIGHT_MAX) {
+        thread::scope(|scope| {
+            let checks: Vec<_> = (batch.iter())
+                .map(|watch| scope.spawn(move || check(sources, watch, deadline)))
+                .collect();
+            let joined = checks
+                .into_iter()
+                .map(|check| check.join().unwrap_or(Err(WaitError::PollPanicked)));
+            results.extend(joined);
+        });
+    }
     assert!(results.len() <= watches.len());
     results
 }
@@ -460,6 +508,7 @@ impl Schedule {
 pub struct Outcome {
     pub lines: Vec<String>,
     pub warnings: Vec<WaitError>,
+    pub error: Option<WaitError>,
 }
 
 fn warn(warnings: &mut Vec<WaitError>, error: WaitError) {
@@ -469,11 +518,7 @@ fn warn(warnings: &mut Vec<WaitError>, error: WaitError) {
     assert!(warnings.len() <= WARNINGS_MAX);
 }
 
-pub fn wait(
-    sources: &impl Sources,
-    watches: &[Watch],
-    deadline: Instant,
-) -> Result<Outcome, WaitError> {
+pub fn wait(sources: &impl Sources, watches: &[Watch], deadline: Instant) -> Outcome {
     let start = Instant::now();
     let has = |packet: bool| (watches.iter()).any(|w| matches!(w, Watch::Packet { .. }) == packet);
     let (min, max) = (PACKET_POLL_SECONDS_MIN, PACKET_POLL_SECONDS_MAX);
@@ -493,16 +538,29 @@ pub fn wait(
                     Err(error) if error.is_malformed() && malformed.is_none() => {
                         malformed = Some(error);
                     }
+                    Err(WaitError::Stopped(_)) => {}
                     Err(error) => warn(&mut warnings, error),
                 }
             }
             match malformed {
-                Some(error) if lines.is_empty() => return Err(error),
+                Some(error) if lines.is_empty() => {
+                    let error = Some(error);
+                    return Outcome {
+                        lines,
+                        warnings,
+                        error,
+                    };
+                }
                 Some(error) => warn(&mut warnings, error),
                 None => {}
             }
             if !lines.is_empty() {
-                return Ok(Outcome { lines, warnings });
+                let error = None;
+                return Outcome {
+                    lines,
+                    warnings,
+                    error,
+                };
             }
             if due.0 {
                 packets.polled(now);
@@ -515,9 +573,18 @@ pub fn wait(
         let until = next.filter(|next| *next < deadline).unwrap_or(deadline);
         thread::sleep(until.saturating_duration_since(Instant::now()));
         if until == deadline {
-            let lines = Vec::new();
-            return Ok(Outcome { lines, warnings });
+            let (lines, error) = (Vec::new(), None);
+            return Outcome {
+                lines,
+                warnings,
+                error,
+            };
         }
     }
-    Err(WaitError::TooManyPolls)
+    let (lines, error) = (Vec::new(), Some(WaitError::TooManyPolls));
+    Outcome {
+        lines,
+        warnings,
+        error,
+    }
 }

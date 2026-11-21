@@ -114,7 +114,7 @@ pub enum QueueAction {
             long,
             value_name = "MINUTES",
             default_value_t = WAIT_MINUTES_DEFAULT,
-            value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
+            value_parser = clap::value_parser!(u32).range(1..=i64::from(WAIT_MINUTES_MAX)),
         )]
         timeout: u32,
     },
@@ -928,9 +928,11 @@ fn queue_wait(config: &Config, minutes: u32) -> Result<u8, CliError> {
     }
     let watches = queue_wait::watches(&listing.tasks).map_err(CliError::QueueWait)?;
     let outcome = queue_wait::wait(&queue_wait::Cli, &watches, deadline);
-    let outcome = outcome.map_err(CliError::QueueWait)?;
     for warning in &outcome.warnings {
         eprintln!("rider: {warning}");
+    }
+    if let Some(error) = outcome.error {
+        return Err(CliError::QueueWait(error));
     }
     if outcome.lines.is_empty() {
         return Ok(3);
