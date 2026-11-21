@@ -82,6 +82,8 @@ being `(allow default)` plus a `deny network-outbound` of
   directory is under `/private/var`, not `/var`).
 - `--` before the command is accepted. A `(param "X")` that no `-D X=...` defines fails the
   profile with exit 65.
+- A command not found on `PATH` makes it print `sandbox-exec: execvp() of '<command>' failed:
+  No such file or directory` and exit 71.
 - A process already in a sandbox cannot apply another: `sandbox-exec` inside one prints
   `sandbox_apply: Operation not permitted` and exits 71.
 
