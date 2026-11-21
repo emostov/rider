@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
 
 use serde_json::{Value, json};
 
@@ -8,7 +12,7 @@ use crate::steps::{
     given_a_board_and_a_repository, given_a_running_daemon, then_the_daemon_exits, when_rider_runs,
     when_the_daemon_is_sent_sigterm,
 };
-use crate::world::{Output, World};
+use crate::world::{Output, World, run_bounded};
 
 const MANIFEST: &str = ".rider-install.json";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -286,4 +290,148 @@ fn rider_skills_list_and_show_print_the_embedded_skills() {
     assert_eq!(show.stdout.as_bytes(), expected.as_slice());
     assert_eq!(unknown.code, Some(1), "{unknown:?}");
     assert!(unknown.stderr.contains("no-such-skill"), "{unknown:?}");
+}
+
+const INSTALLERS: usize = 6;
+const INSTALLS_MAX: usize = 32;
+
+fn rider(world: &World) -> Command {
+    world.command(Path::new(env!("CARGO_BIN_EXE_rider")))
+}
+
+#[test]
+fn several_installs_into_one_directory_at_once_leave_every_skill_whole() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let dir = agent_skills(&world, "claude");
+
+    let outputs: Vec<Output> = thread::scope(|scope| {
+        let installers: Vec<_> = (0..INSTALLERS)
+            .map(|_| scope.spawn(|| when_skills_are_installed_into(&world, &dir)))
+            .collect();
+        installers
+            .into_iter()
+            .map(|installer| installer.join().expect("an installer thread"))
+            .collect()
+    });
+
+    for output in &outputs {
+        assert_eq!(output.code, Some(0), "{output:?}");
+    }
+    let again = when_skills_are_installed_into(&world, &dir);
+    assert_eq!(again.stdout, installed_lines(&dir, "up to date"), "{again:?}");
+    for (path, content) in source_files() {
+        assert_eq!(fs::read(dir.join(&path)).ok(), Some(content), "{path}");
+    }
+}
+
+#[test]
+fn a_replace_killed_between_its_renames_is_finished_by_the_next_run() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let claude = agent_skills(&world, "claude");
+    let codex = agent_skills(&world, "codex");
+    assert_eq!(when_skills_are_installed_into(&world, &claude).code, Some(0));
+    given_an_older_install_without(&claude, "ship-swarm", "settings.md");
+    let aside = claude.join(".ship-swarm.rider-old");
+    fs::rename(claude.join("ship-swarm"), &aside).expect("move the skill aside");
+
+    let output = when_skills_are_installed_into(&world, &codex);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let replaced = format!("replaced {} (was 0.0.1)\n", claude.join("ship-swarm").display());
+    assert!(output.stdout.contains(&replaced), "{output:?}");
+    let settings = fs::read(claude.join("ship-swarm/settings.md")).ok();
+    assert_eq!(settings.as_ref(), source_files().get("ship-swarm/settings.md"));
+    assert!(!aside.exists());
+}
+
+#[test]
+fn an_into_path_that_is_not_utf8_or_holds_a_newline_is_refused_before_any_write() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let mut bytes = world.root.join("bad").into_os_string().into_vec();
+    bytes.push(0xff);
+    let not_utf8 = PathBuf::from(OsString::from_vec(bytes));
+    let newline = world.root.join("first\n").join("second");
+
+    for dir in [&not_utf8, &newline] {
+        let mut command = rider(&world);
+        command.args(["skills", "install", "--into"]).arg(dir);
+        let output = run_bounded(command, None);
+
+        assert_eq!(output.code, Some(1), "{output:?}");
+        assert!(output.stderr.contains("--into"), "{output:?}");
+        assert!(!dir.exists(), "{}", dir.display());
+    }
+    assert!(!world.home.join("skill-installs").exists());
+}
+
+#[test]
+fn a_fifo_in_place_of_a_manifest_is_skipped_without_waiting() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let claude = agent_skills(&world, "claude");
+    let codex = agent_skills(&world, "codex");
+    assert_eq!(when_skills_are_installed_into(&world, &claude).code, Some(0));
+    let manifest = claude.join("ride-swarm").join(MANIFEST);
+    fs::remove_file(&manifest).expect("remove the manifest");
+    let mut mkfifo = Command::new("mkfifo");
+    mkfifo.arg(&manifest);
+    assert_eq!(run_bounded(mkfifo, None).code, Some(0));
+
+    let output = when_skills_are_installed_into(&world, &codex);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let skipped = format!("skipped {}: ", claude.join("ride-swarm").display());
+    let line = output.stdout.lines().find(|line| line.starts_with(&skipped));
+    assert!(
+        line.is_some_and(|line| line.ends_with("is not a regular file")),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_directory_where_nothing_was_installed_is_not_recorded() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let file = world.root.join("a-file");
+    fs::write(&file, "not a directory\n").expect("write a file");
+    let failed = when_skills_are_installed_into(&world, &file);
+    assert_eq!(failed.code, Some(1), "{failed:?}");
+
+    let output = when_skills_are_installed_into(&world, &agent_skills(&world, "claude"));
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let file_text = file.display().to_string();
+    assert!(!output.stdout.contains(&file_text), "{output:?}");
+}
+
+#[test]
+fn a_full_record_refuses_a_new_directory_before_writing_and_forgets_removed_ones() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let dirs: Vec<PathBuf> = (0..INSTALLS_MAX)
+        .map(|index| agent_skills(&world, &format!("agent{index}")))
+        .collect();
+    for dir in &dirs {
+        assert_eq!(when_skills_are_installed_into(&world, dir).code, Some(0));
+    }
+    let extra = agent_skills(&world, "extra");
+
+    let full = when_skills_are_installed_into(&world, &extra);
+
+    assert_eq!(full.code, Some(1), "{full:?}");
+    assert!(full.stderr.contains("too many install directories"), "{full:?}");
+    assert!(!extra.exists());
+    fs::remove_dir_all(dirs[0].parent().expect("an agent directory")).expect("remove");
+    let freed = when_skills_are_installed_into(&world, &extra);
+    assert_eq!(freed.code, Some(0), "{freed:?}");
+    assert_eq!(freed.stdout, installed_lines(&extra, "installed"));
 }
