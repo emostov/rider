@@ -40,7 +40,9 @@ for Claude Code or `~/.codex/skills` for Codex.
 ## Quickstart
 
 The `ride-swarm` skill needs Rust, Node 22, `jq`, and both `claude` and `codex` on `PATH`,
-each signed in. It stops and names any that is missing.
+each signed in. It stops and names any that is missing. Rider installs the Board CLI it
+needs under its home the first time `rider up`, `rider serve` or `rider vb` runs, and
+`rider vb <args>` runs it on the local board.
 
 Open a coding-agent session in a terminal you keep open and say `ride a swarm to <goal>`.
 The lead starts the daemon with `rider up`, plans the goal into tasks on the board, and

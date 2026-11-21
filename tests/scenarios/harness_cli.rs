@@ -2,11 +2,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::fake_agent::{BLOCK_QUESTION, Behaviour};
 use crate::steps::*;
-use crate::world::{World, run_bounded, write_executable};
+use crate::world::{LEAD, World, run_bounded, write_executable};
 
 type EnvCase = (
     Vec<(&'static str, OsString)>,
@@ -243,4 +245,434 @@ fn an_agent_whose_inherited_path_lacks_the_board_cli_still_runs_rider_homes_vb()
         block,
         Some(("needs_input".to_string(), BLOCK_QUESTION.to_string()))
     );
+}
+
+const BOARD_LOCK: &str = include_str!("../../board-cli/package-lock.json");
+const NPM_ARGS: &str = "--ignore-scripts\n--no-global\n--no-audit\n--no-fund\n--loglevel=error\n";
+
+fn given_a_fake_npm_in(dir: &Path, record: &Path, then: &str) {
+    fs::create_dir_all(dir).expect("create the fake npm's directory");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$@" "canary=${{RIDER_CANARY-unset}}" "home=$HOME" >> '{}'
+mkdir -p "$3/node_modules/.bin"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$0.args"\nexit 3\n' > "$3/node_modules/.bin/vb"
+chmod +x "$3/node_modules/.bin/vb"
+{then}
+"#,
+        record.display()
+    );
+    write_executable(&dir.join("npm"), &script);
+}
+
+fn listed_ids(json: &str) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .unwrap_or_else(|error| panic!("not a task listing ({error}): {json}"));
+    let tasks = value["tasks"].as_array().expect("a listing holds tasks");
+    tasks
+        .iter()
+        .map(|task| match &task["message"]["id"] {
+            serde_json::Value::String(id) => id.clone(),
+            id => id.to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn rider_vb_runs_the_homes_board_cli_when_vb_is_not_on_path() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "List me."));
+    let vb_dir = world.vb.parent().expect("vb has a directory");
+    let path = world
+        .child_path()
+        .replace(&format!(":{}:", vb_dir.display()), ":");
+    assert!(!path.contains(&vb_dir.display().to_string()), "{path}");
+
+    let mut command = rider(&world);
+    command.env("PATH", &path).args([
+        "vb",
+        "tasks",
+        "work/demo",
+        "--state",
+        "all",
+        "--json",
+        "--as",
+        LEAD,
+    ]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert_eq!(listed_ids(&output.stdout), vec![task]);
+}
+
+#[test]
+fn rider_vb_passes_every_argument_and_the_local_board_url_and_exits_with_vbs_code() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("vb-home");
+    let record = world.root.join("vb-args");
+    let bin = home.join("node/node_modules/.bin");
+    fs::create_dir_all(&bin).expect("create the fake vb's directory");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$BOARD_URL\" \"$@\" > '{}'\nexit 7\n",
+        record.display()
+    );
+    write_executable(&bin.join("vb"), &script);
+    let args = ["reply", "42", "--help", "--", "-starts with a dash"];
+
+    let mut command = rider(&world);
+    command
+        .env_remove("BOARD_URL")
+        .env("RIDER_HOME", &home)
+        .arg("vb")
+        .args(args);
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(7), "{output:?}");
+    let recorded = fs::read_to_string(&record).expect("read the fake vb's arguments");
+    let expected = format!("http://127.0.0.1:4100/api/board\n{}\n", args.join("\n"));
+    assert_eq!(recorded, expected);
+    let mut command = rider(&world);
+    command
+        .env("BOARD_URL", "http://127.0.0.1:9/api/board")
+        .env("RIDER_HOME", &home)
+        .args(["vb", "whoami"]);
+    let output = run_bounded(command, None);
+    assert_eq!(output.code, Some(7), "{output:?}");
+    let recorded = fs::read_to_string(&record).expect("read the fake vb's arguments");
+    assert_eq!(recorded, "http://127.0.0.1:9/api/board\nwhoami\n");
+}
+
+#[test]
+fn rider_serve_installs_the_locked_board_cli_once_without_scripts_or_rider_environment() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("empty-home");
+    let npm_dir = world.root.join("npm");
+    let record = world.root.join("npm-args");
+    given_a_fake_npm_in(&npm_dir, &record, "");
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    for args in [&["serve"][..], &["vb", "whoami"]] {
+        let mut command = rider(&world);
+        command
+            .env("PATH", &path)
+            .env("RIDER_HOME", &home)
+            .env("RIDER_CANARY", "inherited")
+            .args(args);
+        let output = run_bounded(command, None);
+
+        assert_eq!(output.code, Some(3), "the stand-in vb ran: {output:?}");
+    }
+    let recorded = fs::read_to_string(&record).expect("read the fake npm's arguments");
+    let prefix = home.join("node");
+    let user_home = world.root.join("user-home");
+    assert_eq!(
+        recorded,
+        format!(
+            "ci\n--prefix\n{}\n{NPM_ARGS}canary=unset\nhome={}\n",
+            prefix.display(),
+            user_home.display()
+        )
+    );
+    let lock = fs::read_to_string(prefix.join("package-lock.json")).expect("read the lock");
+    assert_eq!(lock, BOARD_LOCK);
+    let vb_args = prefix.join("node_modules/.bin/vb.args");
+    let vb_args = fs::read_to_string(vb_args).expect("read the stand-in vb's arguments");
+    assert_eq!(vb_args, "whoami\n");
+}
+
+#[test]
+fn rider_vb_passes_a_leading_separator_on_to_vb() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("separator-home");
+    let npm_dir = world.root.join("npm");
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), "");
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .args(["vb", "--", "--version"]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(3), "{output:?}");
+    let vb_args = home.join("node/node_modules/.bin/vb.args");
+    let vb_args = fs::read_to_string(vb_args).expect("read the stand-in vb's arguments");
+    assert_eq!(vb_args, "--\n--version\n");
+}
+
+#[test]
+fn rider_vb_passes_every_id_of_a_full_needs_list() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("needs-home");
+    let npm_dir = world.root.join("npm");
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), "");
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+    let ids: Vec<String> = (2..=65).map(|id| id.to_string()).collect();
+
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .args(["vb", "tasks", "needs", "1"])
+        .args(&ids)
+        .args(["--as", LEAD, "--json"]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(3), "{output:?}");
+    let vb_args = home.join("node/node_modules/.bin/vb.args");
+    let vb_args = fs::read_to_string(vb_args).expect("read the stand-in vb's arguments");
+    let expected = format!(
+        "tasks\nneeds\n1\n{}\n--as\n{LEAD}\n--json\n",
+        ids.join("\n")
+    );
+    assert_eq!(vb_args, expected);
+}
+
+#[test]
+fn a_failed_install_shows_a_bounded_part_of_npms_output() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("loud-home");
+    let npm_dir = world.root.join("npm");
+    let loud = r#"head -c 2000000 /dev/zero | tr '\0' x
+head -c 2000000 /dev/zero | tr '\0' y >&2
+rm -r "$3/node_modules"
+exit 9"#;
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), loud);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .arg("serve");
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(1), "{}", output.stderr.len());
+    assert!(output.stdout.is_empty(), "{}", output.stdout.len());
+    assert!(output.stderr.len() < 128 * 1024, "{}", output.stderr.len());
+    assert!(output.stderr.contains("yyy"), "npm's error output is shown");
+    assert!(
+        output
+            .stderr
+            .ends_with("rider: could not install the Board CLI: npm exit status: 9\n"),
+        "{}",
+        &output.stderr[output.stderr.len().saturating_sub(200)..]
+    );
+}
+
+fn spawn_rider(world: &World, path: &str, home: &Path, args: &[&str]) -> std::process::Child {
+    let mut command = rider(world);
+    command
+        .env("PATH", path)
+        .env("RIDER_HOME", home)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().expect("start rider")
+}
+
+fn read_pid(file: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let pid = fs::read_to_string(file).ok();
+        if let Some(pid) = pid.and_then(|text| text.trim().parse::<i32>().ok()) {
+            return pid;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("{} holds no pid", file.display());
+}
+
+fn then_it_ends_within(pid: i32, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while send_signal(pid, "0") && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let alive = send_signal(pid, "0");
+    if alive {
+        send_signal(pid, "KILL");
+    }
+    !alive
+}
+
+fn wait_within(child: &mut std::process::Child, seconds: u64) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll rider") {
+            return Some(status);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+#[test]
+fn stopping_rider_during_the_install_with_term_hup_or_quit_stops_npm() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let npm_dir = world.root.join("npm");
+    let pid_file = world.root.join("npm-pid");
+    let slow = format!("echo $$ > '{}'\nexec sleep 30", pid_file.display());
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), &slow);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    for signal in ["TERM", "HUP", "QUIT"] {
+        let _ = fs::remove_file(&pid_file);
+        let home = world.root.join(format!("slow-home-{signal}"));
+        let mut child = spawn_rider(&world, &path, &home, &["serve"]);
+        let npm = read_pid(&pid_file);
+
+        let rider_pid = i32::try_from(child.id()).expect("a pid fits");
+        assert!(send_signal(rider_pid, signal), "signal rider");
+        let status = wait_within(&mut child, 10);
+
+        assert_eq!(status.and_then(|status| status.code()), Some(1), "{signal}");
+        assert!(
+            then_it_ends_within(npm, 10),
+            "npm outlived rider's SIG{signal}"
+        );
+    }
+}
+
+#[test]
+fn rider_serve_after_an_install_still_stops_on_sigterm() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("serve-home");
+    let npm_dir = world.root.join("npm");
+    let pid_file = world.root.join("vb-pid");
+    let serving = format!(
+        "printf '#!/bin/sh\\necho $$ > {}\\nexec sleep 30\\n' > \"$3/node_modules/.bin/vb\"",
+        pid_file.display()
+    );
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), &serving);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+    let mut child = spawn_rider(&world, &path, &home, &["serve"]);
+    let vb = read_pid(&pid_file);
+
+    let rider_pid = i32::try_from(child.id()).expect("a pid fits");
+    assert!(send_signal(rider_pid, "TERM"), "signal rider");
+    let status = wait_within(&mut child, 10);
+    send_signal(vb, "KILL");
+
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.and_then(|status| status.signal()), Some(15));
+}
+
+#[test]
+fn two_commands_on_an_empty_home_install_the_board_cli_once() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("racing-home");
+    let npm_dir = world.root.join("npm");
+    let record = world.root.join("npm-args");
+    given_a_fake_npm_in(&npm_dir, &record, "sleep 1");
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let mut first = spawn_rider(&world, &path, &home, &["vb", "one"]);
+    let mut second = spawn_rider(&world, &path, &home, &["vb", "two"]);
+    let ends = [wait_within(&mut first, 20), wait_within(&mut second, 20)];
+
+    let codes: Vec<Option<i32>> = ends
+        .iter()
+        .map(|end| end.and_then(|end| end.code()))
+        .collect();
+    assert_eq!(codes, vec![Some(3), Some(3)]);
+    let recorded = fs::read_to_string(&record).expect("read the fake npm's arguments");
+    assert_eq!(recorded.matches("ci\n--prefix\n").count(), 1, "{recorded}");
+}
+
+#[test]
+fn a_failed_install_returns_at_once_though_a_child_of_npm_keeps_its_output_open() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("lingering-home");
+    let npm_dir = world.root.join("npm");
+    let lingering = "rm -r \"$3/node_modules\"\n/bin/sleep 30 &\nexit 1";
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), lingering);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let started = Instant::now();
+    let mut child = spawn_rider(&world, &path, &home, &["vb", "x"]);
+    let status = wait_within(&mut child, 20);
+
+    assert_eq!(status.and_then(|status| status.code()), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_failed_install_shows_npms_output_without_control_bytes() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("escape-home");
+    let npm_dir = world.root.join("npm");
+    let escape = "rm -r \"$3/node_modules\"\nprintf '\\033]0;owned\\007boom\\tx\\n' >&2\nexit 1";
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), escape);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .args(["vb", "x"]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    let shown = "?]0;owned?boom\tx\nrider: could not install the Board CLI: npm exit status: 1\n";
+    assert!(output.stderr.ends_with(shown), "{:?}", output.stderr);
+}
+
+fn send_signal(pid: i32, signal: &str) -> bool {
+    Command::new("/bin/kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[test]
+fn rider_serve_and_vb_without_the_board_cli_or_npm_exit_one_naming_node_22() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("no-npm-home");
+    let empty = world.root.join("no-tools");
+    fs::create_dir_all(&empty).expect("create an empty PATH directory");
+
+    for args in [&["serve"][..], &["vb", "whoami"], &["up"]] {
+        let mut command = rider(&world);
+        command
+            .env("PATH", &empty)
+            .env("RIDER_HOME", &home)
+            .args(args);
+        let output = run_bounded(command, None);
+
+        assert_eq!(output.code, Some(1), "{args:?}: {output:?}");
+        assert!(output.stderr.contains("Node 22"), "{args:?}: {output:?}");
+    }
 }
