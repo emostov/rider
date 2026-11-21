@@ -527,6 +527,7 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
 
 /// How long `rider up` waits for the daemon's socket to answer.
 const UP_SECONDS_MAX: u64 = 30;
+const UP_LOG_TAIL_BYTES: usize = 4096;
 /// How often `rider up` asks the socket again.
 const UP_POLL_MILLIS: u64 = 100;
 /// Upper bound on the lines one `rider down` prints.
@@ -574,13 +575,15 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
     for _ in 0..polls {
         if let Ok(mut client) = Client::connect(&config.home) {
-            let data = client.send("status", &[]).map_err(CliError::Client)?;
+            let data = match client.send("status", &[]) {
+                Ok(data) => data,
+                Err(error) => return Err(not_started(&mut child, &log_path, deadline, error)),
+            };
             println!("{}", status_line(&data));
             return Ok(0);
         }
         if let Ok(Some(exit)) = child.try_wait() {
-            let why = format!("it exited with {exit}; see {}", log_path.display());
-            return Err(CliError::NotStarted(why));
+            return Err(exited(exit, &log_path));
         }
         if Instant::now() >= deadline {
             break;
@@ -590,6 +593,52 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let socket = config.home.join(SOCKET_FILE);
     let why = format!("{} did not answer in {UP_SECONDS_MAX} s", socket.display());
     Err(CliError::NotStarted(why))
+}
+
+fn not_started(
+    child: &mut std::process::Child,
+    log_path: &Path,
+    deadline: Instant,
+    error: ClientError,
+) -> CliError {
+    assert!(log_path.is_absolute());
+    let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(exit)) => return exited(exit, log_path),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(UP_POLL_MILLIS));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(polls > 0);
+    CliError::Client(error)
+}
+
+fn exited(exit: std::process::ExitStatus, log_path: &Path) -> CliError {
+    assert!(log_path.is_absolute());
+    let why = format!("it exited with {exit}: {}", last_line(log_path));
+    CliError::NotStarted(format!("{why}; see {}", log_path.display()))
+}
+
+fn last_line(log_path: &Path) -> String {
+    let mut tail = Vec::with_capacity(UP_LOG_TAIL_BYTES);
+    let read = File::open(log_path).and_then(|mut file| {
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(UP_LOG_TAIL_BYTES as u64);
+        io::Seek::seek(&mut file, io::SeekFrom::Start(start))?;
+        file.take(UP_LOG_TAIL_BYTES as u64).read_to_end(&mut tail)
+    });
+    let text = String::from_utf8_lossy(&tail);
+    let line = text.lines().rev().find(|line| !line.trim().is_empty());
+    let line = match (read, line) {
+        (Ok(_), Some(line)) => line.trim().to_string(),
+        (Ok(_), None) => "its log is empty".to_string(),
+        (Err(error), _) => format!("its log could not be read: {error}"),
+    };
+    assert!(!line.is_empty() && line.len() <= 4 * UP_LOG_TAIL_BYTES);
+    line
 }
 
 fn down(config: &Config, now: bool) -> Result<u8, CliError> {

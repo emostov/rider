@@ -888,6 +888,35 @@ exec '{}' "$@"
     crate::world::write_executable(&world.vb, &script);
 }
 
+/// Given every `vb` run appends its first two arguments, as one line, to `calls`.
+pub fn given_vb_records_its_calls(world: &World, calls: &Path) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s %s\n' "$1" "$2" >> '{}'
+exec '{}' "$@"
+"#,
+        calls.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb schemas create` waits a second, then fails saying `schemas refused`.
+pub fn given_vb_refuses_to_create_schemas(world: &World) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+[ "$1 $2" = "schemas create" ] && {{ sleep 1; echo 'schemas refused' >&2; exit 1; }}
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
 /// Waits until `path` exists.
 pub fn when_the_file_exists(world: &World, path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);

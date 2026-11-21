@@ -724,6 +724,8 @@ fn rider_daemon_registers_its_schemas_on_a_fresh_board_before_claiming() {
     let Some(mut world) = given_a_fresh_board_and_a_repository() else {
         return;
     };
+    let calls = world.root.join("vb-calls");
+    given_vb_records_its_calls(&world, &calls);
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
@@ -734,6 +736,40 @@ fn rider_daemon_registers_its_schemas_on_a_fresh_board_before_claiming() {
         rider_schemas_in_the_source()
     );
     assert_eq!(task_records(&world, &task, "rider-result").len(), 1);
+    let calls = fs::read_to_string(&calls).expect("read the vb calls");
+    let calls: Vec<&str> = calls.lines().collect();
+    let first = |call: &str| calls.iter().position(|line| *line == call);
+    let (create, claim) = (first("schemas create"), first("tasks claim"));
+    assert!(
+        create
+            .zip(claim)
+            .is_some_and(|(create, claim)| create < claim),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn rider_up_reports_a_refused_schema_registration_and_the_daemon_log() {
+    let Some(world) = given_a_fresh_board_and_a_repository() else {
+        return;
+    };
+    given_vb_refuses_to_create_schemas(&world);
+    when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let output = when_rider_runs(&world, &["up"]);
+
+    assert_eq!(output.code, Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("could not register Rider's schemas"),
+        "{output:?}"
+    );
+    assert!(output.stderr.contains("schemas refused"), "{output:?}");
+    let log = world.home.join("daemon.log");
+    assert!(
+        output.stderr.contains(&log.display().to_string()),
+        "{output:?}"
+    );
+    assert_eq!(tasks_in_state(&world, "ready").len(), 1);
 }
 
 #[test]
