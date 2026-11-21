@@ -36,12 +36,18 @@ Paste this into your coding agent:
 ```
 Install Rider: clone https://github.com/emostov/rider if you don't have it yet, then run
 `cargo install --locked --path <that clone>`, which installs the `rider` binary. Then run
-`npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
+`npx skills add emostov/rider --skill ride-swarm --skill ship-swarm --skill review-queue -g`.
 ```
 
 Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
 review threads) and saves the answers in `<rider home>/ship.toml`.
+
+The `review-queue` skill keeps one ordered list of the pull requests that wait on you: those
+that request your review by name, and your own where someone else spoke last. A repository
+opts in with `queue = true`; `rider queue` prints the list and tells you how to opt in when
+nothing has. Agents merge each PR into current main, review it, and hand you a card with a
+verdict and one next action. Nothing is posted on GitHub until you name the item.
 
 ## Quickstart
 
