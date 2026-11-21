@@ -38,6 +38,11 @@
         "url": "https://github.com/example/repo/pull/7#issuecomment-1",
         "viewerDidAuthor": false
       }
-    ]
+    ],
+    "author": {
+      "login": "owner",
+      "is_bot": false
+    },
+    "isCrossRepository": false
   }
 ]

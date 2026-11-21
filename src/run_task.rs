@@ -69,6 +69,13 @@ const LOGS_DIR: &str = "logs";
 // then the repository it ran in.
 const SESSION_FILE: &str = "session";
 const SESSION_FILE_BYTES_MAX: usize = 4096;
+// gh reads a token from any of these before its config, and treats an empty one as unset.
+const GITHUB_TOKENS: [&str; 4] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
 pub(crate) const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const DELIVERY_NOTE: &str = "These replies were posted in your task's thread while you worked. \
                              They amend the brief, and the latest wins.";
@@ -780,6 +787,16 @@ fn prepare(
             ("BOARD_PROFILE".to_string(), env.profile.clone()),
             ("BOARD_URL".to_string(), env.board_url.clone()),
         ]);
+        if brief.github {
+            let scratch = env.home.join(LOGS_DIR).join(&id).join("gh-config");
+            let tokens = GITHUB_TOKENS.map(|name| (name.to_string(), String::new()));
+            cmd.env.extend(tokens);
+            let scratch = (
+                "GH_CONFIG_DIR".to_string(),
+                scratch.to_string_lossy().into_owned(),
+            );
+            cmd.env.push(scratch);
+        }
         Ok::<CommandLine, Block>(cmd)
     };
     let cmd = command(resume.as_ref())?;

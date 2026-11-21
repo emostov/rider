@@ -47,6 +47,11 @@
         "workflowName": "ci"
       }
     ],
-    "url": "https://github.com/example/repo/pull/7"
+    "url": "https://github.com/example/repo/pull/7",
+    "author": {
+      "login": "owner",
+      "is_bot": false
+    },
+    "isCrossRepository": false
   }
 ]

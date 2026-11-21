@@ -22,3 +22,10 @@ bodies and ids replaced with `example/repo`, `reviewer`, `commenter` and short n
   `<job>\t<step>\t<timestamp> <text>`; the job id is the last segment of a check's
   `detailsUrl` after `/job/`. `run-log-failed.txt` is the last lines of a real failed `test`
   job, with its terminal colour codes removed.
+- `gh pr list` also prints `author.login` (the PR's author) and `isCrossRepository` (true when
+  the head branch lives in a fork) when asked for them; the pr-list fixtures carry both, and
+  `pr-list-fork.json` is `pr-list-failed.json` from a fork.
+- `gh api repos/{owner}/{repo}/collaborators/<login>/permission` prints the user's
+  `permission` on the repository: `admin`, `maintain`, `write`, `triage`, `read` or `none`. A
+  user with no access to a public repository is reported as `read`, not as an error.
+  `permission-write.json` and `permission-read.json` are redacted to their first fields.

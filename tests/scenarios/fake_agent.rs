@@ -253,6 +253,12 @@ echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
 [ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
+for name in GH_TOKEN GITHUB_TOKEN; do
+  eval "value=\${{$name-unset}}"
+  [ "$value" = unset ] || [ -z "$value" ] || value=set
+  echo "$name=${{value:-empty}}"
+done > "$world/{ARGS_DIR}/$task-$attempt.gh-env"
+echo "GH_CONFIG_DIR=${{GH_CONFIG_DIR-unset}}" >> "$world/{ARGS_DIR}/$task-$attempt.gh-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -427,6 +433,16 @@ pub fn git_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
         .join(ARGS_DIR)
         .join(format!("{task}-{attempt}.git-env"));
     let text = fs::read_to_string(&path).expect("read an agent's git environment");
+    text.lines().map(str::to_string).collect()
+}
+
+/// Whether attempt `attempt` of `task` saw each GitHub token as `set`, `empty` or `unset`,
+/// then its `GH_CONFIG_DIR`.
+pub fn gh_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.gh-env"));
+    let text = fs::read_to_string(&path).expect("read an agent's gh environment");
     text.lines().map(str::to_string).collect()
 }
 

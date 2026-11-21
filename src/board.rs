@@ -54,7 +54,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
 const POLLS_MAX: u64 =
     (BOARD_CALL_SECONDS_MAX as u64 + WAIT_SECONDS_MAX as u64) * 1000 / POLL_MILLIS + 1;
 /// Upper bound on the arguments of one `vb` run.
-const ARGS_MAX: usize = 24;
+const ARGS_MAX: usize = 32;
 /// How long a claim holds its task before the board may give it to someone else.
 const CLAIM_LEASE: &str = "1h";
 /// Failure reasons that mean a claim found nothing, not that it went wrong.

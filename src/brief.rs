@@ -35,6 +35,7 @@ pub struct Brief {
     pub resume: bool,
     /// Label `restack=1`: the task rebases its `onto` branch, so it may drop the starting commit.
     pub restack: bool,
+    pub github: bool,
     pub text: String,
 }
 
@@ -56,6 +57,7 @@ pub enum BriefError {
     BadFrom(String),
     BadResume(String),
     BadRestack(String),
+    BadSource(String),
     RestackWithoutOnto,
     /// The `base` task, which the task does not need.
     BaseNotNeeded(TaskId),
@@ -125,6 +127,10 @@ impl fmt::Display for BriefError {
             BriefError::BadRestack(value) => write!(
                 f,
                 "Change the `restack` label from {value:?} to 1, or remove it."
+            ),
+            BriefError::BadSource(value) => write!(
+                f,
+                "Change the `source` label from {value:?} to github, or remove it."
             ),
             BriefError::RestackWithoutOnto => write!(
                 f,
@@ -196,6 +202,11 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         Some("1") => true,
         Some(other) => return Err(BriefError::BadRestack(echo(other))),
     };
+    let github = match label(view, "source") {
+        None => false,
+        Some("github") => true,
+        Some(other) => return Err(BriefError::BadSource(echo(other))),
+    };
     if restack && onto.is_none() {
         return Err(BriefError::RestackWithoutOnto);
     }
@@ -210,6 +221,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         from,
         resume,
         restack,
+        github,
         text: view.text.clone(),
     };
     assert!(brief.repo.is_absolute());
