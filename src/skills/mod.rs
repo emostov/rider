@@ -3,7 +3,7 @@ mod install;
 use std::fmt;
 use std::path::PathBuf;
 
-pub use install::{Mode, Outcome, Report, install_into, record, resolve, update_recorded};
+pub use install::{InstallDir, Outcome, Report, install, resolve, update_recorded};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SKILLS: [&str; 2] = ["ride-swarm", "ship-swarm"];
@@ -47,6 +47,7 @@ pub enum SkillsError {
         why: String,
     },
     TooLarge(PathBuf),
+    NotRegular(PathBuf),
     TooManyFiles(PathBuf),
     TooManyInstalls(PathBuf),
     BadRecord(PathBuf),
@@ -70,6 +71,9 @@ impl fmt::Display for SkillsError {
                 )
             }
             SkillsError::TooLarge(path) => write!(f, "{} is too large", path.display()),
+            SkillsError::NotRegular(path) => {
+                write!(f, "{} is not a regular file", path.display())
+            }
             SkillsError::TooManyFiles(path) => {
                 write!(f, "{} holds too many files", path.display())
             }
@@ -84,7 +88,11 @@ impl fmt::Display for SkillsError {
                 )
             }
             SkillsError::BadInto(path) => {
-                write!(f, "--into {} must not contain ..", path.display())
+                let path = path.display();
+                write!(
+                    f,
+                    "--into {path} must be UTF-8 with no .. and no line break"
+                )
             }
             SkillsError::UnknownSkill(name) => {
                 write!(

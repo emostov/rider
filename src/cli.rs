@@ -27,7 +27,7 @@ use crate::feed::{
 use crate::harness::LOG_BYTES_MAX;
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
-use crate::skills::{self, Mode, Outcome, Report, SKILLS, SkillsError};
+use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
 const ENVIRONMENT: &str = r#"environment:
@@ -501,9 +501,9 @@ fn run_skills(config: &Config, command: &SkillsCommand) -> Result<u8, CliError> 
         SkillsCommand::Install { into } => {
             let dir = match into {
                 Some(into) => skills::resolve(into)?,
-                None => config.home.join(SKILLS_DIR),
+                None => InstallDir::parse(&config.home.join(SKILLS_DIR))?,
             };
-            let report = skills::install_into(&dir, Mode::Install);
+            let (report, others) = skills::install(&config.home, &dir)?;
             let mut refused = 0_usize;
             for (path, outcome) in &report {
                 say(&skill_line(path, outcome));
@@ -511,8 +511,7 @@ fn run_skills(config: &Config, command: &SkillsCommand) -> Result<u8, CliError> 
                     refused += 1;
                 }
             }
-            skills::record(&config.home, &dir)?;
-            update_skills(config, Some(&dir));
+            say_updates(&others);
             if refused > 0 {
                 return Err(CliError::SkillsRefused(refused));
             }
@@ -542,12 +541,15 @@ fn skill_line(path: &Path, outcome: &Result<Outcome, SkillsError>) -> String {
     }
 }
 
-fn update_skills(config: &Config, except: Option<&Path>) {
-    let report: Report = match skills::update_recorded(&config.home, except) {
-        Ok(report) => report,
-        Err(error) => return say(&format!("rider: the skills were not updated: {error}")),
-    };
-    for (path, outcome) in &report {
+fn update_skills(config: &Config) {
+    match skills::update_recorded(&config.home) {
+        Ok(report) => say_updates(&report),
+        Err(error) => say(&format!("rider: the skills were not updated: {error}")),
+    }
+}
+
+fn say_updates(report: &Report) {
+    for (path, outcome) in report {
         if !matches!(outcome, Ok(Outcome::UpToDate | Outcome::Absent)) {
             say(&skill_line(path, outcome));
         }
@@ -653,7 +655,7 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 fn daemon(config: &Config) -> Result<u8, CliError> {
     let (table, limits) = settings(config)?;
     write_prompts(config)?;
-    update_skills(config, None);
+    update_skills(config);
     let paths = Paths {
         home: config.home.clone(),
         prompts: config.prompts(),
@@ -674,7 +676,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
-    update_skills(config, None);
+    update_skills(config);
     if let Ok(mut client) = Client::connect(&config.home) {
         let data = client.send("status", &[]).map_err(CliError::Client)?;
         println!("rider: the daemon is already running");

@@ -1,15 +1,20 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
+use std::process;
 
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::{SKILLS, SkillsError, VERSION, skill_files};
 
 const MANIFEST_FILE: &str = ".rider-install.json";
 const RECORD_FILE: &str = "skill-installs";
+const HOME_LOCK_FILE: &str = "skill-installs.lock";
+const DIR_LOCK_FILE: &str = ".rider-install.lock";
+const ASIDE_SUFFIX: &str = ".rider-old";
 const MANIFEST_BYTES_MAX: u64 = 64 << 10;
 const SKILL_FILE_BYTES_MAX: u64 = 1 << 20;
 const SKILL_FILES_MAX: usize = 64;
@@ -78,12 +83,24 @@ fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Skil
     }
 }
 
+fn regular(path: &Path) -> Result<bool, SkillsError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(true),
+        Ok(_) => Err(SkillsError::NotRegular(path.to_path_buf())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect", path)(error)),
+    }
+}
+
 fn read_bounded(path: &Path, most: u64) -> Result<Option<Vec<u8>>, SkillsError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error("open", path)(error)),
-    };
+    if !regular(path)? {
+        return Ok(None);
+    }
+    let file = File::open(path).map_err(io_error("open", path))?;
+    let meta = file.metadata().map_err(io_error("inspect", path))?;
+    if !meta.is_file() {
+        return Err(SkillsError::NotRegular(path.to_path_buf()));
+    }
     let mut bytes = Vec::new();
     let limit = most
         .checked_add(1)
@@ -169,7 +186,42 @@ fn installed(skill_dir: &Path) -> Result<Option<Manifest>, SkillsError> {
     Ok(Some(manifest))
 }
 
+fn lock(path: &Path) -> Result<File, SkillsError> {
+    regular(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(io_error("open", path))?;
+    FileExt::lock(&file).map_err(io_error("lock", path))?;
+    assert!(file.metadata().is_ok_and(|meta| meta.is_file()));
+    Ok(file)
+}
+
+fn recover(dir: &Path, skill: &str) -> Result<(), SkillsError> {
+    let target = dir.join(skill);
+    let aside = dir.join(format!(".{skill}{ASIDE_SUFFIX}"));
+    let absent = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(io_error("inspect", path)(error)),
+    };
+    let aside_is_ours = match fs::symlink_metadata(&aside) {
+        Ok(meta) => meta.is_dir() && regular(&aside.join(MANIFEST_FILE))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(io_error("inspect", &aside)(error)),
+    };
+    if aside_is_ours && absent(&target)? {
+        fs::rename(&aside, &target).map_err(io_error("move back", &aside))?;
+    }
+    assert!(!aside_is_ours || target.exists() || aside.exists());
+    Ok(())
+}
+
 fn install_skill(dir: &Path, skill: &str, mode: Mode) -> Result<Outcome, SkillsError> {
+    recover(dir, skill)?;
     let skill_dir = dir.join(skill);
     let ours = embedded(skill);
     match fs::symlink_metadata(&skill_dir) {
@@ -209,8 +261,8 @@ fn write_skill(
     manifest: &Manifest,
     replace: bool,
 ) -> Result<(), SkillsError> {
-    let staging = dir.join(format!(".{skill}.rider-new"));
-    let aside = dir.join(format!(".{skill}.rider-old"));
+    let staging = dir.join(format!(".{skill}.rider-new-{}", process::id()));
+    let aside = dir.join(format!(".{skill}{ASIDE_SUFFIX}"));
     let target = dir.join(skill);
     for leftover in [&staging, &aside] {
         match fs::remove_dir_all(leftover) {
@@ -255,17 +307,46 @@ fn write_skill(
 
 pub type Report = Vec<(PathBuf, Result<Outcome, SkillsError>)>;
 
-pub fn install_into(dir: &Path, mode: Mode) -> Report {
-    assert!(dir.is_absolute());
-    let created = match mode {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallDir(PathBuf);
+
+impl InstallDir {
+    pub fn parse(path: &Path) -> Result<InstallDir, SkillsError> {
+        let bad = || SkillsError::BadInto(path.to_path_buf());
+        let text = path.to_str().ok_or_else(bad)?;
+        let safe = path.is_absolute()
+            && !text.contains(['\n', '\r'])
+            && !path.components().any(|c| c == Component::ParentDir);
+        if !safe {
+            return Err(bad());
+        }
+        let dir: PathBuf = path.components().collect();
+        assert!(dir.is_absolute() && dir.to_str().is_some());
+        Ok(InstallDir(dir))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+pub fn resolve(into: &Path) -> Result<InstallDir, SkillsError> {
+    let here = env::current_dir().map_err(io_error("find", Path::new(".")))?;
+    InstallDir::parse(&here.join(into))
+}
+
+fn install_into(dir: &InstallDir, mode: Mode) -> Report {
+    let dir = dir.path();
+    let locked = match mode {
         Mode::Install => fs::create_dir_all(dir).map_err(io_error("create", dir)),
         Mode::Update => Ok(()),
-    };
+    }
+    .and_then(|()| lock(&dir.join(DIR_LOCK_FILE)));
     let report: Report = SKILLS
         .iter()
         .map(|skill| {
-            let outcome = match &created {
-                Ok(()) => install_skill(dir, skill, mode),
+            let outcome = match &locked {
+                Ok(_) => install_skill(dir, skill, mode),
                 Err(error) => Err(error.clone()),
             };
             (dir.join(skill), outcome)
@@ -275,63 +356,87 @@ pub fn install_into(dir: &Path, mode: Mode) -> Report {
     report
 }
 
-pub fn resolve(into: &Path) -> Result<PathBuf, SkillsError> {
-    if into.components().any(|c| c == Component::ParentDir) {
-        return Err(SkillsError::BadInto(into.to_path_buf()));
-    }
-    let here = env::current_dir().map_err(io_error("find", Path::new(".")))?;
-    let dir: PathBuf = here.join(into).components().collect();
-    assert!(dir.is_absolute());
-    Ok(dir)
-}
-
-pub fn recorded(home: &Path) -> Result<Vec<PathBuf>, SkillsError> {
+fn recorded(home: &Path) -> Result<(Vec<InstallDir>, bool), SkillsError> {
     let path = home.join(RECORD_FILE);
     let Some(bytes) = read_bounded(&path, RECORD_BYTES_MAX)? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let text = String::from_utf8(bytes).map_err(|_| SkillsError::BadRecord(path.clone()))?;
     let mut dirs = Vec::new();
+    let mut dropped = false;
     for line in text.lines() {
-        let dir = PathBuf::from(line);
-        if !dir.is_absolute() {
-            return Err(SkillsError::BadRecord(path));
-        }
+        let dir =
+            InstallDir::parse(Path::new(line)).map_err(|_| SkillsError::BadRecord(path.clone()))?;
         if dirs.len() == INSTALLS_MAX {
             return Err(SkillsError::TooManyInstalls(path));
         }
-        dirs.push(dir);
+        match fs::symlink_metadata(dir.path()) {
+            Err(error) if error.kind() == ErrorKind::NotFound => dropped = true,
+            _ => dirs.push(dir),
+        }
     }
     assert!(dirs.len() <= INSTALLS_MAX);
-    Ok(dirs)
+    Ok((dirs, dropped))
 }
 
-pub fn record(home: &Path, dir: &Path) -> Result<(), SkillsError> {
-    assert!(dir.is_absolute() && dir.to_str().is_some());
-    let mut dirs = recorded(home)?;
-    if dirs.iter().any(|known| known == dir) {
-        return Ok(());
-    }
-    let path = home.join(RECORD_FILE);
-    if dirs.len() == INSTALLS_MAX {
-        return Err(SkillsError::TooManyInstalls(path));
-    }
-    dirs.push(dir.to_path_buf());
+fn write_record(home: &Path, dirs: &[InstallDir]) -> Result<(), SkillsError> {
+    assert!(dirs.len() <= INSTALLS_MAX);
     let text: String = dirs
         .iter()
-        .map(|dir| format!("{}\n", dir.display()))
+        .map(|dir| format!("{}\n", dir.path().display()))
         .collect();
+    let path = home.join(RECORD_FILE);
     let fresh = home.join(format!("{RECORD_FILE}.new"));
-    fs::create_dir_all(home).map_err(io_error("create", home))?;
+    regular(&fresh)?;
     fs::write(&fresh, text).map_err(io_error("write", &fresh))?;
     fs::rename(&fresh, &path).map_err(io_error("write", &path))
 }
 
-pub fn update_recorded(home: &Path, except: Option<&Path>) -> Result<Report, SkillsError> {
-    let dirs = recorded(home)?;
+fn lock_home(home: &Path) -> Result<File, SkillsError> {
+    fs::create_dir_all(home).map_err(io_error("create", home))?;
+    lock(&home.join(HOME_LOCK_FILE))
+}
+
+pub fn install(home: &Path, dir: &InstallDir) -> Result<(Report, Report), SkillsError> {
+    let _home = lock_home(home)?;
+    let (mut dirs, dropped) = recorded(home)?;
+    let known = dirs.contains(dir);
+    if !known && dirs.len() == INSTALLS_MAX {
+        return Err(SkillsError::TooManyInstalls(home.join(RECORD_FILE)));
+    }
+    let report = install_into(dir, Mode::Install);
+    let landed = report.iter().any(|(_, outcome)| {
+        matches!(
+            outcome,
+            Ok(Outcome::Installed
+                | Outcome::UpToDate
+                | Outcome::Replaced { .. }
+                | Outcome::Newer(_))
+        )
+    });
+    if landed && !known {
+        dirs.push(dir.clone());
+    }
+    if dropped || (landed && !known) {
+        write_record(home, &dirs)?;
+    }
+    let others: Report = dirs
+        .iter()
+        .filter(|other| *other != dir)
+        .flat_map(|other| install_into(other, Mode::Update))
+        .collect();
+    assert!(others.len() <= dirs.len().saturating_mul(SKILLS.len()));
+    Ok((report, others))
+}
+
+pub fn update_recorded(home: &Path) -> Result<Report, SkillsError> {
+    let _home = lock_home(home)?;
+    let (dirs, dropped) = recorded(home)?;
+    if dropped {
+        write_record(home, &dirs)?;
+    }
     let report: Report = dirs
         .iter()
-        .filter(|dir| Some(dir.as_path()) != except)
         .flat_map(|dir| install_into(dir, Mode::Update))
         .collect();
     assert!(report.len() <= dirs.len().saturating_mul(SKILLS.len()));

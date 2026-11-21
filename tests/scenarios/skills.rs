@@ -320,7 +320,11 @@ fn several_installs_into_one_directory_at_once_leave_every_skill_whole() {
         assert_eq!(output.code, Some(0), "{output:?}");
     }
     let again = when_skills_are_installed_into(&world, &dir);
-    assert_eq!(again.stdout, installed_lines(&dir, "up to date"), "{again:?}");
+    assert_eq!(
+        again.stdout,
+        installed_lines(&dir, "up to date"),
+        "{again:?}"
+    );
     for (path, content) in source_files() {
         assert_eq!(fs::read(dir.join(&path)).ok(), Some(content), "{path}");
     }
@@ -333,7 +337,10 @@ fn a_replace_killed_between_its_renames_is_finished_by_the_next_run() {
     };
     let claude = agent_skills(&world, "claude");
     let codex = agent_skills(&world, "codex");
-    assert_eq!(when_skills_are_installed_into(&world, &claude).code, Some(0));
+    assert_eq!(
+        when_skills_are_installed_into(&world, &claude).code,
+        Some(0)
+    );
     given_an_older_install_without(&claude, "ship-swarm", "settings.md");
     let aside = claude.join(".ship-swarm.rider-old");
     fs::rename(claude.join("ship-swarm"), &aside).expect("move the skill aside");
@@ -341,10 +348,16 @@ fn a_replace_killed_between_its_renames_is_finished_by_the_next_run() {
     let output = when_skills_are_installed_into(&world, &codex);
 
     assert_eq!(output.code, Some(0), "{output:?}");
-    let replaced = format!("replaced {} (was 0.0.1)\n", claude.join("ship-swarm").display());
+    let replaced = format!(
+        "replaced {} (was 0.0.1)\n",
+        claude.join("ship-swarm").display()
+    );
     assert!(output.stdout.contains(&replaced), "{output:?}");
     let settings = fs::read(claude.join("ship-swarm/settings.md")).ok();
-    assert_eq!(settings.as_ref(), source_files().get("ship-swarm/settings.md"));
+    assert_eq!(
+        settings.as_ref(),
+        source_files().get("ship-swarm/settings.md")
+    );
     assert!(!aside.exists());
 }
 
@@ -377,7 +390,10 @@ fn a_fifo_in_place_of_a_manifest_is_skipped_without_waiting() {
     };
     let claude = agent_skills(&world, "claude");
     let codex = agent_skills(&world, "codex");
-    assert_eq!(when_skills_are_installed_into(&world, &claude).code, Some(0));
+    assert_eq!(
+        when_skills_are_installed_into(&world, &claude).code,
+        Some(0)
+    );
     let manifest = claude.join("ride-swarm").join(MANIFEST);
     fs::remove_file(&manifest).expect("remove the manifest");
     let mut mkfifo = Command::new("mkfifo");
@@ -388,7 +404,10 @@ fn a_fifo_in_place_of_a_manifest_is_skipped_without_waiting() {
 
     assert_eq!(output.code, Some(0), "{output:?}");
     let skipped = format!("skipped {}: ", claude.join("ride-swarm").display());
-    let line = output.stdout.lines().find(|line| line.starts_with(&skipped));
+    let line = output
+        .stdout
+        .lines()
+        .find(|line| line.starts_with(&skipped));
     assert!(
         line.is_some_and(|line| line.ends_with("is not a regular file")),
         "{output:?}"
@@ -428,7 +447,10 @@ fn a_full_record_refuses_a_new_directory_before_writing_and_forgets_removed_ones
     let full = when_skills_are_installed_into(&world, &extra);
 
     assert_eq!(full.code, Some(1), "{full:?}");
-    assert!(full.stderr.contains("too many install directories"), "{full:?}");
+    assert!(
+        full.stderr.contains("too many install directories"),
+        "{full:?}"
+    );
     assert!(!extra.exists());
     fs::remove_dir_all(dirs[0].parent().expect("an agent directory")).expect("remove");
     let freed = when_skills_are_installed_into(&world, &extra);
