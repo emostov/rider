@@ -27,6 +27,7 @@ use crate::feed::{
 use crate::harness::LOG_BYTES_MAX;
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
+use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
 const ENVIRONMENT: &str = r#"environment:
@@ -50,6 +51,7 @@ const HOME_DEFAULT_DIR: &str = ".rider";
 /// The directory under the Rider home that holds the built-in worker prompts.
 pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
+const SKILLS_DIR: &str = "skills";
 const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the characters of a project or profile name.
@@ -159,6 +161,29 @@ pub enum Command {
         /// The lead's profile, whose own events never end the wait; by default any lead-*.
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
+    },
+    /// List, print or install the skills built into rider.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
+}
+
+/// What to do with the built-in skills.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SkillsCommand {
+    /// Print each skill's name and description.
+    List,
+    /// Print a skill's SKILL.md.
+    Show {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Write each skill as DIR/<skill>/ and update every recorded older install.
+    Install {
+        /// The agent's skills directory (default <rider home>/skills).
+        #[arg(long, value_name = "DIR")]
+        into: Option<PathBuf>,
     },
 }
 
@@ -362,6 +387,9 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    Skills(SkillsError),
+    /// `rider skills install` left these skill directories as they were.
+    SkillsRefused(usize),
 }
 
 impl fmt::Display for CliError {
@@ -387,10 +415,20 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::Skills(error) => write!(f, "{error}"),
+            CliError::SkillsRefused(count) => {
+                write!(f, "{count} skills were not installed; see the lines above")
+            }
             CliError::BadCursor(path) => {
                 write!(f, "{} does not hold a board cursor", path.display())
             }
         }
+    }
+}
+
+impl From<SkillsError> for CliError {
+    fn from(error: SkillsError) -> CliError {
+        CliError::Skills(error)
     }
 }
 
@@ -439,6 +477,82 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             timeout,
             lead,
         } => wait(config, project, *timeout, lead.as_deref()),
+        Command::Skills { command } => run_skills(config, command),
+    }
+}
+
+fn run_skills(config: &Config, command: &SkillsCommand) -> Result<u8, CliError> {
+    match command {
+        SkillsCommand::List => {
+            for name in SKILLS {
+                say(&format!("{name}  {}", skills::description(name)?));
+            }
+        }
+        SkillsCommand::Show { name } => {
+            let text = skills::show(name)?;
+            let mut out = io::stdout().lock();
+            out.write_all(text.as_bytes())
+                .map_err(|error| CliError::Io {
+                    action: "write",
+                    path: PathBuf::from("standard output"),
+                    message: error.to_string(),
+                })?;
+        }
+        SkillsCommand::Install { into } => {
+            let dir = match into {
+                Some(into) => skills::resolve(into)?,
+                None => InstallDir::parse(&config.home.join(SKILLS_DIR))?,
+            };
+            let (report, others) = skills::install(&config.home, &dir)?;
+            let mut refused = 0_usize;
+            for (path, outcome) in &report {
+                say(&skill_line(path, outcome));
+                if matches!(outcome, Ok(Outcome::Edited(_) | Outcome::Foreign) | Err(_)) {
+                    refused += 1;
+                }
+            }
+            say_updates(&others);
+            if refused > 0 {
+                return Err(CliError::SkillsRefused(refused));
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn skill_line(path: &Path, outcome: &Result<Outcome, SkillsError>) -> String {
+    let path = path.display();
+    match outcome {
+        Ok(Outcome::Installed) => format!("installed {path}"),
+        Ok(Outcome::UpToDate) => format!("up to date {path}"),
+        Ok(Outcome::Replaced { from }) => format!("replaced {path} (was {from})"),
+        Ok(Outcome::Edited(files)) => {
+            format!("skipped {path}: edited by hand: {}", files.join(", "))
+        }
+        Ok(Outcome::Foreign) => format!("skipped {path}: not installed by rider"),
+        Ok(Outcome::Newer(version)) => {
+            format!(
+                "kept {path}: rider {version} installed it, newer than {}",
+                skills::VERSION
+            )
+        }
+        Ok(Outcome::Absent) => format!("skipped {path}: removed"),
+        Err(error) => format!("skipped {path}: {error}"),
+    }
+}
+
+fn update_skills(config: &Config) {
+    match skills::update_recorded(&config.home) {
+        Ok(report) => say_updates(&report),
+        Err(error) => say(&format!("rider: the skills were not updated: {error}")),
+    }
+}
+
+fn say_updates(report: &Report) {
+    for (path, outcome) in report {
+        if !matches!(outcome, Ok(Outcome::UpToDate | Outcome::Absent)) {
+            say(&skill_line(path, outcome));
+        }
     }
 }
 
@@ -541,6 +655,7 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 fn daemon(config: &Config) -> Result<u8, CliError> {
     let (table, limits) = settings(config)?;
     write_prompts(config)?;
+    update_skills(config);
     let paths = Paths {
         home: config.home.clone(),
         prompts: config.prompts(),
@@ -561,6 +676,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
+    update_skills(config);
     if let Ok(mut client) = Client::connect(&config.home) {
         let data = client.send("status", &[]).map_err(CliError::Client)?;
         println!("rider: the daemon is already running");
