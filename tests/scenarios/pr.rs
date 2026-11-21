@@ -430,3 +430,27 @@ fn rider_pr_opens_the_draft_against_the_base_the_daemon_used_not_a_relabelled_on
     let create = create_call(&branch, "Add one work file.", MAIN);
     assert_eq!(gh_calls(&remote), vec![list_call(&branch), create]);
 }
+
+#[test]
+fn rider_pr_never_runs_an_ssh_command_planted_in_the_repository_config() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let remote = given_an_origin_and_a_fake_gh(&world);
+    let (task, branch) = given_a_completed_task(&mut world);
+    let ran = world.root.join("planted-ran");
+    let planted = world.root.join("planted.sh");
+    write_executable(
+        &planted,
+        &format!("#!/bin/sh\n: > '{}'\nexec ssh \"$@\"\n", ran.display()),
+    );
+    let planted = planted.to_str().expect("UTF-8 path");
+    world.git_ok(&["config", "core.sshCommand", planted]);
+
+    let published = when_rider_runs(&world, &["pr", &task]);
+
+    assert_eq!(published.code, Some(0), "{published:?}");
+    let head = branch_head(&world, &branch);
+    assert_eq!(origin_head(&world, &remote.origin, &branch), Some(head));
+    assert!(!ran.exists(), "rider pr ran the planted ssh command");
+}

@@ -671,7 +671,7 @@ fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
         fs::write(&path, text).map_err(|error| io_error("write", &path, &error))?;
     }
     eprintln!("rider: installing the Board CLI into {}", prefix.display());
-    let mut npm = Process::new("npm");
+    let mut npm = Process::new(git::resolve("npm"));
     npm.env_clear()
         .args(["ci", "--prefix"])
         .arg(&prefix)

@@ -152,8 +152,7 @@ exec "$@""#;
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 #[cfg(target_os = "macos")]
-const PROGRAMS: [&str; 4] = ["git", "node", "npm", "sh"];
-const PATH_DIRS_MAX: usize = 256;
+const PROGRAMS: [&str; 5] = ["git", "gh", "node", "npm", "sh"];
 #[cfg(target_os = "macos")]
 const DENIED_MAX: usize = 4096;
 #[cfg(target_os = "macos")]
@@ -1279,7 +1278,7 @@ fn denied_writes(home: &Path, vb: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     let dirs: Vec<PathBuf> = std::env::split_paths(&path)
-        .take(PATH_DIRS_MAX)
+        .take(git::PATH_DIRS_MAX)
         .filter(|dir| dir.is_absolute())
         .collect();
     let programs = PROGRAMS.iter().filter_map(|program| {
@@ -1311,13 +1310,10 @@ fn denied_writes(home: &Path, vb: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf
 }
 
 fn confine_git(paths: &Paths) -> Result<(), DaemonError> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let program = std::env::split_paths(&path)
-        .take(PATH_DIRS_MAX)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("git"))
-        .find(|file| file.is_file());
-    let program = program.ok_or_else(|| DaemonError::Confine("no git on PATH".to_string()))?;
+    let program = git::resolve("git");
+    if !program.is_file() {
+        return Err(DaemonError::Confine("no git on PATH".to_string()));
+    }
     let sandbox = confinement(&paths.home, &paths.vb, true)
         .map_err(|error| DaemonError::Confine(error.to_string()))?;
     assert!(program.is_absolute());

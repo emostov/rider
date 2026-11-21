@@ -47,12 +47,15 @@ pub const ENV_REMOVED: [&str; 8] = [
 ];
 const GIT: &str = "git";
 const GH: &str = "gh";
+pub const PATH_DIRS_MAX: usize = 256;
+const NOT_ON_PATH: &str = "/nonexistent";
 static CONFINED: OnceLock<Confined> = OnceLock::new();
 const WORKTREE_LIST: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
 // An agent can write the repository's config, so the settings that make git run a command
 // are overridden where Rider never needs them: `-c` outranks every config file.
-const SAFE_CONFIG: [&str; 6] = [
+const SAFE_CONFIG: [&str; 7] = [
     "core.fsmonitor=false",
+    "core.sshCommand=ssh",
     "core.hooksPath=/dev/null",
     "core.pager=cat",
     "core.editor=false",
@@ -309,6 +312,19 @@ fn collect(child: &mut dyn ChildWrapper, args: &str, limit: Duration) -> Result<
     Ok(output)
 }
 
+pub fn resolve(program: &str) -> PathBuf {
+    assert!(!program.is_empty() && !program.contains('/'));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path)
+        .take(PATH_DIRS_MAX)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|file| file.is_file());
+    let found = found.unwrap_or_else(|| Path::new(NOT_ON_PATH).join(program));
+    assert!(found.is_absolute());
+    found
+}
+
 pub fn confine(git: PathBuf, sandbox: Vec<String>) -> bool {
     assert!(git.is_absolute() && !sandbox.is_empty());
     CONFINED.set(Confined { git, sandbox }).is_ok()
@@ -321,7 +337,7 @@ pub fn hardened() -> Process {
             command.args(&confined.sandbox[1..]).arg(&confined.git);
             command
         }
-        None => Process::new(GIT),
+        None => Process::new(resolve(GIT)),
     };
     for setting in SAFE_CONFIG {
         command.arg("-c").arg(setting);
@@ -349,7 +365,7 @@ fn command(dir: &Path, args: &[&OsStr]) -> Process {
 
 fn isolated(program: &str) -> Process {
     assert!(program == GH);
-    let mut command = Process::new(program);
+    let mut command = Process::new(resolve(program));
     for name in ENV_REMOVED {
         command.env_remove(name);
     }
