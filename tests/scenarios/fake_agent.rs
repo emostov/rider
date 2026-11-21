@@ -18,6 +18,8 @@ const HEADS_DIR: &str = "agent-heads";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
+/// How long the one line a `LongLine` agent prints is, in bytes.
+pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
 
@@ -54,6 +56,30 @@ pub enum Behaviour {
     /// Like `RefuseResume`, but once it has reported the refusal it holds like `Hold` before
     /// it exits 1.
     RefuseResumeThenHold,
+    /// Switches to a new branch `elsewhere`, then commits like `Commit`.
+    WanderBranch,
+    /// Detaches its worktree's `HEAD`, then commits like `Commit`.
+    Detach,
+    /// Commits like `Commit`, then exits `FAIL_EXIT_CODE`.
+    CommitThenFail,
+    /// Commits like `Commit`, then starts a `git bisect` it leaves in progress.
+    CommitThenBisect,
+    /// Commits a `.gitignore` naming `target/`, then writes ignored output under `target/`.
+    IgnoredOutput,
+    /// Resets its branch to the commit below `HEAD` and commits nothing.
+    DropOnly,
+    /// Fast-forwards its branch to the branch `sibling` and commits nothing.
+    FastForwardSibling,
+    /// Prints `line 1` to `line 50`, then exits `FAIL_EXIT_CODE`.
+    ManyLines,
+    /// Prints one line of `LONG_LINE_BYTES` bytes without a newline, then exits
+    /// `FAIL_EXIT_CODE`.
+    LongLine,
+    /// Prints a line of `LONG_LINE_BYTES` bytes, a line holding the byte 0xff, and `end`,
+    /// then exits `FAIL_EXIT_CODE`.
+    BadBytes,
+    /// Prints 40 lines of 250 four-byte characters each, then exits `FAIL_EXIT_CODE`.
+    WideLines,
     /// Commits like `Commit` and reports `dashed_summary(task)`, as JSON-escaped text.
     CommitDashedSummary,
     /// Prints `TALK_LINES` lines of `talk_line(n)` and exits `FAIL_EXIT_CODE`.
@@ -106,6 +132,17 @@ impl Behaviour {
             Behaviour::DropEarlier => "drop-earlier",
             Behaviour::RebaseOntoMain => "rebase-onto-main",
             Behaviour::RefuseResumeThenHold => "refuse-resume-then-hold",
+            Behaviour::WanderBranch => "wander-branch",
+            Behaviour::Detach => "detach",
+            Behaviour::CommitThenFail => "commit-then-fail",
+            Behaviour::CommitThenBisect => "commit-then-bisect",
+            Behaviour::IgnoredOutput => "ignored-output",
+            Behaviour::DropOnly => "drop-only",
+            Behaviour::FastForwardSibling => "fast-forward-sibling",
+            Behaviour::ManyLines => "many-lines",
+            Behaviour::LongLine => "long-line",
+            Behaviour::BadBytes => "bad-bytes",
+            Behaviour::WideLines => "wide-lines",
             Behaviour::CommitDashedSummary => "commit-dashed-summary",
             Behaviour::FailTalkingLong => "fail-talking-long",
             Behaviour::ExitOnSignal => "exit-on-signal",
@@ -165,6 +202,7 @@ fn script() -> String {
     let steps = HOLD_SECONDS_MAX * HOLD_STEPS_PER_SECOND;
     let fail = FAIL_EXIT_CODE;
     let slow = SLOW_SECONDS;
+    let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
     format!(
         r#"#!/bin/sh
@@ -233,6 +271,22 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  wander-branch) git switch -q -c elsewhere && commit || exit 1 ;;
+  detach) git checkout -q --detach && commit || exit 1 ;;
+  commit-then-fail) commit; exit {fail} ;;
+  commit-then-bisect) commit && git bisect start || exit 1 ;;
+  ignored-output)
+    printf 'target/\n' > .gitignore && git add .gitignore && git commit -q -m "Ignore target" \
+      && mkdir -p target && echo built > target/out.o || exit 1 ;;
+  drop-only) git reset -q --hard HEAD~1 || exit 1 ;;
+  fast-forward-sibling) git merge -q --ff-only sibling || exit 1 ;;
+  many-lines) i=1; while [ $i -le 50 ]; do echo "line $i"; i=$((i + 1)); done; exit {fail} ;;
+  long-line) head -c {long} /dev/zero | tr '\0' z; exit {fail} ;;
+  bad-bytes)
+    head -c {long} /dev/zero | tr '\0' y; printf '\nbad \377 byte\nend\n'; exit {fail} ;;
+  wide-lines)
+    l=$(i=0; while [ $i -lt 250 ]; do printf '\360\237\230\200'; i=$((i + 1)); done)
+    i=0; while [ $i -lt 40 ]; do printf '%s\n' "$l"; i=$((i + 1)); done; exit {fail} ;;
   commit-dashed-summary)
     commit || exit 1
     summary='-first  line\\n\\t-task '"$task"
