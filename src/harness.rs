@@ -677,13 +677,23 @@ enum ClaudeEvent {
         subtype: Option<Field<String>>,
         is_error: Option<Field<bool>>,
         num_turns: Option<Field<u64>>,
-        usage: Option<Field<ClaudeUsage>>,
-        total_cost_usd: Option<Field<f64>>,
     },
     #[serde(rename = "assistant")]
     Assistant,
     #[serde(rename = "user")]
     User,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeUsageEvent {
+    #[serde(rename = "result")]
+    Result {
+        usage: Option<Field<ClaudeUsage>>,
+        total_cost_usd: Option<Field<f64>>,
+    },
     #[serde(other)]
     Other,
 }
@@ -939,7 +949,7 @@ fn priced(model: &str, usage: &Usage) -> Option<u64> {
     }
     let micros = nanos / 1000;
     assert!(micros <= nanos);
-    Some(micros)
+    (micros <= COST_MICROS_MAX).then_some(micros)
 }
 
 fn micros_of(dollars: f64) -> Option<u64> {
@@ -957,10 +967,9 @@ pub fn usage(harness: &Harness, model: &str, log: &Path) -> Option<Usage> {
     let mut reported: Option<u64> = None;
     let complete = match harness {
         Harness::Claude => scan(log, |event| {
-            if let ClaudeEvent::Result {
+            if let ClaudeUsageEvent::Result {
                 usage,
                 total_cost_usd,
-                ..
             } = event
                 && let Some(usage) = valid(usage)
             {

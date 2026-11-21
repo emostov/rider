@@ -30,7 +30,7 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use fake_agent::{Behaviour, Run};
 use steps::*;
@@ -133,6 +133,91 @@ fn a_codex_review_on_sol_6_2_records_the_last_usage_snapshot_priced_with_cache_w
         "cost_usd": 0.00151,
     });
     assert_eq!(records[0]["usage"], usage);
+}
+
+fn when_a_task_and_its_review_report(
+    world: &mut World,
+    built: Behaviour,
+    review: Behaviour,
+) -> [(String, Value); 2] {
+    let task = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
+    given_the_agent_will(world, &task, &[built]);
+    let reviewed = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &task)
+        .needs(&task)
+        .role("review");
+    let reviewed = when_the_lead_creates(world, &reviewed);
+    given_the_agent_will(world, &reviewed, &[review]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(world, &[&task, &reviewed]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    [task, reviewed].map(|id| {
+        let records = task_records(world, &id, "rider-result");
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = records[0].clone();
+        (id, record)
+    })
+}
+
+#[test]
+fn the_usage_in_each_recorded_stream_is_in_its_result_record() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let [(_, built), (_, reviewed)] = when_a_task_and_its_review_report(
+        &mut world,
+        Behaviour::ReplayRecorded,
+        Behaviour::ReplayRecorded,
+    );
+
+    let claude = json!({
+        "input": 4,
+        "cache_read": 52114,
+        "cache_write": 26676,
+        "output": 126,
+        "cost_usd": 0.226367,
+    });
+    let codex = json!({
+        "input": 12,
+        "cache_read": 61023,
+        "cache_write": 20835,
+        "output": 519,
+        "cost_usd": 0.063403,
+    });
+    assert_eq!((&built["usage"], &reviewed["usage"]), (&claude, &codex));
+    assert_eq!(
+        (&built["summary"], &reviewed["summary"]),
+        (&json!("DONE"), &json!("DONE"))
+    );
+}
+
+#[test]
+fn a_result_naming_usage_twice_completes_without_usage_and_a_cost_past_its_bound_is_unpriced() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let [(task, built), (_, reviewed)] = when_a_task_and_its_review_report(
+        &mut world,
+        Behaviour::CommitRepeatingUsage,
+        Behaviour::ReportHugeUsage,
+    );
+
+    assert_eq!(built["summary"], json!(fake_agent::summary(&task, 0)));
+    assert_eq!(built["usage"], Value::Null, "{built}");
+    let tokens = 1u64 << 40;
+    let unpriced = json!({
+        "input": tokens,
+        "cache_read": tokens,
+        "cache_write": tokens,
+        "output": tokens,
+        "cost_usd": null,
+    });
+    assert_eq!(reviewed["usage"], unpriced);
 }
 
 #[test]

@@ -111,6 +111,12 @@ pub enum Behaviour {
     HoldThenNothing,
     /// Commits like `Commit`, then reports `USAGE` and `COST_USD` in its result.
     CommitReportingUsage,
+    /// Commits like `Commit`, then reports a result that names `usage` twice.
+    CommitRepeatingUsage,
+    /// Commits nothing and reports `HUGE_CODEX_USAGE` as its last usage snapshot.
+    ReportHugeUsage,
+    /// Commits like `Commit` when run as `claude`, then prints the harness's recorded fixture.
+    ReplayRecorded,
     MergePr,
 }
 
@@ -119,6 +125,8 @@ pub const USAGE: [u64; 4] = [4, 20, 300, 50];
 /// The input, cached, cache write and output tokens of each cumulative snapshot a fake `codex`
 /// reports, the last holding the run's totals.
 pub const CODEX_USAGE: [[u64; 4]; 2] = [[400, 200, 100, 20], [1000, 600, 300, 50]];
+/// The input, cached, cache write and output tokens a `ReportHugeUsage` agent reports.
+pub const HUGE_CODEX_USAGE: [u64; 4] = [3_298_534_883_328, 1 << 40, 1 << 40, 1 << 40];
 /// The cost a `CommitReportingUsage` agent reports, in US dollars.
 pub const COST_USD: f64 = 0.25;
 
@@ -177,6 +185,9 @@ impl Behaviour {
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::CommitReportingUsage => "commit-reporting-usage",
+            Behaviour::CommitRepeatingUsage => "commit-repeating-usage",
+            Behaviour::ReportHugeUsage => "report-huge-usage",
+            Behaviour::ReplayRecorded => "replay-recorded",
             Behaviour::MergePr => "merge-pr",
         }
     }
@@ -242,12 +253,14 @@ fn script() -> String {
          \"cache_read_input_tokens\":{read},\"output_tokens\":{output}}},\
          \"total_cost_usd\":{COST_USD}"
     );
-    let [early, last] = CODEX_USAGE.map(|[input, cached, write, output]| {
-        format!(
-            "\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\
+    let [early, last, huge] =
+        [CODEX_USAGE[0], CODEX_USAGE[1], HUGE_CODEX_USAGE].map(|[input, cached, write, output]| {
+            format!(
+                "\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\
              \"cache_write_input_tokens\":{write},\"output_tokens\":{output}}}"
-        )
-    });
+            )
+        });
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/harness");
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -281,6 +294,8 @@ done
 [ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
 extra=""
+codex_last='{last}'
+fixtures="{fixtures}"
 report() {{
   if [ "$harness" = codex-review ]; then
     printf 'OpenAI Codex v0.0.0\n--------\ncodex\n%s\n' "$summary" >&2
@@ -291,7 +306,7 @@ report() {{
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
     echo '{{"type":"item.completed",'"$item"'}}'
     echo '{{"type":"turn.completed",{early}}}'
-    echo '{{"type":"turn.completed",{last}}}'
+    echo '{{"type":"turn.completed",'"$codex_last"'}}'
   else
     init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"'"$session"'","model":"fake"'
     echo '{{"type":"system",'"$init"'}}'
@@ -374,6 +389,12 @@ case "$behaviour" in
     exit 0 ;;
   commit-silently) commit || exit 1; exit 0 ;;
   commit-reporting-usage) commit || exit 1; extra='{usage}' ;;
+  commit-repeating-usage) commit || exit 1; extra=',"usage":1,"usage":2' ;;
+  report-huge-usage) codex_last='{huge}' ;;
+  replay-recorded)
+    [ "$harness" = claude ] && {{ commit || exit 1; }}
+    cat "$fixtures/$harness.jsonl"
+    exit 0 ;;
   commit-reporting-blank) commit || exit 1; summary="  " ;;
   leave-branch) git checkout -q -b "elsewhere-$task" && commit || exit 1 ;;
   commit-shared) commit && git branch "shared-$task" || exit 1 ;;

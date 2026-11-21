@@ -1,8 +1,8 @@
 //! `harness::run` against `fake_agent`, a stand-in for a real agent CLI.
 
 use rider::harness::{
-    CommandLine, Exit, HarnessError, Io, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId, Usage,
-    command_for, last_message, run, run_on_clock, session_id, stream_reports_failure, usage,
+    CommandLine, Exit, HarnessError, Io, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId,
+    command_for, last_message, run, run_on_clock, session_id, stream_reports_failure,
 };
 use rider::roles::{AGENTS_MAX, Harness, role_from_label};
 use std::cell::Cell;
@@ -274,43 +274,6 @@ fn the_session_id_is_read_from_the_recorded_claude_stream() {
     let scratch = Scratch::new("session");
     let log = scratch.file("hostile", "{\"session_id\":\"--help\"}\n");
     assert_eq!(session_id(&log), None);
-}
-
-#[test]
-fn usage_is_read_from_each_recorded_stream() {
-    let claude = usage(
-        &Harness::Claude,
-        "claude-opus-5-5",
-        Path::new("fixtures/harness/claude.jsonl"),
-    );
-    let reported = Usage {
-        input: 4,
-        cache_read: 52114,
-        cache_write: 26676,
-        output: 126,
-        cost_micros: 226_367,
-        unpriced: false,
-    };
-    assert_eq!(claude, Some(reported));
-    let codex = Path::new("fixtures/harness/codex.jsonl");
-    let priced = Usage {
-        input: 12,
-        cache_read: 61023,
-        cache_write: 20835,
-        output: 519,
-        cost_micros: 63403,
-        unpriced: false,
-    };
-    assert_eq!(usage(&Harness::Codex, "gpt-6.1-sol", codex), Some(priced));
-    let unpriced = Usage {
-        cost_micros: 0,
-        unpriced: true,
-        ..priced
-    };
-    assert_eq!(
-        usage(&Harness::Codex, "unknown-model", codex),
-        Some(unpriced)
-    );
 }
 
 #[test]
