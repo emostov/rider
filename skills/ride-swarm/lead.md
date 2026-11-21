@@ -272,11 +272,11 @@ task of its own.
 Worktrees are large, mostly the Rust `target/` directory, so remove one once nothing will
 use it again. Rider removes a task's worktree when the task completes, and keeps it when
 the task fails or blocks so a retry can reuse it. When you cancel a task, or give up on a
-failed or blocked one, remove its worktree: `git -C <repo> worktree remove
-<rider home>/worktrees/<repository directory name>/<task id>`. It refuses when there are
-modified or untracked files: then tell the owner rather than forcing. Never `--force`,
-never delete the branch. A completed task whose thread says "Kept the worktree" is the
-same case once its changes are understood. `rider clean` (issue #60) will replace this rule.
+failed one, run `rider clean` to list the worktrees of failed and canceled tasks, then
+`rider clean --yes` to remove each one that is safe to remove. It keeps a worktree with
+modified or untracked files, off its branch or mid-operation, and says why in the task's
+thread: then tell the owner rather than forcing. It never deletes a branch. A completed task
+whose thread says "Kept the worktree" is the same case once its changes are understood.
 
 A branch moves after children were cut from it only when an `onto` task completes on it.
 The `behind` field of that task's `rider-result@2` record names the children whose branches

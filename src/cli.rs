@@ -18,7 +18,8 @@ use fs4::{FileExt, TryLockError};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, TaskId, VbCli};
+use crate::board::{self, Board, BoardError, TaskId, TaskState, VbCli};
+use crate::brief::parse_brief;
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
@@ -27,7 +28,9 @@ use crate::feed::{
 use crate::harness::LOG_BYTES_MAX;
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
+use crate::run_task::board_identity;
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
+use crate::worktree::{self, WorktreeError};
 
 const ENVIRONMENT: &str = r#"environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
@@ -63,6 +66,8 @@ const WAIT_MINUTES_DEFAULT: u32 = 54;
 const WAIT_DIR: &str = "wait";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
+/// The profile `rider clean` reads the board and writes its notes as.
+const CLEAN_PROFILE: &str = "rider-clean";
 /// The profile prefix of a lead, as the ride-swarm skill names it.
 const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
@@ -138,6 +143,15 @@ pub enum Command {
         #[arg(long = "url", value_name = "BOARD", value_parser = parse_url)]
         urls: Vec<String>,
         /// Stop the listed processes.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List the worktrees of failed and canceled tasks; --yes removes each one that is safe.
+    ///
+    /// A worktree with changes, off its branch or mid-operation is kept and its thread says
+    /// why. No branch is ever deleted.
+    Clean {
+        /// Remove the listed worktrees that are safe to remove.
         #[arg(long)]
         yes: bool,
     },
@@ -351,6 +365,7 @@ pub enum CliError {
     /// The task has no attempt log under the Rider home.
     NoLog(TaskId),
     Board(BoardError),
+    Worktree(WorktreeError),
     /// The board's feed ended or failed while `rider wait` followed it.
     Feed(String),
     /// The file holding `rider wait`'s cursor holds something else.
@@ -382,6 +397,7 @@ impl fmt::Display for CliError {
             CliError::TableInstalled => write!(f, "the role table was already installed"),
             CliError::NoLog(id) => write!(f, "task #{} has no log", id.0),
             CliError::Board(error) => write!(f, "{error}"),
+            CliError::Worktree(error) => write!(f, "{error}"),
             CliError::Feed(why) => write!(f, "the board's feed stopped: {why}"),
             CliError::Held { path, holder } => {
                 write!(f, "{} is held by {holder}", path.display())
@@ -434,12 +450,80 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
         Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
+        Command::Clean { yes } => clean(config, *yes),
         Command::Wait {
             project,
             timeout,
             lead,
         } => wait(config, project, *timeout, lead.as_deref()),
     }
+}
+
+fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: CLEAN_PROFILE.to_string(),
+    };
+    let identity = board_identity(&config.board_url, &board).map_err(CliError::Board)?;
+    let dirs = worktree::task_dirs(&config.home).map_err(CliError::Worktree)?;
+    assert!(dirs.len() <= worktree::TASK_DIRS_MAX * worktree::TASK_DIRS_MAX);
+    for (dir, id) in dirs {
+        let shown = dir.display();
+        match worktree::made_for(&dir, &identity) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                say(&format!("skipped {shown}: {error}"));
+                continue;
+            }
+        }
+        let view = match board.read_task(id) {
+            Ok(view) => view,
+            Err(error) => {
+                say(&format!(
+                    "skipped {shown}: task #{} could not be read: {error}",
+                    id.0
+                ));
+                continue;
+            }
+        };
+        let state = match view.state {
+            TaskState::Failed => "failed",
+            TaskState::Canceled => "canceled",
+            _ => continue,
+        };
+        let brief = match parse_brief(&view) {
+            Ok(mut brief) => {
+                brief.role = roles::role_in_repo(brief.role, &brief.repo);
+                brief
+            }
+            Err(error) => {
+                say(&format!("skipped {shown}: task #{} has {error}", id.0));
+                continue;
+            }
+        };
+        if worktree::dir_for(&brief, &config.home) != dir {
+            continue;
+        }
+        if !yes {
+            println!("#{} {state} {shown}", id.0);
+            continue;
+        }
+        match worktree::release_ended(&brief, &view, &config.home) {
+            Ok(()) => println!("removed #{} {shown}", id.0),
+            Err(error) => {
+                let why = match error {
+                    WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
+                    other => other.to_string(),
+                };
+                println!("kept #{} {shown}: {why}", id.0);
+                let note = format!("Kept the worktree at {shown}: {why}.");
+                let _ = board.reply(id, &note.replace('\n', " "));
+            }
+        }
+    }
+    Ok(0)
 }
 
 fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliError> {

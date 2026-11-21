@@ -877,6 +877,7 @@ fn worktree_block(error: &WorktreeError) -> Block {
         ),
         WorktreeError::NotACheckout(_)
         | WorktreeError::BoardRecord { .. }
+        | WorktreeError::Listing { .. }
         | WorktreeError::NotOnBranch { .. }
         | WorktreeError::NotReleasable { .. }
         | WorktreeError::Git(_)

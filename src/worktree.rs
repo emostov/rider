@@ -19,6 +19,8 @@ const HEADS_PREFIX: &str = "refs/heads/";
 // A branch label must still be a safe ref once `HEADS_PREFIX` makes it a full ref.
 const BRANCH_BYTES_MAX: usize = REF_BYTES_MAX - HEADS_PREFIX.len();
 const WORKTREES_DIR: &str = "worktrees";
+/// Upper bound on the projects and on each project's task directories `task_dirs` reads.
+pub const TASK_DIRS_MAX: usize = 1024;
 const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
 pub const BRANCH_LABEL: &str = "branch";
@@ -73,6 +75,11 @@ pub enum WorktreeError {
     ForeignBoard {
         dir: PathBuf,
         record: Record,
+    },
+    /// A directory of worktrees could not be read, or holds more than `TASK_DIRS_MAX`.
+    Listing {
+        path: PathBuf,
+        why: String,
     },
     /// The worktree's record of its board could not be read or written.
     BoardRecord {
@@ -152,6 +159,9 @@ impl fmt::Display for WorktreeError {
                     Record::Different => "its .rider-board record names another board",
                 };
                 write!(f, "{} was not made for this board: {found}", dir.display())
+            }
+            WorktreeError::Listing { path, why } => {
+                write!(f, "could not list {}: {why}", path.display())
             }
             WorktreeError::BoardRecord { path, why } => {
                 write!(f, "the board record {} failed: {why}", path.display())
@@ -541,4 +551,81 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
     git::remove_worktree(repo, &dir)?;
     assert!(dir.starts_with(&root) && dir != root);
     Ok(())
+}
+
+fn entries(dir: &Path) -> Result<Vec<PathBuf>, WorktreeError> {
+    let failed = |why: String| WorktreeError::Listing {
+        path: dir.to_path_buf(),
+        why,
+    };
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    let mut paths = Vec::new();
+    for entry in read {
+        if paths.len() == TASK_DIRS_MAX {
+            return Err(failed(format!(
+                "it holds more than {TASK_DIRS_MAX} entries"
+            )));
+        }
+        paths.push(entry.map_err(|error| failed(error.to_string()))?.path());
+    }
+    paths.sort_unstable();
+    assert!(paths.len() <= TASK_DIRS_MAX);
+    assert!(paths.iter().all(|path| path.starts_with(dir)));
+    Ok(paths)
+}
+
+/// Every task's directory under `home`'s worktrees whose name is a task id, in path order.
+pub fn task_dirs(home: &Path) -> Result<Vec<(PathBuf, TaskId)>, WorktreeError> {
+    assert!(home.is_absolute(), "rider's home is an absolute path");
+    let mut found = Vec::new();
+    for project in entries(&home.join(WORKTREES_DIR))? {
+        if !project.is_dir() {
+            continue;
+        }
+        for dir in entries(&project)? {
+            let name = dir.file_name().and_then(OsStr::to_str);
+            let id = name.filter(|name| name.bytes().all(|b| b.is_ascii_digit()));
+            if let Some(id) = id.and_then(|id| id.parse::<u64>().ok()) {
+                found.push((dir, TaskId(id)));
+            }
+        }
+    }
+    assert!(found.iter().all(|(dir, _)| dir.starts_with(home)));
+    Ok(found)
+}
+
+/// Whether the checkout at `dir` records that it was made for the board `identity` names.
+pub fn made_for(dir: &Path, identity: &BoardIdentity) -> Result<bool, WorktreeError> {
+    assert!(dir.is_absolute());
+    let made = recorded_board(dir)?.is_some_and(|found| found == identity.0);
+    assert!(!made || dir.exists());
+    Ok(made)
+}
+
+/// Removes the worktree of a task that ended without completing, only when that is provably
+/// safe; its branch is kept.
+pub fn release_ended(brief: &Brief, view: &TaskView, home: &Path) -> Result<(), WorktreeError> {
+    assert!(brief.id == view.id);
+    let dir = dir_for(brief, home);
+    let branch = match brief.role.commits_expected {
+        true => match branch_label(view) {
+            Some(branch) => Some(branch.to_string()),
+            None => {
+                let reason = "its task has no usable `branch` label";
+                return Err(WorktreeError::NotReleasable { dir, reason });
+            }
+        },
+        false => None,
+    };
+    let start_head = git::head(&dir)?;
+    let checkout = Checkout {
+        dir,
+        branch,
+        start_head,
+    };
+    release(&checkout, &brief.repo, home)
 }
