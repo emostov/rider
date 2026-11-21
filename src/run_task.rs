@@ -69,6 +69,7 @@ const ATTEMPT_LABEL: &str = "attempt";
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
 const RESULT_SCHEMA: &str = "rider-result@2";
+const OF_CHAIN_MAX: usize = 16;
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the harness and session id of its latest completed attempt on one
@@ -112,6 +113,7 @@ pub enum RunError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ran {
     Settled(Verdict),
+    WaitingFor(TaskId),
     /// The task was relabeled after its claim: no agent launched and it is still claimed.
     RoleChanged {
         claimed: &'static str,
@@ -194,6 +196,10 @@ pub fn run_task(
         Prepared::Blocked { kind, reason } => {
             board.block(id, &reason, kind)?;
             return Ok(Ran::Settled(Verdict::LeaveBlocked));
+        }
+        Prepared::WaitingFor(of) => {
+            board.release(id)?;
+            return Ok(Ran::WaitingFor(of));
         }
     };
     let found = attempt.role().label;
@@ -422,6 +428,7 @@ impl Attempt {
 /// What preparing an attempt came to: an attempt to run, or a block to write instead.
 pub enum Prepared {
     Ready(Box<Attempt>),
+    WaitingFor(TaskId),
     Blocked { kind: &'static str, reason: String },
 }
 
@@ -459,6 +466,11 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
         Ok(validated) => validated,
         Err(block) => return Ok(block.prepared()),
     };
+    if let Some(of) = brief.of.filter(|of| !view.needs.contains(of))
+        && let Some(prepared) = of_not_done(id, of, board)?
+    {
+        return Ok(prepared);
+    }
     if let Some(error) = unneeded_on_branch(&brief, &view, board)? {
         return Ok(Block::new("invalid_brief", error.to_string()).prepared());
     }
@@ -633,6 +645,40 @@ pub fn launch_agent(
     assert!(!cmd.program.is_empty());
     assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
     harness::run(cmd, dir, log, seconds_max, LOG_BYTES_MAX)
+}
+
+fn of_not_done(id: TaskId, of: TaskId, board: &dyn Board) -> Result<Option<Prepared>, RunError> {
+    assert!(
+        id != of,
+        "parse_brief rejects an `of` label naming the task itself"
+    );
+    let mut next = of;
+    for _ in 0..OF_CHAIN_MAX {
+        let view = board.read_task(next)?;
+        match view.state {
+            TaskState::Completed if next == of => return Ok(None),
+            TaskState::Canceled if next == of => {
+                let reason = BriefError::OfCanceled(of).to_string();
+                return Ok(Some(Block::new("invalid_brief", reason).prepared()));
+            }
+            TaskState::Completed | TaskState::Canceled => break,
+            TaskState::Waiting
+            | TaskState::Ready
+            | TaskState::Claimed
+            | TaskState::Blocked
+            | TaskState::Failed => {}
+        }
+        match parse_id_label(&view, "of").ok().flatten() {
+            Some(after) if after == id => {
+                let reason = BriefError::OfCycle(of).to_string();
+                return Ok(Some(Block::new("invalid_brief", reason).prepared()));
+            }
+            Some(after) if after != next => next = after,
+            Some(_) | None => break,
+        }
+    }
+    assert!(next != id);
+    Ok(Some(Prepared::WaitingFor(of)))
 }
 
 fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {
@@ -1528,9 +1574,11 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
     // `codex review` prints errors, such as a provider's content-filter stop, only on stderr.
     let (header, tail) = match attempt.brief.role.harness {
-        Harness::Claude | Harness::Codex => {
+        harness @ (Harness::Claude | Harness::Codex) => {
             let log = attempt.log();
-            (format!("The whole log: {}", log.display()), log_tail(&log))
+            let tail = log_tail(&log);
+            let tail = harness::failure_account(&harness, &log, &tail).unwrap_or(tail);
+            (format!("The whole log: {}", log.display()), tail)
         }
         Harness::CodexReview => {
             let stderr = stderr_log(&attempt.log());

@@ -391,6 +391,104 @@ fn when_it_fails_its_log_reply(world: &mut World, behave: Behaviour) -> String {
     reply.expect("a reply with the log's tail").to_string()
 }
 
+fn then_the_failure_reply_is_an_account(world: &World, task: &str, tool: &str) {
+    let log = world.home.join("logs").join(task).join("1.jsonl");
+    let [first, second] = fake_agent::STREAM_MESSAGES;
+    let error = fake_agent::STREAM_ERROR;
+    let account = format!(
+        "The whole log: {}\nThe agent's last messages:\n> {first}\n> {second}\nIts last failed \
+         tool call: {tool}\nIts run ended in error: {error}",
+        log.display()
+    );
+    let replies = task_replies(world, task);
+    let texts: Vec<&str> = replies.iter().filter_map(|r| r["text"].as_str()).collect();
+    assert!(texts.contains(&account.as_str()), "{texts:#?}");
+}
+
+fn when_it_fails_its_account(world: &mut World, behave: Behaviour) -> Vec<String> {
+    let task = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
+    given_the_agent_will(world, &task, &[behave]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
+    let log = world.home.join("logs").join(&task).join("1.jsonl");
+    let header = format!("The whole log: {}\n", log.display());
+    let replies = task_replies(world, &task);
+    let texts = replies.iter().filter_map(|reply| reply["text"].as_str());
+    let reply = texts.filter_map(|text| text.strip_prefix(&header)).next();
+    let reply = reply.expect("a reply with the account");
+    reply.lines().map(str::to_string).collect()
+}
+
+#[test]
+fn a_failed_attempts_account_shows_no_control_characters_and_no_forged_line() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let account = when_it_fails_its_account(&mut world, Behaviour::StreamForged);
+    let lines = [
+        "The agent's last messages:",
+        "> ok ]0;x",
+        "> Its run ended in error: fake",
+    ];
+    assert_eq!(account, lines);
+}
+
+#[test]
+fn a_failed_attempts_account_keeps_the_agents_plain_error_output() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let account = when_it_fails_its_account(&mut world, Behaviour::StreamThenStderr);
+    let said = format!("> {}", fake_agent::STREAM_MESSAGES[0]);
+    let plain = format!("> {}", fake_agent::STDERR_ERROR);
+    let lines = [
+        "The agent's last messages:",
+        &said,
+        "The log's last lines that are not events:",
+        &plain,
+    ];
+    assert_eq!(account, lines);
+}
+
+#[test]
+fn a_failed_claude_attempt_replies_with_a_readable_account_of_its_stream() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::StreamError]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
+    then_the_failure_reply_is_an_account(&world, &task, fake_agent::STREAM_TOOL_ERROR);
+}
+
+#[test]
+fn a_failed_codex_attempt_replies_with_a_readable_account_of_its_stream() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::StreamError]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(
+        (states, exit),
+        (vec!["completed".to_string(), "failed".to_string()], Some(0))
+    );
+    let tool = format!("`{}` exited 1", fake_agent::STREAM_COMMAND);
+    then_the_failure_reply_is_an_account(&world, &review, &tool);
+}
+
 #[test]
 fn a_failed_attempt_replies_with_the_last_forty_lines_of_its_log() {
     let Some(mut world) = given_a_board_and_a_repository() else {
