@@ -8,6 +8,7 @@ use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
+use std::env;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
@@ -190,9 +191,8 @@ pub fn codex_mcp_servers(harness: &Harness) -> Result<Vec<String>, HarnessError>
     if *harness == Harness::Claude {
         return Ok(Vec::new());
     }
-    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
-    let home =
-        home.or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".codex")));
+    let home = env::var_os("CODEX_HOME").map(PathBuf::from);
+    let home = home.or_else(|| env::var_os("HOME").map(|home| Path::new(&home).join(".codex")));
     let Some(path) = home.map(|home| home.join("config.toml")) else {
         return Ok(Vec::new());
     };
