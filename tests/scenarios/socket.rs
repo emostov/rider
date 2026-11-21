@@ -482,3 +482,99 @@ fn rider_up_refuses_a_symlink_at_daemon_log_and_leaves_its_target_alone() {
     );
     assert!(!world.home.join("rider.sock").exists());
 }
+
+#[test]
+fn a_known_gap_an_orphaned_agent_child_in_its_own_process_group_can_still_stop_the_daemon() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::OrphanStops]);
+    given_a_running_daemon_with(&mut world, &[("RIDER_BIN", env!("CARGO_BIN_EXE_rider"))]);
+    when_the_agent_has_started(&world, &task);
+
+    let stops = when_the_stop_attempts_end(&world, &task);
+
+    assert!(stops.ends_with("down exit 0\n"), "{stops}");
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+fn when_rider_runs_on_home_under_umask_000(world: &World, home: &Path, args: &str) {
+    let mut command = world.command(Path::new("/bin/sh"));
+    let script = format!(r#"umask 000; exec "$0" {args}"#);
+    command
+        .env("RIDER_HOME", home)
+        .args(["-c", &script, env!("CARGO_BIN_EXE_rider")]);
+    let _ = crate::world::run_bounded(command, None);
+}
+
+#[test]
+fn rider_serve_and_rider_wait_under_umask_000_create_their_home_private() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let served = world.root.join("served-home");
+    let waited = world.root.join("waited-home");
+
+    when_rider_runs_on_home_under_umask_000(&world, &served, "serve");
+    when_rider_runs_on_home_under_umask_000(&world, &waited, "wait rider --timeout 0");
+
+    let mode =
+        |path: &Path| fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o777);
+    assert_eq!(
+        (mode(&served).ok(), mode(&waited).ok()),
+        (Some(0o700), Some(0o700))
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn given_an_acl(path: &Path, entry: &str) {
+    let added = std::process::Command::new("/bin/chmod")
+        .args(["+a", entry])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("run chmod");
+    assert!(added.success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rider_up_refuses_a_home_with_an_acl_whose_path_holds_a_newline() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let home = world.root.join("odd\nhome");
+    fs::create_dir(&home).expect("create the home");
+    given_an_acl(&home, "everyone allow list,search,add_file");
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command.env("RIDER_HOME", &home).arg("up");
+
+    let up = crate::world::run_bounded(command, None);
+
+    assert_eq!(up.code, Some(1), "{up:?}");
+    assert!(up.stderr.contains("it carries an ACL"), "{up:?}");
+    assert!(!home.join("rider.sock").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rider_up_refuses_a_home_under_a_directory_whose_acl_lets_others_change_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_an_acl(&world.root, "everyone allow add_subdirectory,delete_child");
+
+    let up = when_rider_runs(&world, &["up"]);
+    let removed = std::process::Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(&world.root)
+        .status()
+        .expect("run chmod");
+
+    assert!(removed.success());
+    assert_eq!(up.code, Some(1), "{up:?}");
+    let parent = format!("another user can change {}", world.root.display());
+    assert!(up.stderr.contains(&parent), "{up:?}");
+    assert!(!world.home.join("rider.sock").exists());
+}

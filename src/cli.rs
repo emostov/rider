@@ -509,6 +509,7 @@ fn print_config(config: &Config, repo: Option<&Path>) -> Result<u8, CliError> {
 }
 
 fn serve(config: &Config) -> Result<u8, CliError> {
+    secure_home(&config.home)?;
     let dir = config.home.join(BOARD_DIR);
     let io = |action, path: PathBuf| {
         move |error: io::Error| CliError::Io {
@@ -555,6 +556,38 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
 
 const HOME_ANCESTORS_MAX: usize = 256;
 const LS_BYTES_MAX: u64 = 64 * 1024;
+const ACL_ENTRIES_MAX: usize = 1024;
+const ACL_RIGHTS_ANY: &[&str] = &[
+    "read",
+    "list",
+    "search",
+    "execute",
+    "readattr",
+    "readextattr",
+    "readsecurity",
+    "write",
+    "add_file",
+    "append",
+    "add_subdirectory",
+    "delete",
+    "delete_child",
+    "writeattr",
+    "writeextattr",
+    "writesecurity",
+    "chown",
+];
+const ACL_RIGHTS_CHANGE: &[&str] = &[
+    "write",
+    "add_file",
+    "append",
+    "add_subdirectory",
+    "delete",
+    "delete_child",
+    "writeattr",
+    "writeextattr",
+    "writesecurity",
+    "chown",
+];
 
 // Creates the home 0700 or narrows it to 0700. Refuses a home that is not the user's own, a
 // home on a path another user could change (an ancestor not owned by root or the user, or
@@ -579,50 +612,58 @@ fn secure_home(home: &Path) -> Result<(), CliError> {
         let message = "it must be a directory of the current user that others cannot write to";
         return Err(refuse(message.to_string()));
     }
+    let macos = cfg!(target_os = "macos");
+    if macos && acl_allows(&resolved, ACL_RIGHTS_ANY).map_err(failed)? {
+        return Err(refuse("it carries an ACL; chmod -N removes it".to_string()));
+    }
     let chains = [home, resolved.as_path()];
     let ancestors = chains.iter().flat_map(|path| path.ancestors().skip(1));
     for ancestor in ancestors.take(HOME_ANCESTORS_MAX) {
         let metadata = fs::symlink_metadata(ancestor).map_err(failed)?;
         let owned = metadata.uid() == uid || metadata.uid() == 0;
-        let shared = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
-        if metadata.is_dir() && (!owned || shared) {
+        let shared =
+            metadata.is_dir() && metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+        let acl = macos
+            && metadata.is_dir()
+            && acl_allows(ancestor, ACL_RIGHTS_CHANGE).map_err(failed)?;
+        if !owned || shared || acl {
             let message = format!("another user can change {}", ancestor.display());
             return Err(refuse(message));
         }
-    }
-    if cfg!(target_os = "macos") && has_acl(&resolved).map_err(failed)? {
-        return Err(refuse("it carries an ACL; chmod -N removes it".to_string()));
     }
     fs::set_permissions(&resolved, fs::Permissions::from_mode(0o700)).map_err(failed)?;
     assert!(fs::metadata(&resolved).map_err(failed)?.mode() & 0o077 == 0);
     Ok(())
 }
 
-// macOS mode bits do not show an ACL; `ls -lde` lists its entries below the file, from `0:`. Linux needs
-// no check: narrowing the mode to 0700 also narrows the POSIX ACL mask to nothing.
-fn has_acl(dir: &Path) -> io::Result<bool> {
-    assert!(dir.is_absolute());
-    let child = Process::new("/bin/ls")
-        .arg("-lde")
-        .arg("--")
-        .arg(dir)
+// macOS mode bits do not show an ACL, and neither std nor rustix reads one; `ls -lde` lists
+// its entries below the file. It is run inside the directory on `.`, so no path name can
+// shift its lines. Linux needs no check: narrowing the mode to 0700 also narrows the POSIX ACL
+// mask to nothing.
+fn acl_allows(dir: &Path, rights: &[&str]) -> io::Result<bool> {
+    assert!(dir.is_absolute() && !rights.is_empty());
+    let mut child = Process::new("/bin/ls")
+        .args(["-lde", "."])
+        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
     let mut text = String::new();
-    let mut child = child;
     if let Some(stdout) = child.stdout.take() {
         stdout.take(LS_BYTES_MAX).read_to_string(&mut text)?;
     }
     let status = child.wait()?;
     let mut lines = text.lines();
-    if !status.success() || lines.next().is_none_or(|line| line.len() < 10) {
+    if !status.success() || lines.next().is_none_or(|line| !line.ends_with(" .")) {
         return Err(io::Error::other(format!("ls -lde answered {text:?}")));
     }
-    Ok(lines
-        .next()
-        .is_some_and(|line| line.trim_start().starts_with("0:")))
+    let allowed = lines.take(ACL_ENTRIES_MAX).any(|entry| {
+        let mut words = entry.split_whitespace().skip_while(|word| *word != "allow");
+        let granted = words.nth(1).unwrap_or_default();
+        granted.split(',').any(|right| rights.contains(&right))
+    });
+    Ok(allowed)
 }
 
 /// How long `rider up` waits for the daemon's socket to answer.
@@ -889,6 +930,7 @@ impl Watch<'_> {
 
 fn wait(config: &Config, project: &str, minutes: u32, lead: Option<&str>) -> Result<u8, CliError> {
     assert!(minutes <= WAIT_MINUTES_MAX);
+    secure_home(&config.home)?;
     let deadline = Instant::now() + Duration::from_secs(u64::from(minutes) * 60);
     let board = VbCli {
         vb: config.vb_dir().join("vb"),

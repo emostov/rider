@@ -315,7 +315,8 @@ fn open_log(log: &Path, log_bytes_max: u64) -> Result<Arc<Shared>, HarnessError>
     if let Some(parent) = log.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(failed)?;
     }
-    let file = open_private(log, OpenOptions::new().write(true).truncate(true)).map_err(failed)?;
+    let file = open_private(log, OpenOptions::new().write(true)).map_err(failed)?;
+    file.set_len(0).map_err(failed)?;
     let cap = log_bytes_max;
     Ok(Arc::new(Shared {
         file: Mutex::new(LogFile {

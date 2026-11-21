@@ -103,6 +103,9 @@ pub enum Behaviour {
     /// Runs `$RIDER_BIN kill <task>` and `$RIDER_BIN down --now`, records their output in
     /// `stop_attempts(task)`, then holds like `Hold`.
     TryToStop,
+    /// Starts a child in its own process group that, once orphaned, runs
+    /// `$RIDER_BIN down --now` and records its output in `stop_attempts(task)`; then holds.
+    OrphanStops,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -157,6 +160,7 @@ impl Behaviour {
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::TryToStop => "try-to-stop",
+            Behaviour::OrphanStops => "orphan-stops",
         }
     }
 }
@@ -317,6 +321,11 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  orphan-stops)
+    stops="$world/{HEADS_DIR}/$task-stops"
+    /bin/sh -c 'set -m; ( sleep 1; "$RIDER_BIN" down --now > "$1.new" 2>&1; echo "down exit $?" >> "$1.new"; mv "$1.new" "$1" ) &' sh "$stops"
+    hold
+    commit || exit 1 ;;
   try-to-stop)
     stops="$world/{HEADS_DIR}/$task-stops"
     "$RIDER_BIN" kill "$task" > "$stops.new" 2>&1; echo "kill exit $?" >> "$stops.new"
