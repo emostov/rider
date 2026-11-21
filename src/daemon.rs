@@ -460,7 +460,6 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         }
     };
     let timing = Timing::parse(setting)?;
-    socket::secure_home(&paths.home).map_err(io_error("secure", &paths.home))?;
     let _lock = take_lock(&paths.home)?;
     let agents = paths.home.join(AGENTS_DIR);
     fs::create_dir_all(&agents).map_err(io_error("create", &agents))?;

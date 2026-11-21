@@ -32,6 +32,7 @@ path = "tests/bin/fake_agent.rs"
 clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 jiff = { version = "1.0.1", default-features = false, features = ["std"] }
+nix = { version = "0.31.4", default-features = false, features = ["fs", "socket"] }
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group"] }
 rustix = { version = "1.1.6", features = ["process"] }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }

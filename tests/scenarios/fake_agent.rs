@@ -100,6 +100,9 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    /// Runs `$RIDER_BIN kill <task>` and `$RIDER_BIN down --now`, records their output in
+    /// `stop_attempts(task)`, then holds like `Hold`.
+    TryToStop,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -153,6 +156,7 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::TryToStop => "try-to-stop",
         }
     }
 }
@@ -186,6 +190,11 @@ pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}"));
     let text = fs::read_to_string(&path).expect("read an agent's recorded arguments");
     text.lines().map(str::to_string).collect()
+}
+
+/// What a `TryToStop` agent's stop commands printed, once both have ended.
+pub fn stop_attempts(world: &Path, task: &str) -> Option<String> {
+    fs::read_to_string(world.join(HEADS_DIR).join(format!("{task}-stops"))).ok()
 }
 
 /// The line a `HoldTalking` agent prints before it holds.
@@ -308,6 +317,13 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  try-to-stop)
+    stops="$world/{HEADS_DIR}/$task-stops"
+    "$RIDER_BIN" kill "$task" > "$stops.new" 2>&1; echo "kill exit $?" >> "$stops.new"
+    "$RIDER_BIN" down --now >> "$stops.new" 2>&1; echo "down exit $?" >> "$stops.new"
+    mv "$stops.new" "$stops"
+    hold
+    commit || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'

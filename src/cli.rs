@@ -6,9 +6,10 @@ use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
+use std::process::{Command as Process, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -539,6 +540,7 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 }
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
+    secure_home(&config.home)?;
     let (table, limits) = settings(config)?;
     write_prompts(config)?;
     let paths = Paths {
@@ -551,6 +553,78 @@ fn daemon(config: &Config) -> Result<u8, CliError> {
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
 }
 
+const HOME_ANCESTORS_MAX: usize = 256;
+const LS_BYTES_MAX: u64 = 64 * 1024;
+
+// Creates the home 0700 or narrows it to 0700. Refuses a home that is not the user's own, a
+// home on a path another user could change (an ancestor not owned by root or the user, or
+// writable by others without the sticky bit), and a home carrying an ACL.
+fn secure_home(home: &Path) -> Result<(), CliError> {
+    assert!(home.is_absolute());
+    let refuse = |message: String| CliError::Io {
+        action: "secure",
+        path: home.to_path_buf(),
+        message,
+    };
+    let failed = |error: io::Error| refuse(error.to_string());
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)
+        .map_err(failed)?;
+    let resolved = fs::canonicalize(home).map_err(failed)?;
+    let uid = rustix::process::getuid().as_raw();
+    let metadata = fs::metadata(&resolved).map_err(failed)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        let message = "it must be a directory of the current user that others cannot write to";
+        return Err(refuse(message.to_string()));
+    }
+    let chains = [home, resolved.as_path()];
+    let ancestors = chains.iter().flat_map(|path| path.ancestors().skip(1));
+    for ancestor in ancestors.take(HOME_ANCESTORS_MAX) {
+        let metadata = fs::symlink_metadata(ancestor).map_err(failed)?;
+        let owned = metadata.uid() == uid || metadata.uid() == 0;
+        let shared = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+        if metadata.is_dir() && (!owned || shared) {
+            let message = format!("another user can change {}", ancestor.display());
+            return Err(refuse(message));
+        }
+    }
+    if cfg!(target_os = "macos") && has_acl(&resolved).map_err(failed)? {
+        return Err(refuse("it carries an ACL; chmod -N removes it".to_string()));
+    }
+    fs::set_permissions(&resolved, fs::Permissions::from_mode(0o700)).map_err(failed)?;
+    assert!(fs::metadata(&resolved).map_err(failed)?.mode() & 0o077 == 0);
+    Ok(())
+}
+
+// macOS mode bits do not show an ACL; `ls -lde` lists its entries below the file, from `0:`. Linux needs
+// no check: narrowing the mode to 0700 also narrows the POSIX ACL mask to nothing.
+fn has_acl(dir: &Path) -> io::Result<bool> {
+    assert!(dir.is_absolute());
+    let child = Process::new("/bin/ls")
+        .arg("-lde")
+        .arg("--")
+        .arg(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut text = String::new();
+    let mut child = child;
+    if let Some(stdout) = child.stdout.take() {
+        stdout.take(LS_BYTES_MAX).read_to_string(&mut text)?;
+    }
+    let status = child.wait()?;
+    let mut lines = text.lines();
+    if !status.success() || lines.next().is_none_or(|line| line.len() < 10) {
+        return Err(io::Error::other(format!("ls -lde answered {text:?}")));
+    }
+    Ok(lines
+        .next()
+        .is_some_and(|line| line.trim_start().starts_with("0:")))
+}
+
 /// How long `rider up` waits for the daemon's socket to answer.
 const UP_SECONDS_MAX: u64 = 30;
 /// How often `rider up` asks the socket again.
@@ -561,6 +635,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
+    secure_home(&config.home)?;
     if let Ok(mut client) = Client::connect(&config.home) {
         let data = client.send("status", &[]).map_err(CliError::Client)?;
         println!("rider: the daemon is already running");
@@ -576,14 +651,13 @@ fn up(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    socket::secure_home(&config.home).map_err(io("secure", &config.home))?;
     let log = open_private(&log_path, fs::OpenOptions::new().append(true));
     let log = log.map_err(io("open", &log_path))?;
     let err = log.try_clone().map_err(io("open", &log_path))?;
     let exe = env::current_exe().map_err(io("find", Path::new("rider")))?;
     let mut child = Process::new(&exe)
         .arg("daemon")
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .stdout(log)
         .stderr(err)
         .process_group(0)
@@ -613,9 +687,8 @@ fn up(config: &Config) -> Result<u8, CliError> {
 
 fn down(config: &Config, now: bool) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
-    let token = socket::read_token(&config.home).map_err(CliError::Client)?;
     client
-        .send("down", &[("now", now.into()), ("token", token.into())])
+        .send("down", &[("now", now.into())])
         .map_err(CliError::Client)?;
     for _ in 0..DOWN_LINES_MAX {
         match client.next_line().map_err(CliError::Client)? {
@@ -665,8 +738,7 @@ fn logs(config: &Config, id: TaskId, follow: bool) -> Result<u8, CliError> {
 
 fn kill(config: &Config, id: TaskId) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
-    let token = socket::read_token(&config.home).map_err(CliError::Client)?;
-    let fields = [("task", id.0.into()), ("token", token.into())];
+    let fields = [("task", id.0.into())];
     client.send("kill", &fields).map_err(CliError::Client)?;
     say(&format!("killed the agent of #{}", id.0));
     Ok(0)

@@ -4,6 +4,7 @@
 use crate::board::one_line;
 use crate::git;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
+use nix::fcntl::OFlag;
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
 use serde::Deserialize;
@@ -11,7 +12,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -29,6 +30,7 @@ pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
 const ARGS_MAX: usize = 16;
+const OPEN_TRIES_MAX: usize = 2;
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
@@ -280,30 +282,30 @@ impl Shared {
     }
 }
 
-// Opening a FIFO waits for a reader, so anything there but a regular file is refused first.
+// A FIFO would block a plain open and a symlink would redirect it, so the open neither waits
+// nor follows, and the descriptor is checked. A log readers may already hold open from before
+// it was private is replaced by a new file, not narrowed, so they see nothing written after.
 pub fn open_private(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
     assert!(path.is_absolute());
-    match fs::metadata(path) {
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "it is not a regular file",
-            ));
+    let flags = (OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits();
+    options.create(true).mode(0o600).custom_flags(flags);
+    let uid = rustix::process::getuid().as_raw();
+    for _ in 0..OPEN_TRIES_MAX {
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != uid {
+            let message = "it is not a regular file of the current user";
+            return Err(io::Error::new(ErrorKind::InvalidInput, message));
         }
-        Err(error) if error.kind() != ErrorKind::NotFound => return Err(error),
-        Ok(_) | Err(_) => {}
+        if metadata.mode() & 0o077 == 0 && metadata.nlink() == 1 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            return Ok(file);
+        }
+        drop(file);
+        fs::remove_file(path)?;
     }
-    let file = options.create(true).mode(0o600).open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "it is not a regular file",
-        ));
-    }
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    assert!(file.metadata()?.permissions().mode() & 0o077 == 0);
-    Ok(file)
+    let message = "it was replaced while it was opened";
+    Err(io::Error::new(ErrorKind::InvalidInput, message))
 }
 
 fn open_log(log: &Path, log_bytes_max: u64) -> Result<Arc<Shared>, HarnessError> {

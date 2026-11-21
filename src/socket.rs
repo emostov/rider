@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -12,8 +12,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use nix::sys::socket::{getsockopt, sockopt};
+use rustix::process::{Pid as RawPid, getpgid};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sysinfo::{Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{TaskId, TaskState};
 use crate::core::{
@@ -27,9 +30,6 @@ pub const SOCKET_FILE: &str = "rider.sock";
 const BIND_DIR: &str = ".bind";
 /// The socket's file name inside `BIND_DIR`.
 const BIND_FILE: &str = "s";
-const TOKEN_FILE: &str = "control.token";
-const TOKEN_BYTES: usize = 32;
-const TOKEN_FILE_BYTES_MAX: u64 = 256;
 /// The protocol version a request names in `v`.
 pub const VERSION: u64 = 1;
 /// Upper bound on one request line; a longer one is refused and the connection closed.
@@ -74,6 +74,7 @@ const DRAIN_BYTES_MAX: usize = 1024 * 1024;
 const DRAIN_CHUNK_BYTES: usize = 16 * 1024;
 /// Upper bound on the time spent dropping a client's input before its socket closes.
 const DRAIN_MILLIS_MAX: u64 = 2000;
+const ANCESTORS_MAX: usize = 1024;
 
 /// Hands a socket event to the core; false once the core has gone.
 pub type Sink = Arc<dyn Fn(Event) -> bool + Send + Sync>;
@@ -91,8 +92,6 @@ struct WireRequest {
     task: Option<u64>,
     #[serde(default)]
     follow: Option<bool>,
-    #[serde(default)]
-    token: Option<String>,
 }
 
 enum Outgoing {
@@ -172,12 +171,11 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
     fs::set_permissions(&bound, fs::Permissions::from_mode(0o600))?;
     fs::rename(&bound, path)?;
     fs::remove_dir(&private)?;
-    let token: Arc<str> = Arc::from(write_token(home)?);
     let clients = Arc::new(Mutex::new(Clients::default()));
     let shared = Arc::clone(&clients);
     thread::Builder::new()
         .name("socket".into())
-        .spawn(move || accept(&listener, &shared, &logs, &sink, &token))?;
+        .spawn(move || accept(&listener, &shared, &logs, &sink))?;
     assert!(path.exists());
     Ok(Socket {
         path: path.to_path_buf(),
@@ -185,13 +183,7 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
     })
 }
 
-fn accept(
-    listener: &UnixListener,
-    clients: &Arc<Mutex<Clients>>,
-    logs: &Path,
-    sink: &Sink,
-    control: &Arc<str>,
-) {
+fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, sink: &Sink) {
     for _ in 0..ACCEPTS_MAX {
         let Ok(stream) = listener.accept().map(|(stream, _)| stream) else {
             continue;
@@ -249,11 +241,11 @@ fn accept(
         });
         assert!(guard.slots.len() <= guard.live.len() && guard.live.len() <= CLIENTS_MAX);
         drop(guard);
-        let (held, sink, control) = (Arc::clone(clients), Arc::clone(sink), Arc::clone(control));
+        let (held, sink) = (Arc::clone(clients), Arc::clone(sink));
         let spawned = thread::Builder::new()
             .name("client-reader".into())
             .spawn(move || {
-                read_requests(reader, id, &held, &sink, &control);
+                read_requests(reader, id, &held, &sink);
                 drop(token);
             });
         if spawned.is_err() {
@@ -263,13 +255,7 @@ fn accept(
 }
 
 // Reads requests until the client goes, then tells the core.
-fn read_requests(
-    stream: UnixStream,
-    id: ClientId,
-    clients: &Mutex<Clients>,
-    sink: &Sink,
-    token: &str,
-) {
+fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sink: &Sink) {
     let mut reader = BufReader::new(stream);
     for _ in 0..REQUESTS_MAX {
         let mut bytes = Vec::new();
@@ -285,7 +271,13 @@ fn read_requests(
             }
             Ok(_) => {}
         }
-        match parse_request(&bytes, token) {
+        match parse_request(&bytes) {
+            Ok((request_id, Request::Down { .. } | Request::Kill(_)))
+                if !from_outside_the_daemon(&reader) =>
+            {
+                let message = "down and kill are refused from the daemon's own agents";
+                refuse(clients, id, Some(request_id), "forbidden", message);
+            }
             Ok((request_id, request)) => {
                 let mut guard = lock(clients);
                 let Some(slot) = guard.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -306,7 +298,9 @@ fn read_requests(
                     break;
                 }
             }
-            Err((request_id, code, message)) => refuse(clients, id, request_id, code, &message),
+            Err((request_id, message)) => {
+                refuse(clients, id, request_id, "bad_request", &message);
+            }
         }
     }
     remove(&mut lock(clients), id);
@@ -346,34 +340,58 @@ fn queue(guard: &mut Clients, index: usize, outgoing: Outgoing, request: Option<
     assert!(guard.slots.len() <= CLIENTS_MAX);
 }
 
-type Refused = (Option<u64>, &'static str, String);
+// Whether the peer is neither in nor below a process the daemon started: walking up from the
+// peer and from its group's leader never meets the daemon. Unknown counts as inside.
+fn from_outside_the_daemon(reader: &BufReader<UnixStream>) -> bool {
+    let Ok(peer) = peer_pid(reader.get_ref()) else {
+        return false;
+    };
+    let Some(group) = RawPid::from_raw(peer).and_then(|pid| getpgid(Some(pid)).ok()) else {
+        return false;
+    };
+    let daemon = SysPid::from_u32(std::process::id());
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let starts = [peer, group.as_raw_nonzero().get()];
+    for start in starts {
+        let Ok(start) = u32::try_from(start) else {
+            return false;
+        };
+        let mut at = Some(SysPid::from_u32(start));
+        for _ in 0..ANCESTORS_MAX {
+            let Some(pid) = at else { break };
+            if pid == daemon && start != std::process::id() {
+                return false;
+            }
+            at = system.process(pid).and_then(sysinfo::Process::parent);
+        }
+    }
+    assert!(peer > 0);
+    true
+}
 
-fn parse_request(bytes: &[u8], token: &str) -> Result<(u64, Request), Refused> {
-    assert!(token.len() == TOKEN_BYTES * 2);
+#[cfg(target_vendor = "apple")]
+fn peer_pid(stream: &UnixStream) -> nix::Result<i32> {
+    getsockopt(stream, sockopt::LocalPeerPid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> nix::Result<i32> {
+    getsockopt(stream, sockopt::PeerCredentials).map(|credentials| credentials.pid())
+}
+
+/// The request in `bytes`, or the request id, if readable, and why it is refused.
+fn parse_request(bytes: &[u8]) -> Result<(u64, Request), (Option<u64>, String)> {
     let wire: WireRequest = serde_json::from_slice(bytes).map_err(|error| {
         let id = serde_json::from_slice::<Value>(bytes)
             .ok()
             .and_then(|value| value.get("id").and_then(Value::as_u64));
-        (id, "bad_request", format!("malformed request: {error}"))
+        (id, format!("malformed request: {error}"))
     })?;
-    let bad = |message: String| Err((Some(wire.id), "bad_request", message));
     if wire.v != VERSION {
-        return bad(format!("unknown version {}", wire.v));
-    }
-    let controls = matches!(wire.cmd.as_str(), "down" | "kill");
-    let held = wire.token.as_deref().unwrap_or("");
-    let matched = held.len() == token.len()
-        && held
-            .bytes()
-            .zip(token.bytes())
-            .fold(0, |acc, (a, b)| acc | (a ^ b))
-            == 0;
-    if controls && !matched {
-        let message = format!("{:?} needs the owner's control token", wire.cmd);
-        return Err((Some(wire.id), "forbidden", message));
-    }
-    if !controls && wire.token.is_some() {
-        return bad(format!("wrong fields for {:?}", wire.cmd));
+        return Err((Some(wire.id), format!("unknown version {}", wire.v)));
     }
     let fields = (wire.now, wire.task.map(TaskId), wire.follow);
     let request = match (wire.cmd.as_str(), fields) {
@@ -388,72 +406,11 @@ fn parse_request(bytes: &[u8], token: &str) -> Result<(u64, Request), Refused> {
             follow: follow.unwrap_or(false),
         },
         (cmd @ ("status" | "agents" | "down" | "kill" | "logs"), _) => {
-            return bad(format!("wrong fields for {cmd:?}"));
+            return Err((Some(wire.id), format!("wrong fields for {cmd:?}")));
         }
-        (cmd, _) => return bad(format!("unknown command {cmd:?}")),
+        (cmd, _) => return Err((Some(wire.id), format!("unknown command {cmd:?}"))),
     };
     Ok((wire.id, request))
-}
-
-// Creates the home 0700 or narrows it to 0700, and refuses one that is not the user's own or
-// that other users can write to, since they could replace the socket or the token.
-pub fn secure_home(home: &Path) -> io::Result<()> {
-    assert!(home.is_absolute());
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(home)?;
-    let metadata = fs::metadata(home)?;
-    let uid = rustix::process::getuid().as_raw();
-    if !metadata.is_dir() || metadata.uid() != uid {
-        let message = "it is not a directory the current user owns";
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
-    }
-    if metadata.mode() & 0o022 != 0 {
-        let message = "other users can write to it";
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
-    }
-    fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
-    assert!(fs::metadata(home)?.mode() & 0o077 == 0);
-    Ok(())
-}
-
-// A fresh token per start, in a file only the owner can read, which `down` and `kill` carry.
-fn write_token(home: &Path) -> io::Result<String> {
-    let mut random = [0u8; TOKEN_BYTES];
-    File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let path = home.join(TOKEN_FILE);
-    match fs::remove_file(&path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-        Ok(()) | Err(_) => {}
-    }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    file.write_all(token.as_bytes())?;
-    assert!(token.len() == TOKEN_BYTES * 2);
-    Ok(token)
-}
-
-/// The control token the running daemon wrote under `home`.
-pub fn read_token(home: &Path) -> Result<String, ClientError> {
-    let path = home.join(TOKEN_FILE);
-    let failed = |error: io::Error| ClientError::Io(format!("{}: {error}", path.display()));
-    let mut text = String::new();
-    File::open(&path)
-        .and_then(|file| file.take(TOKEN_FILE_BYTES_MAX).read_to_string(&mut text))
-        .map_err(failed)?;
-    let token = text.trim();
-    if token.len() != TOKEN_BYTES * 2 {
-        return Err(ClientError::Malformed(format!(
-            "{} holds no token",
-            path.display()
-        )));
-    }
-    Ok(token.to_string())
 }
 
 impl Socket {
