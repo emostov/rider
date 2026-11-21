@@ -27,7 +27,11 @@ pub const LOG_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
-const ARGS_MAX: usize = 24;
+/// Upper bound on the MCP servers a user's Codex configuration declares.
+pub const MCP_SERVERS_MAX: usize = 32;
+const MCP_NAME_BYTES_MAX: usize = 64;
+const CODEX_CONFIG_BYTES_MAX: u64 = 1024 * 1024;
+const ARGS_MAX: usize = 24 + 2 * MCP_SERVERS_MAX;
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
@@ -111,6 +115,9 @@ pub enum HarnessError {
     PromptUnsafe,
     /// Too many reader threads are still blocked on pipes from earlier runs.
     ReadersExhausted,
+    /// The user's Codex configuration could not be read, or its MCP servers are not ones
+    /// Rider can turn off.
+    CodexConfig(String),
 }
 
 impl fmt::Display for HarnessError {
@@ -140,6 +147,9 @@ impl fmt::Display for HarnessError {
                 f,
                 "too many reader threads are still blocked on pipes from earlier runs"
             ),
+            HarnessError::CodexConfig(message) => {
+                write!(f, "the Codex configuration: {}", one_line(message))
+            }
         }
     }
 }
@@ -174,11 +184,65 @@ pub enum Resume<'a> {
     InPlace(&'a SessionId),
 }
 
+/// The MCP servers the user's Codex configuration declares, for a Codex agent to turn off;
+/// none for Claude, which takes an empty strict MCP configuration instead.
+pub fn codex_mcp_servers(harness: &Harness) -> Result<Vec<String>, HarnessError> {
+    if *harness == Harness::Claude {
+        return Ok(Vec::new());
+    }
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    let home =
+        home.or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".codex")));
+    let Some(path) = home.map(|home| home.join("config.toml")) else {
+        return Ok(Vec::new());
+    };
+    let error = |why: String| HarnessError::CodexConfig(format!("{}: {why}", path.display()));
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(missing) if missing.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(failed) => return Err(error(failed.to_string())),
+    };
+    let mut text = String::new();
+    let read = file
+        .take(CODEX_CONFIG_BYTES_MAX + 1)
+        .read_to_string(&mut text);
+    read.map_err(|failed| error(failed.to_string()))?;
+    if u64::try_from(text.len()).map_or(true, |bytes| bytes > CODEX_CONFIG_BYTES_MAX) {
+        return Err(error(format!("over {CODEX_CONFIG_BYTES_MAX} bytes")));
+    }
+    let table: toml::Table = toml::from_str(&text).map_err(|bad| error(bad.to_string()))?;
+    let servers = match table.get("mcp_servers") {
+        None => return Ok(Vec::new()),
+        Some(toml::Value::Table(servers)) => servers,
+        Some(_) => return Err(error("`mcp_servers` is not a table".to_string())),
+    };
+    if servers.len() > MCP_SERVERS_MAX {
+        return Err(error(format!("over {MCP_SERVERS_MAX} MCP servers")));
+    }
+    let valid = |name: &str| {
+        !name.is_empty()
+            && name.len() <= MCP_NAME_BYTES_MAX
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    if let Some(name) = servers.keys().find(|name| !valid(name)) {
+        return Err(error(format!(
+            "the MCP server name {name:?} is not one Rider can pass"
+        )));
+    }
+    let names: Vec<String> = servers.keys().cloned().collect();
+    assert!(names.len() <= MCP_SERVERS_MAX);
+    assert!(names.iter().all(|name| valid(name)));
+    Ok(names)
+}
+
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,
     dir: &Path,
     resume: Option<Resume>,
+    mcp_servers: &[String],
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
     assert!(
@@ -186,6 +250,11 @@ pub fn command_for(
         "only Claude sessions are resumed"
     );
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
+    assert!(mcp_servers.len() <= MCP_SERVERS_MAX);
+    assert!(
+        mcp_servers.is_empty() || spec.harness != Harness::Claude,
+        "Claude takes an empty strict MCP configuration instead"
+    );
     assert!(dir.to_str().is_some(), "worktree paths are UTF-8");
     if prompt.len() > PROMPT_BYTES_MAX {
         let bytes = prompt.len();
@@ -227,8 +296,6 @@ pub fn command_for(
                 model,
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
-                // `-c mcp_servers={}` merges into the user's table instead of replacing it;
-                // these drop the servers plugins and apps add.
                 "--disable",
                 "plugins",
                 "--disable",
@@ -261,6 +328,13 @@ pub fn command_for(
         ),
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
+    // `-c mcp_servers={}` merges into the user's table instead of replacing it, and naming a
+    // server the configuration lacks is an error, so each declared server is turned off.
+    let off = mcp_servers.iter().flat_map(|name| {
+        let setting = format!("mcp_servers.{name}.enabled=false");
+        ["-c".to_string(), setting]
+    });
+    args.splice(1..1, off);
     match resume {
         // Without `--fork-session` Claude appends to the resumed session in place.
         Some(Resume::Fork(session)) => {

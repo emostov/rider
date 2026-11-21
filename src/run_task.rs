@@ -346,17 +346,18 @@ impl Attempt {
             Harness::Codex | Harness::CodexReview => None,
         };
         let dir = &self.checkout.dir;
+        let servers = harness::codex_mcp_servers(&self.brief.role.harness).ok()?;
         let (cmd, how) = match &session {
             Some(session) => {
                 let resume = Some(Resume::InPlace(session));
-                let cmd = command_for(self.brief.role, &render(new), dir, resume);
+                let cmd = command_for(self.brief.role, &render(new), dir, resume, &servers);
                 (cmd, "resuming the agent's session")
             }
             None => {
                 let mut all = self.delivery().delivered.clone();
                 all.extend_from_slice(new);
                 let prompt = format!("{}\n\n{RETRY_NOTE}\n\n{}", self.prompt, render(&all));
-                let cmd = command_for(self.brief.role, &prompt, dir, None);
+                let cmd = command_for(self.brief.role, &prompt, dir, None, &servers);
                 (cmd, "running the agent again in its worktree")
             }
         };
@@ -766,15 +767,23 @@ fn prepare(
     });
     let resume = session.and_then(Result::ok);
     let id = brief.id.0.to_string();
+    let cannot = |error: HarnessError| {
+        let reason = format!(
+            "Rider cannot build the agent's command: {}.",
+            harness_reason(&error)
+        );
+        Block::new("rider_error", reason)
+    };
+    let servers = harness::codex_mcp_servers(&brief.role.harness).map_err(cannot)?;
     let command = |resume: Option<&SessionId>| {
-        let cmd = command_for(brief.role, &prompt, &dir, resume.map(Resume::Fork));
-        let mut cmd = cmd.map_err(|error| {
-            let reason = format!(
-                "Rider cannot build the agent's command: {}.",
-                harness_reason(&error)
-            );
-            Block::new("rider_error", reason)
-        })?;
+        let cmd = command_for(
+            brief.role,
+            &prompt,
+            &dir,
+            resume.map(Resume::Fork),
+            &servers,
+        );
+        let mut cmd = cmd.map_err(cannot)?;
         cmd.env.extend([
             ("BOARD_TASK".to_string(), id.clone()),
             ("BOARD_PROFILE".to_string(), env.profile.clone()),
@@ -999,7 +1008,8 @@ fn harness_reason(error: &HarnessError) -> String {
         HarnessError::Spawn(_)
         | HarnessError::Log(_)
         | HarnessError::Wait(_)
-        | HarnessError::ReadersExhausted => error.to_string(),
+        | HarnessError::ReadersExhausted
+        | HarnessError::CodexConfig(_) => error.to_string(),
     }
 }
 

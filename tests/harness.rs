@@ -62,7 +62,7 @@ fn a_prompt_a_cli_could_misread_is_an_error() {
     let codex = role_from_label("review").unwrap();
     for prompt in ["", " \n\t ", "-", "mcp", "doctor", "--help"] {
         for spec in [claude, codex] {
-            let result = command_for(spec, prompt, Path::new("/w"), None);
+            let result = command_for(spec, prompt, Path::new("/w"), None, &[]);
             assert!(
                 matches!(result, Err(HarnessError::PromptUnsafe)),
                 "{prompt:?}"
@@ -76,10 +76,10 @@ fn an_oversized_prompt_is_an_error() {
     let spec = role_from_label("implement").unwrap();
     let prompt = "x ".repeat(PROMPT_BYTES_MAX / 2);
     assert_eq!(prompt.len(), PROMPT_BYTES_MAX);
-    let c = command_for(spec, &prompt, Path::new("/w"), None).unwrap();
+    let c = command_for(spec, &prompt, Path::new("/w"), None, &[]).unwrap();
     assert_eq!(c.args.last(), Some(&prompt));
     let over = format!("{prompt}x");
-    let result = command_for(spec, &over, Path::new("/w"), None);
+    let result = command_for(spec, &over, Path::new("/w"), None, &[]);
     assert!(matches!(
         result,
         Err(HarnessError::PromptTooLarge { bytes }) if bytes == PROMPT_BYTES_MAX + 1

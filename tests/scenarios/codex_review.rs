@@ -23,6 +23,7 @@ fn a_native_review_runs_codex_review_with_its_prompt_on_stdin_and_completes_with
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     let review = when_the_lead_creates(&world, &a_native_review_of(&world, &built));
     given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
+    given_the_users_codex_config_declares_mcp_servers(&world, &["alpha"]);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
 
@@ -33,6 +34,8 @@ fn a_native_review_runs_codex_review_with_its_prompt_on_stdin_and_completes_with
     assert_eq!(runs[0].harness, "codex-review");
     let args = fake_agent::args(&world.root, &review, 0);
     let expected = r#"review
+-c
+mcp_servers.alpha.enabled=false
 -c
 model="gpt-6.2-sol"
 -c
@@ -50,6 +53,8 @@ approval_policy="never"
         "{prompt}"
     );
     assert!(prompt.contains("## Simpler and faster\n"), "{prompt}");
+    let unit_tests = "A new unit test, or a test that calls internal functions directly";
+    assert!(prompt.contains(unit_tests), "{prompt}");
     assert!(
         prompt.contains("Review the work: git diff main...HEAD."),
         "{prompt}"

@@ -1509,3 +1509,14 @@ exec '{}' "$@"
     );
     crate::world::write_executable(&world.vb, &script);
 }
+
+/// Given the user's Codex configuration declares an MCP server for each of `names`.
+pub fn given_the_users_codex_config_declares_mcp_servers(world: &World, names: &[&str]) {
+    let dir = world.root.join("user-home").join(".codex");
+    fs::create_dir_all(&dir).expect("create the user's Codex home");
+    let tables = names
+        .iter()
+        .map(|name| format!("[mcp_servers.{name}]\ncommand = \"true\"\n"));
+    fs::write(dir.join("config.toml"), tables.collect::<String>()).expect("write config.toml");
+    assert!(dir.join("config.toml").is_file());
+}

@@ -242,6 +242,7 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
         .role("review");
     let review = when_the_lead_creates(&world, &review);
     given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+    given_the_users_codex_config_declares_mcp_servers(&world, &["beta", "alpha"]);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
 
@@ -254,8 +255,10 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].dir, worktree_dir(&world, &review));
     let dir = worktree_dir(&world, &review).display().to_string();
-    let options = ["exec", "--model", "gpt-6.1-sol", "--json"]
+    let options = ["exec", "-c", "mcp_servers.alpha.enabled=false"]
         .into_iter()
+        .chain(["-c", "mcp_servers.beta.enabled=false"])
+        .chain(["--model", "gpt-6.1-sol", "--json"])
         .chain(["--dangerously-bypass-approvals-and-sandbox"])
         .chain(["--disable", "plugins", "--disable", "apps", "-C", &dir]);
     let expected: Vec<String> = options.map(String::from).collect();
