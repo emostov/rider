@@ -39,7 +39,8 @@ use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
     Attempt, Env, IdentityUnknown, Judgement, Prepared, RunError, board_identity_at_start,
-    judge_attempt, launch_agent, prepare_attempt, settle_attempt,
+    judge_attempt, launch_agent, prepare_attempt, release_canceled_idle, release_if_canceled,
+    settle_attempt,
 };
 use crate::settle::Verdict;
 use crate::socket::{self, Socket, SocketPath};
@@ -456,7 +457,7 @@ impl Shared {
     }
 }
 
-fn pid_file(home: &Path, task: TaskId) -> PathBuf {
+pub fn pid_file(home: &Path, task: TaskId) -> PathBuf {
     let path = home.join(AGENTS_DIR).join(format!("{}.pid", task.0));
     assert!(path.starts_with(home));
     path
@@ -1008,6 +1009,11 @@ fn job(
                 Input::plain(Event::BoardExited)
             }
         }),
+        Action::ReleaseWorktree(task) => Box::new(move || {
+            let board = shared.board(DAEMON_PROFILE);
+            release_canceled_idle(task, &shared.paths.home, &shared.paths.board_url, &board);
+            Input::plain(Event::WorktreeChecked)
+        }),
         Action::Reply { .. } | Action::Exit(_) => return Ok(None),
     };
     Ok(Some(job))
@@ -1155,6 +1161,12 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&pid_file);
     let _ = shared.recorder.send(Recorded::Ended(task));
+    release_if_canceled(
+        task,
+        &shared.paths.home,
+        &shared.board(DAEMON_PROFILE),
+        attempt,
+    );
     Input {
         event: Event::AgentExited(run),
         extra: Extra::Launched(launched),

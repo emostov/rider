@@ -594,7 +594,10 @@ pub fn settle_attempt(
             complete(id, env, board, attempt, result, work)?
         }
         (Verdict::Complete { .. }, None) => panic!("a completion always has inspected work"),
-        (Verdict::Fail { reason }, _) => fail(id, board, attempt, reason)?,
+        (Verdict::Fail { reason }, _) => {
+            fail(id, board, attempt, reason)?;
+            release_or_note(id, &env.home, board, &attempt.checkout, &attempt.brief.repo);
+        }
         (Verdict::LeaveBlocked, _) => {}
     }
     Ok(())
@@ -1146,6 +1149,7 @@ fn worktree_block(error: &WorktreeError) -> Block {
         ),
         WorktreeError::NotACheckout(_)
         | WorktreeError::BoardRecord { .. }
+        | WorktreeError::Listing { .. }
         | WorktreeError::NotOnBranch { .. }
         | WorktreeError::NotReleasable { .. }
         | WorktreeError::Git(_)
@@ -1331,25 +1335,70 @@ fn complete(
     {
         let _ = board.reply(id, &record);
     }
-    if let Err(error) = worktree::release(&attempt.checkout, &attempt.brief.repo, &env.home) {
-        let why = match error {
-            WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
-            other => other.to_string(),
-        };
-        let dir = attempt.checkout.dir.display();
-        // The warning comes before git's reason, which may be long enough to be cut short.
-        let held = git::current_branch(&attempt.checkout.dir).ok().flatten();
-        let note = match held {
-            Some(branch) => format!(
-                "Kept the worktree at {dir}, so branch {branch} stays checked out there: tasks \
-                 working `onto` it will block as branch_busy until a person removes or fixes \
-                 the worktree at {dir}. It was kept because {why}."
-            ),
-            None => format!("Kept the worktree at {dir}: {why}."),
-        };
-        let _ = board.reply(id, &one_line(&note));
-    }
+    release_or_note(id, &env.home, board, &attempt.checkout, &attempt.brief.repo);
     Ok(())
+}
+
+fn release_or_note(id: TaskId, home: &Path, board: &dyn Board, checkout: &Checkout, repo: &Path) {
+    assert!(home.is_absolute() && repo.is_absolute());
+    if let Err(error) = worktree::release(checkout, repo, home) {
+        note_kept(id, board, &checkout.dir, error);
+    }
+}
+
+pub fn release_canceled_idle(id: TaskId, home: &Path, url: &str, board: &dyn Board) {
+    assert!(home.is_absolute() && !url.is_empty());
+    let Ok(view) = board.read_task(id) else {
+        return;
+    };
+    let Ok(mut brief) = parse_brief(&view) else {
+        return;
+    };
+    if view.state != TaskState::Canceled || view.id != id {
+        return;
+    }
+    brief.role = role_in_repo(brief.role, &brief.repo);
+    let dir = worktree::dir_for(&brief, home);
+    let ours = board_identity(url, board).is_ok_and(|identity| {
+        fs::symlink_metadata(&dir).is_ok() && worktree::made_for(&dir, &identity).unwrap_or(false)
+    });
+    if !ours {
+        return;
+    }
+    if let Err(error) = worktree::release_ended(&brief, &view, home) {
+        note_kept(id, board, &dir, error);
+    }
+}
+
+fn note_kept(id: TaskId, board: &dyn Board, dir: &Path, error: WorktreeError) {
+    assert!(dir.is_absolute());
+    let why = match error {
+        WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
+        other => other.to_string(),
+    };
+    let held = git::current_branch(dir).ok().flatten();
+    let dir = dir.display();
+    let note = match held {
+        Some(branch) => format!(
+            "Kept the worktree at {dir}, so branch {branch} stays checked out there: tasks \
+             working `onto` it will block as branch_busy until a person removes or fixes \
+             the worktree at {dir}. It was kept because {why}."
+        ),
+        None => format!("Kept the worktree at {dir}: {why}."),
+    };
+    assert!(!note.is_empty());
+    let _ = board.reply(id, &one_line(&note));
+}
+
+pub fn release_if_canceled(id: TaskId, home: &Path, board: &dyn Board, attempt: &Attempt) {
+    assert!(attempt.brief.id == id);
+    assert!(home.is_absolute());
+    if board
+        .read_task(id)
+        .is_ok_and(|view| view.state == TaskState::Canceled)
+    {
+        release_or_note(id, home, board, &attempt.checkout, &attempt.brief.repo);
+    }
 }
 
 // A branch's tasks are those labelled with it in the completing task's channel and repository,

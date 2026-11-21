@@ -1108,7 +1108,7 @@ fn a_shortened_attempt_limit_stops_a_never_exiting_agent_and_fails_its_task() {
 }
 
 #[test]
-fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_writes_nothing() {
+fn a_canceled_running_tasks_agent_is_stopped_with_no_writes_and_its_worktree_removed() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -1130,7 +1130,12 @@ fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_wr
     assert_eq!(task_state(&world, &task), "canceled");
     assert_eq!(task_replies(&world, &task), replies);
     assert_eq!(task_labels(&world, &task), labels);
-    assert!(worktree_dir(&world, &task).is_dir(), "the worktree is kept");
+    then_the_worktree_is_removed(&world, &task);
+    let branch = task_label(&world, &task, "branch").expect("the task has a branch label");
+    assert!(
+        branches(&world).contains(&branch),
+        "branch {branch} is kept"
+    );
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
