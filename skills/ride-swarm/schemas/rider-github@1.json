@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "pr", "head", "url"],
+  "properties": {
+    "kind": {
+      "enum": ["checks", "review", "comment"],
+      "description": "checks: CI on the head finished; review: a review or review comment; comment: a PR comment"
+    },
+    "pr": { "type": "integer", "minimum": 1 },
+    "head": { "type": "string", "minLength": 1, "description": "The PR's head commit" },
+    "state": { "type": "string", "description": "checks: passed or failed; review: its state" },
+    "job": { "type": "string", "description": "The first failing job, when checks failed" },
+    "author": { "type": "string" },
+    "file": { "type": ["string", "null"] },
+    "line": { "type": ["integer", "null"] },
+    "excerpt": { "type": "string", "maxLength": 300 },
+    "url": { "type": "string", "minLength": 1 }
+  }
+}

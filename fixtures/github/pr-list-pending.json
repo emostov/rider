@@ -1,0 +1,52 @@
+[
+  {
+    "comments": [],
+    "headRefOid": "2ae54426992ec8249006b5ea9b5531e8900062f3",
+    "number": 7,
+    "reviews": [],
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T05:22:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/example/repo/actions/runs/44870593686/job/136744001592",
+        "name": "fmt",
+        "startedAt": "2026-11-21T05:22:37Z",
+        "status": "COMPLETED",
+        "workflowName": "ci"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T05:22:56Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/example/repo/actions/runs/44870593686/job/136744001549",
+        "name": "clippy",
+        "startedAt": "2026-11-21T05:22:36Z",
+        "status": "COMPLETED",
+        "workflowName": "ci"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "0001-01-01T00:00:00Z",
+        "conclusion": "",
+        "detailsUrl": "https://github.com/example/repo/actions/runs/44870593686/job/136744001571",
+        "name": "test",
+        "startedAt": "2026-11-21T05:22:36Z",
+        "status": "IN_PROGRESS",
+        "workflowName": "ci"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T05:23:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/example/repo/actions/runs/44870593686/job/136744001497",
+        "name": "package",
+        "startedAt": "2026-11-21T05:22:37Z",
+        "status": "COMPLETED",
+        "workflowName": "ci"
+      }
+    ],
+    "url": "https://github.com/example/repo/pull/7"
+  }
+]

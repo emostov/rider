@@ -31,6 +31,7 @@ use crate::core::{
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
+use crate::github;
 use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
@@ -517,6 +518,14 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
     start_signals(shared.events.clone())?;
+    let watcher_log = Arc::clone(&shared);
+    github::start(
+        Box::new(shared.board(DAEMON_PROFILE)),
+        shared.paths.home.clone(),
+        timing.tick_millis,
+        Box::new(move |line| watcher_log.log.write(line)),
+    )
+    .map_err(DaemonError::Thread)?;
     let mut config = Config::from_roles(roles);
     config.agents_max = limits.agents;
     config.builders_max = limits.builders_at_once;

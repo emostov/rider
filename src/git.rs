@@ -105,10 +105,10 @@ impl fmt::Display for GitError {
 
 type Reader = JoinHandle<Result<Vec<u8>, GitError>>;
 
-struct Output {
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// Whether `name` can go to `git` as a ref: not empty, not an option, no whitespace or `..`.
@@ -306,7 +306,7 @@ fn command(dir: &Path, args: &[&OsStr]) -> Process {
 
 /// Runs `process` in its own process group, feeding it `input` if given, and kills the group
 /// unless it ends within `limit`.
-fn spawn_and_collect(
+pub fn spawn_and_collect(
     process: Process,
     line: &str,
     limit: Duration,

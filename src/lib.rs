@@ -6,6 +6,7 @@ pub mod core;
 pub mod daemon;
 pub mod feed;
 pub mod git;
+pub mod github;
 pub mod harness;
 pub mod reap;
 pub mod roles;
