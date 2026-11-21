@@ -62,6 +62,21 @@ rider logs <id>     # the newest attempt's log of a task; -f follows it
 
 The board's web inspector is at <http://127.0.0.1:4100>.
 
+## What agents can reach
+
+Agents run as your user with permission prompts skipped, so they can read and change what your
+account can: files, credentials and the network.
+
+On macOS Rider starts each agent under `sandbox-exec`. The agent and every process it starts
+cannot connect to the daemon's socket, signal a process outside the agent's sandbox, or write
+Rider's control files, `rider.toml`, `<rider home>/prompts`, the Board CLI, or the `rider`,
+`git`, `node`, `npm` and `sh` programs the daemon runs. The daemon's own git commands ignore
+hooks, fsmonitor, filters and other commands set in a repository's config.
+
+On Linux agents are not confined: an agent can run `rider down` or `rider kill`, stop the
+daemon, or rewrite its files. The same holds on macOS when the daemon itself was started inside
+a sandbox; `daemon.log` then says `agents run unconfined`.
+
 ## How it's built
 
 - **A deterministic simulator.** The daemon's decisions are one pure function,
