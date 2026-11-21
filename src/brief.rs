@@ -80,12 +80,13 @@ impl fmt::Display for BriefError {
         match self {
             BriefError::NoRole => write!(
                 f,
-                "Set the `role` label to one of implement, light, review, security or qa."
+                "Set the `role` label to one of implement, light, review, native-review, \
+                 security or qa."
             ),
             BriefError::UnknownRole(value) => write!(
                 f,
                 "Change the `role` label from {value:?} to one of implement, light, \
-                 review, security or qa."
+                 review, native-review, security or qa."
             ),
             BriefError::NoRepo => write!(
                 f,

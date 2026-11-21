@@ -12,5 +12,6 @@ pub mod reap;
 pub mod roles;
 pub mod run_task;
 pub mod settle;
+pub mod skills;
 pub mod socket;
 pub mod worktree;
