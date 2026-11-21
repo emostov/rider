@@ -54,8 +54,6 @@ pub const IDENTITY_READS_MAX: u32 = 5;
 const IDENTITY_PAUSE_MILLIS: u64 = 1_000;
 const SUMMARY_CHARS_MAX: usize = TAIL_REPLY_CHARS_MAX / 6;
 const ATTEMPT_LABEL: &str = "attempt";
-// A review the content filter stopped names its rerun in `rerun`; the rerun names it in
-// `rerun_of`.
 const RERUN_LABEL: &str = "rerun";
 const RERUN_OF_LABEL: &str = "rerun_of";
 const RERUN_ROLE: &str = "security";
@@ -1239,7 +1237,6 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
     Ok(())
 }
 
-// The rerun keeps the brief's text as it is: the filter is never worked around.
 fn rerun_on_mythos(id: TaskId, board: &dyn Board, attempt: &Attempt) {
     assert!(attempt.brief.role.needs_of);
     assert!(attempt.brief.role.label != RERUN_ROLE);
