@@ -8,17 +8,18 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, Stdio};
+use std::process::{Command as Process, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use fs4::{FileExt, TryLockError};
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, TaskId, VbCli};
+use crate::board::{self, Board, BoardError, NEEDS_MAX, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
@@ -36,8 +37,8 @@ const ENVIRONMENT: &str = r#"environment:
 
 /// Upper bound on the boards one `rider reap` names.
 pub const REAP_URLS_MAX: usize = 8;
-/// Upper bound on the arguments `rider vb` passes on to the Board CLI.
-pub const VB_ARGS_MAX: usize = 64;
+/// Upper bound on the arguments `rider vb` passes on: a full needs list with its words and options.
+pub const VB_ARGS_MAX: usize = NEEDS_MAX + 64;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = VB_ARGS_MAX + 1;
 const _: () = assert!(ARGS_MAX >= 2 * REAP_URLS_MAX + 2);
@@ -59,8 +60,27 @@ const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
 const BOARD_DIR: &str = "board";
 const NODE_DIR: &str = "node";
-/// The Board CLI version rider installs under its home when it finds none there.
-const BOARD_PACKAGE: &str = "@vercel/board@0.52.0";
+/// The Board CLI rider installs under its home when it finds none there, every package locked.
+const BOARD_PACKAGE: [(&str, &str); 2] = [
+    ("package.json", include_str!("../board-cli/package.json")),
+    (
+        "package-lock.json",
+        include_str!("../board-cli/package-lock.json"),
+    ),
+];
+const NPM_FLAGS: [&str; 5] = [
+    "--ignore-scripts",
+    "--no-global",
+    "--no-audit",
+    "--no-fund",
+    "--loglevel=error",
+];
+/// The only variables npm gets from rider's environment.
+const NPM_VARS: [&str; 2] = ["PATH", "HOME"];
+const INSTALL_SECONDS_MAX: u64 = 600;
+const INSTALL_POLL_MILLIS: u64 = 100;
+/// Upper bound on the bytes of npm's error output that rider shows.
+const INSTALL_OUTPUT_BYTES_MAX: u64 = 64 * 1024;
 const SKILLS_DIR: &str = "skills";
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the characters of a project or profile name.
@@ -440,7 +460,7 @@ impl fmt::Display for CliError {
                 f,
                 "the Board CLI is missing and npm is not on PATH: install Node 22, then retry"
             ),
-            CliError::NotInstalled(why) => write!(f, "could not install {BOARD_PACKAGE}: {why}"),
+            CliError::NotInstalled(why) => write!(f, "could not install the Board CLI: {why}"),
             CliError::Skills(error) => write!(f, "{error}"),
             CliError::SkillsRefused(count) => {
                 write!(f, "{count} skills were not installed; see the lines above")
@@ -581,28 +601,95 @@ fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
     }
     let prefix = config.home.join(NODE_DIR);
     assert!(prefix.is_absolute() && vb.starts_with(&prefix));
-    eprintln!(
-        "rider: installing {BOARD_PACKAGE} into {}",
-        prefix.display()
-    );
-    let status = Process::new("npm")
-        .arg("install")
-        .arg("--prefix")
-        .arg(&prefix)
-        .arg(BOARD_PACKAGE)
-        .stdin(Stdio::null())
-        .stdout(io::stderr())
-        .status();
-    match status {
-        Err(error) if error.kind() == ErrorKind::NotFound => Err(CliError::NoNpm),
-        Err(error) => Err(io_error("run", Path::new("npm"), &error)),
-        Ok(status) if !status.success() => Err(CliError::NotInstalled(format!("npm {status}"))),
-        Ok(_) if !vb.is_file() => Err(CliError::NotInstalled(format!(
-            "npm left no {}",
-            vb.display()
-        ))),
-        Ok(_) => Ok(vb),
+    fs::create_dir_all(&prefix).map_err(|error| io_error("create", &prefix, &error))?;
+    for (name, text) in BOARD_PACKAGE {
+        let path = prefix.join(name);
+        fs::write(&path, text).map_err(|error| io_error("write", &path, &error))?;
     }
+    eprintln!("rider: installing the Board CLI into {}", prefix.display());
+    let mut npm = Process::new("npm");
+    npm.env_clear()
+        .args(["ci", "--prefix"])
+        .arg(&prefix)
+        .args(NPM_FLAGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for var in NPM_VARS {
+        if let Some(value) = env::var_os(var) {
+            npm.env(var, value);
+        }
+    }
+    let spawned = CommandWrap::from(npm).wrap(ProcessGroup::leader()).spawn();
+    let child = match spawned {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err(CliError::NoNpm),
+        Err(error) => return Err(io_error("run", Path::new("npm"), &error)),
+        Ok(child) => child,
+    };
+    let status = supervise_npm(child)?;
+    if !status.success() {
+        return Err(CliError::NotInstalled(format!("npm {status}")));
+    }
+    if !vb.is_file() {
+        let why = format!("npm left no {}", vb.display());
+        return Err(CliError::NotInstalled(why));
+    }
+    Ok(vb)
+}
+
+fn supervise_npm(mut child: Box<dyn ChildWrapper>) -> Result<ExitStatus, CliError> {
+    let npm = Path::new("npm");
+    let signals = Signals::new([SIGTERM, SIGINT]);
+    let mut signals = signals.map_err(|error| io_error("handle", Path::new("signals"), &error))?;
+    let stderr = child.stderr().take();
+    let reader = thread::Builder::new()
+        .name("npm-stderr".into())
+        .spawn(move || {
+            let mut shown = Vec::new();
+            if let Some(mut stderr) = stderr {
+                let _ = (&mut stderr)
+                    .take(INSTALL_OUTPUT_BYTES_MAX)
+                    .read_to_end(&mut shown);
+                let _ = io::copy(&mut stderr, &mut io::sink());
+            }
+            shown
+        });
+    let polls = INSTALL_SECONDS_MAX * 1000 / INSTALL_POLL_MILLIS;
+    let mut ended = Err(CliError::NotInstalled(format!(
+        "npm ran longer than {INSTALL_SECONDS_MAX} s"
+    )));
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                ended = Ok(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ended = Err(io_error("wait for", npm, &error));
+                break;
+            }
+        }
+        if signals.pending().next().is_some() {
+            ended = Err(CliError::Interrupted);
+            break;
+        }
+        thread::sleep(Duration::from_millis(INSTALL_POLL_MILLIS));
+    }
+    signals.handle().close();
+    if ended.is_err() {
+        let killed = child.kill().and_then(|()| child.wait().map(|_| ()));
+        killed.map_err(|error| io_error("stop", npm, &error))?;
+    }
+    let shown = reader
+        .map_err(|error| io_error("read", npm, &error))?
+        .join();
+    let shown = shown.unwrap_or_default();
+    assert!(u64::try_from(shown.len()).is_ok_and(|len| len <= INSTALL_OUTPUT_BYTES_MAX));
+    if ended.as_ref().is_ok_and(|status| !status.success()) {
+        let _ = io::stderr().write_all(&shown);
+    }
+    ended
 }
 
 fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliError> {

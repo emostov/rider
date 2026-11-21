@@ -2,7 +2,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::fake_agent::{BLOCK_QUESTION, Behaviour};
 use crate::steps::*;
@@ -245,16 +247,18 @@ fn an_agent_whose_inherited_path_lacks_the_board_cli_still_runs_rider_homes_vb()
     );
 }
 
-const PINNED_BOARD: &str = "@vercel/board@0.52.0";
+const BOARD_LOCK: &str = include_str!("../../board-cli/package-lock.json");
+const NPM_ARGS: &str = "--ignore-scripts\n--no-global\n--no-audit\n--no-fund\n--loglevel=error\n";
 
-fn given_a_fake_npm_in(dir: &Path, record: &Path) {
+fn given_a_fake_npm_in(dir: &Path, record: &Path, then: &str) {
     fs::create_dir_all(dir).expect("create the fake npm's directory");
     let script = format!(
         r#"#!/bin/sh
-printf '%s\n' "$@" >> '{}'
+printf '%s\n' "$@" "canary=${{RIDER_CANARY-unset}}" "home=$HOME" >> '{}'
 mkdir -p "$3/node_modules/.bin"
-printf '#!/bin/sh\nexit 3\n' > "$3/node_modules/.bin/vb"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$0.args"\nexit 3\n' > "$3/node_modules/.bin/vb"
 chmod +x "$3/node_modules/.bin/vb"
+{then}
 "#,
         record.display()
     );
@@ -343,32 +347,182 @@ fn rider_vb_passes_every_argument_and_the_local_board_url_and_exits_with_vbs_cod
 }
 
 #[test]
-fn rider_serve_installs_the_pinned_board_cli_once_when_it_is_missing() {
+fn rider_serve_installs_the_locked_board_cli_once_without_scripts_or_rider_environment() {
     let Some(world) = World::new() else {
         return;
     };
     let home = world.root.join("empty-home");
     let npm_dir = world.root.join("npm");
     let record = world.root.join("npm-args");
-    given_a_fake_npm_in(&npm_dir, &record);
+    given_a_fake_npm_in(&npm_dir, &record, "");
     let path = format!("{}:{}", npm_dir.display(), world.child_path());
 
-    for _ in 0..2 {
+    for args in [&["serve"][..], &["vb", "whoami"]] {
         let mut command = rider(&world);
         command
             .env("PATH", &path)
             .env("RIDER_HOME", &home)
-            .arg("serve");
+            .env("RIDER_CANARY", "inherited")
+            .args(args);
         let output = run_bounded(command, None);
 
         assert_eq!(output.code, Some(3), "the stand-in vb ran: {output:?}");
     }
     let recorded = fs::read_to_string(&record).expect("read the fake npm's arguments");
     let prefix = home.join("node");
+    let user_home = world.root.join("user-home");
     assert_eq!(
         recorded,
-        format!("install\n--prefix\n{}\n{PINNED_BOARD}\n", prefix.display())
+        format!(
+            "ci\n--prefix\n{}\n{NPM_ARGS}canary=unset\nhome={}\n",
+            prefix.display(),
+            user_home.display()
+        )
     );
+    let lock = fs::read_to_string(prefix.join("package-lock.json")).expect("read the lock");
+    assert_eq!(lock, BOARD_LOCK);
+    let vb_args = prefix.join("node_modules/.bin/vb.args");
+    let vb_args = fs::read_to_string(vb_args).expect("read the stand-in vb's arguments");
+    assert_eq!(vb_args, "whoami\n");
+}
+
+#[test]
+fn rider_vb_passes_a_leading_separator_on_to_vb() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("separator-home");
+    let npm_dir = world.root.join("npm");
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), "");
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .args(["vb", "--", "--version"]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(3), "{output:?}");
+    let vb_args = home.join("node/node_modules/.bin/vb.args");
+    let vb_args = fs::read_to_string(vb_args).expect("read the stand-in vb's arguments");
+    assert_eq!(vb_args, "--\n--version\n");
+}
+
+#[test]
+fn rider_vb_passes_every_id_of_a_full_needs_list() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("needs-home");
+    let npm_dir = world.root.join("npm");
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), "");
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+    let ids: Vec<String> = (2..=65).map(|id| id.to_string()).collect();
+
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .args(["vb", "tasks", "needs", "1"])
+        .args(&ids)
+        .args(["--as", LEAD, "--json"]);
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(3), "{output:?}");
+    let vb_args = home.join("node/node_modules/.bin/vb.args");
+    let vb_args = fs::read_to_string(vb_args).expect("read the stand-in vb's arguments");
+    let expected = format!(
+        "tasks\nneeds\n1\n{}\n--as\n{LEAD}\n--json\n",
+        ids.join("\n")
+    );
+    assert_eq!(vb_args, expected);
+}
+
+#[test]
+fn a_failed_install_shows_a_bounded_part_of_npms_output() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("loud-home");
+    let npm_dir = world.root.join("npm");
+    let loud = "head -c 2000000 /dev/zero | tr '\\0' x\nhead -c 2000000 /dev/zero | tr '\\0' y >&2\n\
+                rm -r \"$3/node_modules\"\nexit 9";
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), loud);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .arg("serve");
+    let output = run_bounded(command, None);
+
+    assert_eq!(output.code, Some(1), "{}", output.stderr.len());
+    assert!(output.stdout.is_empty(), "{}", output.stdout.len());
+    assert!(output.stderr.len() < 128 * 1024, "{}", output.stderr.len());
+    assert!(output.stderr.contains("yyy"), "npm's error output is shown");
+    assert!(
+        output
+            .stderr
+            .ends_with("rider: could not install the Board CLI: npm exit status: 9\n"),
+        "{}",
+        &output.stderr[output.stderr.len().saturating_sub(200)..]
+    );
+}
+
+#[test]
+fn stopping_rider_during_the_install_stops_npm() {
+    let Some(world) = World::new() else {
+        return;
+    };
+    let home = world.root.join("slow-home");
+    let npm_dir = world.root.join("npm");
+    let pid_file = world.root.join("npm-pid");
+    let slow = format!("echo $$ > '{}'\nexec sleep 30", pid_file.display());
+    given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), &slow);
+    let path = format!("{}:{}", npm_dir.display(), world.child_path());
+    let mut command = rider(&world);
+    command
+        .env("PATH", &path)
+        .env("RIDER_HOME", &home)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("start rider serve");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut npm = None;
+    while npm.is_none() && Instant::now() < deadline {
+        npm = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok());
+        thread::sleep(Duration::from_millis(50));
+    }
+    let npm = npm.expect("npm started");
+
+    let rider_pid = i32::try_from(child.id()).expect("a pid fits");
+    assert!(send_signal(rider_pid, "TERM"), "signal rider");
+    let status = child.wait().expect("rider exits");
+
+    assert_eq!(status.code(), Some(1), "{status}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while send_signal(npm, "0") && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let alive = send_signal(npm, "0");
+    if alive {
+        send_signal(npm, "KILL");
+    }
+    assert!(!alive, "npm outlived rider");
+}
+
+fn send_signal(pid: i32, signal: &str) -> bool {
+    Command::new("/bin/kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[test]
