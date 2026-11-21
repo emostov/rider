@@ -252,9 +252,9 @@ harness=$(basename "$0")
 runs="$world/{RUNS_FILE}"
 attempt=$( (grep "^start $task " "$runs" 2>/dev/null || true) | wc -l | tr -d ' ')
 plan="$world/{BEHAVIOURS_DIR}/$task"
+[ -f "$plan" ] || plan="$world/{BEHAVIOURS_DIR}/default"
 behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=$(tail -n 1 "$plan" 2>/dev/null)
-[ -n "$behaviour" ] || behaviour=$(tail -n 1 "$world/{BEHAVIOURS_DIR}/default" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"

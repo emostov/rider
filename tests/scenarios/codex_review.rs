@@ -300,6 +300,48 @@ fn a_long_handoff_is_cut_to_fit_the_board_and_the_rerun_still_runs() {
     assert!(handoff.contains(&format!("by {profile}: ")), "{handoff}");
 }
 
+#[test]
+fn a_reply_from_the_stopped_reviews_worker_is_not_delivered_to_the_rerun() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    let review = NewTask::new("Review the work: git diff main...HEAD.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::ContentFilterStop]);
+    let rerun_plan = [Behaviour::HoldThenNothing, Behaviour::ReportDecision];
+    given_the_agent_will(&world, "default", &rerun_plan);
+    given_a_running_daemon(&mut world);
+    let states = when_the_tasks_settle(&world, &[&built, &review]);
+    let rerun = (0..RERUN_POLLS)
+        .find_map(|_| {
+            let label = task_label(&world, &review, "rerun");
+            if label.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            label
+        })
+        .unwrap_or_else(|| panic!("no rerun of #{review}"));
+    when_the_agent_has_started(&world, &rerun);
+
+    let worker = reply_profile(&world, &review, fake_agent::CONTENT_FILTER_PLAN);
+    let note = world.vb_as(&worker, &["reply", &rerun, "-"], Some("Decision red."));
+    assert_eq!(note.code, Some(0), "{note:?}");
+    world.release_agent(&rerun);
+    let settled = when_the_tasks_settle(&world, &[&rerun]);
+
+    assert_eq!(states, vec!["completed", "failed"]);
+    assert_eq!(settled, vec!["completed"]);
+    assert_eq!(agent_runs_for(&world, &rerun).len(), 1);
+}
+
+const RERUN_POLLS: u32 = 150;
+
 fn reply_profile(world: &World, id: &str, text: &str) -> String {
     let replies = task_replies(world, id);
     let found = replies.iter().find(|reply| reply["text"] == json!(text));

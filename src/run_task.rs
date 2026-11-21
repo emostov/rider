@@ -14,8 +14,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::board::{
-    Amendment, Board, BoardError, MESSAGE_CHARS_MAX, REPLIES_MAX, SET_NEEDS_MAX, TaskId, TaskState,
-    TaskView, Thread, message_tail, one_line,
+    Amendment, Board, BoardError, MESSAGE_CHARS_MAX, REPLIES_MAX, RERUN_OF_LABEL, SET_NEEDS_MAX,
+    TaskId, TaskState, TaskView, Thread, message_tail, one_line,
 };
 use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
 use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES};
@@ -60,7 +60,6 @@ const IDENTITY_PAUSE_MILLIS: u64 = 1_000;
 const SUMMARY_CHARS_MAX: usize = TAIL_REPLY_CHARS_MAX / 6;
 const ATTEMPT_LABEL: &str = "attempt";
 const RERUN_LABEL: &str = "rerun";
-const RERUN_OF_LABEL: &str = "rerun_of";
 const RERUN_ROLE: &str = "security";
 const RERUN_FROM_ROLES: [&str; 2] = ["review", "native-review"];
 const RERUN_TRIES: u32 = 3;

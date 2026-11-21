@@ -64,6 +64,11 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   the first message, and one command whose text held a local path, reworded. The rerun gets a
   handoff reply built from these `command_execution` items (`command`, `exit_code`,
   `aggregated_output`) and `agent_message` texts.
+  Known limits: the `codex review` transcript also holds command output, so a reviewed file
+  that prints the filter's `ERROR:` line near the end of a run that then fails can cause one
+  extra rerun (read-only, at most one per task). The handoff carries the last 160 characters
+  of each command's output, as the failure reply's log tail already does, so a secret a review
+  printed can reach the rerun's thread too.
 
 ## Codex review
 

@@ -92,6 +92,7 @@ pub const LISTING_PAGES_MAX: usize = 16;
 pub const REPLIES_MAX: usize = 10_000;
 /// The schema a reviewer posts each finding under.
 const FINDING_SCHEMA: &str = "rider-finding";
+pub const RERUN_OF_LABEL: &str = "rerun_of";
 /// The reasons a fenced write gives when its claim is over or was never held.
 const CLAIM_LOST_REASONS: [&str; 2] = ["claim_lost", "claim_not_held"];
 /// The reasons `vb` gives when it could not reach the board at all.
@@ -1139,10 +1140,12 @@ pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     let cursor = Cursor(parse_id_text(&thread.cursor)?.0);
     let mut amendments: Vec<Amendment> = Vec::new();
     let mut others: Vec<Amendment> = Vec::new();
+    let made_by_rider = view.labels.iter().any(|(key, _)| key == RERUN_OF_LABEL);
     for reply in thread.replies {
         let by = &reply.by;
         // The board verifies `actor` and `principal`; a profile is only a name its login picks.
-        let amends = by.principal == owner && (by.actor == owner || by.actor == creator);
+        let by_creator = by.actor == creator && !made_by_rider;
+        let amends = by.principal == owner && (by.actor == owner || by_creator);
         let id = Cursor(parse_id_text(&reply.id)?.0);
         let (profile, text) = (reply.by.profile, reply.text);
         let to = if amends { &mut amendments } else { &mut others };
