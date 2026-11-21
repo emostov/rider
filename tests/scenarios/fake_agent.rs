@@ -404,7 +404,9 @@ echo "$#" > "$world/{ARGS_DIR}/$task-$attempt.argc"
 [ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 env | grep -E '^(GH|GITHUB)_' | sort > "$world/{ARGS_DIR}/$task-$attempt.gh-env"
-env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.env"
+# bash and dash each export a different set of their own variables.
+env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | grep -v -x -e PWD -e OLDPWD -e SHLVL -e _ \
+  | sort > "$world/{ARGS_DIR}/$task-$attempt.env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""

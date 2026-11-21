@@ -98,13 +98,10 @@ fn an_untrusted_task_sees_only_the_allowed_variables() {
         "GIT_CONFIG_VALUE_0",
         "HOME",
         "PATH",
-        "PWD",
         "RIDER_AGENT_ACK_FILE",
         "RIDER_AGENT_PID_FILE",
         "RIDER_AGENT_STOP_FILE",
         "RIDER_AGENT_VB_DIR",
-        "SHLVL",
-        "_",
     ]
     .map(String::from)
     .into();

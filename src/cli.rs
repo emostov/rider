@@ -1528,7 +1528,9 @@ fn queue_board(config: &Config) -> Result<Option<VbCli>, CliError> {
 
 fn queue_wait(config: &Config, minutes: u32) -> Result<u8, CliError> {
     assert!(minutes <= WAIT_MINUTES_MAX);
-    let deadline = Instant::now() + Duration::from_secs(u64::from(minutes) * 60);
+    let setting = std::env::var(daemon::TEST_MILLIS_VAR).ok();
+    let second = queue_wait::set_second(setting.as_deref()).map_err(CliError::QueueWait)?;
+    let deadline = Instant::now() + second * (minutes * 60);
     let Some(board) = queue_board(config)? else {
         return Ok(1);
     };

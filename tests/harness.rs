@@ -90,7 +90,7 @@ fn an_oversized_prompt_is_an_error() {
 #[test]
 fn reader_slots_are_returned_after_each_run() {
     let _sharing = sharing_the_reader_budget();
-    const RUNS: usize = 4 * 2 * AGENTS_MAX as usize / 2 + 1;
+    const RUNS: usize = 4 * (2 + 1) * AGENTS_MAX as usize / 2 + 1;
     let scratch = Scratch::new("slots");
     let log = scratch.root.join("agent.log");
     for _ in 0..RUNS {
@@ -174,7 +174,7 @@ fn a_wall_clock_set_back_counts_no_time_and_the_attempt_ends_at_its_limit() {
 
 #[test]
 fn a_run_past_the_reader_budget_is_refused_and_the_holders_finish() {
-    const HOLDERS_MAX: usize = 4 * 2 * AGENTS_MAX as usize / 2 + 1;
+    const HOLDERS_MAX: usize = 4 * (2 + 1) * AGENTS_MAX as usize / 2 + 1;
     const POLLS_MAX: u32 = 1000;
     let _alone = READER_BUDGET
         .write()

@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +24,10 @@ pub const GITHUB_POLL_SECONDS_MAX: u64 = 300;
 const CALL_SECONDS_MAX: u64 = 30;
 const CALL_POLL_MILLIS: u64 = 50;
 const QUEUE_POLLS_MAX: u32 = 4096;
+const SECOND_MILLIS: u64 = 1000;
+const SECOND_SETTING: &str = "second=";
+
+static SECOND: OnceLock<Duration> = OnceLock::new();
 const REPLY_BYTES_MAX: usize = 16 * 1024 * 1024;
 const THREADS_MAX: usize = 1024;
 const COMMENTS_MAX: usize = 4096;
@@ -66,6 +71,7 @@ pub enum WaitError {
     TooManyItems,
     TooManyPolls,
     PollPanicked,
+    Setting(String),
 }
 
 impl WaitError {
@@ -82,7 +88,8 @@ impl WaitError {
             | WaitError::Stopped(_)
             | WaitError::TooManyItems
             | WaitError::TooManyPolls
-            | WaitError::PollPanicked => false,
+            | WaitError::PollPanicked
+            | WaitError::Setting(_) => false,
         }
     }
 }
@@ -130,6 +137,10 @@ impl fmt::Display for WaitError {
             }
             WaitError::TooManyPolls => write!(f, "the wait polled {QUEUE_POLLS_MAX} times"),
             WaitError::PollPanicked => write!(f, "a poll thread panicked"),
+            WaitError::Setting(value) => write!(
+                f,
+                "RIDER_TEST_MILLIS must be {SECOND_SETTING}<1 to {SECOND_MILLIS}>, not {value:?}"
+            ),
         }
     }
 }
@@ -202,7 +213,7 @@ pub fn run(program: &'static str, args: &[&str], deadline: Instant) -> Result<Ve
         let read = stdout.map(|stdout| stdout.take(bound).read_to_end(&mut out));
         let _ = send.send(read.unwrap_or(Ok(0)).map(|_| out));
     });
-    let call_limit = Instant::now() + Duration::from_secs(CALL_SECONDS_MAX);
+    let call_limit = Instant::now() + second() * CALL_SECONDS_MAX as u32;
     let limit = deadline.min(call_limit);
     let stopped = || {
         if limit < call_limit {
@@ -567,6 +578,28 @@ fn poll(
     results
 }
 
+pub fn set_second(setting: Option<&str>) -> Result<Duration, WaitError> {
+    let millis = match setting {
+        None => SECOND_MILLIS,
+        Some(value) => (value.strip_prefix(SECOND_SETTING))
+            .and_then(|millis| millis.parse::<u64>().ok())
+            .filter(|millis| (1..=SECOND_MILLIS).contains(millis))
+            .ok_or_else(|| WaitError::Setting(value.chars().take(64).collect()))?,
+    };
+    let second = *SECOND.get_or_init(|| Duration::from_millis(millis));
+    assert!(second > Duration::ZERO && second <= Duration::from_millis(SECOND_MILLIS));
+    Ok(second)
+}
+
+fn second() -> Duration {
+    let second = SECOND
+        .get()
+        .copied()
+        .unwrap_or(Duration::from_millis(SECOND_MILLIS));
+    assert!(second > Duration::ZERO);
+    second
+}
+
 struct Schedule {
     due: Option<Instant>,
     gap: u64,
@@ -586,7 +619,8 @@ impl Schedule {
 
     fn polled(&mut self, at: Instant) {
         assert!(self.due.is_some());
-        self.due = Some(at + Duration::from_secs(self.gap));
+        let gap = u32::try_from(self.gap).unwrap_or(u32::MAX);
+        self.due = Some(at + second().saturating_mul(gap));
         self.gap = self.gap.saturating_mul(2).min(self.max);
     }
 }

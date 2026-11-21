@@ -22,13 +22,19 @@ fn given_fake_reviews_and_gh(world: &World, reviews: &str, gh: &str) {
     for (name, reply) in [("reviews", reviews), ("gh", gh)] {
         fs::write(world.root.join(format!("{name}.json")), reply).expect("write the reply");
         let script = format!(
-            "#!/bin/sh\ndate +%s >> \"${WORLD_VAR}/{name}.calls\"\n\
+            "#!/bin/sh\nperl -MTime::HiRes=time -e 'printf \"%d\\n\", time * 1000' \
+             >> \"${WORLD_VAR}/{name}.calls\"\n\
              printf '%s\\n' \"$*\" >> \"${WORLD_VAR}/{name}.args\"\n\
              cat \"${WORLD_VAR}/{name}.json\"\n"
         );
         let path = world.agents.join(name);
         fs::write(&path, script).expect("write the fake");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod the fake");
+        // macOS checks a newly written program on its first run, which can take a second.
+        let warmed = world.command(&path).stdout(Stdio::null()).status();
+        assert!(warmed.expect("run the fake once").success());
+        fs::remove_file(world.root.join(format!("{name}.calls"))).expect("forget the warm-up");
+        fs::remove_file(world.root.join(format!("{name}.args"))).expect("forget the warm-up");
     }
 }
 
@@ -67,10 +73,19 @@ fn when_the_queue_is_waited_on(world: &World) -> (Output, Duration) {
 }
 
 // The one-minute timeout outlives the world's command bound, so this run has its own.
+const SECOND_MILLIS: u64 = 200;
+
+fn rider_seconds(seconds: u64) -> Duration {
+    Duration::from_millis(seconds * SECOND_MILLIS)
+}
+
 fn when_the_queue_is_waited_on_until_the_timeout(world: &World) -> (Option<i32>, Duration, String) {
     let started = Instant::now();
     let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
-    command.args(["queue", "wait", "--timeout", "1"]);
+    let second = format!("second={SECOND_MILLIS}");
+    command
+        .env("RIDER_TEST_MILLIS", second)
+        .args(["queue", "wait", "--timeout", "1"]);
     let stderr = world.root.join("wait.stderr");
     let file = fs::File::create(&stderr).expect("create the stderr file");
     command.stdout(Stdio::null()).stderr(file);
@@ -192,18 +207,19 @@ fn rider_queue_wait_exits_3_at_the_timeout_after_polls_at_the_stated_intervals()
 
     assert_eq!((code, stderr.as_str()), (Some(3), ""));
     assert!(
-        took >= Duration::from_secs(59) && took < Duration::from_secs(70),
+        took >= rider_seconds(59) && took < rider_seconds(70),
         "{took:?}"
     );
     let packets = calls(&world, "reviews");
     assert_eq!(
         packets.len(),
         3,
-        "packet polls at 0, 10 and 30 seconds: {packets:?}"
+        "packet polls at 0, 10 and 30 Rider seconds: {packets:?}"
     );
     let gaps: Vec<u64> = packets.windows(2).map(|pair| pair[1] - pair[0]).collect();
     assert!(
-        (9..=11).contains(&gaps[0]) && (19..=21).contains(&gaps[1]),
+        (9 * SECOND_MILLIS..=11 * SECOND_MILLIS).contains(&gaps[0])
+            && (19 * SECOND_MILLIS..=21 * SECOND_MILLIS).contains(&gaps[1]),
         "{gaps:?}"
     );
     assert_eq!(
@@ -342,7 +358,7 @@ fn rider_queue_wait_stops_a_hung_gh_and_still_exits_3_at_the_timeout() {
     let (code, took, stderr) = when_the_queue_is_waited_on_until_the_timeout(&world);
 
     assert_eq!(code, Some(3));
-    assert!(took < Duration::from_secs(70), "{took:?}");
+    assert!(took < rider_seconds(70), "{took:?}");
     assert_eq!(stderr, "rider: gh did not finish within 30 seconds\n");
     assert_eq!(calls(&world, "gh").len(), 1);
 }
@@ -455,7 +471,7 @@ fn rider_queue_wait_stops_a_gh_whose_child_holds_its_output_and_exits_3_at_the_t
     let (code, took, stderr) = when_the_queue_is_waited_on_until_the_timeout(&world);
 
     assert_eq!(code, Some(3));
-    assert!(took < Duration::from_secs(70), "{took:?}");
+    assert!(took < rider_seconds(70), "{took:?}");
     assert_eq!(stderr, "rider: gh did not finish within 30 seconds\n");
 }
 
