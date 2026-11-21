@@ -22,9 +22,8 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
 
 ## Troubleshooting
 
-The `vb` commands below reach the local board with `BOARD_URL`
-(`http://127.0.0.1:4100/api/board` by default); the Board CLI is under
-`<rider home>/node/node_modules/.bin`.
+`rider vb` runs the Board CLI under `<rider home>/node/node_modules/.bin` on the local board
+(`BOARD_URL`, `http://127.0.0.1:4100/api/board` by default).
 
 - **`rider status` says the daemon is not running.** Run `rider up`. If it does not start,
   `daemon.log` says why: an error in `rider.toml` names the field and the file.
@@ -33,18 +32,18 @@ The `vb` commands below reach the local board with `BOARD_URL`
 - **On macOS every agent fails at once with `sandbox_apply: Operation not permitted`.** The
   daemon was started inside a sandbox, and macOS does not let a sandboxed process confine an
   agent again. Start `rider up` from a terminal that is not sandboxed.
-- **`vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
+- **`rider vb tasks work/<project>` says "Couldn't find channel".** The channel exists only after
   its first task.
 - **A failed task's log reply is cut short.** The reply keeps within the board's message
   limit and names the whole log; `rider logs <id>` prints it.
 - **A task is blocked as `invalid_brief`.** The reason names the label to fix. Fix it with
-  `vb label`, then `vb tasks unblock <id>`.
+  `rider vb label`, then `rider vb tasks unblock <id>`.
 - **A task is blocked as `rider_error`: "Rider will not reuse the worktree ... was not made
   for this board".** Each worktree records the board it was made for, in a `.rider-board`
   file in its git directory. The board's identity is the oldest post in its `rider/identity`
   channel, read once when the daemon starts, so restart the daemon after replacing the board
   and leave that channel alone. Keep what you need from the named directory, remove it with
-  `git worktree remove <dir>` from the repository, then `vb tasks unblock <id>`.
+  `git worktree remove <dir>` from the repository, then `rider vb tasks unblock <id>`.
 - **Many `node ... vb` processes are left running.** `rider reap` lists Board CLI processes
   whose board no longer answers; `rider reap --yes` stops them.
 

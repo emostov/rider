@@ -9,35 +9,19 @@ Rider runs one agent per task, each in its own git worktree, with a model picked
 
 ## Feature highlights
 
-- **Ride a swarm to a goal.** Say `ride a swarm to <goal>` in a coding-agent session. The
-  goal can be one feature, many features at once, a milestone, or a list of GitHub issues.
-  The `ride-swarm` skill makes the session the lead, and the lead starts the daemon with
-  `rider up`.
-- **Parallel agents with hard limits.** Rider caps the total number of agents, the number of
-  building agents at once, and the slots of each role. Set them under `[limits]` and each
-  role in `rider.toml`; `rider config` prints the values in effect.
-- **A role for each job.** `implement` (Opus) and `light` (Sonnet) write code. `review` runs
-  `codex exec` and `native-review` runs Codex's built-in `codex review`. `security` runs on
-  Mythos, and `qa` tests the result. Roles are configurable: change any role's harness,
-  model, prompt and slots, or add roles of your own, under `[roles.<name>]` in `rider.toml`.
-- **Reviews at the end of each PR.** The lead runs a `review` and a `native-review` of the
-  whole diff in parallel, then one fix task for their blocking findings. A Mythos `security`
-  review of the whole PR comes last.
-- **One rider.toml for every repository.** `<rider home>/rider.toml` holds the roles and
-  limits. A `[repo."<absolute path>".roles.<role>]` table sets the skills a role runs for
-  that repository's tasks only. `rider config --repo <path>` prints what those tasks see.
-- **Ship finished work as PRs.** Ask the lead to ship the stack. The `ship-swarm` skill opens
-  pull requests, as drafts if you choose, gets CI green and answers review threads. The lead
-  merges a PR only when its CI is green and its review is done; Rider never pushes or merges
-  by itself. The first time, it asks how you like its loops to run and saves the answers in
-  `<rider home>/ship.toml`.
-- **Skills and prompts built into the binary.** The skills and the roles' prompts ship inside
-  `rider`, so they always match it. `rider skills install --into ~/.claude/skills` (Claude
-  Code) or `--into ~/.codex/skills` (Codex) writes the skills where your agent reads them. Rider
-  updates those installs when a newer `rider up`, `rider daemon` or `rider skills install` runs.
-- **Coming: an owner review queue.** Milestone 5 adds `rider queue`, a queue for triaging
-  reviews of other people's PRs and following up on feedback on your own PRs. It is not on
-  `main` yet.
+- **Ship many features at once.** Say `ride a swarm to <goal>`: a feature, a milestone or a
+  list of GitHub issues. One lead plans it; agents build it in parallel.
+- **The right model for each job.** Opus builds, Sonnet takes small edits, Codex reviews and
+  Mythos checks security. Change any role or add your own.
+- **Every PR reviewed by other models.** Two Codex reviews, one fix, then a Mythos security
+  pass, before anything merges.
+- **From goal to merged PR.** Rider opens draft PRs, gets CI green and answers review threads.
+- **Your review queue, triaged.** `rider queue` lines up other people's PRs to review and the
+  feedback waiting on yours, with agents preparing each one.
+- **One config for every repository.** Per-repository skills and settings in one
+  `rider.toml`, for side projects and careful production work alike.
+- **Safe to leave running.** Hard limits on agents, a worktree per task, and recovery from
+  crashes and board outages.
 
 ## Getting started
 
@@ -56,9 +40,10 @@ for Claude Code or `~/.codex/skills` for Codex.
 ## Quickstart
 
 The `ride-swarm` skill needs Rust, Node 22, `jq`, and both `claude` and `codex` on `PATH`,
-each signed in. It stops and names any of those that is missing. It installs what it can
-and tells you: `rider` with `cargo install --git`, and the Board CLI with an unpinned
-`npm install @vercel/board` under `<rider home>/node`.
+each signed in. It stops and names any of those that is missing. It installs `rider`
+with `cargo install --git` when it is absent and tells you. Rider installs the Board CLI
+it needs from npm under its home the first time `rider up`, `rider serve` or `rider vb`
+runs, and `rider vb <args>` runs it on the local board.
 
 Open a coding-agent session in a terminal you keep open and say `ride a swarm to <goal>`.
 The lead starts the daemon with `rider up`, plans the goal into tasks on the board, and
@@ -76,25 +61,6 @@ rider logs <id>     # the newest attempt's log of a task; -f follows it
 ```
 
 The board's web inspector is at <http://127.0.0.1:4100>.
-
-To stop by hand, `rider down` lets running agents finish and claims nothing new.
-`rider down --now` stops every agent at once and releases its task. `rider kill <id>` stops
-one task's agent and fails the task.
-
-Agents run with permission prompts skipped, as your user: they can read and change anything
-your account can, not only the repository. Run Rider only where you accept that. The daemon
-never pushes or merges; work stays on local branches named `rider/<task id>-<slug>` until
-you ship it.
-
-On macOS Rider starts each agent under `sandbox-exec`. The agent, and every process it starts,
-detached or in a process group of its own, cannot connect to `rider.sock`, so it cannot run
-`rider down`, `rider kill` or any other command that talks to the daemon. It also cannot write,
-rename or delete `rider.sock`, `daemon.lock`, `agents.json`, `cursor`, `board.json`,
-`daemon.log`, `board.log`, anything under `agents/` or `logs/`, the Rider home itself, or a
-directory above it. Everything else is allowed: an agent can still signal the daemon's process
-and change `rider.toml`, `prompts/` and the rest of the home. On Linux agents are not confined.
-
-Maintaining Rider? See [MAINTAINERS.md](MAINTAINERS.md).
 
 ## How it's built
 
