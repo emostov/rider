@@ -210,6 +210,18 @@ pub enum BoardError {
     },
 }
 
+impl BoardError {
+    pub fn call_failed(&self) -> bool {
+        matches!(
+            self,
+            BoardError::Spawn(_)
+                | BoardError::Io(_)
+                | BoardError::TimedOut { .. }
+                | BoardError::Unreachable { .. }
+        )
+    }
+}
+
 impl fmt::Display for BoardError {
     /// One line saying how `vb` failed, with its own text cut short.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

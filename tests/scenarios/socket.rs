@@ -3,13 +3,15 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
 
@@ -27,6 +29,15 @@ const DAEMON_STARTS: usize = 20;
 const WATCH_POLLS_MAX: u64 = u64::MAX;
 const SEAT_PROBES_MAX: usize = 1000;
 const SEAT_PROBE_MILLIS: u64 = 50;
+const DAEMON_IDLE_SECONDS: u64 = 5;
+const REQUEST_BYTES_MAX: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const SOCKET_PATH_BYTES_MAX: usize = 107;
+#[cfg(not(target_os = "linux"))]
+const SOCKET_PATH_BYTES_MAX: usize = 103;
+const SOCKET_SUFFIX_BYTES: usize = "/rider.sock".len();
+const FOLLOWER_LINES_MAX: usize = 1 << 16;
+const SEAT_FREE_SECONDS: u64 = 5;
 
 #[test]
 fn a_client_flooding_bad_requests_without_reading_never_holds_up_rider_status() {
@@ -157,6 +168,185 @@ fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
         Vec::<&str>::new(),
         "left behind by a daemon that stopped"
     );
+}
+
+#[test]
+fn an_oversized_request_gets_its_bad_request_reply_before_the_connection_ends() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    let mut client = given_a_client_on_the_socket(&world);
+
+    client
+        .write_all(&vec![b'x'; REQUEST_BYTES_MAX + 1])
+        .expect("send the oversized request");
+    let data = then_the_client_reads_to_its_end(&client);
+
+    let text = String::from_utf8(data).expect("the daemon sends UTF-8");
+    let first: Value = serde_json::from_str(text.lines().next().unwrap_or_default())
+        .unwrap_or_else(|_| panic!("no reply line before the end: {text:?}"));
+    assert_eq!(first["error"]["code"], json!("bad_request"), "{first}");
+}
+
+#[test]
+fn idle_connections_in_every_seat_are_closed_so_rider_status_answers() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::HoldTalking]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+    let mut follow = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    follow.args(["logs", "-f", &task]).stdout(Stdio::piped());
+    let mut follower = follow.spawn().expect("start rider logs -f");
+    let lines = crate::lines_of(follower.stdout.take().expect("rider logs -f output"));
+    let first = lines.recv_timeout(Duration::from_secs(READ_SECONDS_MAX));
+    let opened = Instant::now();
+    let idle: Vec<UnixStream> = (1..CLIENTS_MAX)
+        .map(|_| given_a_client_on_the_socket(&world))
+        .collect();
+
+    let closed: Vec<Vec<u8>> = idle.iter().map(then_the_client_reads_to_its_end).collect();
+    let closed_after = opened.elapsed();
+    drop(idle);
+    let answered = when_rider_status_shows_within(&world, "board up", SEAT_FREE_SECONDS);
+    let following = follower.try_wait().expect("poll rider logs -f");
+    world.release_agent(&task);
+    let deadline = Instant::now() + Duration::from_secs(READ_SECONDS_MAX);
+    let rest: Vec<String> = (0..FOLLOWER_LINES_MAX)
+        .map_while(|_| {
+            lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+        })
+        .collect();
+    let followed = then_the_child_exits_within(&mut follower, READ_SECONDS_MAX);
+
+    assert!(
+        closed_after >= Duration::from_secs(DAEMON_IDLE_SECONDS),
+        "the idle connections were closed after {closed_after:?}"
+    );
+    assert!(
+        answered,
+        "rider status stayed busy after the idle clients went"
+    );
+    assert_eq!(first, Ok(fake_agent::hold_line(&task)));
+    assert_eq!(following, None, "rider logs -f ended while it followed");
+    assert_eq!(closed, vec![Vec::<u8>::new(); CLIENTS_MAX - 1]);
+    assert_eq!(followed, Some(0));
+    let summary = fake_agent::summary(&task, 0);
+    assert!(rest.iter().any(|line| line.contains(&summary)), "{rest:?}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_log_read_slowly_past_the_idle_cutoff_reaches_rider_logs_whole() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = 7;
+    given_a_log_larger_than_every_buffer(&world, task);
+    given_a_running_daemon(&mut world);
+
+    let mut logs = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    logs.args(["logs", "-f", &task.to_string()])
+        .stdout(Stdio::piped());
+    let mut reader = logs.spawn().expect("start rider logs -f");
+    let mut output = reader.stdout.take().expect("rider logs -f output");
+    thread::sleep(Duration::from_secs(DAEMON_IDLE_SECONDS + 1));
+    let read = thread::spawn(move || {
+        let mut data = Vec::new();
+        output.read_to_end(&mut data).map(|_| data.len())
+    });
+    let exit = then_the_child_exits_within(&mut reader, READ_SECONDS_MAX);
+
+    assert_eq!(exit, Some(0));
+    let read = read
+        .join()
+        .expect("the reader ends")
+        .expect("read the output");
+    assert_eq!(read, LOG_LINES * LOG_LINE_BYTES);
+}
+
+#[test]
+fn a_home_too_long_for_a_socket_address_fails_naming_the_limit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let longest = given_a_home_whose_socket_path_is(&mut world, SOCKET_PATH_BYTES_MAX);
+    let fits = when_rider_runs(&world, &["status"]);
+    let too_long = given_a_home_whose_socket_path_is(&mut world, SOCKET_PATH_BYTES_MAX + 1);
+
+    let up = when_rider_runs(&world, &["up"]);
+    let status = when_rider_runs(&world, &["status"]);
+
+    assert_eq!(fits.code, Some(1), "{fits:?}");
+    assert!(
+        fits.stderr.contains("the daemon is not running"),
+        "{fits:?}"
+    );
+    assert_eq!(up.code, Some(1), "{up:?}");
+    assert!(up.stderr.contains("byte limit for a socket path"), "{up:?}");
+    assert!(
+        status.stderr.contains("byte limit for a socket path"),
+        "{status:?}"
+    );
+    assert_eq!(entries(&too_long), Vec::<String>::new());
+    assert_ne!(longest, too_long);
+}
+
+#[test]
+fn a_direct_daemon_with_a_home_too_long_for_a_socket_address_creates_nothing() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let home = given_a_home_whose_socket_path_is(&mut world, SOCKET_PATH_BYTES_MAX + 1);
+
+    let daemon = when_rider_runs(&world, &["daemon"]);
+
+    assert_eq!(daemon.code, Some(1), "{daemon:?}");
+    assert!(
+        daemon.stderr.contains("byte limit for a socket path"),
+        "{daemon:?}"
+    );
+    assert_eq!(entries(&home), Vec::<String>::new());
+}
+
+fn given_a_home_whose_socket_path_is(world: &mut World, bytes: usize) -> PathBuf {
+    let parent = world.root.clone();
+    let home = bytes - SOCKET_SUFFIX_BYTES;
+    let used = parent.as_os_str().len() + 1;
+    assert!(used < home, "the temporary directory is too long");
+    world.home = parent.join("h".repeat(home - used));
+    assert_eq!(world.home.join("rider.sock").as_os_str().len(), bytes);
+    world.home.clone()
+}
+
+fn entries(dir: &Path) -> Vec<String> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    read.map(|entry| {
+        let entry = entry.expect("read a directory entry");
+        entry.file_name().to_string_lossy().into_owned()
+    })
+    .collect()
+}
+
+fn then_the_child_exits_within(child: &mut Child, seconds: u64) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            return status.code();
+        }
+        thread::sleep(Duration::from_millis(SEAT_PROBE_MILLIS));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("the child did not exit within {seconds} seconds");
 }
 
 struct StopOnDrop<'a>(&'a AtomicBool);

@@ -46,6 +46,7 @@ pub struct Checkout {
     pub branch: Option<String>,
     /// The commit HEAD points at when `prepare` returns.
     pub start_head: String,
+    pub base: Option<String>,
 }
 
 /// Why a checkout could not be prepared or released.
@@ -321,6 +322,15 @@ fn plan(brief: &Brief, board: &dyn Board) -> Result<Plan, WorktreeError> {
     Ok(Plan::NewBranch { branch, from })
 }
 
+fn base_of(plan: &Plan) -> Option<String> {
+    let Plan::NewBranch { from, .. } = plan else {
+        return None;
+    };
+    let base = from.strip_prefix(HEADS_PREFIX).unwrap_or(from);
+    assert!(!base.is_empty() && git::is_safe_ref(base));
+    Some(base.to_string())
+}
+
 fn add(repo: &Path, dir: &Path, plan: Plan) -> Result<Option<String>, WorktreeError> {
     assert!(dir.is_absolute() && repo.is_absolute());
     let branch = match plan {
@@ -452,10 +462,12 @@ fn reuse(
     let start_head = git::head(&dir)?;
     assert!(brief.role.commits_expected || branch.is_none());
     assert!(branch.as_deref().is_none_or(|b| !b.is_empty()));
+    let base = plan(brief, board).ok().as_ref().and_then(base_of);
     Ok(Checkout {
         dir,
         branch,
         start_head,
+        base,
     })
 }
 
@@ -510,10 +522,12 @@ pub fn prepare(
                 dir: held,
                 branch: Some(branch.clone()),
                 start_head: String::new(),
+                base: None,
             };
             let _ = release(&left, &brief.repo, home);
         }
     }
+    let base = base_of(&plan);
     let branch = add(&brief.repo, &dir, plan)?;
     let path = record_path(&dir)?;
     fs::write(&path, &identity.0).map_err(|error| WorktreeError::BoardRecord {
@@ -526,6 +540,7 @@ pub fn prepare(
         dir,
         branch,
         start_head,
+        base,
     })
 }
 

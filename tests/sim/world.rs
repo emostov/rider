@@ -1027,6 +1027,7 @@ impl World {
                     .and_then(|fake| fake.labels.iter().find(|(name, _)| name == "role"))
                     .map(|(_, role)| role.clone());
                 let event = match (self.rng.u32(0..10), role) {
+                    _ if self.board_fails() => Event::BoardFailed(Call::Prepare(run)),
                     (0, _) | (_, None) => Event::PrepareBlocked {
                         run,
                         kind: "invalid_brief".to_string(),
@@ -1066,6 +1067,10 @@ impl World {
             Action::Renew { run, task } => self.renew(run, task),
             Action::Judge { run, .. } => {
                 let id = self.expect(Some(run), "judge");
+                if self.board_fails() {
+                    self.reply(id, Event::BoardFailed(Call::Judge(run)));
+                    return Ok(());
+                }
                 let verdict = match self.rng.u32(0..3) {
                     0 => Verdict::Complete {
                         result: "done".to_string(),
