@@ -68,10 +68,12 @@ Agents run as your user with permission prompts skipped, so they can read and ch
 account can: files, credentials and the network.
 
 On macOS Rider starts each agent under `sandbox-exec`. The agent and every process it starts
-cannot connect to the daemon's socket, signal a process outside the agent's sandbox, or write
-Rider's control files, `rider.toml`, `<rider home>/prompts`, the Board CLI, or the `rider`,
-`git`, `node`, `npm` and `sh` programs the daemon runs. The daemon's own git commands ignore
-hooks, fsmonitor, filters and other commands set in a repository's config.
+cannot connect to the daemon's socket, signal a process outside the agent's sandbox, open apps
+through LaunchServices or send Apple events, or write Rider's control files, `rider.toml`,
+`<rider home>/prompts`, any directory on `PATH`, or the install directory of a program the
+daemon runs (`rider`, `git`, `node`, `npm`, `sh` and the Board CLI). The daemon runs its own git
+commands under the same sandbox with no network, so hooks, filters and remotes set in a
+repository's config run confined.
 
 On Linux agents are not confined: an agent can run `rider down` or `rider kill`, stop the
 daemon, or rewrite its files. The same holds on macOS when the daemon itself was started inside
