@@ -3,7 +3,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, Stdio};
+use std::process::Stdio;
 
 use crate::board::{LABELS_MAX, TaskId, TaskView};
 use crate::git;
@@ -36,6 +36,7 @@ pub struct Brief {
     /// Label `restack=1`: the task rebases its `onto` branch, so it may drop the starting commit.
     pub restack: bool,
     pub github: bool,
+    pub untrusted: bool,
     pub text: String,
 }
 
@@ -44,6 +45,7 @@ pub struct Brief {
 pub enum BriefError {
     NoRole,
     UnknownRole(String),
+    RoleOff(String),
     NoRepo,
     RepoNotAbsolute(String),
     /// The repo path, or the reason it could not be checked.
@@ -58,7 +60,14 @@ pub enum BriefError {
     BadResume(String),
     BadRestack(String),
     BadSource(String),
+    BadUntrusted(String),
+    UntrustedInGit(&'static str),
     RestackWithoutOnto,
+    /// An `onto` task on a role without commits, which names only a session to resume.
+    OntoWithoutResume {
+        onto: TaskId,
+        role: &'static str,
+    },
     /// The `base` task, which the task does not need.
     BaseNotNeeded(TaskId),
     OfSelf,
@@ -90,6 +99,11 @@ impl fmt::Display for BriefError {
                 f,
                 "Change the `role` label from {value:?} to one of implement, light, \
                  review, native-review, security or qa."
+            ),
+            BriefError::RoleOff(role) => write!(
+                f,
+                "Change the `role` label from {role:?}: the role is turned off by \
+                 `enabled = false` under [roles.{role}] in rider.toml."
             ),
             BriefError::NoRepo => write!(
                 f,
@@ -133,10 +147,25 @@ impl fmt::Display for BriefError {
                 f,
                 "Change the `source` label from {value:?} to github, or remove it."
             ),
+            BriefError::BadUntrusted(value) => write!(
+                f,
+                "Change the `untrusted` label from {value:?} to 1, or remove it."
+            ),
+            BriefError::UntrustedInGit(key) => write!(
+                f,
+                "Remove the `{key}` label: an untrusted task gets no git worktree or branch, \
+                 only a scratch directory."
+            ),
             BriefError::RestackWithoutOnto => write!(
                 f,
                 "Remove the `restack` label, or set `onto` to the task whose branch this task \
                  rebases."
+            ),
+            BriefError::OntoWithoutResume { onto, role } => write!(
+                f,
+                "Set the `resume` label to 1 to continue the agent session of task #{}, or \
+                 remove the `onto` label: a {role} task works on no branch.",
+                onto.0
             ),
             BriefError::BaseNotNeeded(base) => write!(
                 f,
@@ -185,6 +214,9 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     );
     let role = label(view, "role").ok_or(BriefError::NoRole)?;
     let role = role_from_label(role).ok_or_else(|| BriefError::UnknownRole(echo(role)))?;
+    if !role.enabled {
+        return Err(BriefError::RoleOff(role.label.to_string()));
+    }
     let repo = parse_repo(label(view, "repo"))?;
     let base = parse_id_label(view, "base")?;
     let onto = parse_id_label(view, "onto")?;
@@ -192,7 +224,12 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     if base.is_some() && onto.is_some() {
         return Err(BriefError::BaseAndOnto);
     }
-    if role.needs_of && of.is_none() {
+    let untrusted = match label(view, "untrusted") {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => return Err(BriefError::BadUntrusted(echo(other))),
+    };
+    if role.needs_of && of.is_none() && !untrusted {
         return Err(BriefError::ReviewWithoutOf);
     }
     if of == Some(view.id) {
@@ -220,6 +257,19 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     if restack && onto.is_none() {
         return Err(BriefError::RestackWithoutOnto);
     }
+    if let Some(onto) = onto.filter(|_| !role.commits_expected && !resume) {
+        let role = role.label;
+        return Err(BriefError::OntoWithoutResume { onto, role });
+    }
+    let in_git = [
+        ("base", base.is_some()),
+        ("from", from.is_some()),
+        ("restack", restack),
+        ("onto", onto.is_some() && role.commits_expected),
+    ];
+    if let Some((key, _)) = in_git.iter().find(|(_, set)| untrusted && *set) {
+        return Err(BriefError::UntrustedInGit(key));
+    }
     check_git_repo(&repo)?;
     let brief = Brief {
         id: view.id,
@@ -232,13 +282,16 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         resume,
         restack,
         github,
+        untrusted,
         text: view.text.clone(),
     };
     assert!(brief.repo.is_absolute());
     assert!(!brief.restack || brief.onto.is_some());
+    assert!(brief.role.commits_expected || brief.onto.is_none() || brief.resume);
     assert!(brief.base.is_none_or(|base| view.needs.contains(&base)));
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
-    assert!(!brief.role.needs_of || brief.of.is_some());
+    assert!(!brief.role.needs_of || brief.of.is_some() || brief.untrusted);
+    assert!(!brief.untrusted || (brief.base.is_none() && brief.from.is_none()));
     assert!(brief.of != Some(brief.id));
     assert!(brief.role.commits_expected || brief.role.needs_of);
     Ok(brief)
@@ -293,11 +346,7 @@ fn check_git_repo(repo: &Path) -> Result<(), BriefError> {
         let reason = format!("{shown:?} is not a directory");
         return Err(BriefError::RepoNotAGitRepo(reason));
     }
-    let mut git = Process::new("git");
-    for name in git::ENV_REMOVED {
-        git.env_remove(name);
-    }
-    let status = git
+    let status = git::hardened()
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--git-dir"])

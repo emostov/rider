@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["surface", "pr", "path", "line", "in_reply_to", "body", "from"],
+  "properties": {
+    "surface": {
+      "enum": ["github_comment", "github_reply", "github_review"],
+      "description": "Where it would be posted: a new comment, a reply in a thread, or a review"
+    },
+    "pr": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$",
+      "description": "The pull request, as <owner>/<name>#<n>, the queue item's pr label"
+    },
+    "path": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "Path relative to the repository root, or null for a top-level comment"
+    },
+    "line": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "The line in path the comment is on, or null"
+    },
+    "in_reply_to": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "The GitHub comment or review thread it answers, or null"
+    },
+    "body": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The text to post, exactly as the owner will see it"
+    },
+    "from": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "The link to the packet thread it was converted from, or null"
+    }
+  }
+}

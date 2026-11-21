@@ -9,6 +9,8 @@ pub mod git;
 pub mod github;
 pub mod harness;
 pub mod queue;
+pub mod queue_files;
+pub mod queue_wait;
 pub mod reap;
 pub mod roles;
 pub mod run_task;

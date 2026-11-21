@@ -86,7 +86,7 @@ fn a_task_whose_branch_label_names_another_branch_is_blocked_and_the_label_kept(
 }
 
 #[test]
-fn a_failed_attempt_counts_its_attempt_and_replies_with_its_log_keeping_the_worktree() {
+fn a_failed_attempt_counts_its_attempt_replies_with_its_log_and_removes_its_clean_worktree() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -104,7 +104,12 @@ fn a_failed_attempt_counts_its_attempt_and_replies_with_its_log_keeping_the_work
     let log = world.home.join("logs").join(&task).join("2.jsonl");
     let log = format!("The whole log: {}", log.display());
     assert!(text.contains(&log), "{text}");
-    assert!(worktree_dir(&world, &task).exists());
+    then_the_worktree_is_removed(&world, &task);
+    let branch = task_label(&world, &task, "branch").expect("the task has a branch label");
+    assert!(
+        branches(&world).contains(&branch),
+        "branch {branch} is kept"
+    );
 }
 
 #[test]
@@ -643,8 +648,16 @@ fn an_agent_cli_missing_from_path_fails_its_attempt_replying_with_the_error() {
     assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
     assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
     let text = task_text(&world, &task);
-    assert!(text.contains("agent exited 127"), "{text}");
-    assert!(text.contains("claude: not found"), "{text}");
+    let (exit, error) = if cfg!(target_os = "macos") {
+        (
+            "agent exited 71",
+            "execvp() of 'claude' failed: No such file or directory",
+        )
+    } else {
+        ("agent exited 127", "claude: not found")
+    };
+    assert!(text.contains(exit), "{text}");
+    assert!(text.contains(error), "{text}");
 }
 
 #[test]

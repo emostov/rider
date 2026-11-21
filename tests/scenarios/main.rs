@@ -1,6 +1,8 @@
 //! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
+mod agent_process;
+mod agent_stream;
 mod board_feed;
 mod brief_settle;
 mod codex_review;
@@ -13,13 +15,18 @@ mod github;
 mod harness_cli;
 mod pr;
 mod queue;
+mod queue_files;
 mod queue_unclaimed;
+mod queue_wait;
+mod resume_review;
 mod review_pr;
 mod run_task;
+mod shipped_prompts;
 mod skills;
 mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
+mod untrusted;
 mod worktree_git;
 mod world;
 
@@ -33,9 +40,10 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use fake_agent::{Behaviour, Run};
+use shipped_prompts::shipped_schema;
 use steps::*;
 use world::{MAIN, PROJECT, World};
 
@@ -61,7 +69,177 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
         "summary": fake_agent::summary(&task, 0),
         "behind": [],
     });
+    let schema = shipped_schema("rider-result@3.json");
+    let fields: Vec<&String> = record.as_object().expect("an object").keys().collect();
+    let mut required: Vec<&str> = (schema["required"].as_array().expect("required fields"))
+        .iter()
+        .map(|field| field.as_str().expect("a field name"))
+        .collect();
+    required.sort_unstable();
+    assert_eq!(required, fields);
+    for field in fields {
+        assert!(schema["properties"][field].is_object(), "{field}");
+    }
     assert_eq!(task_records(&world, &task, "rider-result"), vec![record]);
+}
+
+#[test]
+fn the_usage_an_agent_reports_is_in_its_result_record_and_in_rider_status() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add one work file."));
+    given_the_agent_will(&world, &task, &[Behaviour::CommitReportingUsage]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+    let status = when_rider_runs(&world, &["status"]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    let spent = "4 in, 300 cache read, 20 cache write, 50 out, $0.25";
+    let lines: Vec<&str> = status.stdout.lines().collect();
+    assert_eq!(
+        lines.get(1),
+        Some(&format!("spent {spent}").as_str()),
+        "{status:?}"
+    );
+    let project = format!("{PROJECT} spent {spent}");
+    assert!(lines.contains(&project.as_str()), "{status:?}");
+    let settled = format!("  #{task} spent {spent}");
+    assert!(
+        when_rider_status_shows_within(&world, &settled, SETTLE_SECONDS_MAX),
+        "{:?}",
+        when_rider_runs(&world, &["status"])
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let records = task_records(&world, &task, "rider-result");
+    let usage = json!({
+        "input": 4,
+        "cache_write": 20,
+        "cache_read": 300,
+        "output": 50,
+        "cost_usd": fake_agent::COST_USD,
+    });
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["usage"], usage);
+}
+
+#[test]
+fn a_codex_review_on_sol_6_2_records_the_last_usage_snapshot_priced_with_cache_writes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodel = \"gpt-6.2-sol\"\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_model(&world, &review, 0), "gpt-6.2-sol");
+    let records = task_records(&world, &review, "rider-result");
+    assert_eq!(records.len(), 1, "{records:?}");
+    let usage = json!({
+        "input": 100,
+        "cache_read": 600,
+        "cache_write": 300,
+        "output": 50,
+        "cost_usd": 0.00151,
+    });
+    assert_eq!(records[0]["usage"], usage);
+}
+
+fn when_a_task_and_its_review_report(
+    world: &mut World,
+    built: Behaviour,
+    review: Behaviour,
+) -> [(String, Value); 2] {
+    let task = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
+    given_the_agent_will(world, &task, &[built]);
+    let reviewed = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &task)
+        .needs(&task)
+        .role("review");
+    let reviewed = when_the_lead_creates(world, &reviewed);
+    given_the_agent_will(world, &reviewed, &[review]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(world, &[&task, &reviewed]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    [task, reviewed].map(|id| {
+        let records = task_records(world, &id, "rider-result");
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = records[0].clone();
+        (id, record)
+    })
+}
+
+#[test]
+fn the_usage_in_each_recorded_stream_is_in_its_result_record() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let [(_, built), (_, reviewed)] = when_a_task_and_its_review_report(
+        &mut world,
+        Behaviour::ReplayRecorded,
+        Behaviour::ReplayRecorded,
+    );
+
+    let claude = json!({
+        "input": 4,
+        "cache_read": 52114,
+        "cache_write": 26676,
+        "output": 126,
+        "cost_usd": 0.226367,
+    });
+    let codex = json!({
+        "input": 12,
+        "cache_read": 61023,
+        "cache_write": 20835,
+        "output": 519,
+        "cost_usd": 0.063403,
+    });
+    assert_eq!((&built["usage"], &reviewed["usage"]), (&claude, &codex));
+    assert_eq!(
+        (&built["summary"], &reviewed["summary"]),
+        (&json!("DONE"), &json!("DONE"))
+    );
+}
+
+#[test]
+fn a_result_naming_usage_twice_completes_without_usage_and_a_cost_past_its_bound_is_unpriced() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let [(task, built), (_, reviewed)] = when_a_task_and_its_review_report(
+        &mut world,
+        Behaviour::CommitRepeatingUsage,
+        Behaviour::ReportHugeUsage,
+    );
+
+    assert_eq!(built["summary"], json!(fake_agent::summary(&task, 0)));
+    assert_eq!(built["usage"], Value::Null, "{built}");
+    let tokens = 1u64 << 40;
+    let unpriced = json!({
+        "input": tokens,
+        "cache_read": tokens,
+        "cache_write": tokens,
+        "output": tokens,
+        "cost_usd": null,
+    });
+    assert_eq!(reviewed["usage"], unpriced);
 }
 
 #[test]
@@ -229,6 +407,7 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
         .role("review");
     let review = when_the_lead_creates(&world, &review);
     given_the_agent_will(&world, &review, &[Behaviour::RecordHead]);
+    given_the_users_codex_config_declares_mcp_servers(&world, &["beta", "alpha"]);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
 
@@ -240,6 +419,21 @@ fn a_review_runs_detached_at_the_reviewed_head_and_completes_leaving_the_branch_
     let runs = agent_runs_for(&world, &review);
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].dir, worktree_dir(&world, &review));
+    let dir = worktree_dir(&world, &review).display().to_string();
+    let options = ["exec", "-c", "mcp_servers.alpha.enabled=false"]
+        .into_iter()
+        .chain(["-c", "mcp_servers.beta.enabled=false"])
+        .chain(["--model", "gpt-6.1-sol", "--json"])
+        .chain(["--dangerously-bypass-approvals-and-sandbox"])
+        .chain(["--disable", "plugins", "--disable", "apps", "-C", &dir]);
+    let expected: Vec<String> = options.map(String::from).collect();
+    assert_eq!(fake_agent::options(&world.root, &review, 0), expected);
+    let count = fake_agent::arg_count(&world.root, &review, 0);
+    assert_eq!(
+        count,
+        expected.len() + 2,
+        "one prompt argument follows `--`"
+    );
     assert_eq!(task_label(&world, &review, "branch"), None);
     assert_eq!(branches(&world), vec![MAIN.to_string(), branch]);
     then_the_worktree_is_removed(&world, &review);
@@ -869,6 +1063,36 @@ fn a_repository_table_giving_implement_a_skill_puts_it_in_only_that_repositorys_
 }
 
 #[test]
+fn rider_config_refuses_a_role_named_lead_or_beginning_lead_dash() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let prompt = world.root.join("lead-prompt.md");
+    fs::write(&prompt, "You lead.\n").expect("write a prompt");
+    for label in ["lead", "lead-two"] {
+        let toml = format!(
+            r#"[roles.{label}]
+harness = "claude"
+model = "m"
+title = "Lead"
+model_name = "M"
+model_slug = "x"
+prompt = "{}"
+commits = true
+"#,
+            prompt.display()
+        );
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{output:?}");
+        let problem = format!("roles.{label} is reserved for the lead's board profile");
+        assert!(output.stderr.contains(&problem), "{output:?}");
+    }
+}
+
+#[test]
 fn an_unknown_key_in_a_repository_role_table_stops_the_daemon_naming_it() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;
@@ -950,6 +1174,69 @@ fn a_task_labelled_with_the_removed_polish_role_is_left_unclaimed_as_an_unknown_
     assert_eq!(task_state(&world, &polish), "ready");
     assert_eq!(task_claim_profile(&world, &polish), None);
     assert_eq!(agent_runs_for(&world, &polish).len(), 0);
+}
+
+#[test]
+fn a_task_of_a_role_turned_off_in_rider_toml_is_blocked_unclaimed_naming_the_setting() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nenabled = false\n");
+    let new = an_implement_task(&world, "Add the work.").role("light");
+    let task = when_the_lead_creates(&world, &new);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = "Change the `role` label from \"light\": the role is turned off by \
+                  `enabled = false` under [roles.light] in rider.toml.";
+    let block = Some(("invalid_brief".to_string(), reason.to_string()));
+    assert_eq!(task_block(&world, &task), block);
+    assert_eq!(task_epoch(&world, &task), 0);
+    assert_eq!(agent_runs(&world), vec![]);
+}
+
+#[test]
+fn rider_config_shows_a_built_in_role_turned_off() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.security]\nenabled = false\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let default = include_str!("rider-config-default.toml");
+    let header = "[roles.security]\n";
+    let expected = default.replacen(header, &format!("{header}enabled = false\n"), 1);
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn a_rider_toml_role_named_like_the_lead_is_refused_naming_the_role() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    for label in ["lead", "lead-x"] {
+        let toml = format!(
+            r#"[roles.{label}]
+harness = "claude"
+model = "claude-lead-model"
+title = "{label}"
+model_name = "Lead Model"
+model_slug = "lead-model"
+prompt = "implement"
+commits = true
+"#
+        );
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{output:?}");
+        let field = format!("roles.{label} is reserved");
+        assert!(output.stderr.contains(&field), "{output:?}");
+    }
 }
 
 #[test]
@@ -1109,7 +1396,7 @@ fn a_shortened_attempt_limit_stops_a_never_exiting_agent_and_fails_its_task() {
 }
 
 #[test]
-fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_writes_nothing() {
+fn a_canceled_running_tasks_agent_is_stopped_with_no_writes_and_its_worktree_removed() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -1131,7 +1418,12 @@ fn a_running_agents_task_canceled_on_the_board_stops_the_agent_and_the_daemon_wr
     assert_eq!(task_state(&world, &task), "canceled");
     assert_eq!(task_replies(&world, &task), replies);
     assert_eq!(task_labels(&world, &task), labels);
-    assert!(worktree_dir(&world, &task).is_dir(), "the worktree is kept");
+    then_the_worktree_is_removed(&world, &task);
+    let branch = task_label(&world, &task, "branch").expect("the task has a branch label");
+    assert!(
+        branches(&world).contains(&branch),
+        "branch {branch} is kept"
+    );
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
@@ -1185,7 +1477,7 @@ fn a_task_onto_one_that_is_still_settling_waits_for_its_worktree_and_completes()
     // released, so the fix is ready while the branch is still checked out. Only the result
     // post is held: the daemon posts the board's identity before it follows.
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@3", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_task_is(&world, &fix, "ready");
@@ -1325,6 +1617,31 @@ fn a_daemon_log_that_is_a_fifo_is_refused_and_the_daemon_exits() {
     assert!(
         output.stderr.contains("daemon.log is not a regular file"),
         "{output:?}"
+    );
+}
+
+#[test]
+fn a_fix_resumes_a_session_recorded_before_the_harness_word_as_claudes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&built]);
+    assert_eq!(states, vec!["completed"]);
+    let path = world.home.join("logs").join(&built).join("session");
+    let recorded = fs::read_to_string(&path).expect("read the recorded session");
+    let old = recorded.strip_prefix("claude ").expect("a Claude session");
+    fs::write(&path, old).expect("write the session in the earlier shape");
+    let fix = a_fix(&world, "Fix the work.", &built, &built, true);
+    let fix = when_the_lead_creates(&world, &fix);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&fix]);
+
+    assert_eq!(states, vec!["completed"]);
+    let session = fake_agent::session(&built, 0);
+    assert_eq!(
+        fake_agent::options(&world.root, &fix, 0),
+        claude_options(Some(&session))
     );
 }
 
@@ -1540,7 +1857,7 @@ fn a_session_recorded_for_another_repository_is_not_resumed() {
 }
 
 #[test]
-fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
+fn a_resumed_fix_of_a_codex_implement_role_starts_fresh_and_says_why() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -1561,7 +1878,19 @@ fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
     let runs = agent_runs_for(&world, &fix);
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].harness, "codex");
-    assert_eq!(agent_model(&world, &fix, 0), "gpt-test-implement");
+    let args = fake_agent::args(&world.root, &fix, 0);
+    assert!(
+        args.starts_with("exec\n--model\ngpt-test-implement\n"),
+        "{args}"
+    );
+    let note = "Starting a fresh session despite `resume=1`: Codex continues a session in \
+                place, so only a review resumes one, and role implement is not review.";
+    let replies = task_replies(&world, &fix);
+    let texts: Vec<&str> = replies
+        .iter()
+        .filter_map(|reply| reply["text"].as_str())
+        .collect();
+    assert!(texts.contains(&note), "{texts:?}");
 }
 
 /// An implement task whose agent will `behave`, given its role only then, so a running
@@ -1618,6 +1947,9 @@ fn claude_options(session: Option<&str>) -> Vec<String> {
         "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
+        "--strict-mcp-config",
+        "--mcp-config",
+        r#"{"mcpServers":{}}"#,
     ]
     .map(String::from)
     .into();
@@ -2682,12 +3014,11 @@ fn rider_kill_of_a_task_the_owner_canceled_writes_nothing_to_the_task() {
 
     assert_eq!(kill.code, Some(0), "{kill:?}");
     assert!(when_the_process_ends_within(run.pid, 10));
-    thread::sleep(Duration::from_secs(2));
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert_eq!(task_state(&world, &task), "canceled");
     assert_eq!(task_replies(&world, &task), replies);
     assert_eq!(task_labels(&world, &task), labels);
-    when_the_daemon_is_sent_sigterm(&world);
-    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
 
 const LOG_POLL_MILLIS: u64 = 50;
@@ -2742,7 +3073,7 @@ fn an_onto_task_completes_after_a_daemon_crash_between_complete_and_worktree_rel
     given_the_agent_will(&world, &built, &[Behaviour::Commit]);
     given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@3", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_daemon_crashes(&mut world);
@@ -2772,7 +3103,7 @@ fn a_worktree_left_by_a_crash_that_another_board_made_is_kept_and_the_onto_task_
     given_the_agent_will(&world, &built, &[Behaviour::Commit]);
     given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@3", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_daemon_crashes(&mut world);
@@ -2868,6 +3199,7 @@ fn a_second_restart_within_the_lease_leaves_an_unidentified_live_agent_s_task_al
 
 #[test]
 fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_be_read() {
+    const AGENT_FILES_MAX: usize = 256;
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -2878,7 +3210,10 @@ fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_b
     when_agents_json_names(&world, leftover.pid);
     when_the_daemon_crashes(&mut world);
     fs::write(world.home.join("agents.json"), "{").expect("corrupt agents.json");
-    fs::write(world.home.join("agents").join("bad.pid"), "1").expect("add a bad pid file");
+    for n in 0..=AGENT_FILES_MAX {
+        let stray = world.home.join("agents").join(format!("stray-{n}.txt"));
+        fs::write(stray, "").expect("add a stray file");
+    }
     let left = "leaving every held claim to its lease";
 
     given_a_running_daemon(&mut world);
@@ -2895,6 +3230,42 @@ fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_b
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert_eq!(runs.len(), 1, "{}", world.daemon_log());
     assert!(when_the_process_ends_within(leftover.pid, 10));
+}
+
+#[test]
+fn a_restart_removes_a_pid_file_naming_no_task_and_a_stale_left_file_naming_no_group() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let agents = world.home.join("agents");
+    fs::create_dir_all(&agents).expect("make the agents directory");
+    fs::write(agents.join("bad.pid"), "1").expect("add a pid file naming no task");
+    let stale = fs::File::create(agents.join("123.left")).expect("add a stale left file");
+    let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+    stale.set_modified(old).expect("age the left file");
+    fs::write(agents.join("124.left"), "").expect("add a fresh left file");
+
+    given_a_running_daemon(&mut world);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+
+    let mut left: Vec<String> = fs::read_dir(&agents)
+        .expect("list the agents directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["124.left".to_string()]);
+    let log = world.daemon_log();
+    assert!(
+        !log.contains("leaving every held claim to its lease"),
+        "{log}"
+    );
 }
 
 fn when_the_daemon_log_shows_twice(world: &World, text: &str) {

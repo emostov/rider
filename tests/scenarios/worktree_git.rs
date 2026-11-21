@@ -244,6 +244,49 @@ fn a_finished_worktree_with_a_commit_only_its_head_reflog_reaches_is_kept() {
 }
 
 #[test]
+fn a_finished_worktree_hiding_an_edit_behind_an_index_flag_is_kept() {
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let Some(mut world) = given_a_board_and_a_repository() else {
+            return;
+        };
+
+        let task = when_a_held_agent_finishes_after(&mut world, |world, dir| {
+            fs::write(dir.join("input.txt"), "committed\n").expect("write the input");
+            git_in(world, dir, &["add", "--", "input.txt"]);
+            git_in(world, dir, &["commit", "-q", "-m", "Input."]);
+            git_in(world, dir, &["update-index", flag, "--", "input.txt"]);
+            fs::write(dir.join("input.txt"), "edited\n").expect("edit the input");
+        });
+
+        let why = "a tracked file is marked assume-unchanged or skip-worktree";
+        then_the_worktree_is_kept_because(&world, &task, why);
+    }
+}
+
+#[test]
+fn a_finished_worktree_in_a_repository_without_files_ref_storage_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo.clone();
+    git_in(&world, &repo, &["refs", "migrate", "--ref-format=reftable"]);
+
+    let task = when_a_held_agent_finishes_after(&mut world, |world, dir| {
+        let branch = git_in(world, dir, &["symbolic-ref", "--short", "HEAD"]);
+        git_in(world, dir, &["checkout", "-q", "--detach"]);
+        git_in(
+            world,
+            dir,
+            &["commit", "-q", "--allow-empty", "-m", "Orphan."],
+        );
+        git_in(world, dir, &["checkout", "-q", &branch]);
+    });
+
+    let why = "its repository does not keep refs in files, so its HEAD reflog cannot be checked";
+    then_the_worktree_is_kept_because(&world, &task, why);
+}
+
+#[test]
 fn a_finished_worktree_holding_only_ignored_build_output_is_removed_and_its_branch_kept() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
@@ -668,7 +711,7 @@ fn when_the_checkout_changes_after_completion(
 ) {
     let marker = world.root.join("result-posted");
     let release = world.root.join("release-result");
-    given_vb_waits_for(world, "rider-result@2", &marker, &release);
+    given_vb_waits_for(world, "rider-result@3", &marker, &release);
     given_a_running_daemon(world);
     when_the_file_exists(world, &marker);
     assert_eq!(task_state(world, task), "completed");
@@ -780,20 +823,17 @@ fn a_finished_worktree_with_a_cherry_pick_stopped_after_its_first_commit_is_kept
 }
 
 #[test]
-fn a_hook_printing_past_git_output_bound_blocks_the_task_and_its_process_group_is_killed() {
+fn a_git_call_printing_past_its_output_bound_blocks_the_task_and_its_process_group_is_killed() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let hooks = world.root.join("hooks");
-    fs::create_dir_all(&hooks).expect("create the hooks directory");
     let pid_file = world.root.join("sleeper.pid");
-    let hook = format!(
-        "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nhead -c 4194305 /dev/zero\nexec sleep 60\n",
+    let git = format!(
+        "#!/bin/sh\ncase \" $* \" in *\" worktree add \"*)\n  sleep 60 &\n  echo $! > '{}'\n  \
+         head -c 4194305 /dev/zero\n  exec sleep 60 ;;\nesac\nexec /usr/bin/git \"$@\"\n",
         pid_file.display()
     );
-    crate::world::write_executable(&hooks.join("post-checkout"), &hook);
-    let hooks_path = hooks.to_str().expect("UTF-8 path");
-    world.git_ok(&["config", "core.hooksPath", hooks_path]);
+    crate::world::write_executable(&world.tools.join("git"), &git);
     let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     given_a_running_daemon(&mut world);
 
@@ -806,11 +846,11 @@ fn a_hook_printing_past_git_output_bound_blocks_the_task_and_its_process_group_i
         block.1.contains("printed more than 4194304 bytes"),
         "{block:?}"
     );
-    let pid = fs::read_to_string(&pid_file).expect("the hook wrote its sleeper's pid");
+    let pid = fs::read_to_string(&pid_file).expect("git wrote its sleeper's pid");
     let pid: u32 = pid.trim().parse().expect("a pid");
     assert!(
         when_the_process_ends_within(pid, 10),
-        "the hook's background sleep {pid} outlived the git call"
+        "git's background sleep {pid} outlived the git call"
     );
 }
 
@@ -857,12 +897,11 @@ fn a_commit_another_local_branch_also_holds_is_not_the_agents_own() {
         git_in(world, dir, &["branch", "sibling"]);
     });
 
-    then_the_task_failed_because(
-        &world,
-        &task,
-        &state,
-        "the branch has no commits of its own",
-    );
+    assert_eq!(state, "failed");
+    let text = task_text(&world, &task);
+    let reason = "the branch has no commits of its own";
+    assert!(text.contains(reason), "no {reason:?} in {text}");
+    then_the_worktree_is_removed(&world, &task);
 }
 
 #[test]
@@ -997,4 +1036,267 @@ fn a_task_whose_heading_is_all_punctuation_gets_the_fallback_branch_name() {
         then_the_branch_has_the_agents_commit(&world, &task, 0),
         format!("rider/{task}-task")
     );
+}
+
+#[test]
+fn a_failed_tasks_dirty_worktree_is_kept_and_its_thread_says_why() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(states, vec!["failed".to_string()]);
+    let dir = worktree_dir(&world, &task);
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    then_a_reply_holds(
+        &world,
+        &task,
+        &format!("Kept the worktree at {}", dir.display()),
+    );
+}
+
+#[test]
+fn rider_clean_yes_removes_a_cleaned_up_worktree_with_its_ignored_build_output() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+    assert_eq!(states, vec!["failed".to_string()]);
+    let dir = worktree_dir(&world, &task);
+    fs::remove_file(dir.join(format!("uncommitted-{task}.txt"))).expect("remove the file");
+    fs::create_dir_all(dir.join(".git-ignored-target")).expect("create the build output");
+    let exclude = git_in(&world, &dir, &["rev-parse", "--git-path", "info/exclude"]);
+    let exclude = dir.join(exclude);
+    fs::create_dir_all(exclude.parent().expect("a parent")).expect("create info");
+    fs::write(&exclude, ".git-ignored-target/\n").expect("ignore the build output");
+    fs::write(dir.join(".git-ignored-target").join("big.o"), "x").expect("write output");
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    then_the_worktree_is_removed(&world, &task);
+    let removed = format!("removed #{task} {}", dir.display());
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![removed]);
+}
+
+#[test]
+fn rider_clean_yes_keeps_an_open_tasks_worktree_and_says_why() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Block]);
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+    assert_eq!(states, vec!["blocked".to_string()]);
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    let dir = worktree_dir(&world, &task);
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    let kept = format!("kept #{task} {}: its task is blocked", dir.display());
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
+}
+
+#[test]
+fn rider_clean_yes_keeps_a_canceled_tasks_worktree_while_its_agent_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::HoldIgnoringTerm]);
+    given_a_running_daemon_with(&mut world, &[(TEST_MILLIS_VAR, "lease=30000,tick=1000")]);
+    when_the_agent_has_started(&world, &task);
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    let dir = worktree_dir(&world, &task);
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    let kept = format!(
+        "kept #{task} {}: its task has a running agent",
+        dir.display()
+    );
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
+    world.release_agent(&task);
+}
+
+#[test]
+fn a_blocked_task_canceled_after_its_agent_exits_has_its_worktree_removed() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Block]);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["blocked"]);
+    assert!(when_rider_status_shows_within(
+        &world,
+        "0 of 32 running",
+        SETTLE_SECONDS_MAX
+    ));
+    let branch = task_label(&world, &task, "branch").expect("the task has a branch label");
+
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+
+    let dir = worktree_dir(&world, &task);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while dir.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    when_the_daemon_stops(&mut world);
+    then_the_worktree_is_removed(&world, &task);
+    assert!(
+        branches(&world).contains(&branch),
+        "branch {branch} is kept"
+    );
+}
+
+fn given_a_failed_tasks_kept_worktree(world: &mut World) -> (String, std::path::PathBuf) {
+    let task = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
+    given_the_agent_will(world, &task, &[Behaviour::LeaveUncommitted]);
+    let (states, _) = when_the_daemon_runs_until_settled(world, &[&task]);
+    assert_eq!(states, vec!["failed".to_string()]);
+    let dir = worktree_dir(world, &task);
+    fs::remove_file(dir.join(format!("uncommitted-{task}.txt"))).expect("remove the file");
+    (task, dir)
+}
+
+#[test]
+fn a_failed_tasks_untracked_file_is_kept_when_status_hides_untracked_files() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo.clone();
+    git_in(
+        &world,
+        &repo,
+        &["config", "status.showUntrackedFiles", "no"],
+    );
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(states, vec!["failed".to_string()]);
+    let left = worktree_dir(&world, &task).join(format!("uncommitted-{task}.txt"));
+    assert_eq!(
+        fs::read_to_string(left).ok(),
+        Some("left behind\n".to_string())
+    );
+    let why = "it has modified or untracked files";
+    then_a_reply_holds(&world, &task, why);
+}
+
+#[test]
+fn rider_clean_yes_keeps_a_worktree_holding_a_per_worktree_ref() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let (task, dir) = given_a_failed_tasks_kept_worktree(&mut world);
+    let commit = git_in(&world, &dir, &["commit-tree", "HEAD^{tree}", "-m", "Kept."]);
+    git_in(&world, &dir, &["update-ref", "refs/worktree/keep", &commit]);
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    let kept = format!("kept #{task} {}: it holds per-worktree refs", dir.display());
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
+}
+
+#[test]
+fn rider_clean_yes_does_not_follow_a_symlink_at_an_ended_tasks_path() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let open = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &open, &[Behaviour::Block]);
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&open]);
+    assert_eq!(states, vec!["blocked".to_string()]);
+    let branch = task_label(&world, &open, "branch").expect("the task has a branch label");
+    let ended = when_the_lead_creates(&world, &an_implement_task(&world, "Other work."));
+    world.vb_lead(&["tasks", "cancel", &ended, "superseded", "--json"], None);
+    world.vb_lead(&["label", &ended, &format!("branch={branch}")], None);
+    let target = worktree_dir(&world, &open);
+    let link = worktree_dir(&world, &ended);
+    std::os::unix::fs::symlink(&target, &link).expect("plant the symlink");
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    assert!(
+        target.is_dir(),
+        "the open task's worktree is kept: {output:?}"
+    );
+    let kept = format!("kept #{ended} {}: it is a symlink", link.display());
+    assert!(output.stdout.lines().any(|line| line == kept), "{output:?}");
+}
+
+#[test]
+fn a_tracked_edit_hidden_by_a_silent_fsmonitor_hook_fails_the_task_and_keeps_the_worktree() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let hook = world.root.join("fsmonitor.sh");
+    fs::write(&hook, "#!/bin/sh\nprintf 'x\\0'\n").expect("write the hook");
+    let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+    fs::set_permissions(&hook, mode).expect("make the hook runnable");
+    let new = an_implement_task(&world, "Add the work.");
+
+    let (task, state) = when_a_task_settles_after_a_hold(&mut world, &new, |world, dir| {
+        fs::write(dir.join("notes.txt"), "committed\n").expect("write the notes");
+        git_in(world, dir, &["add", "--", "notes.txt"]);
+        git_in(world, dir, &["commit", "-q", "-m", "Notes."]);
+        let hook = hook.to_str().expect("a UTF-8 path");
+        git_in(world, &world.repo, &["config", "core.fsmonitor", hook]);
+        git_in(world, dir, &["status", "--porcelain"]);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(dir.join("notes.txt"), "edited\n").expect("edit the notes");
+    });
+
+    then_the_task_failed_because(
+        &world,
+        &task,
+        &state,
+        "the worktree has uncommitted changes",
+    );
+    let notes = worktree_dir(&world, &task).join("notes.txt");
+    assert_eq!(fs::read_to_string(notes).ok(), Some("edited\n".to_string()));
+}
+
+#[test]
+fn a_finished_worktree_whose_orig_head_alone_names_a_commit_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo.clone();
+    git_in(&world, &repo, &["config", "core.logAllRefUpdates", "false"]);
+
+    let task = when_a_held_agent_finishes_after(&mut world, |world, dir| {
+        git_in(
+            world,
+            dir,
+            &["commit", "-q", "--allow-empty", "-m", "Dropped."],
+        );
+        git_in(world, dir, &["reset", "-q", "--hard", "HEAD~1"]);
+    });
+
+    then_the_worktree_is_kept_because(&world, &task, "commits only its ORIG_HEAD reaches");
+}
+
+#[test]
+fn rider_never_runs_an_fsmonitor_an_agent_planted_in_the_repository_config() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantFsmonitor]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert!(!fake_agent::fsmonitor_ran(&world.root, &task, 0));
 }

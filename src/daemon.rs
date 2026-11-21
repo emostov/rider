@@ -1,11 +1,15 @@
 //! `rider daemon`: the core driven by the board's feed, a timer, signals and worker threads.
 
 use std::cell::Cell;
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -21,26 +25,44 @@ use signal_hook::iterator::Signals;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
-    Board, BoardError, Listing, NewTask, TaskId, TaskState, TaskView, Thread, Timestamp, VbCli,
-    one_line, parse_failure_reason, register_schemas,
+    Board, BoardError, Listing, TaskId, TaskState, TaskView, Thread, Timestamp, VbCli, one_line,
+    parse_failure_reason, register_schemas,
 };
+use crate::brief::BriefError;
 use crate::cli::board_serve;
+#[cfg(target_os = "macos")]
+use crate::config::FILE_NAME as CONFIG_FILE;
 use crate::config::Limits;
 use crate::core::{
     self, ACTIONS_MAX, ATTEMPT_MILLIS_MAX, Action, AgentRecord, Call, Config, Event, LEASE_MILLIS,
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
+use crate::git::{self, GitError};
 use crate::github;
-use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
+use crate::harness::{
+    ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PrivateOpenError,
+    open_private,
+};
+#[cfg(target_os = "macos")]
+use crate::queue_files::PRS_DIR;
+#[cfg(target_os = "macos")]
+use crate::queue_wait::QUEUE_DIR;
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
+#[cfg(target_os = "macos")]
+use crate::run_task::UNTRUSTED_DIR;
 use crate::run_task::{
     Attempt, Env, IdentityUnknown, Judgement, Prepared, RunError, board_identity_at_start,
-    judge_attempt, launch_agent, prepare_attempt, settle_attempt,
+    judge_attempt, launch_agent, prepare_attempt, release_canceled_idle, release_if_canceled,
+    settle_attempt,
 };
 use crate::settle::Verdict;
+#[cfg(target_os = "macos")]
+use crate::socket::SOCKET_FILE;
 use crate::socket::{self, Socket, SocketPath};
+#[cfg(target_os = "macos")]
+use crate::worktree::WORKTREES_DIR;
 
 /// Upper bound on the events waiting for the core; sources block when it is full.
 pub const EVENT_QUEUE_MAX: usize = 1024;
@@ -92,7 +114,9 @@ const BOARD_POLLS_MAX: u64 = u64::MAX;
 /// How long a board the daemon started is given to end after SIGTERM before SIGKILL.
 const BOARD_STOP_MILLIS_MAX: u64 = 10_000;
 const AGENTS_DIR: &str = "agents";
+const STAGED_SUFFIX: &str = ".new";
 const LEFT_EXTENSION: &str = "left";
+const STOP_EXTENSION: &str = "stop";
 /// The directory under the Rider home holding each task's attempt logs.
 pub const LOGS_DIR: &str = "logs";
 const LOCK_BYTES_MAX: u64 = 256;
@@ -134,11 +158,67 @@ until read -r group start 2>/dev/null < "$RIDER_AGENT_ACK_FILE" && [ "$group" = 
   [ "$n" -gt 600 ] && exit 1
   sleep 0.05
 done
+[ -e "$RIDER_AGENT_STOP_FILE" ] && exit 1
 PATH="$RIDER_AGENT_VB_DIR${PATH:+:$PATH}"
 export PATH
 exec "$@""#;
 
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+#[cfg(target_os = "macos")]
+const NODE_MODULES: &str = "node_modules";
+#[cfg(target_os = "macos")]
+const PACKAGE_DEPTH_MAX: usize = 16;
+#[cfg(target_os = "macos")]
+const HOME_DIRS: [&str; 4] = ["board", "wait", "roles", "run"];
+#[cfg(target_os = "macos")]
+const HOME_FILES: [&str; 2] = ["node.lock", "ship.toml"];
+#[cfg(target_os = "macos")]
+const GIT_SHARED_DIRS: [&str; 4] = ["objects", "refs", "reftable", "logs"];
+#[cfg(target_os = "macos")]
+const GIT_SHARED_FILES: [&str; 5] = [
+    "packed-refs",
+    "packed-refs.lock",
+    "FETCH_HEAD",
+    "gc.pid",
+    "gc.log",
+];
+#[cfg(target_os = "macos")]
+const GIT_OWN_FILES: [&str; 6] = [
+    "index",
+    "index.lock",
+    "HEAD",
+    "HEAD.lock",
+    "ORIG_HEAD",
+    "COMMIT_EDITMSG",
+];
+#[cfg(target_os = "macos")]
+const GIT_LINKS: [&str; 4] = ["commondir", "gitdir", "config", "config.worktree"];
+#[cfg(target_os = "macos")]
+const PROGRAMS: [&str; 5] = ["git", "gh", "node", "npm", "sh"];
+#[cfg(target_os = "macos")]
+const DENIED_MAX: usize = 4096;
+#[cfg(target_os = "macos")]
+const PROMPTS_DIR: &str = "prompts";
+#[cfg(target_os = "macos")]
+const SANDBOX_REFUSED_EXIT: i32 = 71;
+#[cfg(target_os = "macos")]
+const SANDBOX_PROBE: &str =
+    "(version 1)\n(allow default)\n(deny file-write* (literal \"/var/empty/rider-probe\"))\n";
+#[cfg(target_os = "macos")]
+const CONTROL_FILES: [&str; 7] = [
+    SOCKET_FILE,
+    LOCK_FILE,
+    AGENTS_FILE,
+    CURSOR_FILE,
+    BOARD_FILE,
+    LOG_FILE,
+    BOARD_LOG_FILE,
+];
+
 /// Where the daemon's files are and how it reaches the board and its agents.
+pub const NODE_DIR: &str = "node";
+
 pub struct Paths {
     pub home: PathBuf,
     pub socket: SocketPath,
@@ -166,16 +246,17 @@ pub enum DaemonError {
     QueueClosed,
     /// `TEST_MILLIS_VAR` is malformed.
     Setting(String),
-    /// The daemon's log exists and is not a regular file.
     NotAFile(PathBuf),
     /// The board's identity could not be read at start-up.
     Identity(IdentityUnknown),
     Schemas(BoardError),
+    Confine(String),
 }
 
 impl fmt::Display for DaemonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
             DaemonError::Held { path, holder } => {
                 write!(f, "{} is held by {holder}", path.display())
             }
@@ -188,7 +269,7 @@ impl fmt::Display for DaemonError {
             DaemonError::JobsFull => write!(f, "more than {JOBS_QUEUED_MAX} actions waited"),
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
-            DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
+            DaemonError::Confine(message) => write!(f, "cannot confine git: {message}"),
             DaemonError::Identity(error) => write!(f, "{error}"),
             DaemonError::Schemas(error) => {
                 write!(
@@ -197,6 +278,19 @@ impl fmt::Display for DaemonError {
                 )
             }
         }
+    }
+}
+
+fn log_error(path: &Path) -> impl FnOnce(PrivateOpenError) -> DaemonError {
+    let path = path.to_path_buf();
+    move |error| match error {
+        PrivateOpenError::NotAFile => DaemonError::NotAFile(path),
+        PrivateOpenError::Replaced => DaemonError::Io {
+            action: "open",
+            message: error.to_string(),
+            path,
+        },
+        PrivateOpenError::Io(error) => io_error("open", &path)(error),
     }
 }
 
@@ -363,6 +457,7 @@ struct Shared {
     lease_millis: u64,
     grace_millis: u64,
     runner_seconds: u64,
+    confine: bool,
     attempts: u8,
     feed: Mutex<FeedSlot>,
     /// The board process the daemon started, if it had to.
@@ -442,7 +537,7 @@ impl Shared {
     }
 }
 
-fn pid_file(home: &Path, task: TaskId) -> PathBuf {
+pub fn pid_file(home: &Path, task: TaskId) -> PathBuf {
     let path = home.join(AGENTS_DIR).join(format!("{}.pid", task.0));
     assert!(path.starts_with(home));
     path
@@ -452,6 +547,12 @@ fn pid_file(home: &Path, task: TaskId) -> PathBuf {
 fn ack_file(pid_file: &Path) -> PathBuf {
     let path = pid_file.with_extension("ack");
     assert!(path != pid_file);
+    path
+}
+
+fn stop_file(pid_file: &Path) -> PathBuf {
+    let path = pid_file.with_extension(STOP_EXTENSION);
+    assert!(path != pid_file && path != ack_file(pid_file));
     path
 }
 
@@ -476,7 +577,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
     let lease_millis = timing.lease_millis;
     let log = Log::start(&paths.home.join(LOG_FILE))?;
-    let unaccounted = stop_leftovers(&paths.home, timing.grace_millis, &log);
+    let unaccounted = stop_leftovers(&paths.home, &timing, &log);
     let saved_cursor = read_cursor(&paths.home, &log);
     let recorder = start_recorder(paths.home.clone())?;
     match reap::find_leaks(&paths.board_url) {
@@ -496,6 +597,10 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let sink: socket::Sink = Arc::new(move |event| send(&sink_events, event));
     let socket = socket::listen(&paths.socket, paths.home.join(LOGS_DIR), sink)
         .map_err(io_error("listen on", paths.socket.path()))?;
+    let confine = confines_agents(&log);
+    if confine {
+        confine_git(&paths)?;
+    }
     let shared = Arc::new(Shared {
         paths,
         events,
@@ -503,6 +608,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         lease_millis,
         grace_millis: timing.grace_millis,
         runner_seconds: timing.runner_millis / 1000,
+        confine,
         attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
         served: Mutex::new(ServedSlot::default()),
@@ -609,8 +715,8 @@ fn start_board(shared: &Arc<Shared>) -> Result<(), DaemonError> {
     }
     let home = &shared.paths.home;
     let path = home.join(BOARD_LOG_FILE);
-    let log = OpenOptions::new().create(true).append(true).open(&path);
-    let log = log.map_err(io_error("open", &path))?;
+    let log = open_private(&path, OpenOptions::new().append(true));
+    let log = log.map_err(log_error(&path))?;
     let err = log.try_clone().map_err(io_error("share", &path))?;
     let vb = &shared.paths.vb;
     let mut command = board_serve(home, vb).map_err(io_error("create the board under", home))?;
@@ -941,6 +1047,11 @@ fn job(
         Action::Resume { run, task, profile } => {
             Box::new(move || resume(&shared, run, task, &profile))
         }
+        Action::Refuse {
+            task,
+            role,
+            profile,
+        } => Box::new(move || refuse(&shared, task, role, &profile)),
         Action::Prepare { run, task } => {
             let profile = find(contexts, run, lost(run, "prepare"))?.profile.clone();
             Box::new(move || prepare(&shared, run, task, &profile))
@@ -961,6 +1072,7 @@ fn job(
             let unjudged = Event::Judged {
                 run,
                 verdict: Verdict::Fail { reason },
+                usage: None,
             };
             let context = find(contexts, run, unjudged.clone())?;
             let attempt = context.attempt.clone().ok_or(unjudged.clone())?;
@@ -1003,6 +1115,11 @@ fn job(
                 Input::plain(Event::BoardExited)
             }
         }),
+        Action::ReleaseWorktree(task) => Box::new(move || {
+            let board = shared.board(DAEMON_PROFILE);
+            release_canceled_idle(task, &shared.paths.home, &shared.paths.board_url, &board);
+            Input::plain(Event::WorktreeChecked)
+        }),
         Action::Reply { .. } | Action::Exit(_) => return Ok(None),
     };
     Ok(Some(job))
@@ -1031,6 +1148,21 @@ fn claim(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
         Err(_) => Event::ClaimRefused(run),
     };
     Input::plain(event)
+}
+
+// Blocks, unclaimed, a ready task whose role is off; `vb` lets the task's owner block it.
+fn refuse(shared: &Shared, task: TaskId, role: String, profile: &str) -> Input {
+    assert!(!profile.is_empty() && !role.is_empty());
+    let reason = BriefError::RoleOff(role).to_string();
+    let outcome = match shared.board(profile).block(task, &reason, "invalid_brief") {
+        Ok(()) => "blocked".to_string(),
+        Err(error) => format!("not blocked: {error}"),
+    };
+    shared.log.write(&format!(
+        "refused #{} of a role that is off: {outcome}",
+        task.0
+    ));
+    Input::plain(Event::Refused(task))
 }
 
 // Renews a claim held from before a restart; it is answered as a claim, keeping its epoch.
@@ -1124,21 +1256,46 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let pid_text = pid_file.to_string_lossy().into_owned();
     let ack = ack_file(&pid_file);
     let ack_text = ack.to_string_lossy().into_owned();
+    let stop = stop_file(&pid_file);
+    let stop_text = stop.to_string_lossy().into_owned();
     let runner_seconds = shared.runner_seconds;
+    let home = shared.paths.home.clone();
+    let vb = shared.paths.vb.clone();
+    let confine = shared.confine;
+    let repo = attempt.repo().to_path_buf();
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
+    let _ = fs::remove_file(&stop);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
+        let unreadable = |error: GitError| HarnessError::Spawn(error.to_string());
+        if confine && cmd.untrusted {
+            let common = git::common_dir(&repo).map_err(unreadable)?;
+            let scratch = dir.parent().unwrap_or(dir).to_path_buf();
+            let repo = [repo.clone(), common];
+            args.extend(confinement(
+                &home,
+                &vb,
+                Confined::Untrusted { repo, scratch },
+            )?);
+        } else if confine {
+            let common = git::common_dir(dir).map_err(unreadable)?;
+            let own = git::git_dir(dir).map_err(unreadable)?;
+            let dirs = [dir.to_path_buf(), common, own];
+            args.extend(confinement(&home, &vb, Confined::Worktree(dirs))?);
+        }
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
         let mut env = cmd.env.clone();
         env.push(("RIDER_AGENT_VB_DIR".to_string(), vb_dir.clone()));
         env.push(("RIDER_AGENT_PID_FILE".to_string(), pid_text.clone()));
         env.push(("RIDER_AGENT_ACK_FILE".to_string(), ack_text.clone()));
+        env.push(("RIDER_AGENT_STOP_FILE".to_string(), stop_text.clone()));
         let wrapped = CommandLine {
             program: "/bin/sh".to_string(),
             args,
             env,
+            untrusted: cmd.untrusted,
             io: cmd.io.clone(),
         };
         launch_agent(&wrapped, dir, log, runner_seconds)
@@ -1149,19 +1306,310 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     // The agent is gone, so its pid may be reused: nothing may signal it any more.
     let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&pid_file);
+    let _ = fs::remove_file(stop_file(&pid_file));
     let _ = shared.recorder.send(Recorded::Ended(task));
+    release_if_canceled(
+        task,
+        &shared.paths.home,
+        &shared.board(DAEMON_PROFILE),
+        attempt,
+    );
     Input {
         event: Event::AgentExited(run),
         extra: Extra::Launched(launched),
     }
 }
 
+enum Confined {
+    DaemonGit,
+    Untrusted {
+        repo: [PathBuf; 2],
+        scratch: PathBuf,
+    },
+    Worktree([PathBuf; 3]),
+}
+
+// macOS still ships the deprecated sandbox-exec. Every process a confined agent starts,
+// detached or in a group of its own, inherits the profile and cannot leave it.
+#[cfg(target_os = "macos")]
+fn confinement(home: &Path, vb: &Path, confined: Confined) -> Result<Vec<String>, HarnessError> {
+    let offline = matches!(confined, Confined::DaemonGit);
+    let (repo, untouchable, scratch): (&[PathBuf], &[PathBuf], _) = match &confined {
+        Confined::Worktree(dirs) => (dirs, &[], None),
+        Confined::Untrusted { repo, scratch } => (&[], repo, Some(scratch)),
+        Confined::DaemonGit => (&[], &[], None),
+    };
+    let unusable = |why: String| HarnessError::Spawn(format!("cannot confine: {why}"));
+    let resolve = |path: &Path| {
+        fs::canonicalize(path)
+            .map_err(|error| unusable(format!("resolve {}: {error}", path.display())))
+    };
+    let quote = |path: &Path| match path.to_str() {
+        Some(text) if !text.contains(['"', '\\']) && !text.contains(char::is_control) => {
+            Ok(format!("\"{text}\""))
+        }
+        _ => Err(unusable(format!(
+            "{} cannot be named in a profile",
+            path.display()
+        ))),
+    };
+    let home = resolve(home)?;
+    let vb = resolve(vb)?;
+    let repo: Vec<PathBuf> = repo
+        .iter()
+        .map(|dir| resolve(dir))
+        .collect::<Result<_, _>>()?;
+    let (mut literals, mut subpaths) = denied_writes(&home, &vb);
+    for dir in repo.iter().skip(1) {
+        literals.extend(dir.ancestors().map(Path::to_path_buf));
+    }
+    for dir in untouchable.iter().map(|dir| resolve(dir)) {
+        let dir = dir?;
+        literals.extend(dir.ancestors().skip(1).map(Path::to_path_buf));
+        subpaths.insert(dir);
+    }
+    let scratch = scratch.map(|scratch| resolve(scratch)).transpose()?;
+    if let Some(scratch) = &scratch {
+        let untrusted = home.join(UNTRUSTED_DIR);
+        if scratch.parent() != Some(untrusted.as_path()) {
+            return Err(unusable(format!("{} is not a scratch", scratch.display())));
+        }
+        subpaths.extend([home.join(WORKTREES_DIR), untrusted]);
+    }
+    let git = match (repo.as_slice(), &scratch) {
+        ([], Some(scratch)) => format!("(allow file-write* (subpath {}))\n", quote(scratch)?),
+        ([], None) => String::new(),
+        ([worktree, common, own], None) => git_rules(worktree, common, own, &quote)?,
+        _ => {
+            return Err(unusable(
+                "a worktree and its two git directories".to_string(),
+            ));
+        }
+    };
+    if literals.len() + subpaths.len() > DENIED_MAX {
+        return Err(unusable(format!("more than {DENIED_MAX} paths to deny")));
+    }
+    let mut denied = Vec::with_capacity(literals.len() + subpaths.len());
+    for path in &literals {
+        denied.push(format!("(literal {})", quote(path)?));
+    }
+    for path in &subpaths {
+        denied.push(format!("(subpath {})", quote(path)?));
+    }
+    let socket = quote(&home.join(SOCKET_FILE))?;
+    let staging = quote(&home.join(socket::BIND_DIR))?;
+    let network = if offline { "(deny network*)\n" } else { "" };
+    let profile = format!(
+        "(version 1)\n(allow default)\n\
+         (deny signal)\n(allow signal (target same-sandbox))\n\
+         (deny lsopen)\n(deny appleevent-send)\n{network}\
+         (deny network-outbound (remote unix-socket (path-literal {socket})))\n\
+         (deny network-outbound (remote unix-socket (subpath {staging})))\n\
+         (deny file-write* {})\n{git}",
+        denied.join(" ")
+    );
+    assert!(denied.len() > 2 * CONTROL_FILES.len() && profile.contains(&socket));
+    Ok(vec![
+        SANDBOX_EXEC.to_string(),
+        "-p".to_string(),
+        profile,
+        "--".to_string(),
+    ])
+}
+
+// What the daemon trusts: its control files and config, every directory on PATH, and the
+// install directory of each program it runs; the ancestors of each are literals, so none can
+// be renamed and replaced by a link.
+#[cfg(target_os = "macos")]
+fn denied_writes(home: &Path, vb: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
+    assert!(home.is_absolute() && vb.is_absolute());
+    let mut subpaths: BTreeSet<PathBuf> = [AGENTS_DIR, LOGS_DIR, NODE_DIR, PROMPTS_DIR]
+        .into_iter()
+        .chain(HOME_DIRS)
+        .chain([socket::BIND_DIR, PRS_DIR, QUEUE_DIR])
+        .map(|name| home.join(name))
+        .collect();
+    let mut literals: BTreeSet<PathBuf> = BTreeSet::new();
+    for name in CONTROL_FILES
+        .into_iter()
+        .chain(HOME_FILES)
+        .chain([CONFIG_FILE])
+    {
+        literals.insert(home.join(name));
+        literals.insert(home.join(format!("{name}{STAGED_SUFFIX}")));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        .take(git::PATH_DIRS_MAX)
+        .filter(|dir| dir.is_absolute())
+        .collect();
+    let programs = PROGRAMS.iter().filter_map(|program| {
+        dirs.iter()
+            .map(|dir| dir.join(program))
+            .find(|f| f.is_file())
+    });
+    let programs = programs
+        .chain(std::env::current_exe())
+        .chain([vb.to_path_buf()]);
+    let installs = programs.filter_map(install_dir);
+    let resolved = dirs.iter().filter_map(|dir| fs::canonicalize(dir).ok());
+    let trusted: Vec<PathBuf> = dirs
+        .iter()
+        .cloned()
+        .chain(resolved)
+        .chain(installs)
+        .collect();
+    let trusted = trusted.into_iter().filter(|dir| !home.starts_with(dir));
+    for dir in trusted.chain([home.to_path_buf()]) {
+        literals.extend(dir.ancestors().skip(1).map(Path::to_path_buf));
+        if dir != home {
+            subpaths.insert(dir);
+        }
+    }
+    literals.insert(home.to_path_buf());
+    assert!(!subpaths.contains(home));
+    (literals, subpaths)
+}
+
+fn confine_git(paths: &Paths) -> Result<(), DaemonError> {
+    let program = git::resolve("git");
+    if !program.is_file() {
+        return Err(DaemonError::Confine("no git on PATH".to_string()));
+    }
+    let sandbox = confinement(&paths.home, &paths.vb, Confined::DaemonGit)
+        .map_err(|error| DaemonError::Confine(error.to_string()))?;
+    assert!(program.is_absolute());
+    if !git::confine(program, sandbox) {
+        return Err(DaemonError::Confine("git is already confined".to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn git_rules(
+    worktree: &Path,
+    common: &Path,
+    own: &Path,
+    quote: &dyn Fn(&Path) -> Result<String, HarnessError>,
+) -> Result<String, HarnessError> {
+    assert!(worktree.is_absolute() && common.is_absolute() && own.is_absolute());
+    let rule = |kind: &str, paths: &[PathBuf]| -> Result<String, HarnessError> {
+        let quoted: Vec<String> = paths
+            .iter()
+            .map(|path| quote(path).map(|path| format!("({kind} {path})")))
+            .collect::<Result<_, _>>()?;
+        Ok(quoted.join(" "))
+    };
+    let mut allowed = vec![rule(
+        "subpath",
+        &GIT_SHARED_DIRS.map(|name| common.join(name)),
+    )?];
+    allowed.push(rule(
+        "literal",
+        &GIT_SHARED_FILES.map(|name| common.join(name)),
+    )?);
+    let own_files = if own == common {
+        allowed.push(rule("literal", &GIT_OWN_FILES.map(|name| own.join(name)))?);
+        Vec::new()
+    } else {
+        allowed.push(rule("subpath", &[own.to_path_buf()])?);
+        GIT_LINKS
+            .map(|name| own.join(name))
+            .into_iter()
+            .chain([own.to_path_buf()])
+            .collect()
+    };
+    let denied = rule("subpath", &[common.to_path_buf(), own.to_path_buf()])?;
+    let link = rule("literal", &[worktree.join(".git")])?;
+    let links = rule("literal", &own_files)?;
+    let rules = format!(
+        "(deny file-write* {denied} {link})\n(allow file-write* {})\n",
+        allowed.join(" ")
+    );
+    assert!(!rules.is_empty());
+    Ok(if links.is_empty() {
+        rules
+    } else {
+        format!("{rules}(deny file-write* {links})\n")
+    })
+}
+
+// A program that is a script inside an npm package runs the rest of its package too.
+#[cfg(target_os = "macos")]
+fn install_dir(program: PathBuf) -> Option<PathBuf> {
+    let file = fs::canonicalize(program).ok()?;
+    let named = |dir: Option<&Path>, name: &str| {
+        dir.and_then(Path::file_name)
+            .is_some_and(|found| found == name)
+    };
+    let scoped = |dir: Option<&Path>| {
+        let name = dir
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy());
+        name.is_some_and(|name| name.starts_with('@'))
+    };
+    let package = file.ancestors().take(PACKAGE_DEPTH_MAX).find(|dir| {
+        let parent = dir.parent();
+        (named(parent, NODE_MODULES) && !scoped(Some(dir)))
+            || (scoped(parent) && named(parent.and_then(Path::parent), NODE_MODULES))
+    });
+    let dir = package.or(file.parent())?.to_path_buf();
+    assert!(file.starts_with(&dir) && dir != file);
+    Some(dir)
+}
+
+// sandbox-exec exits 71, printing `sandbox_apply: Operation not permitted`, when the process
+// that starts it is already in a sandbox: macOS refuses to apply a second profile that denies
+// anything, though it accepts one that only allows.
+#[cfg(target_os = "macos")]
+fn confines_agents(log: &Log) -> bool {
+    let probe = Command::new(SANDBOX_EXEC)
+        .args(["-p", SANDBOX_PROBE, "--", "/usr/bin/true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let nested = probe.is_ok_and(|status| status.code() == Some(SANDBOX_REFUSED_EXIT));
+    if nested {
+        log.write(
+            "agents run unconfined: the daemon runs in a sandbox, \
+             and macOS does not let it confine an agent again",
+        );
+    }
+    !nested
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confines_agents(log: &Log) -> bool {
+    let _ = log;
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confinement(home: &Path, vb: &Path, confined: Confined) -> Result<Vec<String>, HarnessError> {
+    assert!(home.is_absolute() && !vb.as_os_str().is_empty());
+    match confined {
+        Confined::Worktree(dirs) => assert!(dirs.iter().all(|dir| dir.is_absolute())),
+        Confined::Untrusted { repo, scratch } => {
+            assert!(repo.iter().all(|dir| dir.is_absolute()) && scratch.is_absolute());
+        }
+        Confined::DaemonGit => {}
+    }
+    Ok(Vec::new())
+}
+
 fn stop_agent(shared: &Shared, run: RunId, task: TaskId, attempt: Option<&Attempt>) -> Input {
     assert!(shared.grace_millis > 0 && shared.grace_millis <= GRACE_MILLIS);
+    let path = shared.pid_file(task);
     if let Some(attempt) = attempt {
         attempt.stop();
+        // The marker goes before the pid file is read, and the wrapper writes its pid before
+        // it looks for the marker, so an agent starting now either sees it or is signalled.
+        if let Err(error) = fs::write(stop_file(&path), "") {
+            let line = format!("could not mark #{} stopped: {error}", task.0);
+            shared.log.write(&line);
+        }
     }
-    let path = shared.pid_file(task);
     let mut stopped = None;
     // A refused resume's fresh start may have begun before the attempt was told to stop.
     for _ in 0..AGENT_GROUPS_MAX {
@@ -1203,11 +1651,13 @@ fn judge(
     launched: Result<Exit, HarnessError>,
 ) -> Input {
     let board = shared.board(profile);
+    let usage = attempt.usage();
     match judge_attempt(task, &board, attempt, &launched) {
         Ok(judgement) => Input {
             event: Event::Judged {
                 run,
                 verdict: judgement.verdict.clone(),
+                usage,
             },
             extra: Extra::Judgement(Arc::new(judgement)),
         },
@@ -1220,6 +1670,7 @@ fn judge(
             Input::plain(Event::Judged {
                 run,
                 verdict: Verdict::Fail { reason },
+                usage,
             })
         }
         Err(_) => Input::plain(Event::ClaimLost(run)),
@@ -1389,10 +1840,6 @@ impl Board for Guarded<'_> {
         self.gate(false)?;
         self.board.post_structured(id, schema, json)
     }
-    fn create_task(&self, task: &NewTask) -> Result<TaskId, BoardError> {
-        self.gate(true)?;
-        self.board.create_task(task)
-    }
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError> {
         self.gate(true)?;
         self.board.complete(id, result)
@@ -1439,6 +1886,21 @@ impl Board for Guarded<'_> {
     }
     fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError> {
         self.board.create_schema(id, json)
+    }
+    fn set_needs(&self, id: TaskId, needs: &[TaskId]) -> Result<(), BoardError> {
+        self.gate(false)?;
+        self.board.set_needs(id, needs)
+    }
+    fn create_task(
+        &self,
+        channel: &str,
+        text: &str,
+        labels: &[(&str, &str)],
+        needs: &[TaskId],
+        key: &str,
+    ) -> Result<TaskId, BoardError> {
+        self.gate(false)?;
+        self.board.create_task(channel, text, labels, needs, key)
     }
 }
 
@@ -1608,23 +2070,9 @@ struct Log {
 }
 
 impl Log {
-    // Anything there but a regular file is refused before opening, which would block on a FIFO.
     fn start(path: &Path) -> Result<Log, DaemonError> {
-        match fs::metadata(path) {
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(DaemonError::NotAFile(path.to_path_buf()));
-            }
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(io_error("inspect", path)(error));
-            }
-            Ok(_) | Err(_) => {}
-        }
-        let opened = OpenOptions::new().create(true).append(true).open(path);
-        let file = opened.map_err(io_error("open", path))?;
-        let metadata = file.metadata().map_err(io_error("inspect", path))?;
-        if !metadata.is_file() {
-            return Err(DaemonError::NotAFile(path.to_path_buf()));
-        }
+        let file = open_private(path, OpenOptions::new().append(true));
+        let file = file.map_err(log_error(path))?;
         let (lines, queued) = sync_channel::<String>(LOG_QUEUE_MAX);
         let dropped = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&dropped);
@@ -1718,7 +2166,7 @@ enum Recorded {
 /// Writes `bytes` to `path` by renaming a finished file beside it over it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".new");
+    name.push(STAGED_SUFFIX);
     let staged = path.with_file_name(name);
     assert!(staged != path);
     fs::write(&staged, bytes)?;
@@ -1816,7 +2264,7 @@ fn read_pid_files(home: &Path) -> Result<Vec<PidFile>, String> {
         }
         let stem = path.file_stem().and_then(|stem| stem.to_str());
         let Some(task) = stem.and_then(|stem| stem.parse::<u64>().ok()).map(TaskId) else {
-            return Err(format!("{} names no task", path.display()));
+            continue;
         };
         let group = agent_group(&path).map(|group| group.as_raw_nonzero().get());
         let acked = (extension == Some("pid")).then(|| read_ack(&ack_file(&path)));
@@ -1838,7 +2286,8 @@ fn read_ack(path: &Path) -> Option<(i32, u64)> {
 
 /// Stops each agent a crashed daemon left running, only a group whose leader started when a
 /// record says, so a reused pid is never signalled; returns the tasks to leave to their leases.
-fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
+fn stop_leftovers(home: &Path, timing: &Timing, log: &Log) -> Unaccounted {
+    let grace_millis = timing.grace_millis;
     assert!(grace_millis > 0);
     let records = read_agents(home)
         .inspect_err(|error| log.write(&format!("could not read {AGENTS_FILE}: {error}")))
@@ -1894,7 +2343,7 @@ fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
             }
         }
     }
-    clear_agents(home, &recovery.unaccounted, log);
+    clear_agents(home, &recovery.unaccounted, timing.lease_millis, log);
     assert!(groups.len() <= LEFTOVERS_MAX);
     recovery.unaccounted
 }
@@ -1902,7 +2351,9 @@ fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
 // Removes the agents file and every pid, left and ack file, which name no agent of this daemon,
 // but keeps the pid file of an unaccounted task as its left file, apart from the pid file a new
 // attempt writes, which the next start reads while that agent may live.
-fn clear_agents(home: &Path, unaccounted: &Unaccounted, log: &Log) {
+fn clear_agents(home: &Path, unaccounted: &Unaccounted, lease_millis: u64, log: &Log) {
+    assert!(lease_millis > 0);
+    let lease = Duration::from_millis(lease_millis);
     let agents = home.join(AGENTS_FILE);
     if let Err(error) = fs::remove_file(&agents)
         && error.kind() != io::ErrorKind::NotFound
@@ -1922,9 +2373,25 @@ fn clear_agents(home: &Path, unaccounted: &Unaccounted, log: &Log) {
             Unaccounted::Tasks(tasks) => task.is_some_and(|task| tasks.contains(&TaskId(task))),
         };
         let extension = path.extension().and_then(|extension| extension.to_str());
+        let lapsed = || {
+            let age = entry.metadata().and_then(|meta| meta.modified()).ok();
+            let age = age.and_then(|modified| modified.elapsed().ok());
+            age.is_some_and(|age| age > lease) && agent_group(&path).is_none()
+        };
         let removed = match extension {
-            Some("ack") => fs::remove_file(&path),
+            Some("ack" | STOP_EXTENSION) => fs::remove_file(&path),
+            Some("pid" | LEFT_EXTENSION) if task.is_none() => {
+                log.write(&format!("removing {}: it names no task", path.display()));
+                fs::remove_file(&path)
+            }
             Some("pid" | LEFT_EXTENSION) if !kept => fs::remove_file(&path),
+            Some(LEFT_EXTENSION) if lapsed() => {
+                let shown = path.display();
+                log.write(&format!(
+                    "removing {shown}: it names no group and its lease lapsed"
+                ));
+                fs::remove_file(&path)
+            }
             Some("pid") if task.is_some() => fs::rename(&path, path.with_extension(LEFT_EXTENSION)),
             _ => Ok(()),
         };

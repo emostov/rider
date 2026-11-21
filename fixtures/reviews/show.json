@@ -1,0 +1,224 @@
+{
+ "description": null,
+ "patchsets": [
+  {
+   "base_sha": "0000000000000000000000000000000000000000",
+   "branch_name": "<redacted>",
+   "code_snapshot_status": null,
+   "number": 1,
+   "packet_present": true,
+   "pushed_at": "2026-11-19T18:02:53Z",
+   "stats": {
+    "additions": 0,
+    "deletions": 0,
+    "files": 0
+   }
+  }
+ ],
+ "selected_patchset": {
+  "base_sha": "0000000000000000000000000000000000000000",
+  "branch_name": "<redacted>",
+  "files": [
+   {
+    "additions": 0,
+    "deletions": 0,
+    "old_path": null,
+    "path": "<redacted>",
+    "raw_diff": "<redacted>",
+    "status": "modified"
+   }
+  ],
+  "number": 1,
+  "packet": {
+   "format_version": 0,
+   "sections": [
+    {
+     "rows": [
+      {
+       "body": "<redacted>",
+       "kind": "markdown"
+      },
+      {
+       "body": "<redacted>",
+       "kind": "markdown"
+      },
+      {
+       "body": "<redacted>",
+       "kind": "markdown"
+      }
+     ],
+     "title": "<redacted>"
+    }
+   ],
+   "summary": "<redacted>",
+   "title": "<redacted>"
+  },
+  "pushed_at": "2026-11-19T18:02:53Z",
+  "stats": {
+   "additions": 0,
+   "deletions": 0,
+   "files": 0
+  }
+ },
+ "slug": "<redacted>",
+ "threads": [
+  {
+   "anchor_status": "current",
+   "author": {
+    "avatar_url": "<redacted>",
+    "display_name": "<redacted>",
+    "handle": "<redacted>",
+    "id": 5,
+    "kind": "human",
+    "username": "<redacted>"
+   },
+   "comments": [
+    {
+     "attribution": null,
+     "author": {
+      "avatar_url": "<redacted>",
+      "display_name": "<redacted>",
+      "handle": "<redacted>",
+      "id": 5,
+      "kind": "human",
+      "username": "<redacted>"
+     },
+     "body": "<redacted>",
+     "id": 313,
+     "inserted_at": "2026-11-19T18:10:35Z"
+    },
+    {
+     "attribution": null,
+     "author": {
+      "avatar_url": null,
+      "display_name": "<redacted>",
+      "handle": "<redacted>",
+      "id": 51,
+      "kind": "agent",
+      "username": "<redacted>"
+     },
+     "body": "<redacted>",
+     "id": 314,
+     "inserted_at": "2026-11-19T18:11:03Z"
+    }
+   ],
+   "file_path": "<redacted>",
+   "id": 224,
+   "line": 211,
+   "line_hint": 211,
+   "line_text": "<redacted>",
+   "originating_revision": 1,
+   "path": "<redacted>",
+   "resolved_at": null,
+   "resolved_by": null,
+   "side": "new",
+   "status": "open"
+  },
+  {
+   "anchor_status": "current",
+   "author": {
+    "avatar_url": "<redacted>",
+    "display_name": "<redacted>",
+    "handle": "<redacted>",
+    "id": 5,
+    "kind": "human",
+    "username": "<redacted>"
+   },
+   "comments": [
+    {
+     "attribution": null,
+     "author": {
+      "avatar_url": "<redacted>",
+      "display_name": "<redacted>",
+      "handle": "<redacted>",
+      "id": 5,
+      "kind": "human",
+      "username": "<redacted>"
+     },
+     "body": "<redacted>",
+     "id": 315,
+     "inserted_at": "2026-11-19T18:44:15Z"
+    },
+    {
+     "attribution": null,
+     "author": {
+      "avatar_url": null,
+      "display_name": "<redacted>",
+      "handle": "<redacted>",
+      "id": 51,
+      "kind": "agent",
+      "username": "<redacted>"
+     },
+     "body": "<redacted>",
+     "id": 317,
+     "inserted_at": "2026-11-19T18:55:03Z"
+    }
+   ],
+   "file_path": "<redacted>",
+   "id": 225,
+   "line": 274,
+   "line_hint": 274,
+   "line_text": "<redacted>",
+   "originating_revision": 1,
+   "path": "<redacted>",
+   "resolved_at": null,
+   "resolved_by": null,
+   "side": "new",
+   "status": "open"
+  },
+  {
+   "anchor_status": "current",
+   "author": {
+    "avatar_url": "<redacted>",
+    "display_name": "<redacted>",
+    "handle": "<redacted>",
+    "id": 5,
+    "kind": "human",
+    "username": "<redacted>"
+   },
+   "comments": [
+    {
+     "attribution": null,
+     "author": {
+      "avatar_url": "<redacted>",
+      "display_name": "<redacted>",
+      "handle": "<redacted>",
+      "id": 5,
+      "kind": "human",
+      "username": "<redacted>"
+     },
+     "body": "<redacted>",
+     "id": 316,
+     "inserted_at": "2026-11-19T18:47:19Z"
+    },
+    {
+     "attribution": null,
+     "author": {
+      "avatar_url": null,
+      "display_name": "<redacted>",
+      "handle": "<redacted>",
+      "id": 51,
+      "kind": "agent",
+      "username": "<redacted>"
+     },
+     "body": "<redacted>",
+     "id": 318,
+     "inserted_at": "2026-11-19T18:55:04Z"
+    }
+   ],
+   "file_path": "<redacted>",
+   "id": 226,
+   "line": 400,
+   "line_hint": 400,
+   "line_text": "<redacted>",
+   "originating_revision": 1,
+   "path": "<redacted>",
+   "resolved_at": null,
+   "resolved_by": null,
+   "side": "new",
+   "status": "open"
+  }
+ ],
+ "title": "<redacted>",
+ "url": "<redacted>"
+}

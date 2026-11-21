@@ -268,12 +268,14 @@ fn ci_pending_then_failed_posts_one_record_and_a_restart_posts_it_not_again() {
     }
     assert_eq!(when_the_tasks_settle(&world, &[&fix]), vec!["completed"]);
     let owner_env = fake_agent::gh_env(&world.root, &task, 0);
-    assert_eq!(owner_env[..2], ["GH_TOKEN=set", "GITHUB_TOKEN=unset"]);
+    assert_eq!(owner_env, vec!["GH_TOKEN=a-token".to_string()]);
     let scratch = world.home.join("logs").join(&fix).join("gh-config");
     let fix_env = vec![
-        "GH_TOKEN=empty".to_string(),
-        "GITHUB_TOKEN=empty".to_string(),
         format!("GH_CONFIG_DIR={}", scratch.display()),
+        "GH_ENTERPRISE_TOKEN=".to_string(),
+        "GH_TOKEN=".to_string(),
+        "GITHUB_ENTERPRISE_TOKEN=".to_string(),
+        "GITHUB_TOKEN=".to_string(),
     ];
     assert_eq!(fake_agent::gh_env(&world.root, &fix, 0), fix_env);
     let options = fake_agent::options(&world.root, &fix, 0);

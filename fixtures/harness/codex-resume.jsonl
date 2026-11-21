@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a1fc58-fc01-71b0-8198-90b27c5a779b"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`[features].multi_agent` is deprecated. It still controls the V1 fallback. `[agents].enabled = false` disables subagent tools even when the model selects a subagent version, unless `[features].multi_agent_v2` is enabled."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`[features].multi_agent` is deprecated. It still controls the V1 fallback. `[agents].enabled = false` disables subagent tools even when the model selects a subagent version, unless `[features].multi_agent_v2` is enabled."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"PELICAN"}}
+{"type":"turn.completed","usage":{"input_tokens":40089,"cached_input_tokens":19942,"cache_write_input_tokens":20141,"output_tokens":23,"reasoning_output_tokens":9}}

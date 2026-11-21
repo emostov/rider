@@ -274,9 +274,9 @@ When every check is green and no thread is unresolved:
 
 1. Find the linked issues: `gh pr view <n> --json closingIssuesReferences`, or the issues
    the owner named.
-2. The `Closes #<issue>` lines close GitHub issues when the owner merges. Link a Linear issue
+2. The `Closes #<issue>` lines close GitHub issues when the PR merges. Link a Linear issue
    through the Linear MCP. An issue only partly resolved stays open, with a comment saying
-   what remains. Once the work ships (the owner has merged it, or told you to close), close
+   what remains. Once the work ships (the PR has merged, or the owner told you to close), close
    any GitHub issue that is still open with the PR's link, what shipped in a few lines, and
    the command that verifies it:
    `gh issue close <issue> --comment "<text>"`, or with the text from a file:
@@ -288,7 +288,8 @@ When every check is green and no thread is unresolved:
 4. Remove the worktree of each task that is cancelled or given up on, as `lead.md` says:
    never with `--force`, and never delete the branch.
 5. Tell the owner: each PR's link, that CI is green and no thread is open, the fix task ids,
-   and the issues closed. Merging is theirs. End with the `Your move:` line from `lead.md`.
+   the issues closed, and each PR merged under the Rules or still waiting, with what it
+   waits on. End with the `Your move:` line from `lead.md`.
 
 ## Common mistakes
 

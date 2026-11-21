@@ -10,11 +10,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::board::{Board, ListedTask, NewTask, TaskId, TaskState};
+use crate::board::{Board, ListedTask, TaskId, TaskState};
 use crate::brief::label;
 use crate::core::TASKS_MAX;
 use crate::git::{self, ENV_REMOVED, GitHub, Group};
-use crate::roles::ROLES;
+use crate::roles::{Harness, ROLES};
 use crate::run_task::{RESUMABLE_ROLES, recorded_session};
 use crate::worktree::BRANCH_LABEL;
 
@@ -362,7 +362,7 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
             hub: &hub,
             task: Some(task),
             pr: Some(pr),
-            channel: &listed.channel,
+            channel: &listed.view.channel,
             role,
             repo: Path::new(repo),
             branch,
@@ -370,7 +370,8 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
             dead: &dead,
             resumable: RESUMABLE_ROLES.contains(&role)
                 && Path::new(repo).is_absolute()
-                && recorded_session(home, task, Path::new(repo)).is_ok(),
+                && recorded_session(home, task, Path::new(repo))
+                    .is_ok_and(|session| session.harness == Harness::Claude && !session.untrusted),
         };
         if !watched.repo.is_absolute() {
             continue;
@@ -449,7 +450,7 @@ fn watch_unowned(
             if repos.len() >= REPOS_MAX {
                 break;
             }
-            repos.push((repo, &listed.channel));
+            repos.push((repo, &listed.view.channel));
         }
     }
     let mut posted = 0usize;
@@ -703,15 +704,9 @@ fn queue_fix(
         ("role", watched.role),
     ];
     let idempotency = format!("rider-github-{key}");
-    let task = NewTask {
-        channel: watched.channel,
-        text: &text,
-        labels: &labels,
-        needs: after,
-        key: &idempotency,
-    };
+    let needs: Vec<TaskId> = after.into_iter().collect();
     let fix = board
-        .create_task(&task)
+        .create_task(watched.channel, &text, &labels, &needs, &idempotency)
         .map_err(|error| WatchError::State(error.to_string()))?;
     remember(
         seen,

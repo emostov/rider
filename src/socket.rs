@@ -12,21 +12,23 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use nix::sys::socket::{getsockopt, sockopt};
+use rustix::process::{Pid as RawPid, getpgid};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sysinfo::{Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{TaskId, TaskState};
 use crate::core::{
     AgentRow, BoardHealth, CLIENTS_MAX, ClientId, ErrorCode, Event, Phase, Reply, Request,
     StatusView, Stopping, TaskRow, Untracked,
 };
+use crate::harness::Usage;
 
 /// The socket's file name under the Rider home.
 pub const SOCKET_FILE: &str = "rider.sock";
 /// The directory under the Rider home the socket is bound in before it is moved into place.
-const BIND_DIR: &str = ".bind";
-/// The socket's file name inside `BIND_DIR`.
-const BIND_FILE: &str = "s";
+pub const BIND_DIR: &str = ".b";
 /// The protocol version a request names in `v`.
 pub const VERSION: u64 = 1;
 /// Upper bound on one request line; a longer one is refused and the connection closed.
@@ -71,6 +73,7 @@ const DRAIN_BYTES_MAX: usize = 1024 * 1024;
 const DRAIN_CHUNK_BYTES: usize = 16 * 1024;
 /// Upper bound on the time spent dropping a client's input before its socket closes.
 const DRAIN_MILLIS_MAX: u64 = 2000;
+const ANCESTORS_MAX: usize = 1024;
 const IDLE_MILLIS_MAX: u64 = 5000;
 // A socket address holds at most 108 bytes of path on Linux and 104 on macOS and the BSDs,
 // a closing NUL included.
@@ -159,22 +162,23 @@ pub fn listen(path: &SocketPath, logs: PathBuf, sink: Sink) -> io::Result<Socket
     // Bound inside a directory only the owner can enter, the socket takes connections only
     // once it is 0600 and renamed into place, whatever the umask. The bound path is short,
     // since a socket's path is limited to about 100 bytes.
-    let private = home.join(BIND_DIR);
-    let bound = private.join(BIND_FILE);
+    let staging = home.join(BIND_DIR);
+    let bound = staging.join(std::process::id().to_string());
     assert!(bound.starts_with(home) && bound != path);
-    // A daemon that died while binding leaves the directory behind.
-    for removed in [fs::remove_file(&bound), fs::remove_dir(&private)] {
-        match removed {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            Ok(()) | Err(_) => {}
-        }
+    assert!(bound.as_os_str().len() <= path.as_os_str().len());
+    match fs::DirBuilder::new().mode(0o700).create(&staging) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        Ok(()) | Err(_) => {}
     }
-    fs::DirBuilder::new().mode(0o700).create(&private)?;
-    fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+    match fs::remove_file(&bound) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Ok(()) | Err(_) => {}
+    }
     let listener = UnixListener::bind(&bound)?;
     fs::set_permissions(&bound, fs::Permissions::from_mode(0o600))?;
     fs::rename(&bound, path)?;
-    fs::remove_dir(&private)?;
+    let _ = fs::remove_dir(&staging);
     let clients = Arc::new(Mutex::new(Clients::default()));
     let shared = Arc::clone(&clients);
     thread::Builder::new()
@@ -281,13 +285,19 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
             Ok(0) | Err(_) => break,
             Ok(_) if bytes.len() > REQUEST_BYTES_MAX => {
                 let message = format!("a request is at most {REQUEST_BYTES_MAX} bytes");
-                refuse(clients, id, None, &message);
+                refuse(clients, id, None, "bad_request", &message);
                 lock(clients).slots.retain(|slot| slot.id != id);
                 break;
             }
             Ok(_) => {}
         }
         match parse_request(&std::mem::take(&mut bytes)) {
+            Ok((request_id, Request::Down { .. } | Request::Kill(_)))
+                if !from_outside_the_daemon(&reader) =>
+            {
+                let message = "down and kill are refused from the daemon's own agents";
+                refuse(clients, id, Some(request_id), "forbidden", message);
+            }
             Ok((request_id, request)) => {
                 let mut guard = lock(clients);
                 let Some(slot) = guard.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -296,7 +306,7 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
                 if slot.request.is_some() {
                     drop(guard);
                     let message = "one command at a time per connection";
-                    refuse(clients, id, Some(request_id), message);
+                    refuse(clients, id, Some(request_id), "bad_request", message);
                     continue;
                 }
                 slot.request = Some(request_id);
@@ -308,7 +318,9 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
                     break;
                 }
             }
-            Err((request_id, message)) => refuse(clients, id, request_id, &message),
+            Err((request_id, message)) => {
+                refuse(clients, id, request_id, "bad_request", &message);
+            }
         }
     }
     remove(&mut lock(clients), id);
@@ -323,10 +335,10 @@ fn remove(guard: &mut Clients, id: ClientId) {
     assert!(guard.slots.iter().all(|slot| slot.id != id));
 }
 
-fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, message: &str) {
+fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, code: &str, text: &str) {
     let mut guard = lock(clients);
     if let Some(index) = guard.slots.iter().position(|slot| slot.id == id) {
-        let line = error_line(request, "bad_request", message);
+        let line = error_line(request, code, text);
         queue(&mut guard, index, Outgoing::Refusal(line), request);
     }
 }
@@ -346,6 +358,48 @@ fn queue(guard: &mut Clients, index: usize, outgoing: Outgoing, request: Option<
         Err(TrySendError::Disconnected(_)) => hang_up(&guard.slots.remove(index).stream),
     }
     assert!(guard.slots.len() <= CLIENTS_MAX);
+}
+
+// Whether the peer is neither in nor below a process the daemon started: walking up from the
+// peer and from its group's leader never meets the daemon. Unknown counts as inside.
+fn from_outside_the_daemon(reader: &BufReader<UnixStream>) -> bool {
+    let Ok(peer) = peer_pid(reader.get_ref()) else {
+        return false;
+    };
+    let Some(group) = RawPid::from_raw(peer).and_then(|pid| getpgid(Some(pid)).ok()) else {
+        return false;
+    };
+    let daemon = SysPid::from_u32(std::process::id());
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let starts = [peer, group.as_raw_nonzero().get()];
+    for start in starts {
+        let Ok(start) = u32::try_from(start) else {
+            return false;
+        };
+        let mut at = Some(SysPid::from_u32(start));
+        for _ in 0..ANCESTORS_MAX {
+            let Some(pid) = at else { break };
+            if pid == daemon && start != std::process::id() {
+                return false;
+            }
+            at = system.process(pid).and_then(sysinfo::Process::parent);
+        }
+    }
+    assert!(peer > 0);
+    true
+}
+
+#[cfg(target_vendor = "apple")]
+fn peer_pid(stream: &UnixStream) -> nix::Result<i32> {
+    getsockopt(stream, sockopt::LocalPeerPid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> nix::Result<i32> {
+    getsockopt(stream, sockopt::PeerCredentials).map(|credentials| credentials.pid())
 }
 
 /// The request in `bytes`, or the request id, if readable, and why it is refused.
@@ -595,7 +649,13 @@ fn write_log_lines(stream: &mut UnixStream, id: u64, pending: &mut Vec<u8>, all:
         let (line, used) = match rest.iter().position(|byte| *byte == b'\n') {
             Some(end) if end <= LOG_LINE_BYTES_MAX => (&rest[..end], end + 1),
             _ if rest.len() > LOG_LINE_BYTES_MAX => {
-                (&rest[..LOG_LINE_BYTES_MAX], LOG_LINE_BYTES_MAX)
+                let starts_char = |at: &usize| rest[*at] & 0xc0 != 0x80;
+                let boundary = (0..4)
+                    .map(|back| LOG_LINE_BYTES_MAX - back)
+                    .find(starts_char);
+                let cut = boundary.unwrap_or(LOG_LINE_BYTES_MAX);
+                assert!(cut > 0 && cut <= LOG_LINE_BYTES_MAX);
+                (&rest[..cut], cut)
             }
             _ if all => (rest, rest.len()),
             _ => break,
@@ -651,6 +711,14 @@ fn status_json(view: &StatusView) -> Value {
         Untracked::AtLeast(count) => (count, true),
     };
     let tasks: Vec<Value> = view.tasks.iter().map(task_json).collect();
+    let projects: Vec<Value> = (view.projects.iter())
+        .map(|(project, usage)| json!({"project": project, "usage": usage_json(usage)}))
+        .collect();
+    let task_usages: Vec<Value> = (view.task_usages.iter())
+        .map(|entry| {
+            json!({"id": entry.id.0, "project": entry.project, "usage": usage_json(&entry.usage)})
+        })
+        .collect();
     json!({
         "board": board,
         "stopping": stopping,
@@ -659,6 +727,20 @@ fn status_json(view: &StatusView) -> Value {
         "untracked": untracked,
         "untracked_at_least": more,
         "tasks": tasks,
+        "usage": usage_json(&view.usage),
+        "projects": projects,
+        "task_usages": task_usages,
+    })
+}
+
+fn usage_json(usage: &Usage) -> Value {
+    json!({
+        "input": usage.input,
+        "cache_read": usage.cache_read,
+        "cache_write": usage.cache_write,
+        "output": usage.output,
+        "cost_micros": usage.cost_micros,
+        "unpriced": usage.unpriced,
     })
 }
 

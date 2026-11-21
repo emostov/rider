@@ -167,7 +167,7 @@ fn each_failed_attempt_is_failed_with_the_reason_its_evidence_shows() {
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
     let implement = [
-        Behaviour::ExitNonZero,
+        Behaviour::ComplainThenExitNonZero,
         Behaviour::ExitOnSignal,
         Behaviour::CommitReportingFailure,
         Behaviour::LeaveBranch,
@@ -219,6 +219,9 @@ fn each_failed_attempt_is_failed_with_the_reason_its_evidence_shows() {
     for (id, reason) in ids.iter().zip(&reasons) {
         then_the_task_failed_with(&world, id, reason);
     }
+    let log = world.home.join("logs").join(&ids[0]).join("1.jsonl");
+    let log = std::fs::read_to_string(&log).expect("read the failed attempt's log");
+    assert!(log.contains(fake_agent::STDERR_LINE), "{log}");
     let block = Some(("needs_input".to_string(), BLOCK_QUESTION.to_string()));
     assert_eq!(task_block(&world, &ids[4]), block);
     then_the_task_failed_with(&world, &ids[5], "review changed the checkout");
@@ -631,5 +634,28 @@ fn a_reply_posted_while_rider_completes_the_task_is_noted_as_undelivered() {
     assert_eq!(
         when_rider_notes(&world, &task, "landed while rider completed"),
         1
+    );
+}
+
+#[test]
+fn a_worker_set_rerun_of_label_does_not_stop_the_leads_reply_reaching_the_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    let labelled = world.vb_as("implement-9-other", &["label", &task, "rerun_of=1"], None);
+    assert_eq!(labelled.code, Some(0), "{labelled:?}");
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    when_the_lead_replies(&world, &task, "Decision blue: use the blue name.");
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(
+        task_result(&world, &task),
+        Some(fake_agent::heard(&["blue"]))
     );
 }
