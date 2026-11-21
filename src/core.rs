@@ -232,6 +232,9 @@ pub struct Run {
     pub stop_tries: u8,
     /// Every stop went unanswered: the run, its slot and its claim stay until the agent exits.
     pub agent_lost: bool,
+    /// The phase's board call could not reach the board; it is sent again from then on, once
+    /// the board is up.
+    pub resend_at: Option<Timestamp>,
 }
 
 /// A claim given up while the board may hold it: once its epoch is known, it is released.
@@ -374,6 +377,8 @@ pub enum Call {
     Renew(RunId),
     Settle(RunId),
     Release(RunId),
+    Prepare(RunId),
+    Judge(RunId),
     ListTasks,
 }
 
@@ -1340,7 +1345,12 @@ fn board_failed(state: &mut State, call: Call) {
             state.listing = false;
             return;
         }
-        Call::Claim(run) | Call::Renew(run) | Call::Settle(run) | Call::Release(run) => run,
+        Call::Claim(run)
+        | Call::Renew(run)
+        | Call::Settle(run)
+        | Call::Release(run)
+        | Call::Prepare(run)
+        | Call::Judge(run) => run,
     };
     let Some(index) = state.run_index(run) else {
         return;
@@ -1351,6 +1361,12 @@ fn board_failed(state: &mut State, call: Call) {
         // Whether the board granted it is unknown; an unrenewed claim lapses within the lease.
         Call::Claim(_) if entry.phase == Phase::Claiming => remove_run(state, index),
         Call::Renew(_) => entry.renewing = false,
+        Call::Prepare(_) if entry.phase == Phase::Preparing => {
+            entry.resend_at = Some(Timestamp(now.0.saturating_add(pause)));
+        }
+        Call::Judge(_) if entry.phase == Phase::Judging => {
+            entry.resend_at = Some(Timestamp(now.0.saturating_add(pause)));
+        }
         Call::Settle(_) | Call::Release(_) if entry.settling => {
             entry.settling = false;
             entry.settle_tries = entry.settle_tries.saturating_add(1);
@@ -1415,6 +1431,7 @@ fn set_phase(run: &mut Run, phase: Phase, now: Timestamp) {
     assert!(run.phase != phase || phase == Phase::Abandoning);
     run.phase = phase;
     run.phase_start = now;
+    run.resend_at = None;
 }
 
 fn run_in(state: &State, run: RunId, phase: Phase) -> Option<usize> {
@@ -1694,6 +1711,19 @@ fn on_time(state: &mut State, actions: &mut Vec<Action>) {
         if entry.phase == Phase::Settling {
             try_settle(state, index, actions);
         }
+        let entry = &mut state.runs[index];
+        if let Some(at) = entry.resend_at
+            && state.board == BoardHealth::Up
+            && now >= at
+        {
+            entry.resend_at = None;
+            let (run, task) = (entry.id, entry.task);
+            actions.push(match entry.phase {
+                Phase::Preparing => Action::Prepare { run, task },
+                Phase::Judging => Action::Judge { run, task },
+                other => panic!("a board call is resent only in its phase, not {other:?}"),
+            });
+        }
     }
     let due = |run: &Run| now.0 >= run.lease_until.0.saturating_sub(renew_lead);
     assert!(
@@ -1785,6 +1815,7 @@ fn new_run(
         branch,
         stop_tries: 0,
         agent_lost: false,
+        resend_at: None,
     });
     assert!(state.next_run > id.0);
     (id, state.profile(role, slot))

@@ -174,7 +174,7 @@ pub fn run_task(
         });
     }
     let launched = attempt.launch(launch);
-    let judgement = judge_attempt(id, board, &attempt, launched)?;
+    let judgement = judge_attempt(id, board, &attempt, &launched)?;
     settle_attempt(id, env, board, &attempt, &judgement)?;
     Ok(Ran::Settled(judgement.verdict))
 }
@@ -375,7 +375,7 @@ pub fn judge_attempt(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<Judgement, RunError> {
     if let Some(fresh) = attempt.fallback.as_ref()
         && attempt.fresh_log.get().is_some()
@@ -891,7 +891,7 @@ fn inspect(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<(Verdict, Option<Work>), RunError> {
     let fail = |reason: String| (Verdict::Fail { reason }, None);
     let state_after = board.read_task(id)?.state;
@@ -902,7 +902,7 @@ fn inspect(
         other => return Err(RunError::LostClaim(other)),
     }
     let exit = match launched {
-        Ok(exit) => exit,
+        Ok(exit) => *exit,
         Err(error) => return Ok(fail(error.to_string())),
     };
     let evidence = match evidence(attempt) {

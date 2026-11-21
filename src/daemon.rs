@@ -852,6 +852,7 @@ fn absorb(input: Input, contexts: &mut [RunContext], log: &Log) -> Event {
         | Event::Prepared { run, .. }
         | Event::AgentExited(run)
         | Event::Judged { run, .. }
+        | Event::BoardFailed(Call::Judge(run))
         | Event::Settled(run) => Some(*run),
         _ => None,
     };
@@ -1062,6 +1063,9 @@ fn prepare(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
             kind: kind.to_string(),
             reason,
         }),
+        Err(RunError::Board(error)) if call_failed(&error) => {
+            Input::plain(Event::BoardFailed(Call::Prepare(run)))
+        }
         Err(error) => Input::plain(run_error_event(run, &error, "prepare")),
     }
 }
@@ -1180,13 +1184,17 @@ fn judge(
     launched: Result<Exit, HarnessError>,
 ) -> Input {
     let board = shared.board(profile);
-    match judge_attempt(task, &board, attempt, launched) {
+    match judge_attempt(task, &board, attempt, &launched) {
         Ok(judgement) => Input {
             event: Event::Judged {
                 run,
                 verdict: judgement.verdict.clone(),
             },
             extra: Extra::Judgement(Arc::new(judgement)),
+        },
+        Err(RunError::Board(error)) if call_failed(&error) => Input {
+            event: Event::BoardFailed(Call::Judge(run)),
+            extra: Extra::Launched(launched),
         },
         Err(RunError::Board(error)) if !matches!(error, BoardError::ClaimLost { .. }) => {
             let reason = format!("rider could not judge the attempt: {error}");
