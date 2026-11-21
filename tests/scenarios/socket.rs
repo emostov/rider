@@ -37,6 +37,7 @@ const SOCKET_PATH_BYTES_MAX: usize = 107;
 const SOCKET_PATH_BYTES_MAX: usize = 103;
 const SOCKET_SUFFIX_BYTES: usize = "/rider.sock".len();
 const FOLLOWER_LINES_MAX: usize = 1 << 16;
+const SEAT_FREE_SECONDS: u64 = 5;
 
 #[test]
 fn a_client_flooding_bad_requests_without_reading_never_holds_up_rider_status() {
@@ -202,14 +203,16 @@ fn idle_connections_in_every_seat_are_closed_so_rider_status_answers() {
     let mut follower = follow.spawn().expect("start rider logs -f");
     let lines = crate::lines_of(follower.stdout.take().expect("rider logs -f output"));
     let first = lines.recv_timeout(Duration::from_secs(READ_SECONDS_MAX));
+    let opened = Instant::now();
     let idle: Vec<UnixStream> = (1..CLIENTS_MAX)
         .map(|_| given_a_client_on_the_socket(&world))
         .collect();
 
-    thread::sleep(Duration::from_secs(DAEMON_IDLE_SECONDS + 2));
-    let status = when_rider_runs(&world, &["status"]);
-    let following = follower.try_wait().expect("poll rider logs -f");
     let closed: Vec<Vec<u8>> = idle.iter().map(then_the_client_reads_to_its_end).collect();
+    let closed_after = opened.elapsed();
+    drop(idle);
+    let answered = when_rider_status_shows_within(&world, "board up", SEAT_FREE_SECONDS);
+    let following = follower.try_wait().expect("poll rider logs -f");
     world.release_agent(&task);
     let deadline = Instant::now() + Duration::from_secs(READ_SECONDS_MAX);
     let rest: Vec<String> = (0..FOLLOWER_LINES_MAX)
@@ -221,8 +224,14 @@ fn idle_connections_in_every_seat_are_closed_so_rider_status_answers() {
         .collect();
     let followed = then_the_child_exits_within(&mut follower, READ_SECONDS_MAX);
 
-    assert_eq!(status.code, Some(0), "{status:?}");
-    assert!(status.stdout.contains("board up"), "{status:?}");
+    assert!(
+        closed_after >= Duration::from_secs(DAEMON_IDLE_SECONDS),
+        "the idle connections were closed after {closed_after:?}"
+    );
+    assert!(
+        answered,
+        "rider status stayed busy after the idle clients went"
+    );
     assert_eq!(first, Ok(fake_agent::hold_line(&task)));
     assert_eq!(following, None, "rider logs -f ended while it followed");
     assert_eq!(closed, vec![Vec::<u8>::new(); CLIENTS_MAX - 1]);
