@@ -139,15 +139,12 @@ fn lock(clients: &Mutex<Clients>) -> MutexGuard<'_, Clients> {
 
 /// Binds `path` with mode 0600, replacing a socket left there, and serves it on its own threads.
 /// No connection can be made before the mode is in effect.
-pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
+pub fn listen(path: &SocketPath, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
+    let path = path.path();
     assert!(path.is_absolute() && logs.is_absolute());
     let Some(home) = path.parent() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no directory"));
     };
-    if path.as_os_str().len() > SOCKET_PATH_BYTES_MAX {
-        let message = ClientError::PathTooLong(path.to_path_buf()).to_string();
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
-    }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
         Ok(_) => {
@@ -213,8 +210,10 @@ fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, s
             continue;
         }
         let timeout = Some(Duration::from_millis(WRITE_MILLIS_MAX));
-        let (Ok(()), Ok(reader), Ok(writer)) = (
+        let idle = Some(Duration::from_millis(IDLE_MILLIS_MAX));
+        let (Ok(()), Ok(()), Ok(reader), Ok(writer)) = (
             stream.set_write_timeout(timeout),
+            stream.set_read_timeout(idle),
             stream.try_clone(),
             stream.try_clone(),
         ) else {
@@ -265,21 +264,18 @@ fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, s
 fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sink: &Sink) {
     let mut reader = BufReader::new(stream);
     let mut bytes = Vec::new();
-    let idle = Some(Duration::from_millis(IDLE_MILLIS_MAX));
     for _ in 0..REQUESTS_MAX {
         assert!(bytes.len() <= REQUEST_BYTES_MAX);
         let room = u64::try_from(REQUEST_BYTES_MAX + 1 - bytes.len()).unwrap_or(u64::MAX);
-        if reader.get_ref().set_read_timeout(idle).is_err() {
-            break;
-        }
         let read = (&mut reader).take(room).read_until(b'\n', &mut bytes);
         match read {
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                let guard = lock(clients);
+                let mut guard = lock(clients);
                 let slot = guard.slots.iter().find(|slot| slot.id == id);
                 if slot.is_some_and(|slot| slot.request.is_some()) {
                     continue;
                 }
+                guard.slots.retain(|slot| slot.id != id);
                 break;
             }
             Ok(0) | Err(_) => break,
@@ -768,6 +764,23 @@ impl fmt::Display for ClientError {
     }
 }
 
+pub struct SocketPath(PathBuf);
+
+impl SocketPath {
+    pub fn under(home: &Path) -> Result<SocketPath, ClientError> {
+        let path = home.join(SOCKET_FILE);
+        if path.as_os_str().len() > SOCKET_PATH_BYTES_MAX {
+            return Err(ClientError::PathTooLong(path));
+        }
+        assert!(path.ends_with(SOCKET_FILE) && path.starts_with(home));
+        Ok(SocketPath(path))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// One connection to the daemon, sending one command.
 pub struct Client {
     reader: BufReader<UnixStream>,
@@ -776,10 +789,7 @@ pub struct Client {
 impl Client {
     /// Connects to the socket under `home`.
     pub fn connect(home: &Path) -> Result<Client, ClientError> {
-        let path = home.join(SOCKET_FILE);
-        if path.as_os_str().len() > SOCKET_PATH_BYTES_MAX {
-            return Err(ClientError::PathTooLong(path));
-        }
+        let SocketPath(path) = SocketPath::under(home)?;
         let stream = UnixStream::connect(&path).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                 ClientError::NotRunning(path.clone())

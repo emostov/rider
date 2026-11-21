@@ -39,7 +39,7 @@ use crate::run_task::{
     judge_attempt, launch_agent, prepare_attempt, settle_attempt,
 };
 use crate::settle::Verdict;
-use crate::socket::{self, SOCKET_FILE, Socket};
+use crate::socket::{self, Socket, SocketPath};
 
 /// Upper bound on the events waiting for the core; sources block when it is full.
 pub const EVENT_QUEUE_MAX: usize = 1024;
@@ -139,6 +139,7 @@ exec "$@""#;
 /// Where the daemon's files are and how it reaches the board and its agents.
 pub struct Paths {
     pub home: PathBuf,
+    pub socket: SocketPath,
     pub vb: PathBuf,
     pub board_url: String,
 }
@@ -489,11 +490,10 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         }
         Err(error) => log.write(&format!("could not look for leaked vb processes: {error}")),
     }
-    let socket_path = paths.home.join(SOCKET_FILE);
     let sink_events = events.clone();
     let sink: socket::Sink = Arc::new(move |event| send(&sink_events, event));
-    let socket = socket::listen(&socket_path, paths.home.join(LOGS_DIR), sink)
-        .map_err(io_error("listen on", &socket_path))?;
+    let socket = socket::listen(&paths.socket, paths.home.join(LOGS_DIR), sink)
+        .map_err(io_error("listen on", paths.socket.path()))?;
     let shared = Arc::new(Shared {
         paths,
         events,
