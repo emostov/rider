@@ -50,14 +50,14 @@ for Claude Code or `~/.codex/skills` for Codex.
 ```
 
 `rider skills list` and `rider skills show <name>` print the built-in skills. Then say
-"ride a swarm to <goal>" in a new session.
+`ride a swarm to <goal>` in a new session.
 
 ## Quickstart
 
 The `ride-swarm` skill needs Rust, Node 22, `jq`, and both `claude` and `codex` on `PATH`,
 each signed in. It stops and names any that is missing.
 
-Open a coding-agent session in a terminal you keep open and say "ride a swarm to <goal>".
+Open a coding-agent session in a terminal you keep open and say `ride a swarm to <goal>`.
 The lead starts the daemon with `rider up`, plans the goal into tasks on the board, and
 waits on the board with `rider wait`.
 
