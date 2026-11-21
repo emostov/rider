@@ -1234,6 +1234,7 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
     let socket = quote(&home.join(SOCKET_FILE))?;
     let profile = format!(
         "(version 1)\n(allow default)\n\
+         (deny signal)\n(allow signal (target same-sandbox))\n\
          (deny network-outbound (remote unix-socket (path-literal {socket})))\n\
          (deny file-write* {})\n",
         denied.join(" ")

@@ -278,6 +278,26 @@ fn a_daemon_started_inside_a_sandbox_runs_its_agents_unconfined_and_says_so() {
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn a_detached_child_of_an_agent_cannot_signal_the_daemon() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::SignalDaemonDetached]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    let (code, output) = fake_agent::detached_signal(&world.root, &task, 0);
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    assert_ne!(code, "0", "{output}");
+    assert!(output.contains("Operation not permitted"), "{output}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
 fn given_a_log(world: &World, task: &str, text: &str) {
     let dir = world.home.join("logs").join(task);
     fs::create_dir_all(&dir).expect("create the task's log directory");

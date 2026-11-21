@@ -114,6 +114,7 @@ pub enum Behaviour {
     /// record its exit code and output, then commits like `Commit`.
     StopRiderDetached,
     TryWrites,
+    SignalDaemonDetached,
     ReportDecision,
     HoldAttempt,
     MergePr,
@@ -175,6 +176,7 @@ impl Behaviour {
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::StopRiderDetached => "stop-rider-detached",
             Behaviour::TryWrites => "try-writes",
+            Behaviour::SignalDaemonDetached => "signal-daemon-detached",
             Behaviour::ReportDecision => "report-decision",
             Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
@@ -373,6 +375,19 @@ case "$behaviour" in
       sleep 0.1
     done
     commit || exit 1 ;;
+  signal-daemon-detached)
+    signalled="$world/{ARGS_DIR}/$task-$attempt.signal"
+    daemon=$(awk '{{print $2}}' "$world/rider-home/daemon.lock")
+    set -m
+    ( kill -TERM "$daemon" > "$signalled.out" 2>&1; echo "$?" > "$signalled.code" ) &
+    set +m
+    step=0
+    while [ ! -s "$signalled.code" ]; do
+      step=$((step + 1))
+      [ "$step" -le {steps} ] || exit 1
+      sleep 0.1
+    done
+    commit || exit 1 ;;
   try-writes)
     for name in {TRIED_WRITES}; do
       if ( : > "$world/rider-home/$name" ) 2>/dev/null; then
@@ -452,6 +467,17 @@ pub fn stdin(world: &Path, task: &str, attempt: u32) -> String {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+pub fn detached_signal(world: &Path, task: &str, attempt: u32) -> (String, String) {
+    let read = |end: &str| {
+        let path = world
+            .join(ARGS_DIR)
+            .join(format!("{task}-{attempt}.signal.{end}"));
+        fs::read_to_string(&path).expect("read what the detached signal recorded")
+    };
+    let (code, output) = (read("code"), read("out"));
+    (code.trim().to_string(), output)
 }
 
 pub fn tried_writes(world: &Path, task: &str, attempt: u32) -> String {
