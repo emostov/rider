@@ -29,6 +29,12 @@ before completing. A `[repo."<absolute path>".roles.<role>]` table sets only tha
 `skills`, for that repository's tasks only, and `rider config --repo <path>` prints the table
 they see.
 
+The built-in roles' prompts, and the slop rules the implement prompt carries, are built into
+`rider`, so they always match the installed binary; a role's `prompt` may instead name a file
+of your own. When the daemon starts, it registers Rider's board schemas (`rider-result@2`,
+`rider-finding@1`) on any board that lacks them. A `prompts/` directory an older Rider wrote
+under `<rider home>` is no longer read and can be deleted.
+
 ## Getting started
 
 Paste this into your coding agent:

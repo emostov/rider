@@ -10,7 +10,7 @@ daemon runs one agent per ready task in its own git worktree, and a lead plans t
 into tasks. When the user rides a swarm from this session, **this session is the lead**.
 
 `<skill>` is the directory that contains this SKILL.md. It holds `lead.md`, the lead's
-instructions, and `schemas/`. The board is reached with `vb`, which needs:
+instructions, and `schemas/`, which Rider registers on the board itself. The board is reached with `vb`, which needs:
 
 ```sh
 export BOARD_URL=http://127.0.0.1:4100/api/board PATH="$HOME/.rider/node/node_modules/.bin:$PATH"
@@ -62,9 +62,6 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
    (`git -C <repo> merge --no-ff <branch>` on a clean checkout, `git merge --abort` and a
    restack task on conflict, never push), or the user merges when asked in `decisions`.
 3. **Board.** If it is down, start `rider serve` as a background command and check again.
-   `vb schemas list` must list `rider-result@2` and `rider-finding@1`;
-   register a missing one with `vb schemas create rider-result@2 --file
-   <skill>/schemas/rider-result@2.json` (`rider-finding@1` from `rider-finding.json`).
 4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
    run `rider up`, which starts it in the background, and check `rider status` again.
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as

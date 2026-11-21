@@ -38,18 +38,18 @@ const ENVIRONMENT: &str = r#"environment:
 pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
-/// Every role's prompt file and the files they read, once each, built into the binary.
+pub const IMPLEMENT_PROMPT: &str = "implement.md";
+pub const SLOP_RULES: &str = include_str!("../prompts/slop-rules.md");
+/// Every role's prompt and the slop rules, once each, built into the binary.
 pub const PROMPTS: [(&str, &str); 5] = [
-    ("implement.md", include_str!("../prompts/implement.md")),
+    (IMPLEMENT_PROMPT, include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
     ("security.md", include_str!("../prompts/security.md")),
-    ("slop-rules.md", include_str!("../prompts/slop-rules.md")),
+    ("slop-rules.md", SLOP_RULES),
     ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
-/// The directory under the Rider home that holds the built-in worker prompts.
-pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
 const SKILLS_DIR: &str = "skills";
 const VB_DIR: &str = "node/node_modules/.bin";
@@ -286,10 +286,6 @@ impl Config {
     fn vb_dir(&self) -> PathBuf {
         self.home.join(VB_DIR)
     }
-
-    fn prompts(&self) -> PathBuf {
-        self.home.join(PROMPTS_DIR)
-    }
 }
 
 /// An environment variable rider cannot use.
@@ -436,26 +432,6 @@ impl From<ConfigError> for CliError {
     fn from(error: ConfigError) -> CliError {
         CliError::Config(error)
     }
-}
-
-/// Writes every role's prompt under the prompts directory, replacing what is there.
-pub fn write_prompts(config: &Config) -> Result<(), CliError> {
-    let dir = config.prompts();
-    let io = |action, path: &Path| {
-        let path = path.to_path_buf();
-        move |error: io::Error| CliError::Io {
-            action,
-            path,
-            message: error.to_string(),
-        }
-    };
-    fs::create_dir_all(&dir).map_err(io("create", &dir))?;
-    for (name, text) in PROMPTS.iter() {
-        assert!(!name.contains('/') && !text.is_empty());
-        let path = dir.join(name);
-        fs::write(&path, text).map_err(io("write", &path))?;
-    }
-    Ok(())
 }
 
 /// Runs `command` and returns the exit code rider should end with.
@@ -654,20 +630,19 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
     let (table, limits) = settings(config)?;
-    write_prompts(config)?;
     update_skills(config);
     let paths = Paths {
         home: config.home.clone(),
-        prompts: config.prompts(),
         vb: config.vb_dir().join("vb"),
         board_url: config.board_url.clone(),
     };
-    assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
+    assert!(paths.vb.is_absolute() && paths.home.is_absolute());
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
 }
 
 /// How long `rider up` waits for the daemon's socket to answer.
 const UP_SECONDS_MAX: u64 = 30;
+const UP_LOG_TAIL_BYTES: usize = 4096;
 /// How often `rider up` asks the socket again.
 const UP_POLL_MILLIS: u64 = 100;
 /// Upper bound on the lines one `rider down` prints.
@@ -716,13 +691,15 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
     for _ in 0..polls {
         if let Ok(mut client) = Client::connect(&config.home) {
-            let data = client.send("status", &[]).map_err(CliError::Client)?;
+            let data = match client.send("status", &[]) {
+                Ok(data) => data,
+                Err(error) => return Err(not_started(&mut child, &log_path, deadline, error)),
+            };
             println!("{}", status_line(&data));
             return Ok(0);
         }
         if let Ok(Some(exit)) = child.try_wait() {
-            let why = format!("it exited with {exit}; see {}", log_path.display());
-            return Err(CliError::NotStarted(why));
+            return Err(exited(exit, &log_path));
         }
         if Instant::now() >= deadline {
             break;
@@ -732,6 +709,52 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let socket = config.home.join(SOCKET_FILE);
     let why = format!("{} did not answer in {UP_SECONDS_MAX} s", socket.display());
     Err(CliError::NotStarted(why))
+}
+
+fn not_started(
+    child: &mut std::process::Child,
+    log_path: &Path,
+    deadline: Instant,
+    error: ClientError,
+) -> CliError {
+    assert!(log_path.is_absolute());
+    let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(exit)) => return exited(exit, log_path),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(UP_POLL_MILLIS));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(polls > 0);
+    CliError::Client(error)
+}
+
+fn exited(exit: std::process::ExitStatus, log_path: &Path) -> CliError {
+    assert!(log_path.is_absolute());
+    let why = format!("it exited with {exit}: {}", last_line(log_path));
+    CliError::NotStarted(format!("{why}; see {}", log_path.display()))
+}
+
+fn last_line(log_path: &Path) -> String {
+    let mut tail = Vec::with_capacity(UP_LOG_TAIL_BYTES);
+    let read = File::open(log_path).and_then(|mut file| {
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(UP_LOG_TAIL_BYTES as u64);
+        io::Seek::seek(&mut file, io::SeekFrom::Start(start))?;
+        file.take(UP_LOG_TAIL_BYTES as u64).read_to_end(&mut tail)
+    });
+    let text = String::from_utf8_lossy(&tail);
+    let line = text.lines().rev().find(|line| !line.trim().is_empty());
+    let line = match (read, line) {
+        (Ok(_), Some(line)) => line.trim().to_string(),
+        (Ok(_), None) => "its log is empty".to_string(),
+        (Err(error), _) => format!("its log could not be read: {error}"),
+    };
+    assert!(!line.is_empty() && line.len() <= 4 * UP_LOG_TAIL_BYTES);
+    line
 }
 
 fn down(config: &Config, now: bool) -> Result<u8, CliError> {
