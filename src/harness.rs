@@ -34,7 +34,7 @@ const UNTRUSTED_ENV_ALLOWED: [&str; 10] = [
 ];
 const CODEX_REFUSAL_BYTES_MAX: usize = 64 * 1024;
 const CODEX_NO_ROLLOUT: &str = "no rollout found for thread id";
-const ENV_MAX: usize = 48;
+const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
 const POLLS_MAX: u64 = (ATTEMPT_SECONDS_MAX + KILL_GRACE_SECONDS) * 1000 / POLL_MILLIS + 16;

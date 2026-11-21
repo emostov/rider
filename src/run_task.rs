@@ -33,22 +33,11 @@ use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError
 
 pub const DELIVERY_ROUNDS_MAX: u8 = 3;
 const UNTRUSTED_DIR: &str = "untrusted";
-// Git runs a tracked `core.hooksPath` and any configured command from the merged tree, so
-// every config key that names a command is forced off through git's environment config.
-const UNTRUSTED_GIT_CONFIG: [(&str, &str); 12] = [
-    ("core.hooksPath", "/dev/null"),
-    ("core.fsmonitor", "false"),
-    ("core.pager", "cat"),
-    ("core.editor", "true"),
-    ("sequence.editor", "true"),
-    ("core.askPass", ""),
-    ("credential.helper", ""),
-    ("diff.external", ""),
-    ("commit.gpgSign", "false"),
-    ("tag.gpgSign", "false"),
-    ("protocol.ext.allow", "never"),
-    ("submodule.recurse", "false"),
-];
+const NO_WORKTREE_HEAD: &str = "none";
+const UNTRUSTED_NOTE: &str = "This task is untrusted: you work in a scratch directory that is \
+                              not a git repository, and Rider gives you no worktree. Read the \
+                              pull request as plain files there; commit nothing. Your final \
+                              message is the task's result.";
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
 /// The failed attempts after which a task is blocked, unless the configuration sets them.
@@ -357,7 +346,7 @@ impl Attempt {
 
     fn delivery_command(&self, new: &[Amendment]) -> Option<(CommandLine, &'static str)> {
         assert!(!new.is_empty() && new.len() <= REPLIES_MAX);
-        let ask = if self.brief.role.commits_expected {
+        let ask = if self.brief.role.commits_expected && !self.brief.untrusted {
             COMMIT_ASK
         } else {
             REPORT_ASK
@@ -788,7 +777,12 @@ fn prepare(
     identity: &BoardIdentity,
 ) -> Result<Attempt, Unprepared> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
-    let dir = worktree::dir_for(&brief, &env.home);
+    let id = brief.id.0.to_string();
+    let untrusted_dir = env.home.join(UNTRUSTED_DIR).join(&id);
+    let dir = match brief.untrusted {
+        true => untrusted_dir.join("work"),
+        false => worktree::dir_for(&brief, &env.home),
+    };
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
     let retry = fs::symlink_metadata(&dir).is_ok();
     let prompt = build_prompt(&brief, retry)?;
@@ -803,13 +797,14 @@ fn prepare(
         (Err(why), _) => format!("Starting a fresh session despite `resume=1`: {why}."),
     });
     let resume = session.and_then(Result::ok);
-    let id = brief.id.0.to_string();
-    let gh_config = env.home.join(UNTRUSTED_DIR).join(&id).join("gh-config");
+    let gh_config = untrusted_dir.join("gh-config");
     if brief.untrusted {
-        fs::create_dir_all(&gh_config).map_err(|error| {
-            let reason = format!("Rider cannot create {}: {error}.", gh_config.display());
-            Block::new("rider_error", reason)
-        })?;
+        for made in [&gh_config, &dir] {
+            fs::create_dir_all(made).map_err(|error| {
+                let reason = format!("Rider cannot create {}: {error}.", made.display());
+                Block::new("rider_error", reason)
+            })?;
+        }
     }
     let command = |resume: Option<&SessionId>| {
         let cmd = command_for(brief.role, &prompt, &dir, resume.map(Resume::Fork));
@@ -829,7 +824,6 @@ fn prepare(
             cmd.untrusted = true;
             let dir = gh_config.to_string_lossy().into_owned();
             cmd.env.push(("GH_CONFIG_DIR".to_string(), dir));
-            cmd.env.extend(untrusted_git_env());
         }
         assert_eq!(cmd.untrusted, brief.untrusted);
         Ok::<CommandLine, Block>(cmd)
@@ -842,19 +836,30 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
-        Ok(checkout) => checkout,
-        Err(WorktreeError::Board(error)) if error.call_failed() => {
-            return Err(Unprepared::CallFailed(error));
+    let checkout = if brief.untrusted {
+        let start_head = NO_WORKTREE_HEAD.to_string();
+        let (branch, base) = (None, None);
+        Checkout {
+            dir: dir.clone(),
+            branch,
+            start_head,
+            base,
         }
-        Err(error) => return Err(worktree_block(&error).into()),
+    } else {
+        match worktree::prepare(&brief, board, &env.home, identity) {
+            Ok(checkout) => checkout,
+            Err(WorktreeError::Board(error)) if error.call_failed() => {
+                return Err(Unprepared::CallFailed(error));
+            }
+            Err(error) => return Err(worktree_block(&error).into()),
+        }
     };
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
     assert!(log.is_absolute());
     let start = start.filter(|value| git::commit_exists(&checkout.dir, value).unwrap_or(false));
     let reference = start.unwrap_or(&checkout.start_head).to_string();
-    assert!(git::is_commit_id(&reference));
+    assert!(brief.untrusted || git::is_commit_id(&reference));
     Ok(Attempt {
         brief,
         failed,
@@ -953,24 +958,6 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);
     Ok(session)
-}
-
-fn untrusted_git_env() -> Vec<(String, String)> {
-    let mut env = vec![
-        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-        ("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string()),
-        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        (
-            "GIT_CONFIG_COUNT".to_string(),
-            UNTRUSTED_GIT_CONFIG.len().to_string(),
-        ),
-    ];
-    for (index, (key, value)) in UNTRUSTED_GIT_CONFIG.iter().enumerate() {
-        env.push((format!("GIT_CONFIG_KEY_{index}"), key.to_string()));
-        env.push((format!("GIT_CONFIG_VALUE_{index}"), value.to_string()));
-    }
-    assert_eq!(env.len(), 4 + 2 * UNTRUSTED_GIT_CONFIG.len());
-    env
 }
 
 fn harness_name(harness: Harness) -> &'static str {
@@ -1091,6 +1078,10 @@ fn build_prompt(brief: &Brief, retry: bool) -> Result<String, Block> {
     if retry {
         prompt.push_str("\n\n");
         prompt.push_str(RETRY_NOTE);
+    }
+    if brief.untrusted {
+        prompt.push_str("\n\n");
+        prompt.push_str(UNTRUSTED_NOTE);
     }
     if !brief.role.skills.is_empty() {
         let names: Vec<String> = brief
@@ -1235,7 +1226,7 @@ fn inspect(
         head_moved: evidence.head_moved,
         keeps_start: evidence.keeps_start,
         own_commits: evidence.work.commits,
-        commits_expected: attempt.brief.role.commits_expected,
+        commits_expected: attempt.brief.role.commits_expected && !attempt.brief.untrusted,
         last_message: last_message.as_deref(),
     };
     let verdict = judge(&outcome);
@@ -1248,6 +1239,18 @@ fn inspect(
 
 // For a task on a branch, the work is the branch's own commit, not wherever HEAD points.
 fn evidence(attempt: &Attempt) -> Result<Evidence, String> {
+    if attempt.brief.untrusted {
+        let head = NO_WORKTREE_HEAD.to_string();
+        let work = Work { head, commits: 0 };
+        assert!(attempt.checkout.branch.is_none());
+        return Ok(Evidence {
+            clean: true,
+            on_branch: true,
+            head_moved: false,
+            keeps_start: true,
+            work,
+        });
+    }
     let checkout = &attempt.checkout;
     let dir = checkout.dir.as_path();
     // A branch is measured from where the task began; a detached checkout from this attempt.
@@ -1372,6 +1375,17 @@ fn complete(
         && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
     {
         let _ = board.reply(id, &record);
+    }
+    if attempt.brief.untrusted {
+        let scratch = env
+            .home
+            .join(UNTRUSTED_DIR)
+            .join(attempt.brief.id.0.to_string());
+        if let Err(error) = fs::remove_dir_all(&scratch) {
+            let note = format!("Kept the scratch directory {}: {error}.", scratch.display());
+            let _ = board.reply(id, &one_line(&note));
+        }
+        return Ok(());
     }
     if let Err(error) = worktree::release(&attempt.checkout, &attempt.brief.repo, &env.home) {
         let why = match error {

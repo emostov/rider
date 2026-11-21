@@ -58,6 +58,7 @@ pub enum BriefError {
     BadResume(String),
     BadRestack(String),
     BadUntrusted(String),
+    UntrustedInGit(&'static str),
     RestackWithoutOnto,
     /// An `onto` task on a role without commits, which names only a session to resume.
     OntoWithoutResume {
@@ -137,6 +138,11 @@ impl fmt::Display for BriefError {
                 f,
                 "Change the `untrusted` label from {value:?} to 1, or remove it."
             ),
+            BriefError::UntrustedInGit(key) => write!(
+                f,
+                "Remove the `{key}` label: an untrusted task gets no git worktree or branch, \
+                 only a scratch directory."
+            ),
             BriefError::RestackWithoutOnto => write!(
                 f,
                 "Remove the `restack` label, or set `onto` to the task whose branch this task \
@@ -193,7 +199,12 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     if base.is_some() && onto.is_some() {
         return Err(BriefError::BaseAndOnto);
     }
-    if role.needs_of && of.is_none() {
+    let untrusted = match label(view, "untrusted") {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => return Err(BriefError::BadUntrusted(echo(other))),
+    };
+    if role.needs_of && of.is_none() && !untrusted {
         return Err(BriefError::ReviewWithoutOf);
     }
     if let Some(base) = base.filter(|base| !view.needs.contains(base)) {
@@ -213,17 +224,21 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         Some("1") => true,
         Some(other) => return Err(BriefError::BadRestack(echo(other))),
     };
-    let untrusted = match label(view, "untrusted") {
-        None | Some("0") => false,
-        Some("1") => true,
-        Some(other) => return Err(BriefError::BadUntrusted(echo(other))),
-    };
     if restack && onto.is_none() {
         return Err(BriefError::RestackWithoutOnto);
     }
     if let Some(onto) = onto.filter(|_| !role.commits_expected && !resume) {
         let role = role.label;
         return Err(BriefError::OntoWithoutResume { onto, role });
+    }
+    let in_git = [
+        ("base", base.is_some()),
+        ("from", from.is_some()),
+        ("restack", restack),
+        ("onto", onto.is_some() && role.commits_expected),
+    ];
+    if let Some((key, _)) = in_git.iter().find(|(_, set)| untrusted && *set) {
+        return Err(BriefError::UntrustedInGit(key));
     }
     check_git_repo(&repo)?;
     let brief = Brief {
@@ -244,7 +259,8 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     assert!(brief.role.commits_expected || brief.onto.is_none() || brief.resume);
     assert!(brief.base.is_none_or(|base| view.needs.contains(&base)));
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
-    assert!(!brief.role.needs_of || brief.of.is_some());
+    assert!(!brief.role.needs_of || brief.of.is_some() || brief.untrusted);
+    assert!(!brief.untrusted || (brief.base.is_none() && brief.from.is_none()));
     assert!(brief.role.commits_expected || brief.role.needs_of);
     Ok(brief)
 }

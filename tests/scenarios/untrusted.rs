@@ -18,8 +18,9 @@ fn an_untrusted_task_runs_without_github_tokens_and_with_an_empty_gh_config() {
         return;
     };
     let trusted = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    let untrusted = an_implement_task(&world, "Merge the pull request.").label("untrusted", "1");
+    let untrusted = an_untrusted_task(&world, "Review the pull request.", "implement");
     let untrusted = when_the_lead_creates(&world, &untrusted);
+    given_the_agent_will(&world, &untrusted, &[Behaviour::CommitNothing]);
     given_a_running_daemon_with(&mut world, &TOKENS);
 
     let states = when_the_tasks_settle(&world, &[&trusted, &untrusted]);
@@ -35,10 +36,7 @@ fn an_untrusted_task_runs_without_github_tokens_and_with_an_empty_gh_config() {
         .join("gh-config");
     let expected = vec![format!("GH_CONFIG_DIR={}", config.display())];
     assert_eq!(fake_agent::gh_env(&world.root, &untrusted, 0), expected);
-    let entries = fs::read_dir(&config)
-        .expect("the gh config directory exists")
-        .count();
-    assert_eq!(entries, 0);
+    assert!(!world.home.join("untrusted").join(&untrusted).exists());
 }
 
 #[test]
@@ -46,7 +44,8 @@ fn an_untrusted_label_other_than_1_is_an_invalid_brief() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let task = an_implement_task(&world, "Merge the pull request.").label("untrusted", "yes");
+    let task = an_untrusted_task(&world, "Review the pull request.", "implement")
+        .label("untrusted", "yes");
     let task = when_the_lead_creates(&world, &task);
 
     let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
@@ -74,8 +73,9 @@ fn an_untrusted_task_sees_only_the_allowed_variables() {
         return;
     };
     let trusted = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    let untrusted = an_implement_task(&world, "Merge the pull request.").label("untrusted", "1");
+    let untrusted = an_untrusted_task(&world, "Review the pull request.", "implement");
     let untrusted = when_the_lead_creates(&world, &untrusted);
+    given_the_agent_will(&world, &untrusted, &[Behaviour::CommitNothing]);
     given_a_running_daemon_with(&mut world, &SECRETS);
 
     let states = when_the_tasks_settle(&world, &[&trusted, &untrusted]);
@@ -92,10 +92,6 @@ fn an_untrusted_task_sees_only_the_allowed_variables() {
         "BOARD_TASK",
         "BOARD_URL",
         "GH_CONFIG_DIR",
-        "GIT_ATTR_NOSYSTEM",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_NOSYSTEM",
-        "GIT_TERMINAL_PROMPT",
         "HOME",
         "PATH",
         "PWD",
@@ -107,10 +103,6 @@ fn an_untrusted_task_sees_only_the_allowed_variables() {
     ]
     .map(String::from)
     .into();
-    for index in 0..12 {
-        expected.push(format!("GIT_CONFIG_KEY_{index}"));
-        expected.push(format!("GIT_CONFIG_VALUE_{index}"));
-    }
     expected.sort();
     assert_eq!(fake_agent::env_names(&world.root, &untrusted, 0), expected);
 }
@@ -149,34 +141,67 @@ fn given_tracked_hooks_and_a_fetched_pr(world: &World) -> PathBuf {
     log
 }
 
+fn an_untrusted_task(world: &World, text: &str, role: &str) -> NewTask {
+    NewTask::new(text)
+        .label("repo", world.repo_label())
+        .label("untrusted", "1")
+        .role(role)
+}
+
 #[test]
-fn an_untrusted_merge_and_commit_run_none_of_the_repositorys_tracked_hooks() {
+fn an_untrusted_task_gets_a_scratch_directory_and_never_the_prs_code_in_git() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let log = given_tracked_hooks_and_a_fetched_pr(&world);
-    let merge = NewTask::new("Merge the pull request onto main.")
-        .label("repo", world.repo_label())
-        .label("from", MAIN)
-        .label("untrusted", "1")
-        .role("light");
-    let merge = when_the_lead_creates(&world, &merge);
+    let branches_before = branches(&world);
+    let merge = when_the_lead_creates(
+        &world,
+        &an_untrusted_task(&world, "Merge the pull request.", "light"),
+    );
     given_the_agent_will(&world, &merge, &[Behaviour::MergePr]);
-    let synthesis = NewTask::new("Write the review file.")
-        .label("repo", world.repo_label())
-        .label("base", &merge)
-        .label("untrusted", "1")
-        .needs(&merge)
-        .role("implement");
+    let synthesis = an_untrusted_task(&world, "Write the review.", "implement");
     let synthesis = when_the_lead_creates(&world, &synthesis);
-    let trusted = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &synthesis, &[Behaviour::CommitNothing]);
+    let review = an_untrusted_task(&world, "Review the pull request.", "review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
 
-    let tasks = [merge.as_str(), synthesis.as_str(), trusted.as_str()];
+    let tasks = [merge.as_str(), synthesis.as_str(), review.as_str()];
     let (states, _) = when_the_daemon_runs_until_settled(&mut world, &tasks);
 
-    assert_eq!(states, vec!["completed"; 3]);
-    let ran = fs::read_to_string(&log).expect("the trusted commit ran its hook");
-    let trusted_dir = worktree_dir(&world, &trusted);
-    let expected = format!("pre-commit {}\n", trusted_dir.display());
-    assert_eq!(ran, expected);
+    assert_eq!(states, vec!["failed", "completed", "completed"]);
+    assert!(
+        !log.exists(),
+        "{}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(branches(&world), branches_before);
+    let worktrees = world.git_ok(&["worktree", "list", "--porcelain"]);
+    assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+    for task in tasks {
+        let run = &agent_runs_for(&world, task)[0];
+        let scratch = world.home.join("untrusted").join(task).join("work");
+        assert_eq!(run.dir, scratch);
+        assert_eq!(task_label(&world, task, "branch"), None);
+    }
+}
+
+#[test]
+fn an_untrusted_task_with_a_branch_label_is_an_invalid_brief() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = an_untrusted_task(&world, "Merge the pull request.", "light").label("from", MAIN);
+    let task = when_the_lead_creates(&world, &task);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(states, vec!["blocked"]);
+    let reason = "Remove the `from` label: an untrusted task gets no git worktree or branch, \
+                  only a scratch directory.";
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("invalid_brief".to_string(), reason.to_string()))
+    );
 }
