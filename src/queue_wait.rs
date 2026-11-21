@@ -149,6 +149,9 @@ pub enum Watch {
         after: Option<Timestamp>,
         comments: bool,
     },
+    Unrecorded {
+        pr: String,
+    },
 }
 
 pub trait Sources: Sync {
@@ -363,8 +366,15 @@ pub fn watches(home: &Path, tasks: &[ListedTask]) -> Result<Vec<Watch>, WaitErro
         let kind = label(task, "kind");
         let comments = turn == Some("author") || kind == Some("respond");
         let label = checked(task, "head", commit)?;
-        let head = recorded_head(home, task.view.id)?.or(label);
-        let owner_review = turn == Some("owner") && kind == Some("review") && head.is_some();
+        let recorded = recorded_head(home, task.view.id)?;
+        let owner_review = turn == Some("owner") && kind == Some("review");
+        if owner_review && recorded.is_none() {
+            if label.is_some() {
+                watches.push(Watch::Unrecorded { pr });
+            }
+            continue;
+        }
+        let head = recorded.or(label);
         if comments || owner_review {
             let after = checked(task, "github_at", time)?;
             let repo = repo.to_string();
@@ -501,6 +511,7 @@ fn check(
                 lines.push(format!("{pr}: packet {slug} has a comment at {at}"));
             }
         }
+        Watch::Unrecorded { pr } => lines.push(format!("{pr}: no reviewed head is recorded")),
         Watch::Pull {
             pr,
             repo,
@@ -533,7 +544,7 @@ fn poll(
 ) -> Vec<Result<Vec<String>, WaitError>> {
     let is_due = |watch: &&Watch| match watch {
         Watch::Packet { .. } => due.0,
-        Watch::Pull { .. } => due.1,
+        Watch::Pull { .. } | Watch::Unrecorded { .. } => due.1,
     };
     let due: Vec<&Watch> = watches.iter().filter(is_due).collect();
     let mut results = Vec::with_capacity(due.len());

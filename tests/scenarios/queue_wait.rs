@@ -354,13 +354,34 @@ fn rider_queue_wait_ends_when_the_head_of_a_review_on_the_owners_turn_moves() {
     };
     given_fake_reviews_and_gh(&world, REVIEWS_SHOW, GH_PR_VIEW);
     let labels = [("kind", "review"), ("turn", "owner"), ("head", OLD_HEAD)];
-    given_a_queue_item(&world, 412, &labels);
+    let item = given_a_queue_item(&world, 412, &labels);
+    let recorded = when_rider_runs(&world, &["queue", "reviewed", &item, OLD_HEAD]);
+    assert_eq!(recorded.code, Some(0), "{recorded:?}");
 
     let (output, _) = when_the_queue_is_waited_on(&world);
 
     assert_eq!(output.code, Some(0), "{output:?}");
     let line = format!("acme/widgets#412: head moved to {PR_HEAD}\n");
     assert_eq!(output.stdout, line);
+}
+
+#[test]
+fn rider_queue_wait_reports_an_owner_review_with_a_head_label_but_no_recorded_head() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_fake_reviews_and_gh(&world, REVIEWS_SHOW, GH_PR_VIEW);
+    let labels = [("kind", "review"), ("turn", "owner"), ("head", PR_HEAD)];
+    given_a_queue_item(&world, 412, &labels);
+
+    let (output, _) = when_the_queue_is_waited_on(&world);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        "acme/widgets#412: no reviewed head is recorded\n"
+    );
+    assert_eq!(calls(&world, "gh"), Vec::<u64>::new());
 }
 
 #[test]
