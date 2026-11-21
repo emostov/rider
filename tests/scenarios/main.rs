@@ -1933,6 +1933,32 @@ fn an_onto_task_that_does_not_need_an_unfinished_task_onto_a_completed_fix_is_bl
 }
 
 #[test]
+fn an_onto_task_runs_when_a_task_on_its_branch_waits_for_it_through_a_task_of_no_repository() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let first = a_fix(&world, "Fix the work.", &built, &built, false);
+    let first = when_the_lead_creates(&world, &first);
+    let gate = NewTask::new("Finish a prerequisite.").needs(&first);
+    let gate = when_the_lead_creates(&world, &gate);
+    let later = a_fix(&world, "Fix the work again.", &built, &gate, false);
+    let later = when_the_lead_creates(&world, &later);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &first]);
+
+    assert_eq!(
+        (states, exit),
+        (
+            vec!["completed".to_string(), "completed".to_string()],
+            Some(0)
+        )
+    );
+    assert_eq!(task_block(&world, &first), None);
+    assert_eq!(task_state(&world, &later), "waiting");
+}
+
+#[test]
 fn an_unfinished_task_on_a_same_named_branch_of_another_repository_does_not_block_a_fix() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;

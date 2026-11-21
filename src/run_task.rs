@@ -498,10 +498,10 @@ fn unneeded_on_branch(
         .tasks
         .iter()
         .map(|listed| &listed.view)
-        .filter(|task| task.id != view.id && in_repo(task, &brief.repo))
+        .filter(|task| task.id != view.id)
         .collect();
     let mut targets: Vec<TaskId> = vec![onto];
-    for task in &open {
+    for task in open.iter().filter(|task| in_repo(task, &brief.repo)) {
         let target = label(task, BRANCH_LABEL)
             .is_none()
             .then(|| parse_id_label(task, "onto").ok().flatten())
@@ -532,8 +532,9 @@ fn unneeded_on_branch(
         let inherited = works_onto
             .and_then(branch_of)
             .and_then(|(_, b)| b.as_deref());
-        own.or(inherited) == Some(branch.as_str())
-            || own.is_none() && works_onto.is_some_and(|id| members.contains(&id))
+        in_repo(task, &brief.repo)
+            && (own.or(inherited) == Some(branch.as_str())
+                || own.is_none() && works_onto.is_some_and(|id| members.contains(&id)))
     });
     let after = closure(&open, view.id, |task, members| {
         task.needs.iter().any(|need| members.contains(need))
