@@ -117,6 +117,8 @@ pub enum Behaviour {
     ReportHugeUsage,
     /// Commits like `Commit` when run as `claude`, then prints the harness's recorded fixture.
     ReplayRecorded,
+    ReportDecision,
+    HoldAttempt,
     MergePr,
 }
 
@@ -188,6 +190,8 @@ impl Behaviour {
             Behaviour::CommitRepeatingUsage => "commit-repeating-usage",
             Behaviour::ReportHugeUsage => "report-huge-usage",
             Behaviour::ReplayRecorded => "replay-recorded",
+            Behaviour::ReportDecision => "report-decision",
+            Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
         }
     }
@@ -234,6 +238,14 @@ pub fn options(world: &Path, task: &str, attempt: u32) -> Vec<String> {
 /// The line a `HoldTalking` agent prints before it holds.
 pub fn hold_line(task: &str) -> String {
     format!(r#"{{"type":"fake","text":"holding task {task}"}}"#)
+}
+
+pub fn heard(decisions: &[&str]) -> String {
+    let heard: Vec<String> = decisions
+        .iter()
+        .map(|word| format!("Decision {word}"))
+        .collect();
+    format!("Fake agent heard {}.", heard.join(", "))
 }
 
 /// The final message a fake agent reports; it becomes the task's result.
@@ -376,6 +388,20 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  hold-attempt)
+    step=0
+    while [ ! -e "$world/{RELEASES_DIR}/$task-$attempt" ]; do
+      step=$((step + 1))
+      [ "$step" -le {steps} ] || exit 1
+      sleep 0.1
+    done
+    commit || exit 1 ;;
+  report-decision)
+    for arg in "$@"; do prompt="$arg"; done
+    heard=$(printf '%s\n' "$prompt" | grep -o 'Decision [a-z0-9]*' | paste -s -d '#' - \
+      | sed 's/#/, /g')
+    [ -n "$heard" ] || heard="Decision none"
+    summary="Fake agent heard $heard." ;;
   merge-pr) git merge -q --no-edit {PR_REF} || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
@@ -471,6 +497,12 @@ pub fn release(world: &Path, task: &str) {
     assert!(!task.is_empty());
     let path = world.join(RELEASES_DIR).join(task);
     fs::write(&path, "").expect("release an agent");
+    assert!(path.exists());
+}
+
+pub fn release_attempt(world: &Path, task: &str, attempt: u32) {
+    let path = world.join(RELEASES_DIR).join(format!("{task}-{attempt}"));
+    fs::write(&path, "").expect("release an agent's attempt");
     assert!(path.exists());
 }
 

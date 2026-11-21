@@ -168,13 +168,17 @@ impl SessionId {
     }
 }
 
-/// The command line that runs `spec` on `prompt` in `dir`, starting from a fork of session
-/// `resume` when given (Claude only); the prompt is last, after `--`.
+#[derive(Debug, Clone, Copy)]
+pub enum Resume<'a> {
+    Fork(&'a SessionId),
+    InPlace(&'a SessionId),
+}
+
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,
     dir: &Path,
-    resume: Option<&SessionId>,
+    resume: Option<Resume>,
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
     assert!(
@@ -248,11 +252,18 @@ pub fn command_for(
         ),
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
-    if let Some(session) = resume {
+    match resume {
         // Without `--fork-session` Claude appends to the resumed session in place.
-        let at = args.len() - 2;
-        let fork = [session.0.clone(), "--fork-session".to_string()];
-        args.splice(at..at, ["--resume".to_string()].into_iter().chain(fork));
+        Some(Resume::Fork(session)) => {
+            let at = args.len() - 2;
+            let fork = [session.0.clone(), "--fork-session".to_string()];
+            args.splice(at..at, ["--resume".to_string()].into_iter().chain(fork));
+        }
+        Some(Resume::InPlace(session)) => {
+            let at = args.len() - 2;
+            args.splice(at..at, ["--resume".to_string(), session.0.clone()]);
+        }
+        None => {}
     }
     assert!(args.len() <= ARGS_MAX);
     assert!(args.iter().any(|a| a == model || *a == model_setting));
