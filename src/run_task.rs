@@ -33,12 +33,6 @@ use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError
 
 pub const DELIVERY_ROUNDS_MAX: u8 = 3;
 const UNTRUSTED_DIR: &str = "untrusted";
-const UNTRUSTED_HIDDEN: [&str; 4] = [
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN",
-];
 /// Upper bound on the failed attempts after which a task is blocked instead of run again.
 pub const ATTEMPTS_MAX: u8 = 9;
 /// The failed attempts after which a task is blocked, unless the configuration sets them.
@@ -381,7 +375,7 @@ impl Attempt {
         };
         let mut cmd = cmd.ok()?;
         cmd.env.clone_from(&self.cmd.env);
-        cmd.hidden = self.cmd.hidden;
+        cmd.untrusted = self.cmd.untrusted;
         let prompt = match &cmd.io {
             Io::Stream => cmd.args.last(),
             Io::PromptOnStdin(prompt) => Some(prompt),
@@ -816,11 +810,11 @@ fn prepare(
             ("BOARD_URL".to_string(), env.board_url.clone()),
         ]);
         if brief.untrusted {
-            cmd.hidden = &UNTRUSTED_HIDDEN;
+            cmd.untrusted = true;
             let dir = gh_config.to_string_lossy().into_owned();
             cmd.env.push(("GH_CONFIG_DIR".to_string(), dir));
         }
-        assert!(!brief.untrusted || cmd.hidden.contains(&"GH_TOKEN"));
+        assert_eq!(cmd.untrusted, brief.untrusted);
         Ok::<CommandLine, Block>(cmd)
     };
     let cmd = command(resume.as_ref())?;

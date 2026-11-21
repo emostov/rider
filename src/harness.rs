@@ -8,6 +8,7 @@ use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
+use std::env;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
@@ -28,6 +29,9 @@ pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
 const ARGS_MAX: usize = 16;
+const UNTRUSTED_ENV_ALLOWED: [&str; 10] = [
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG", "LC_ALL", "LC_CTYPE",
+];
 const CODEX_REFUSAL_BYTES_MAX: usize = 64 * 1024;
 const CODEX_NO_ROLLOUT: &str = "no rollout found for thread id";
 const ENV_MAX: usize = 16;
@@ -65,7 +69,7 @@ pub struct CommandLine {
     pub args: Vec<String>,
     /// Set on top of the inherited environment.
     pub env: Vec<(String, String)>,
-    pub hidden: &'static [&'static str],
+    pub untrusted: bool,
     pub io: Io,
 }
 
@@ -271,7 +275,7 @@ pub fn command_for(
         program,
         args,
         env,
-        hidden: &[],
+        untrusted: false,
         io,
     })
 }
@@ -526,6 +530,14 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
     assert!(cmd.args.len() <= ARGS_MAX && cmd.env.len() <= ENV_MAX);
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
     let mut process = Command::new(&cmd.program);
+    if cmd.untrusted {
+        process.env_clear();
+        for name in UNTRUSTED_ENV_ALLOWED {
+            if let Some(value) = env::var_os(name) {
+                process.env(name, value);
+            }
+        }
+    }
     process
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(key, value)| (key, value)))
@@ -536,7 +548,7 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for name in git::ENV_REMOVED.iter().chain(cmd.hidden) {
+    for name in git::ENV_REMOVED {
         process.env_remove(name);
     }
     let spawned = CommandWrap::from(process)

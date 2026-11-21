@@ -247,7 +247,7 @@ fn script() -> String {
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
     format!(
         r#"#!/bin/sh
-world="${WORLD_VAR}"
+world="${{{WORLD_VAR}:-$(dirname "$(dirname "$(command -v "$0")")")}}"
 task="$BOARD_TASK"
 harness=$(basename "$0")
 [ "$harness" = codex ] && [ "$1" = review ] && harness=codex-review
@@ -262,6 +262,7 @@ printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
 [ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 env | grep -E '^(GH|GITHUB)_' | sort > "$world/{ARGS_DIR}/$task-$attempt.gh-env"
+env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -446,6 +447,13 @@ pub fn git_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
         .join(ARGS_DIR)
         .join(format!("{task}-{attempt}.git-env"));
     let text = fs::read_to_string(&path).expect("read an agent's git environment");
+    text.lines().map(str::to_string).collect()
+}
+
+/// The names of every variable attempt `attempt` of `task` was started with.
+pub fn env_names(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.env"));
+    let text = fs::read_to_string(&path).expect("read an agent's environment");
     text.lines().map(str::to_string).collect()
 }
 
