@@ -20,6 +20,13 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
 | `daemon.log`, `board.log` | what the daemon and the board it started printed |
 | `rider.sock` | the daemon's control socket |
 
+## Agent sandbox
+
+On macOS agents run under a best-effort `sandbox-exec` sandbox that blocks the obvious ways to
+reach Rider's socket, control files and programs. It is defence in depth, not a security
+boundary: a determined agent running as the owner's user can still escape it. Linux agents are
+not confined.
+
 ## Troubleshooting
 
 `rider vb` runs the Board CLI under `<rider home>/node/node_modules/.bin` on the local board

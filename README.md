@@ -67,7 +67,9 @@ The board's web inspector is at <http://127.0.0.1:4100>.
 Agents run as your user with permission prompts skipped, so they can read and change what your
 account can: files, credentials and the network.
 
-On macOS Rider starts each agent under `sandbox-exec`. The agent and every process it starts
+On macOS Rider starts each agent under `sandbox-exec`, a best-effort sandbox. It blocks the
+obvious ways to reach Rider's socket, control files and programs. It is not a security
+boundary: a determined agent running as your user can still escape it. The agent and every process it starts
 cannot connect to the daemon's socket, signal a process outside the agent's sandbox, open apps
 through LaunchServices or send Apple events, or write Rider's control files, `rider.toml`,
 `<rider home>/prompts`, anything in its repository's git directories but objects, refs, logs
@@ -77,7 +79,7 @@ commands under the same sandbox with no network, so hooks, filters and remotes s
 repository's config run confined. Every git call Rider makes, `rider pr`'s included, ignores
 credential helpers and askpass programs, so `rider pr` pushes over ssh, not https.
 
-On Linux agents are not confined: an agent can run `rider down` or `rider kill`, stop the
+On Linux agents are not confined at all: an agent can run `rider down` or `rider kill`, stop the
 daemon, or rewrite its files. The same holds on macOS when the daemon itself was started inside
 a sandbox; `daemon.log` then says `agents run unconfined`.
 
