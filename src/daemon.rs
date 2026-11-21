@@ -22,7 +22,7 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
     Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
-    parse_failure_reason,
+    parse_failure_reason, register_schemas,
 };
 use crate::cli::board_serve;
 use crate::config::Limits;
@@ -139,7 +139,6 @@ exec "$@""#;
 /// Where the daemon's files are and how it reaches the board and its agents.
 pub struct Paths {
     pub home: PathBuf,
-    pub prompts: PathBuf,
     pub vb: PathBuf,
     pub board_url: String,
 }
@@ -168,6 +167,7 @@ pub enum DaemonError {
     NotAFile(PathBuf),
     /// The board's identity could not be read at start-up.
     Identity(IdentityUnknown),
+    Schemas(BoardError),
 }
 
 impl fmt::Display for DaemonError {
@@ -187,6 +187,12 @@ impl fmt::Display for DaemonError {
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
             DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
             DaemonError::Identity(error) => write!(f, "{error}"),
+            DaemonError::Schemas(error) => {
+                write!(
+                    f,
+                    "could not register Rider's schemas on the board: {error}"
+                )
+            }
         }
     }
 }
@@ -402,7 +408,6 @@ impl Shared {
         assert!(self.paths.home.is_absolute());
         Env {
             home: self.paths.home.clone(),
-            prompts: self.paths.prompts.clone(),
             profile: profile.to_string(),
             board_url: self.paths.board_url.clone(),
             attempts: self.attempts,
@@ -513,6 +518,17 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         shared.socket.close();
         drop(board);
         return Err(DaemonError::Identity(error));
+    }
+    match register_schemas(&shared.board(DAEMON_PROFILE)) {
+        Ok(registered) if registered.is_empty() => {}
+        Ok(registered) => (shared.log).write(&format!("registered {}", registered.join(", "))),
+        Err(error) => {
+            let error = DaemonError::Schemas(error);
+            shared.log.write(&error.to_string());
+            shared.socket.close();
+            drop(board);
+            return Err(error);
+        }
     }
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
@@ -1118,6 +1134,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
             program: "/bin/sh".to_string(),
             args,
             env,
+            io: cmd.io.clone(),
         };
         launch_agent(&wrapped, dir, log, runner_seconds)
     };
@@ -1382,6 +1399,12 @@ impl Board for Guarded<'_> {
     }
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
         self.board.blocking_findings(id)
+    }
+    fn schema_ids(&self) -> Result<Vec<String>, BoardError> {
+        self.board.schema_ids()
+    }
+    fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError> {
+        self.board.create_schema(id, json)
     }
 }
 

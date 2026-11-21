@@ -1,7 +1,7 @@
 //! `harness::run` against `fake_agent`, a stand-in for a real agent CLI.
 
 use rider::harness::{
-    CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId, Usage,
+    CommandLine, Exit, HarnessError, Io, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId, Usage,
     command_for, last_message, run, run_on_clock, session_id, stream_reports_failure, usage,
 };
 use rider::roles::{AGENTS_MAX, Harness, role_from_label};
@@ -56,7 +56,18 @@ fn fake(args: &[&str]) -> CommandLine {
         program: env!("CARGO_BIN_EXE_fake_agent").to_string(),
         args: args.iter().map(|a| a.to_string()).collect(),
         env: Vec::new(),
+        io: Io::Stream,
     }
+}
+
+#[test]
+fn the_recorded_codex_review_output_is_its_final_text() {
+    let log = Path::new("fixtures/harness/codex-review.txt");
+    let recorded = fs::read_to_string(log).unwrap();
+    let text = last_message(&Harness::CodexReview, log).unwrap();
+    assert_eq!(text, recorded.trim());
+    assert!(text.starts_with("The new function returns the wrong number of items"));
+    assert!(!stream_reports_failure(&Harness::CodexReview, log));
 }
 
 #[test]
@@ -484,6 +495,7 @@ until [ -e '{}' ] || [ "$n" -gt 600 ]; do n=$((n + 1)); sleep 0.05; done"#,
                 started.display().to_string(),
             ],
             env: Vec::new(),
+            io: Io::Stream,
         };
         let (root, log) = (
             scratch.root.clone(),

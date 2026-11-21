@@ -11,7 +11,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -43,6 +43,7 @@ const LINE_BYTES_MAX: usize = 4 * 1024 * 1024;
 // Every line holds at least its newline, so a log read up to `LOG_BYTES_MAX` has fewer lines.
 const LINES_MAX: u64 = LOG_BYTES_MAX + 1;
 const SKIP_READS_MAX: u64 = LOG_BYTES_MAX / LINE_BYTES_MAX as u64 + 2;
+const REVIEW_INTERRUPTED: &str = "Review was interrupted.";
 const POISONED: &str = "the log lock was poisoned";
 
 const _: () = {
@@ -62,6 +63,26 @@ pub struct CommandLine {
     pub args: Vec<String>,
     /// Set on top of the inherited environment.
     pub env: Vec<(String, String)>,
+    pub io: Io,
+}
+
+/// What an agent reads and where its output goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Io {
+    /// Standard input is closed; standard output and error both go to the log.
+    Stream,
+    /// The prompt is fed on standard input; standard output, the final text, goes to the log
+    /// and standard error, the transcript, to `stderr_log(log)`.
+    PromptOnStdin(String),
+}
+
+/// Where an `Io::PromptOnStdin` agent's standard error is logged: beside `log`.
+pub fn stderr_log(log: &Path) -> PathBuf {
+    let mut path = log.as_os_str().to_owned();
+    path.push(".stderr");
+    let path = PathBuf::from(path);
+    assert!(path != log && path.parent() == log.parent());
+    path
 }
 
 /// How an attempt ended.
@@ -173,7 +194,9 @@ pub fn command_for(
     }
     let dir = dir.to_string_lossy();
     let model = spec.model;
-    let (program, head) = match spec.harness {
+    let model_setting = format!("model={model:?}");
+    let review_model_setting = format!("review_model={model:?}");
+    let (program, head, io) = match spec.harness {
         Harness::Claude => (
             "claude",
             vec![
@@ -184,7 +207,10 @@ pub fn command_for(
                 "stream-json",
                 "--verbose",
                 "--dangerously-skip-permissions",
+                "--",
+                prompt,
             ],
+            Io::Stream,
         ),
         Harness::Codex => (
             "codex",
@@ -196,25 +222,48 @@ pub fn command_for(
                 "--dangerously-bypass-approvals-and-sandbox",
                 "-C",
                 &dir,
+                "--",
+                prompt,
             ],
+            Io::Stream,
+        ),
+        // `codex review` refuses a prompt with `--base`, `--commit` or `--uncommitted`, has no
+        // bypass flag, and reads its prompt from stdin for `-`.
+        Harness::CodexReview => (
+            "codex",
+            vec![
+                "review",
+                "-c",
+                &model_setting,
+                // The review subagent runs `review_model` when one is configured, not `model`.
+                "-c",
+                &review_model_setting,
+                "-c",
+                r#"sandbox_mode="danger-full-access""#,
+                "-c",
+                r#"approval_policy="never""#,
+                "-",
+            ],
+            Io::PromptOnStdin(prompt.to_string()),
         ),
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
     if let Some(session) = resume {
         // Without `--fork-session` Claude appends to the resumed session in place.
-        args.extend([
-            "--resume".to_string(),
-            session.0.clone(),
-            "--fork-session".to_string(),
-        ]);
+        let at = args.len() - 2;
+        let fork = [session.0.clone(), "--fork-session".to_string()];
+        args.splice(at..at, ["--resume".to_string()].into_iter().chain(fork));
     }
-    args.push("--".to_string());
-    args.push(prompt.to_string());
     assert!(args.len() <= ARGS_MAX);
-    assert!(args.iter().any(|a| a == model));
+    assert!(args.iter().any(|a| a == model || *a == model_setting));
     let program = program.to_string();
     let env = Vec::new();
-    Ok(CommandLine { program, args, env })
+    Ok(CommandLine {
+        program,
+        args,
+        env,
+        io,
+    })
 }
 
 struct LogFile {
@@ -391,7 +440,7 @@ fn timed_out(
 
 fn supervise(
     child: &mut dyn ChildWrapper,
-    shared: &Shared,
+    logs: [&Arc<Shared>; READERS],
     seconds_max: u64,
     wall_clock: &dyn Fn() -> SystemTime,
 ) -> Result<(ExitStatus, bool), HarnessError> {
@@ -412,7 +461,7 @@ fn supervise(
         if let Some(status) = polled {
             return Ok((status, term_sent.is_some()));
         }
-        if let Some(message) = shared.error() {
+        if let Some(message) = logs.iter().find_map(|log| log.error()) {
             let _ = kill_and_reap(child);
             return Err(HarnessError::Log(message));
         }
@@ -471,7 +520,10 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(key, value)| (key, value)))
         .current_dir(dir)
-        .stdin(Stdio::null())
+        .stdin(match cmd.io {
+            Io::Stream => Stdio::null(),
+            Io::PromptOnStdin(_) => Stdio::piped(),
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for name in git::ENV_REMOVED {
@@ -486,16 +538,36 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
 fn start_readers(
     child: &mut dyn ChildWrapper,
     slots: [ReaderSlot; READERS],
-    shared: &Arc<Shared>,
+    logs: [&Arc<Shared>; READERS],
     done: &SyncSender<Result<(), String>>,
 ) -> Result<(), HarnessError> {
     let missing = |name: &str| HarnessError::Spawn(format!("the agent has no {name}"));
     let stdout = child.stdout().take().ok_or_else(|| missing("stdout"))?;
     let stderr = child.stderr().take().ok_or_else(|| missing("stderr"))?;
     let [stdout_slot, stderr_slot] = slots;
-    start_reader(stdout, "stdout", stdout_slot, shared, done)?;
-    start_reader(stderr, "stderr", stderr_slot, shared, done)?;
+    start_reader(stdout, "stdout", stdout_slot, logs[0], done)?;
+    start_reader(stderr, "stderr", stderr_slot, logs[1], done)?;
     assert!(child.stdout().is_none() && child.stderr().is_none());
+    Ok(())
+}
+
+fn feed(child: &mut dyn ChildWrapper, io: &Io) -> Result<(), HarnessError> {
+    let Io::PromptOnStdin(prompt) = io else {
+        assert!(child.stdin().is_none());
+        return Ok(());
+    };
+    assert!(prompt.len() <= PROMPT_BYTES_MAX);
+    let missing = || HarnessError::Spawn("the agent has no stdin".to_string());
+    let mut stdin = child.stdin().take().ok_or_else(missing)?;
+    let prompt = prompt.clone();
+    // An agent that exits without reading closes the pipe, so the write ends; its exit status
+    // says what happened.
+    let builder = thread::Builder::new().name("agent-stdin".to_string());
+    let started = builder.spawn(move || {
+        let _ = stdin.write_all(prompt.as_bytes());
+    });
+    started.map_err(|error| HarnessError::Spawn(format!("starting the stdin writer: {error}")))?;
+    assert!(child.stdin().is_none());
     Ok(())
 }
 
@@ -527,23 +599,31 @@ pub fn run_on_clock(
     };
     let slots = [reserve()?, reserve()?];
     let shared = open_log(log, log_bytes_max)?;
+    let apart = match cmd.io {
+        Io::Stream => None,
+        Io::PromptOnStdin(_) => Some(open_log(&stderr_log(log), log_bytes_max)?),
+    };
     let mut child = spawn(cmd, dir)?;
     assert!(
         child.id() > 1,
         "a spawned child is never init or the scheduler"
     );
     let (done, finished) = mpsc::sync_channel(READERS);
-    if let Err(error) = start_readers(child.as_mut(), slots, &shared, &done) {
+    let logs = [&shared, apart.as_ref().unwrap_or(&shared)];
+    let started = start_readers(child.as_mut(), slots, logs, &done);
+    if let Err(error) = started.and_then(|()| feed(child.as_mut(), &cmd.io)) {
         let _ = kill_and_reap(child.as_mut());
         shared.close();
+        apart.as_ref().map(|apart| apart.close());
         return Err(error);
     }
     drop(done);
-    let outcome = supervise(child.as_mut(), &shared, seconds_max, wall_clock);
+    let outcome = supervise(child.as_mut(), logs, seconds_max, wall_clock);
     // The leader is reaped; leftover members of its group would hold the pipes open.
     let _ = child.start_kill();
     let drained = drain(&finished);
     let logged = shared.close();
+    let logged = logged.or(apart.and_then(|apart| apart.close()));
     let (status, timed_out) = outcome?;
     if let Some(message) = logged {
         return Err(HarnessError::Log(message));
@@ -710,6 +790,17 @@ pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
                 set(valid(item.text));
             }
         }),
+        // `codex review` prints no events: its standard output is the final text.
+        Harness::CodexReview => {
+            let mut text = Vec::new();
+            let limit = u64::try_from(LINE_BYTES_MAX + 1).unwrap_or(u64::MAX);
+            let read = File::open(log).and_then(|file| file.take(limit).read_to_end(&mut text));
+            let fits = read.is_ok() && text.len() <= LINE_BYTES_MAX;
+            if fits {
+                set(String::from_utf8(text).ok());
+            }
+            fits
+        }
     };
     if !complete {
         return None;
@@ -763,6 +854,7 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
 pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut last_result_failed = false;
     let mut last_turn_failed = false;
+    let mut last_review_failed = false;
     // A log cut short still counts for what it showed.
     let _ = match harness {
         // `item.type == "error"` inside `item.completed` is a harmless warning, and a
@@ -772,6 +864,13 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
             CodexEvent::TurnCompleted { .. } => last_turn_failed = false,
             CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
         }),
+        // Without an event stream, a run that exits 0 still failed when it printed no review or
+        // Codex's own message for a review delegate that never started.
+        Harness::CodexReview => {
+            last_review_failed =
+                last_message(harness, log).is_none_or(|text| text.starts_with(REVIEW_INTERRUPTED));
+            true
+        }
         Harness::Claude => scan(log, |event| {
             if let ClaudeEvent::Result {
                 subtype, is_error, ..
@@ -785,7 +884,8 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     };
     assert!(!last_result_failed || *harness == Harness::Claude);
     assert!(!last_turn_failed || *harness == Harness::Codex);
-    last_result_failed || last_turn_failed
+    assert!(!last_review_failed || *harness == Harness::CodexReview);
+    last_result_failed || last_turn_failed || last_review_failed
 }
 
 /// Upper bound on the tokens of each kind one attempt may report.
@@ -899,6 +999,8 @@ pub fn usage(harness: &Harness, model: &str, log: &Path) -> Option<Usage> {
             };
             found = Some(found.unwrap_or_default().plus(turn));
         }),
+        // `codex review` prints plain text and reports no usage.
+        Harness::CodexReview => return None,
     };
     let mut usage = found.filter(|_| complete)?;
     let counts = [

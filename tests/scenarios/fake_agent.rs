@@ -1,4 +1,4 @@
-//! Fake `claude` and `codex` scripts that play a scripted worker, one behaviour per attempt.
+//! Fake `claude` and `codex` (also as `codex review`) scripts that play a scripted worker, one behaviour per attempt.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,14 @@ pub enum Behaviour {
     Block,
     /// Prints nothing and exits `FAIL_EXIT_CODE`.
     ExitNonZero,
+    /// As `codex review`, prints no final text and exits 0.
+    ReviewNothing,
+    /// As `codex review` whose review delegate never started: prints Codex's interruption
+    /// message and exits 0.
+    ReviewInterrupted,
+    /// As `codex review` stopped by the provider's content filter: prints `CONTENT_FILTER_ERROR`
+    /// on stderr and exits 1.
+    ContentFilterStop,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
     /// Like `Hold`, but ignores SIGTERM.
@@ -131,6 +139,9 @@ impl Behaviour {
             Behaviour::LeaveUncommitted => "leave-uncommitted",
             Behaviour::Block => "block",
             Behaviour::ExitNonZero => "exit-non-zero",
+            Behaviour::ReviewNothing => "review-nothing",
+            Behaviour::ReviewInterrupted => "review-interrupted",
+            Behaviour::ContentFilterStop => "content-filter-stop",
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::HoldTalking => "hold-talking",
@@ -164,6 +175,13 @@ impl Behaviour {
         }
     }
 }
+
+/// What Codex's interruption message for a review that never started begins with.
+pub const REVIEW_INTERRUPTED: &str =
+    "Review was interrupted. Please re-run /review and wait for it to complete.";
+/// The error a `ContentFilterStop` agent prints on stderr.
+pub const CONTENT_FILTER_ERROR: &str =
+    "ERROR: This content was flagged for possible cybersecurity risk.";
 
 /// The question a blocking agent asks.
 pub const BLOCK_QUESTION: &str = "The fake agent needs an answer.";
@@ -223,6 +241,7 @@ fn script() -> String {
 world="${WORLD_VAR}"
 task="$BOARD_TASK"
 harness=$(basename "$0")
+[ "$harness" = codex ] && [ "$1" = review ] && harness=codex-review
 runs="$world/{RUNS_FILE}"
 attempt=$( (grep "^start $task " "$runs" 2>/dev/null || true) | wc -l | tr -d ' ')
 plan="$world/{BEHAVIOURS_DIR}/$task"
@@ -231,6 +250,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+[ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
@@ -250,7 +270,10 @@ done
 summary="Fake agent finished task $task attempt $attempt."
 extra=""
 report() {{
-  if [ "$harness" = codex ]; then
+  if [ "$harness" = codex-review ]; then
+    printf 'OpenAI Codex v0.0.0\n--------\ncodex\n%s\n' "$summary" >&2
+    echo "$summary"
+  elif [ "$harness" = codex ]; then
     echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
     echo '{{"type":"turn.started"}}'
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
@@ -286,6 +309,9 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  review-nothing) exit 0 ;;
+  review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
+  content-filter-stop) echo "{CONTENT_FILTER_ERROR}" >&2; exit 1 ;;
   wander-branch) git switch -q -c elsewhere && commit || exit 1 ;;
   detach) git checkout -q --detach && commit || exit 1 ;;
   commit-then-fail) commit; exit {fail} ;;
@@ -369,6 +395,12 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
     assert!(path.is_file());
 }
 
+/// What attempt `attempt` of `task`, started as `codex review`, read from its standard input.
+pub fn stdin(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.stdin"));
+    fs::read_to_string(&path).expect("read an agent's standard input")
+}
+
 /// The arguments attempt `attempt` of `task` was started with, one per line.
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
@@ -414,7 +446,7 @@ pub struct Run {
     pub task: String,
     pub attempt: u32,
     pub pid: u32,
-    /// `claude` or `codex`.
+    /// `claude`, `codex`, or `codex-review`.
     pub harness: String,
     pub behaviour: String,
     pub dir: PathBuf,

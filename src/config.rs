@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{PROMPTS, PROMPTS_DIR};
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
 use crate::roles::{
     AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RepoRoles, RoleSpec,
@@ -148,6 +147,8 @@ struct LimitsShape {
 enum HarnessName {
     Claude,
     Codex,
+    #[serde(rename = "codex-review")]
+    CodexReview,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -182,6 +183,7 @@ impl RoleShape {
         let harness = match spec.harness {
             Harness::Claude => HarnessName::Claude,
             Harness::Codex => HarnessName::Codex,
+            Harness::CodexReview => HarnessName::CodexReview,
         };
         let prompt = spec.prompt_file.strip_suffix(PROMPT_SUFFIX);
         assert!(prompt.is_some(), "built-in prompts are .md files");
@@ -440,6 +442,7 @@ fn role_spec(
     let harness = match role.harness.ok_or_else(|| missing("harness"))? {
         HarnessName::Claude => Harness::Claude,
         HarnessName::Codex => Harness::Codex,
+        HarnessName::CodexReview => Harness::CodexReview,
     };
     let model = role.model.clone().ok_or_else(|| missing("model"))?;
     let spaced = model.contains(char::is_whitespace);
@@ -535,8 +538,6 @@ fn slot_counts(label: &str, set: Option<u8>, agents: u8) -> Result<(u8, u8), Str
     Ok((slots, pool_slots))
 }
 
-// A built-in prompt's file name, or the absolute path of the user's own prompt file, which
-// must not be one of the built-in files Rider rewrites under the prompts directory.
 fn prompt_file(home: &Path, prompt: &str) -> Result<String, String> {
     let built_in = format!("{prompt}{PROMPT_SUFFIX}");
     if ROLES.iter().any(|spec| spec.prompt_file == built_in) {
@@ -554,14 +555,6 @@ fn prompt_file(home: &Path, prompt: &str) -> Result<String, String> {
             names.join(", ")
         ));
     };
-    let prompts = home.join(PROMPTS_DIR);
-    let prompts = prompts.canonicalize().unwrap_or(prompts);
-    if let Some((name, _)) = PROMPTS.iter().find(|(name, _)| found == prompts.join(name)) {
-        return Err(format!(
-            "{} is the built-in prompt {name} that Rider rewrites; copy it to another path",
-            path.display()
-        ));
-    }
     let found = found.to_str().map(str::to_string);
     let found = found.ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
     assert!(Path::new(&found).is_absolute());

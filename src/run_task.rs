@@ -15,12 +15,13 @@ use crate::board::{
     Board, BoardError, MESSAGE_CHARS_MAX, TaskId, TaskState, TaskView, message_tail, one_line,
 };
 use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
+use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES};
 use crate::core::TASKS_MAX;
 use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
-    SESSION_BYTES_MAX, SessionId, Usage, command_for,
+    SESSION_BYTES_MAX, SessionId, Usage, command_for, stderr_log,
 };
 use crate::roles::{Harness, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
@@ -72,7 +73,6 @@ static BOARD_IDENTITY: Mutex<Option<(String, BoardIdentity)>> = Mutex::new(None)
 /// Where rider keeps its files, and how its agents reach the board.
 pub struct Env {
     pub home: PathBuf,
-    pub prompts: PathBuf,
     pub profile: String,
     pub board_url: String,
     /// Failed attempts after which a task is blocked instead of run again.
@@ -614,7 +614,7 @@ fn prepare(
     let dir = worktree::dir_for(&brief, &env.home);
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
     let retry = fs::symlink_metadata(&dir).is_ok();
-    let prompt = build_prompt(env, &brief, retry)?;
+    let prompt = build_prompt(&brief, retry)?;
     let session = brief.resume.then(|| resume_session(&brief, &env.home));
     let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
         (Ok(_), Some(onto)) => format!("Resuming the Claude session of task #{}.", onto.0),
@@ -738,7 +738,7 @@ fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     let path = session_path(home, attempt.brief.id);
     let session = match attempt.brief.role.harness {
         Harness::Claude => harness::session_id(attempt.log()),
-        Harness::Codex => None,
+        Harness::Codex | Harness::CodexReview => None,
     };
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
     let fits = |repo: &&str| repo.len() < SESSION_FILE_BYTES_MAX - SESSION_BYTES_MAX - 2;
@@ -773,8 +773,22 @@ fn log_path(home: &Path, id: TaskId, attempt: u16) -> PathBuf {
     path
 }
 
-fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> {
-    let path = env.prompts.join(brief.role.prompt_file);
+fn role_prompt(prompt_file: &str) -> Result<String, Block> {
+    let built_in = PROMPTS.iter().find(|(name, _)| *name == prompt_file);
+    match built_in.map(|(_, text)| text.trim_end()) {
+        Some(text) if prompt_file == IMPLEMENT_PROMPT => {
+            Ok(format!("{text}\n\n{}", SLOP_RULES.trim_end()))
+        }
+        Some(text) => Ok(text.to_string()),
+        None => read_prompt_file(Path::new(prompt_file)),
+    }
+}
+
+fn read_prompt_file(path: &Path) -> Result<String, Block> {
+    assert!(
+        path.is_absolute(),
+        "a prompt not built in is an absolute path"
+    );
     let unreadable = |error: io::Error| {
         let reason = format!(
             "Rider cannot read its prompt file {}: {error}.",
@@ -782,7 +796,7 @@ fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> 
         );
         Block::new("rider_error", reason)
     };
-    let file = File::open(&path).map_err(unreadable)?;
+    let file = File::open(path).map_err(unreadable)?;
     let mut role_prompt = String::new();
     let mut bounded = file.take(PROMPT_FILE_BYTES_MAX + 1);
     bounded
@@ -795,7 +809,14 @@ fn build_prompt(env: &Env, brief: &Brief, retry: bool) -> Result<String, Block> 
         );
         return Err(Block::new("rider_error", reason));
     }
-    let role_prompt = role_prompt.trim_end();
+    role_prompt.truncate(role_prompt.trim_end().len());
+    assert!(!role_prompt.ends_with(char::is_whitespace));
+    Ok(role_prompt)
+}
+
+fn build_prompt(brief: &Brief, retry: bool) -> Result<String, Block> {
+    let role_prompt = role_prompt(brief.role.prompt_file)?;
+    let role_prompt = role_prompt.as_str();
     let mut prompt = format!("{role_prompt}\n\n# Task {}\n\n{}", brief.id.0, brief.text);
     if retry {
         prompt.push_str("\n\n");
@@ -1196,8 +1217,23 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
         "a failure always states its reason"
     );
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
-    let header = format!("The whole log: {}", attempt.log().display());
-    let tail = log_tail(attempt.log());
+    // `codex review` prints errors, such as a provider's content-filter stop, only on stderr.
+    let (header, tail) = match attempt.brief.role.harness {
+        Harness::Claude | Harness::Codex => {
+            let log = attempt.log();
+            (format!("The whole log: {}", log.display()), log_tail(log))
+        }
+        Harness::CodexReview => {
+            let stderr = stderr_log(attempt.log());
+            let header = format!(
+                "The final text: {}\nThe whole transcript: {}",
+                attempt.log().display(),
+                stderr.display()
+            );
+            let tail = format!("{}\n{}", log_tail(&stderr), log_tail(attempt.log()));
+            (header, tail)
+        }
+    };
     let budget = TAIL_REPLY_CHARS_MAX.saturating_sub(header.chars().count() + 1);
     let tail = if tail.trim().is_empty() {
         NO_OUTPUT
