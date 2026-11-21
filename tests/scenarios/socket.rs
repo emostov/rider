@@ -178,7 +178,7 @@ fn rider_logs_shows_control_characters_in_an_agents_output_escaped() {
     let printed = when_rider_runs(&world, &["logs", task]);
     let followed = when_rider_runs(&world, &["logs", "-f", task]);
 
-    let shown = "plain\tline\n\\u{1b}[2Jcleared\\u{9b}31m\\rback\n";
+    let shown = "plain\\tline\n\\u{1b}[2Jcleared\\u{9b}31m\\rback\n";
     assert_eq!(
         (printed.code, printed.stdout.as_str()),
         (Some(0), shown),
