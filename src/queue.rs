@@ -605,7 +605,7 @@ fn render(
     }
 }
 
-fn hidden(c: char) -> bool {
+pub fn hidden(c: char) -> bool {
     let format = matches!(
         c,
         '\u{ad}'

@@ -1244,7 +1244,7 @@ fn text(value: &serde_json::Value) -> Cow<'_, str> {
 }
 
 fn printable(text: &str) -> Cow<'_, str> {
-    let shown = |c: &char| !c.is_control();
+    let shown = |c: &char| !queue::hidden(*c);
     if text.chars().all(|c| shown(&c)) {
         return Cow::Borrowed(text);
     }

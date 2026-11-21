@@ -171,14 +171,15 @@ fn rider_logs_shows_control_characters_in_an_agents_output_escaped() {
     given_a_log(
         &world,
         task,
-        "plain\tline\n\u{1b}[2Jcleared\u{9b}31m\rback\n",
+        "plain\tline\n\u{1b}[2Jcleared\u{9b}31m\rback\nbidi \u{202e}gnp.exe\u{200b}\n",
     );
     given_a_running_daemon(&mut world);
 
     let printed = when_rider_runs(&world, &["logs", task]);
     let followed = when_rider_runs(&world, &["logs", "-f", task]);
 
-    let shown = "plain\\tline\n\\u{1b}[2Jcleared\\u{9b}31m\\rback\n";
+    let shown = "plain\\tline\n\\u{1b}[2Jcleared\\u{9b}31m\\rback\n\
+                 bidi \\u{202e}gnp.exe\\u{200b}\n";
     assert_eq!(
         (printed.code, printed.stdout.as_str()),
         (Some(0), shown),
