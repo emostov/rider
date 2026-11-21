@@ -226,6 +226,10 @@ impl Attempt {
         assert!(self.checkout.dir.is_absolute() && self.log.is_absolute());
         assert!(!self.cmd.program.is_empty());
         assert!(self.fresh_log.get().is_none(), "an attempt launches once");
+        if self.stopped.load(Ordering::SeqCst) {
+            let stopped = "the attempt was stopped before its agent started".to_string();
+            return Err(HarnessError::Spawn(stopped));
+        }
         let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
         let refused =
             !matches!(launched, Ok(Exit::Code(0))) && harness::ended_before_any_turn(&self.log);
