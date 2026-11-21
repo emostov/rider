@@ -7,7 +7,7 @@ pub use install::{InstallDir, Outcome, Report, install, resolve, update_recorded
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SKILLS: [&str; 3] = ["review-queue", "ride-swarm", "ship-swarm"];
-pub const FILES: [(&str, &str); 8] = [
+pub const FILES: [(&str, &str); 9] = [
     (
         "review-queue/SKILL.md",
         include_str!("../../skills/review-queue/SKILL.md"),
@@ -27,6 +27,10 @@ pub const FILES: [(&str, &str); 8] = [
     (
         "ride-swarm/schemas/rider-finding.json",
         include_str!("../../skills/ride-swarm/schemas/rider-finding.json"),
+    ),
+    (
+        "ride-swarm/schemas/rider-github@1.json",
+        include_str!("../../skills/ride-swarm/schemas/rider-github@1.json"),
     ),
     (
         "ride-swarm/schemas/rider-result@3.json",
