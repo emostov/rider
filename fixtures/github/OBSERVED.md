@@ -33,3 +33,6 @@ bodies and ids replaced with `example/repo`, `reviewer`, `commenter` and short n
   `__typename` `StatusContext`, `context`, `state` (`SUCCESS`, `FAILURE`, `ERROR`, `PENDING`,
   `EXPECTED`) and `targetUrl`, with no `status` or `conclusion`. `pr-list-status.json` is
   `pr-list-failed.json` with one such entry, its context and URL redacted.
+- The review comment list is paged, 30 per page by default. `gh api --paginate --slurp
+  'repos/{owner}/{repo}/pulls/<n>/comments?per_page=100'` follows every page and prints one
+  array holding each page's array; `--slurp` refuses `--jq`.

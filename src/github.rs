@@ -20,6 +20,8 @@ use crate::worktree::BRANCH_LABEL;
 
 pub const WATCH_LABEL: &str = "github";
 pub const WATCH_OFF: &str = "off";
+const PAGE_ITEMS: usize = 100;
+const PAGES_MAX: usize = ITEMS_MAX / PAGE_ITEMS;
 pub const SCHEMA: &str = "rider-github@1";
 pub const STATE_FILE: &str = "github.json";
 pub const WATCHES_MAX: usize = 64;
@@ -343,8 +345,19 @@ fn watch_one(
         remember(seen, ended_key(watched.task));
         return Ok(0);
     }
-    let path = format!("repos/{{owner}}/{{repo}}/pulls/{}/comments", pr.number);
-    let inline: Vec<WireInline> = parse(&gh(watched.repo, &["api", &path])?, "gh api")?;
+    let path = format!(
+        "repos/{{owner}}/{{repo}}/pulls/{}/comments?per_page={PAGE_ITEMS}",
+        pr.number
+    );
+    let args = ["api", "--paginate", "--slurp", &path];
+    let pages: Vec<Vec<WireInline>> = parse(&gh(watched.repo, &args)?, "gh api")?;
+    if pages.len() > PAGES_MAX {
+        return Err(WatchError::TooMany {
+            what: "review comment pages",
+            max: PAGES_MAX,
+        });
+    }
+    let inline: Vec<WireInline> = pages.into_iter().flatten().collect();
     let mut posted = 0usize;
     for change in changes(&pr, &inline)? {
         if seen.keys.contains(&change.key) {

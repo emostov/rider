@@ -46,6 +46,9 @@ case "$1 $2" in
   api*/permission)
     login=$(basename "$(dirname "$2")")
     cat "{root}/gh-permission-$login.json" 2>/dev/null || {{ echo 'HTTP 404' >&2; exit 1; }} ;;
+  "api --paginate")
+    if [ -e '{root}/gh-pages.json' ]; then cat '{root}/gh-pages.json'
+    else printf '['; cat '{root}/gh-comments.json'; printf ']'; fi ;;
   api*) cat '{root}/gh-comments.json' ;;
   run*) cat '{root}/gh-log.txt' ;;
   *) exit 1 ;;
@@ -560,4 +563,28 @@ fn a_commit_status_from_an_external_ci_counts_with_the_check_runs() {
     let records = when_records_reach(&world, &task, 1);
 
     assert_eq!(records, vec![failed_record("lead")]);
+}
+
+#[test]
+fn a_review_comment_on_a_second_page_reaches_the_board() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let task = given_a_settled_task(&mut world, Behaviour::CommitThenFail, "failed");
+    let three: Vec<Value> =
+        serde_json::from_str(&fixture("pulls-comments-three.json")).expect("the fixture parses");
+    let first_page = json!([three[0]]).to_string();
+    let pages = json!([[three[0]], [three[1]]]).to_string();
+    fs::write(world.root.join("gh-comments.json"), first_page).expect("write the first page");
+    fs::write(world.root.join("gh-pages.json"), pages).expect("write both pages");
+
+    let records = when_records_reach(&world, &task, 2);
+
+    let urls: Vec<&Value> = records.iter().map(|record| &record["url"]).collect();
+    let url = "https://github.com/example/repo/pull/7#discussion_r";
+    assert_eq!(
+        urls,
+        vec![&json!(format!("{url}1")), &json!(format!("{url}2"))]
+    );
 }
