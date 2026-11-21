@@ -16,6 +16,7 @@ const RELEASES_DIR: &str = "agent-releases";
 const ARGS_DIR: &str = "agent-args";
 const HEADS_DIR: &str = "agent-heads";
 const STREAMS_DIR: &str = "agent-streams";
+const LEFTOVERS_DIR: &str = "agent-leftovers";
 const RUNS_MAX: usize = 4096;
 /// The exit status of an agent told to fail.
 pub const FAIL_EXIT_CODE: i32 = 3;
@@ -23,6 +24,10 @@ pub const FAIL_EXIT_CODE: i32 = 3;
 pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
+/// How long the process a `CommitLeavingOrphan` or `CommitLeavingEscapee` agent leaves lives.
+pub const LEFTOVER_SECONDS: u64 = 30;
+/// How many bytes a `CommitFlooding` agent prints after its report.
+pub const FLOOD_BYTES: u64 = 65 * 1024 * 1024;
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +109,13 @@ pub enum Behaviour {
     /// Commits like `Commit`, then prints the text given by `stream` as its whole output
     /// stream and exits 0.
     CommitReplaying,
+    /// Commits and reports like `Commit`, then exits leaving a process in its group that
+    /// holds its output open for `LEFTOVER_SECONDS`.
+    CommitLeavingOrphan,
+    /// Like `CommitLeavingOrphan`, but the process it leaves is in a process group of its own.
+    CommitLeavingEscapee,
+    /// Commits and reports like `Commit`, then prints `FLOOD_BYTES` bytes and exits 0.
+    CommitFlooding,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -158,6 +170,9 @@ impl Behaviour {
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::CommitReplaying => "commit-replaying",
+            Behaviour::CommitLeavingOrphan => "commit-leaving-orphan",
+            Behaviour::CommitLeavingEscapee => "commit-leaving-escapee",
+            Behaviour::CommitFlooding => "commit-flooding",
         }
     }
 }
@@ -209,6 +224,7 @@ fn script() -> String {
     let slow = SLOW_SECONDS;
     let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
+    let (leftover, flood) = (LEFTOVER_SECONDS, FLOOD_BYTES);
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -314,6 +330,14 @@ case "$behaviour" in
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
   commit-replaying) commit || exit 1; cat "$world/{STREAMS_DIR}/$task"; exit 0 ;;
+  commit-leaving-orphan)
+    commit || exit 1; report
+    sleep {leftover} & echo $! > "$world/{LEFTOVERS_DIR}/$task"; exit 0 ;;
+  commit-leaving-escapee)
+    commit || exit 1; report
+    sh -c 'set -m; sleep {leftover} & echo $! > "$1"' sh "$world/{LEFTOVERS_DIR}/$task"
+    exit 0 ;;
+  commit-flooding) commit || exit 1; report; yes | head -c {flood}; exit 0 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
@@ -350,6 +374,7 @@ pub fn install(world: &Path, agents: &Path) {
         ARGS_DIR,
         HEADS_DIR,
         STREAMS_DIR,
+        LEFTOVERS_DIR,
     ] {
         fs::create_dir_all(world.join(dir)).expect("create an agent directory");
     }
@@ -371,6 +396,16 @@ pub fn stream(world: &Path, task: &str, text: &[u8]) {
     let path = world.join(STREAMS_DIR).join(task);
     fs::write(&path, text).expect("write an agent's stream");
     assert!(path.is_file());
+}
+
+/// The pid of the process a `CommitLeavingOrphan` or `CommitLeavingEscapee` agent of `task`
+/// left running.
+pub fn leftover(world: &Path, task: &str) -> u32 {
+    let path = world.join(LEFTOVERS_DIR).join(task);
+    let text = fs::read_to_string(&path).expect("read a leftover's pid");
+    let pid = text.trim().parse().expect("a leftover's pid");
+    assert!(pid > 1);
+    pid
 }
 
 /// The arguments attempt `attempt` of `task` was started with, one per line.

@@ -1,6 +1,7 @@
 //! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
+mod agent_process;
 mod agent_stream;
 mod board_feed;
 mod brief_settle;

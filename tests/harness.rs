@@ -1,8 +1,7 @@
 //! `harness::run` against `fake_agent`, a stand-in for a real agent CLI.
 
 use rider::harness::{
-    CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, PROMPT_BYTES_MAX, SessionId, command_for,
-    run, run_on_clock, session_id,
+    CommandLine, Exit, HarnessError, PROMPT_BYTES_MAX, command_for, run, run_on_clock,
 };
 use rider::roles::{AGENTS_MAX, role_from_label};
 use std::cell::Cell;
@@ -29,12 +28,6 @@ impl Scratch {
         let root = dir.path().canonicalize().unwrap();
         Scratch { _dir: dir, root }
     }
-
-    fn file(&self, name: &str, text: &str) -> PathBuf {
-        let path = self.root.join(name);
-        fs::write(&path, text).unwrap();
-        path
-    }
 }
 
 static READER_BUDGET: RwLock<()> = RwLock::new(());
@@ -49,65 +42,6 @@ fn fake(args: &[&str]) -> CommandLine {
         args: args.iter().map(|a| a.to_string()).collect(),
         env: Vec::new(),
     }
-}
-
-#[test]
-fn log_stops_growing_at_the_cap() {
-    let _sharing = sharing_the_reader_budget();
-    let scratch = Scratch::new("cap");
-    let log = scratch.root.join("agent.log");
-    let exit = run(
-        &fake(&["256", "4096", "0", "0"]),
-        &scratch.root,
-        &log,
-        10,
-        4096,
-    );
-    // The agent exits on its own, so rider kept draining past the cap.
-    assert_eq!(exit.unwrap(), Exit::Code(0));
-    assert_eq!(fs::metadata(&log).unwrap().len(), 4096);
-}
-
-#[test]
-fn an_agent_that_ignores_sigterm_is_killed_after_the_grace() {
-    let _sharing = sharing_the_reader_budget();
-    let scratch = Scratch::new("stubborn");
-    let log = scratch.root.join("agent.log");
-    let start = Instant::now();
-    let cmd = fake(&["1", "10", "60", "0", "ignore-term"]);
-    let exit = run(&cmd, &scratch.root, &log, 1, 4096);
-    assert_eq!(exit.unwrap(), Exit::TimedOut);
-    assert!(start.elapsed() >= Duration::from_secs(1 + KILL_GRACE_SECONDS));
-    assert!(start.elapsed() < Duration::from_secs(15));
-}
-
-#[test]
-fn a_leftover_process_holding_the_pipe_does_not_stall_rider() {
-    let _sharing = sharing_the_reader_budget();
-    let scratch = Scratch::new("orphan");
-    let log = scratch.root.join("agent.log");
-    let start = Instant::now();
-    let cmd = fake(&["1", "10", "30", "0", "orphan"]);
-    let exit = run(&cmd, &scratch.root, &log, 20, 4096);
-    assert_eq!(exit.unwrap(), Exit::Code(0));
-    // Under the readers' 5 s drain limit: the group kill closed the leftover's pipe.
-    assert!(start.elapsed() < Duration::from_secs(4));
-}
-
-#[test]
-fn a_process_that_left_the_group_does_not_stall_rider() {
-    let _sharing = sharing_the_reader_budget();
-    let scratch = Scratch::new("escape");
-    let log = scratch.root.join("agent.log");
-    let start = Instant::now();
-    let cmd = fake(&["1", "10", "7", "0", "escape"]);
-    let exit = run(&cmd, &scratch.root, &log, 20, 4096);
-    assert_eq!(exit.unwrap(), Exit::Code(0));
-    assert!(start.elapsed() < Duration::from_secs(9));
-    assert_eq!(
-        fs::read_to_string(&log).unwrap().matches("xxxx\n").count(),
-        1
-    );
 }
 
 #[test]
@@ -138,17 +72,6 @@ fn an_oversized_prompt_is_an_error() {
         result,
         Err(HarnessError::PromptTooLarge { bytes }) if bytes == PROMPT_BYTES_MAX + 1
     ));
-}
-
-#[test]
-fn the_session_id_is_read_from_the_recorded_claude_stream() {
-    let id = session_id(Path::new("fixtures/harness/claude.jsonl"));
-    let expected = SessionId::parse("20de60af-1a54-4519-8f52-8623adc5d76e");
-    assert_eq!(id, expected);
-    assert_eq!(session_id(Path::new("fixtures/harness/codex.jsonl")), None);
-    let scratch = Scratch::new("session");
-    let log = scratch.file("hostile", "{\"session_id\":\"--help\"}\n");
-    assert_eq!(session_id(&log), None);
 }
 
 #[test]

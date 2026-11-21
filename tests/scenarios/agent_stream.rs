@@ -25,7 +25,7 @@ fn recorded(name: &str) -> String {
     fs::read_to_string(&path).expect("read a recorded agent stream")
 }
 
-fn when_agents_replay(world: &mut World, streams: &[(String, Judged)]) {
+fn when_agents_replay(world: &mut World, streams: &[(String, Judged)]) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for (text, _) in streams {
         let id = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
@@ -58,6 +58,7 @@ fn when_agents_replay(world: &mut World, streams: &[(String, Judged)]) {
             }
         }
     }
+    ids
 }
 
 #[test]
@@ -129,4 +130,30 @@ fn a_codex_stream_is_judged_by_how_its_turn_ended() {
     ];
 
     when_agents_replay(&mut world, &streams);
+}
+
+#[test]
+fn only_a_session_id_claude_could_not_misread_is_kept_for_a_later_resume() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"DONE"}"#;
+    let hostile = format!(
+        "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"--help\"}}\n{result}\n"
+    );
+    let streams = [
+        (recorded("claude.jsonl"), Judged::Completed("DONE")),
+        (hostile, Judged::Completed("DONE")),
+    ];
+
+    let ids = when_agents_replay(&mut world, &streams);
+
+    let session = world.home.join("logs").join(&ids[0]).join("session");
+    let kept = fs::read_to_string(&session).expect("the kept session");
+    let repo = world.repo_label();
+    assert_eq!(
+        kept,
+        format!("20de60af-1a54-4519-8f52-8623adc5d76e\n{repo}\n")
+    );
+    assert_eq!(task_logs(&world, &ids[1]), vec!["1.jsonl"]);
 }
