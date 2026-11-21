@@ -58,6 +58,27 @@ fn an_untrusted_label_other_than_1_is_an_invalid_brief() {
     );
 }
 
+#[test]
+fn an_untrusted_task_from_the_github_watcher_is_an_invalid_brief() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = an_untrusted_task(&world, "Review the pull request.", "implement")
+        .label("source", "github");
+    let task = when_the_lead_creates(&world, &task);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(states, vec!["blocked"]);
+    let reason = "Remove the `source` label: an untrusted task gets no git worktree or branch, \
+                  only a scratch directory."
+        .to_string();
+    assert_eq!(
+        task_block(&world, &task),
+        Some(("invalid_brief".to_string(), reason))
+    );
+}
+
 const SECRETS: [(&str, &str); 6] = [
     ("GH_TOKEN", "gh-secret"),
     ("GITHUB_TOKEN", "github-secret"),

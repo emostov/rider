@@ -266,6 +266,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
         ("from", from.is_some()),
         ("restack", restack),
         ("onto", onto.is_some() && role.commits_expected),
+        ("source", github),
     ];
     if let Some((key, _)) = in_git.iter().find(|(_, set)| untrusted && *set) {
         return Err(BriefError::UntrustedInGit(key));
@@ -291,7 +292,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     assert!(brief.base.is_none_or(|base| view.needs.contains(&base)));
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
     assert!(!brief.role.needs_of || brief.of.is_some() || brief.untrusted);
-    assert!(!brief.untrusted || (brief.base.is_none() && brief.from.is_none()));
+    assert!(!brief.untrusted || (brief.base.is_none() && brief.from.is_none() && !brief.github));
     assert!(brief.of != Some(brief.id));
     assert!(brief.role.commits_expected || brief.role.needs_of);
     Ok(brief)
