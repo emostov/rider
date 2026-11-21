@@ -142,6 +142,7 @@ pub enum Command {
     /// Print every agent the daemon runs.
     Agents,
     /// Print the owner's review queue, then the work the daemon runs.
+    #[command(args_conflicts_with_subcommands = true)]
     Queue {
         /// Print the items with every label as JSON.
         #[arg(long)]
@@ -926,12 +927,15 @@ fn queue_wait(config: &Config, minutes: u32) -> Result<u8, CliError> {
         return Err(CliError::Queue(QueueError::TooManyItems));
     }
     let watches = queue_wait::watches(&listing.tasks).map_err(CliError::QueueWait)?;
-    let lines = queue_wait::wait(&queue_wait::Cli, &watches, deadline);
-    let lines = lines.map_err(CliError::QueueWait)?;
-    if lines.is_empty() {
+    let outcome = queue_wait::wait(&queue_wait::Cli, &watches, deadline);
+    let outcome = outcome.map_err(CliError::QueueWait)?;
+    for warning in &outcome.warnings {
+        eprintln!("rider: {warning}");
+    }
+    if outcome.lines.is_empty() {
         return Ok(3);
     }
-    lines.iter().for_each(|line| say(line));
+    outcome.lines.iter().for_each(|line| say(line));
     Ok(0)
 }
 
