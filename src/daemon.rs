@@ -966,6 +966,7 @@ fn job(
             let unjudged = Event::Judged {
                 run,
                 verdict: Verdict::Fail { reason },
+                usage: None,
             };
             let context = find(contexts, run, unjudged.clone())?;
             let attempt = context.attempt.clone().ok_or(unjudged.clone())?;
@@ -1208,11 +1209,13 @@ fn judge(
     launched: Result<Exit, HarnessError>,
 ) -> Input {
     let board = shared.board(profile);
+    let usage = attempt.usage();
     match judge_attempt(task, &board, attempt, &launched) {
         Ok(judgement) => Input {
             event: Event::Judged {
                 run,
                 verdict: judgement.verdict.clone(),
+                usage,
             },
             extra: Extra::Judgement(Arc::new(judgement)),
         },
@@ -1225,6 +1228,7 @@ fn judge(
             Input::plain(Event::Judged {
                 run,
                 verdict: Verdict::Fail { reason },
+                usage,
             })
         }
         Err(_) => Input::plain(Event::ClaimLost(run)),

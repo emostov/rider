@@ -23,6 +23,7 @@ use crate::core::{
     AgentRow, BoardHealth, CLIENTS_MAX, ClientId, ErrorCode, Event, Phase, Reply, Request,
     StatusView, Stopping, TaskRow, Untracked,
 };
+use crate::harness::Usage;
 
 /// The socket's file name under the Rider home.
 pub const SOCKET_FILE: &str = "rider.sock";
@@ -705,6 +706,14 @@ fn status_json(view: &StatusView) -> Value {
         Untracked::AtLeast(count) => (count, true),
     };
     let tasks: Vec<Value> = view.tasks.iter().map(task_json).collect();
+    let projects: Vec<Value> = (view.projects.iter())
+        .map(|(project, usage)| json!({"project": project, "usage": usage_json(usage)}))
+        .collect();
+    let task_usages: Vec<Value> = (view.task_usages.iter())
+        .map(|entry| {
+            json!({"id": entry.id.0, "project": entry.project, "usage": usage_json(&entry.usage)})
+        })
+        .collect();
     json!({
         "board": board,
         "stopping": stopping,
@@ -713,6 +722,20 @@ fn status_json(view: &StatusView) -> Value {
         "untracked": untracked,
         "untracked_at_least": more,
         "tasks": tasks,
+        "usage": usage_json(&view.usage),
+        "projects": projects,
+        "task_usages": task_usages,
+    })
+}
+
+fn usage_json(usage: &Usage) -> Value {
+    json!({
+        "input": usage.input,
+        "cache_read": usage.cache_read,
+        "cache_write": usage.cache_write,
+        "output": usage.output,
+        "cost_micros": usage.cost_micros,
+        "unpriced": usage.unpriced,
     })
 }
 

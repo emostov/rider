@@ -115,6 +115,14 @@ pub enum Behaviour {
     /// Starts a child in its own process group that, once orphaned, runs
     /// `$RIDER_BIN down --now` and records its output in `stop_attempts(task)`; then holds.
     OrphanStops,
+    /// Commits like `Commit`, then reports `USAGE` and `COST_USD` in its result.
+    CommitReportingUsage,
+    /// Commits like `Commit`, then reports a result that names `usage` twice.
+    CommitRepeatingUsage,
+    /// Commits nothing and reports `HUGE_CODEX_USAGE` as its last usage snapshot.
+    ReportHugeUsage,
+    /// Commits like `Commit` when run as `claude`, then prints the harness's recorded fixture.
+    ReplayRecorded,
     /// Prints a stream in its harness's shape with `STREAM_MESSAGES`, a failed tool call and
     /// `STREAM_ERROR` as the run's error, then exits `FAIL_EXIT_CODE`.
     StreamError,
@@ -128,6 +136,16 @@ pub enum Behaviour {
     HoldAttempt,
     MergePr,
 }
+
+/// The input, cache write, cache read and output tokens a `CommitReportingUsage` agent reports.
+pub const USAGE: [u64; 4] = [4, 20, 300, 50];
+/// The input, cached, cache write and output tokens of each cumulative snapshot a fake `codex`
+/// reports, the last holding the run's totals.
+pub const CODEX_USAGE: [[u64; 4]; 2] = [[400, 200, 100, 20], [1000, 600, 300, 50]];
+/// The input, cached, cache write and output tokens a `ReportHugeUsage` agent reports.
+pub const HUGE_CODEX_USAGE: [u64; 4] = [3_298_534_883_328, 1 << 40, 1 << 40, 1 << 40];
+/// The cost a `CommitReportingUsage` agent reports, in US dollars.
+pub const COST_USD: f64 = 0.25;
 
 /// What a `StreamThenStderr` agent prints on standard error before it exits.
 pub const STDERR_ERROR: &str = "error: something broke";
@@ -197,6 +215,10 @@ impl Behaviour {
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::TryToStop => "try-to-stop",
             Behaviour::OrphanStops => "orphan-stops",
+            Behaviour::CommitReportingUsage => "commit-reporting-usage",
+            Behaviour::CommitRepeatingUsage => "commit-repeating-usage",
+            Behaviour::ReportHugeUsage => "report-huge-usage",
+            Behaviour::ReplayRecorded => "replay-recorded",
             Behaviour::StreamError => "stream-error",
             Behaviour::StreamForged => "stream-forged",
             Behaviour::StreamThenStderr => "stream-then-stderr",
@@ -274,6 +296,20 @@ fn script() -> String {
     let slow = SLOW_SECONDS;
     let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
+    let [input, write, read, output] = USAGE;
+    let usage = format!(
+        ",\"usage\":{{\"input_tokens\":{input},\"cache_creation_input_tokens\":{write},\
+         \"cache_read_input_tokens\":{read},\"output_tokens\":{output}}},\
+         \"total_cost_usd\":{COST_USD}"
+    );
+    let [early, last, huge] =
+        [CODEX_USAGE[0], CODEX_USAGE[1], HUGE_CODEX_USAGE].map(|[input, cached, write, output]| {
+            format!(
+                "\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\
+             \"cache_write_input_tokens\":{write},\"output_tokens\":{output}}}"
+            )
+        });
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/harness");
     let ([said0, said1], error) = (STREAM_MESSAGES, STREAM_ERROR);
     let (command, tool_error, stderr_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR, STDERR_ERROR);
     format!(
@@ -308,6 +344,9 @@ for arg in "$@"; do
 done
 [ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
+extra=""
+codex_last='{last}'
+fixtures="{fixtures}"
 report() {{
   if [ "$harness" = codex-review ]; then
     printf 'OpenAI Codex v0.0.0\n--------\ncodex\n%s\n' "$summary" >&2
@@ -317,12 +356,12 @@ report() {{
     echo '{{"type":"turn.started"}}'
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
     echo '{{"type":"item.completed",'"$item"'}}'
-    usage='"usage":{{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
-    echo '{{"type":"turn.completed",'"$usage"'}}'
+    echo '{{"type":"turn.completed",{early}}}'
+    echo '{{"type":"turn.completed",'"$codex_last"'}}'
   else
     init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"'"$session"'","model":"fake"'
     echo '{{"type":"system",'"$init"'}}'
-    echo '{{"type":"result","subtype":"success","is_error":false,"result":"'"$summary"'"}}'
+    echo '{{"type":"result","subtype":"success","is_error":false,"result":"'"$summary"'"'"$extra"'}}'
   fi
 }}
 hold() {{
@@ -453,6 +492,13 @@ case "$behaviour" in
     echo '{{"type":"result","subtype":"error_during_execution","is_error":true}}'
     exit 0 ;;
   commit-silently) commit || exit 1; exit 0 ;;
+  commit-reporting-usage) commit || exit 1; extra='{usage}' ;;
+  commit-repeating-usage) commit || exit 1; extra=',"usage":1,"usage":2' ;;
+  report-huge-usage) codex_last='{huge}' ;;
+  replay-recorded)
+    [ "$harness" = claude ] && {{ commit || exit 1; }}
+    cat "$fixtures/$harness.jsonl"
+    exit 0 ;;
   commit-reporting-blank) commit || exit 1; summary="  " ;;
   leave-branch) git checkout -q -b "elsewhere-$task" && commit || exit 1 ;;
   commit-shared) commit && git branch "shared-$task" || exit 1 ;;

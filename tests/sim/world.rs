@@ -1061,7 +1061,14 @@ impl World {
                     },
                     _ => Verdict::LeaveBlocked,
                 };
-                self.reply(id, Event::Judged { run, verdict });
+                self.reply(
+                    id,
+                    Event::Judged {
+                        run,
+                        verdict,
+                        usage: None,
+                    },
+                );
             }
             Action::Settle {
                 run,

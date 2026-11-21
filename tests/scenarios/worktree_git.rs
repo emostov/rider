@@ -668,7 +668,7 @@ fn when_the_checkout_changes_after_completion(
 ) {
     let marker = world.root.join("result-posted");
     let release = world.root.join("release-result");
-    given_vb_waits_for(world, "rider-result@2", &marker, &release);
+    given_vb_waits_for(world, "rider-result@3", &marker, &release);
     given_a_running_daemon(world);
     when_the_file_exists(world, &marker);
     assert_eq!(task_state(world, task), "completed");

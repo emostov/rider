@@ -1215,23 +1215,59 @@ fn status(config: &Config) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
     let data = client.send("status", &[]).map_err(CliError::Client)?;
     println!("{}", status_line(&data));
-    let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
-    let mut projects: Vec<&str> = tasks
-        .iter()
-        .map(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE))
-        .collect();
+    println!("spent {}", usage_text(&data["usage"]));
+    let list = |key: &str| data[key].as_array().map_or(&[][..], Vec::as_slice);
+    let (tasks, spent, used) = (list("tasks"), list("projects"), list("task_usages"));
+    let name = |value: &serde_json::Value| -> String {
+        value["project"]
+            .as_str()
+            .unwrap_or(daemon::SUBTREE)
+            .to_string()
+    };
+    let mut projects: Vec<String> = tasks.iter().chain(spent).chain(used).map(name).collect();
     projects.sort_unstable();
     projects.dedup();
     for project in projects {
-        println!("{project}");
-        let in_project = tasks
-            .iter()
-            .filter(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE) == project);
-        for task in in_project {
-            println!("{}", task_row(task));
+        match spent.iter().find(|entry| name(entry) == project) {
+            Some(entry) => println!("{project} spent {}", usage_text(&entry["usage"])),
+            None => println!("{project}"),
+        }
+        let usage_of = |id: &serde_json::Value| {
+            let entry = used.iter().find(|entry| entry["id"] == *id);
+            entry.map_or(String::new(), |entry| {
+                format!(" spent {}", usage_text(&entry["usage"]))
+            })
+        };
+        for task in tasks.iter().filter(|task| name(task) == project) {
+            println!("{}{}", task_row(task), usage_of(&task["id"]));
+        }
+        let settled = (used.iter()).filter(|entry| {
+            name(entry) == project && tasks.iter().all(|task| task["id"] != entry["id"])
+        });
+        for entry in settled {
+            println!("  #{}{}", entry["id"], usage_of(&entry["id"]));
         }
     }
     Ok(0)
+}
+
+// Tokens and cost as `status` shows them; a cost missing for some model is said to be.
+fn usage_text(usage: &serde_json::Value) -> String {
+    let count = |kind: &str| usage[kind].as_u64().unwrap_or(0);
+    let micros = count("cost_micros");
+    let cost = format!("${}.{:02}", micros / 1_000_000, micros % 1_000_000 / 10_000);
+    let cost = match (usage["unpriced"] == true, micros) {
+        (false, _) => cost,
+        (true, 0) => "cost unknown".to_string(),
+        (true, _) => format!("{cost} and some unpriced"),
+    };
+    format!(
+        "{} in, {} cache read, {} cache write, {} out, {cost}",
+        count("input"),
+        count("cache_read"),
+        count("cache_write"),
+        count("output"),
+    )
 }
 
 fn task_row(task: &serde_json::Value) -> String {

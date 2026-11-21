@@ -63,8 +63,8 @@ const CLAIM_EMPTY_REASONS: [&str; 2] = ["timeout", "nothing_ready"];
 const VERBS: [&str; 6] = ["read", "tasks", "label", "reply", "post", "schemas"];
 pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
     (
-        "rider-result@2",
-        include_str!("../skills/ride-swarm/schemas/rider-result@2.json"),
+        "rider-result@3",
+        include_str!("../skills/ride-swarm/schemas/rider-result@3.json"),
     ),
     (
         "rider-finding@1",

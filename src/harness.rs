@@ -760,6 +760,18 @@ enum ClaudeEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeUsageEvent {
+    #[serde(rename = "result")]
+    Result {
+        usage: Option<Field<ClaudeUsage>>,
+        total_cost_usd: Option<Field<f64>>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
 struct ClaudeMessage {
     content: Option<Field<Vec<Field<ClaudeBlock>>>>,
 }
@@ -798,11 +810,30 @@ enum CodexEvent {
     #[serde(rename = "turn.failed")]
     TurnFailed { error: Option<Field<CodexError>> },
     #[serde(rename = "turn.completed")]
-    TurnCompleted,
+    TurnCompleted { usage: Option<Field<CodexUsage>> },
     #[serde(rename = "error")]
     Error { message: Option<Field<String>> },
     #[serde(other)]
     Other,
+}
+
+#[derive(Deserialize)]
+struct ClaudeUsage {
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+}
+
+// Codex counts cached and cache-write tokens inside `input_tokens`.
+#[derive(Deserialize)]
+struct CodexUsage {
+    input_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    output_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -946,7 +977,7 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
         // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
         Harness::Codex => scan(log, |event| match event {
             CodexEvent::TurnFailed { .. } | CodexEvent::Error { .. } => last_turn_failed = true,
-            CodexEvent::TurnCompleted => last_turn_failed = false,
+            CodexEvent::TurnCompleted { .. } => last_turn_failed = false,
             CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
         }),
         // Without an event stream, a run that exits 0 still failed when it printed no review or
@@ -971,6 +1002,131 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     assert!(!last_turn_failed || *harness == Harness::Codex);
     assert!(!last_review_failed || *harness == Harness::CodexReview);
     last_result_failed || last_turn_failed || last_review_failed
+}
+
+pub const TOKENS_MAX: u64 = 1 << 40;
+pub const COST_MICROS_MAX: u64 = 1 << 40;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+    pub cost_micros: u64,
+    pub unpriced: bool,
+}
+
+impl Usage {
+    pub fn plus(self, other: Usage) -> Usage {
+        let sum = Usage {
+            input: self.input.saturating_add(other.input),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            output: self.output.saturating_add(other.output),
+            cost_micros: self.cost_micros.saturating_add(other.cost_micros),
+            unpriced: self.unpriced || other.unpriced,
+        };
+        assert!(sum.input >= self.input && sum.output >= other.output);
+        sum
+    }
+}
+
+// Thousandths of a US dollar per million tokens: input, cache read, cache write, output.
+// Source: https://developers.openai.com/api/docs/pricing, Standard tier, prompts up to 272K
+// tokens, read 2026-11-20. Codex reports one cache-write count without its tier, so writes are
+// priced at the 30-minute rate, the lower of the two. Claude reports its own cost.
+const PRICES: [(&str, [u64; 4]); 2] = [
+    ("gpt-6.1-sol", [2_000, 100, 2_500, 10_000]),
+    ("gpt-6.2-sol", [2_000, 100, 2_500, 10_000]),
+];
+
+fn priced(model: &str, usage: &Usage) -> Option<u64> {
+    let (_, price) = PRICES.iter().find(|(name, _)| *name == model)?;
+    let tokens = [
+        usage.input,
+        usage.cache_read,
+        usage.cache_write,
+        usage.output,
+    ];
+    let mut nanos: u64 = 0;
+    for (count, rate) in tokens.iter().zip(price) {
+        nanos = nanos.checked_add(count.checked_mul(*rate)?)?;
+    }
+    let micros = nanos / 1000;
+    assert!(micros <= nanos);
+    (micros <= COST_MICROS_MAX).then_some(micros)
+}
+
+fn micros_of(dollars: f64) -> Option<u64> {
+    let micros = (dollars * 1e6).round();
+    let bound = COST_MICROS_MAX as f64;
+    let valid = micros.is_finite() && (0.0..=bound).contains(&micros);
+    let micros = valid.then_some(micros as u64);
+    assert!(micros.is_none_or(|micros| micros <= COST_MICROS_MAX));
+    micros
+}
+
+pub fn usage(harness: &Harness, model: &str, log: &Path) -> Option<Usage> {
+    assert!(!model.is_empty());
+    let mut found: Option<Usage> = None;
+    let mut reported: Option<u64> = None;
+    let complete = match harness {
+        Harness::Claude => scan(log, |event| {
+            if let ClaudeUsageEvent::Result {
+                usage,
+                total_cost_usd,
+            } = event
+                && let Some(usage) = valid(usage)
+            {
+                found = Some(Usage {
+                    input: usage.input_tokens,
+                    cache_read: usage.cache_read_input_tokens,
+                    cache_write: usage.cache_creation_input_tokens,
+                    output: usage.output_tokens,
+                    ..Usage::default()
+                });
+                reported = valid(total_cost_usd).and_then(micros_of);
+            }
+        }),
+        // Each `turn.completed` carries the run's running totals, not the turn's own.
+        Harness::Codex => scan(log, |event| {
+            let CodexEvent::TurnCompleted { usage } = event else {
+                return;
+            };
+            let snapshot = valid(usage).and_then(|turn| {
+                let cached = turn.cached_input_tokens;
+                let write = turn.cache_write_input_tokens;
+                let input = turn.input_tokens.checked_sub(cached)?.checked_sub(write)?;
+                Some(Usage {
+                    input,
+                    cache_read: cached,
+                    cache_write: write,
+                    output: turn.output_tokens,
+                    ..Usage::default()
+                })
+            });
+            found = snapshot;
+        }),
+        // `codex review` prints plain text and reports no usage.
+        Harness::CodexReview => return None,
+    };
+    let mut usage = found.filter(|_| complete)?;
+    let counts = [
+        usage.input,
+        usage.cache_read,
+        usage.cache_write,
+        usage.output,
+    ];
+    if counts.iter().any(|count| *count > TOKENS_MAX) {
+        return None;
+    }
+    match reported.or_else(|| priced(model, &usage)) {
+        Some(micros) => usage.cost_micros = micros,
+        None => usage.unpriced = true,
+    }
+    assert!(!usage.unpriced || usage.cost_micros == 0);
+    Some(usage)
 }
 
 pub fn failure_account(harness: &Harness, log: &Path, tail: &str) -> Option<String> {
@@ -1119,7 +1275,7 @@ impl Account {
                 self.error = piece(message).or_else(|| Some("(no message)".to_string()));
             }
             CodexEvent::Error { message } => self.error = piece(valid(message)),
-            CodexEvent::TurnCompleted => self.error = None,
+            CodexEvent::TurnCompleted { .. } => self.error = None,
             CodexEvent::Other => {}
         }
     }

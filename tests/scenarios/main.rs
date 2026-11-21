@@ -32,7 +32,7 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use fake_agent::{Behaviour, Run};
 use steps::*;
@@ -61,6 +61,165 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
         "behind": [],
     });
     assert_eq!(task_records(&world, &task, "rider-result"), vec![record]);
+}
+
+#[test]
+fn the_usage_an_agent_reports_is_in_its_result_record_and_in_rider_status() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add one work file."));
+    given_the_agent_will(&world, &task, &[Behaviour::CommitReportingUsage]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+    let status = when_rider_runs(&world, &["status"]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    let spent = "4 in, 300 cache read, 20 cache write, 50 out, $0.25";
+    let lines: Vec<&str> = status.stdout.lines().collect();
+    assert_eq!(
+        lines.get(1),
+        Some(&format!("spent {spent}").as_str()),
+        "{status:?}"
+    );
+    let project = format!("{PROJECT} spent {spent}");
+    assert!(lines.contains(&project.as_str()), "{status:?}");
+    let settled = format!("  #{task} spent {spent}");
+    assert!(
+        when_rider_status_shows_within(&world, &settled, SETTLE_SECONDS_MAX),
+        "{:?}",
+        when_rider_runs(&world, &["status"])
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let records = task_records(&world, &task, "rider-result");
+    let usage = json!({
+        "input": 4,
+        "cache_write": 20,
+        "cache_read": 300,
+        "output": 50,
+        "cost_usd": fake_agent::COST_USD,
+    });
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["usage"], usage);
+}
+
+#[test]
+fn a_codex_review_on_sol_6_2_records_the_last_usage_snapshot_priced_with_cache_writes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodel = \"gpt-6.2-sol\"\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_model(&world, &review, 0), "gpt-6.2-sol");
+    let records = task_records(&world, &review, "rider-result");
+    assert_eq!(records.len(), 1, "{records:?}");
+    let usage = json!({
+        "input": 100,
+        "cache_read": 600,
+        "cache_write": 300,
+        "output": 50,
+        "cost_usd": 0.00151,
+    });
+    assert_eq!(records[0]["usage"], usage);
+}
+
+fn when_a_task_and_its_review_report(
+    world: &mut World,
+    built: Behaviour,
+    review: Behaviour,
+) -> [(String, Value); 2] {
+    let task = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
+    given_the_agent_will(world, &task, &[built]);
+    let reviewed = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &task)
+        .needs(&task)
+        .role("review");
+    let reviewed = when_the_lead_creates(world, &reviewed);
+    given_the_agent_will(world, &reviewed, &[review]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(world, &[&task, &reviewed]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    [task, reviewed].map(|id| {
+        let records = task_records(world, &id, "rider-result");
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = records[0].clone();
+        (id, record)
+    })
+}
+
+#[test]
+fn the_usage_in_each_recorded_stream_is_in_its_result_record() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let [(_, built), (_, reviewed)] = when_a_task_and_its_review_report(
+        &mut world,
+        Behaviour::ReplayRecorded,
+        Behaviour::ReplayRecorded,
+    );
+
+    let claude = json!({
+        "input": 4,
+        "cache_read": 52114,
+        "cache_write": 26676,
+        "output": 126,
+        "cost_usd": 0.226367,
+    });
+    let codex = json!({
+        "input": 12,
+        "cache_read": 61023,
+        "cache_write": 20835,
+        "output": 519,
+        "cost_usd": 0.063403,
+    });
+    assert_eq!((&built["usage"], &reviewed["usage"]), (&claude, &codex));
+    assert_eq!(
+        (&built["summary"], &reviewed["summary"]),
+        (&json!("DONE"), &json!("DONE"))
+    );
+}
+
+#[test]
+fn a_result_naming_usage_twice_completes_without_usage_and_a_cost_past_its_bound_is_unpriced() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+
+    let [(task, built), (_, reviewed)] = when_a_task_and_its_review_report(
+        &mut world,
+        Behaviour::CommitRepeatingUsage,
+        Behaviour::ReportHugeUsage,
+    );
+
+    assert_eq!(built["summary"], json!(fake_agent::summary(&task, 0)));
+    assert_eq!(built["usage"], Value::Null, "{built}");
+    let tokens = 1u64 << 40;
+    let unpriced = json!({
+        "input": tokens,
+        "cache_read": tokens,
+        "cache_write": tokens,
+        "output": tokens,
+        "cost_usd": null,
+    });
+    assert_eq!(reviewed["usage"], unpriced);
 }
 
 #[test]
@@ -1184,7 +1343,7 @@ fn a_task_onto_one_that_is_still_settling_waits_for_its_worktree_and_completes()
     // released, so the fix is ready while the branch is still checked out. Only the result
     // post is held: the daemon posts the board's identity before it follows.
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@3", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_task_is(&world, &fix, "ready");
@@ -2741,7 +2900,7 @@ fn an_onto_task_completes_after_a_daemon_crash_between_complete_and_worktree_rel
     given_the_agent_will(&world, &built, &[Behaviour::Commit]);
     given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@3", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_daemon_crashes(&mut world);
@@ -2771,7 +2930,7 @@ fn a_worktree_left_by_a_crash_that_another_board_made_is_kept_and_the_onto_task_
     given_the_agent_will(&world, &built, &[Behaviour::Commit]);
     given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@3", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_daemon_crashes(&mut world);

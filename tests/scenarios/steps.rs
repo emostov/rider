@@ -27,8 +27,8 @@ const POLL_MILLIS: u64 = 200;
 const LIST_LIMIT: &str = "500";
 const SCHEMAS: [(&str, &str); 2] = [
     (
-        "rider-result@2",
-        "skills/ride-swarm/schemas/rider-result@2.json",
+        "rider-result@3",
+        "skills/ride-swarm/schemas/rider-result@3.json",
     ),
     (
         "rider-finding@1",
@@ -836,7 +836,7 @@ pub fn given_vb_waits_for_the_result_post(
     release: &Path,
 ) {
     assert!(task.bytes().all(|b| b.is_ascii_digit()));
-    let pattern = format!("*\" post {task} --schema rider-result@2 \"*");
+    let pattern = format!("*\" post {task} --schema rider-result@3 \"*");
     given_vb_waits_on(world, &pattern, marker, release);
 }
 

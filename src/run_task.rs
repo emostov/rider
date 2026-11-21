@@ -25,7 +25,7 @@ use crate::feed::Cursor;
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, Io, LOG_BYTES_MAX,
-    PROMPT_BYTES_MAX, Resume, SESSION_BYTES_MAX, SessionId, command_for, stderr_log,
+    PROMPT_BYTES_MAX, Resume, SESSION_BYTES_MAX, SessionId, Usage, command_for, stderr_log,
 };
 use crate::roles::{Harness, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
@@ -39,7 +39,7 @@ pub const ATTEMPTS_DEFAULT: u8 = 3;
 const _: () = assert!(ATTEMPTS_DEFAULT > 0 && ATTEMPTS_DEFAULT <= ATTEMPTS_MAX);
 /// Upper bound on the bytes read from the end of a failed attempt's log.
 pub const LOG_TAIL_BYTES_MAX: u64 = 16 * 1024;
-/// Upper bound on the stacked tasks checked when a branch moves, as `rider-result@2` allows.
+/// Upper bound on the stacked tasks checked when a branch moves, as `rider-result@3` allows.
 pub const STACKED_CHECKS_MAX: usize = 64;
 /// Upper bound on the tasks of one branch whose stacked tasks are looked for when it moves.
 pub const BRANCH_TASKS_MAX: usize = 32;
@@ -62,7 +62,7 @@ const ATTEMPT_LABEL: &str = "attempt";
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
-const RESULT_SCHEMA: &str = "rider-result@2";
+const RESULT_SCHEMA: &str = "rider-result@3";
 const OF_CHAIN_MAX: usize = 16;
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
@@ -156,6 +156,32 @@ struct ResultRecord<'a> {
     commits: u64,
     head: &'a str,
     summary: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageRecord>,
+}
+
+#[derive(Serialize)]
+struct UsageRecord {
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+    cost_usd: Option<f64>,
+}
+
+impl From<Usage> for UsageRecord {
+    fn from(usage: Usage) -> UsageRecord {
+        assert!(!usage.unpriced || usage.cost_micros == 0);
+        let record = UsageRecord {
+            input: usage.input,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            output: usage.output,
+            cost_usd: (!usage.unpriced).then(|| usage.cost_micros as f64 / 1e6),
+        };
+        assert!(record.cost_usd.is_some() != usage.unpriced);
+        record
+    }
 }
 
 #[derive(Serialize)]
@@ -401,6 +427,11 @@ impl Attempt {
             }
             None => launched,
         }
+    }
+
+    pub fn usage(&self) -> Option<Usage> {
+        let role = self.brief.role;
+        harness::usage(&role.harness, role.model, &self.log())
     }
 
     /// Keeps `launch` from starting any further agent, such as a refused resume's fresh start.
@@ -1300,6 +1331,7 @@ fn complete(
         commits: work.commits,
         head: &work.head,
         summary,
+        usage: attempt.usage().map(UsageRecord::from),
     };
     if let Err(error) = record_session(attempt, &env.home) {
         let note = format!("Rider could not record the agent's session: {error}.");

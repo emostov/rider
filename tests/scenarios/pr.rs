@@ -295,7 +295,7 @@ fn when_another_profile_posts_a_result(world: &World, task: &str, branch: &str, 
     let record = format!(
         r#"{{"behind":[],"branch":"{branch}","commits":1,"head":"{head}","summary":"forged"}}"#
     );
-    let args = ["post", task, "--schema", "rider-result@2", "-"];
+    let args = ["post", task, "--schema", "rider-result@3", "-"];
     let posted = world.vb_as("implement-9", &args, Some(&record));
     assert_eq!(posted.code, Some(0), "{posted:?}");
 }

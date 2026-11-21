@@ -70,7 +70,7 @@ fn no_prompt_tells_a_worker_to_settle_its_own_task() {
 fn schemas_are_json_schemas_with_their_required_fields() {
     let cases = [
         (
-            "skills/ride-swarm/schemas/rider-result@2.json",
+            "skills/ride-swarm/schemas/rider-result@3.json",
             vec!["branch", "head", "commits", "summary", "behind"],
         ),
         (
@@ -117,7 +117,7 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
         "rider_error",
         "awaiting_approval",
         "lead",
-        "rider-result@2",
+        "rider-result@3",
         "vb tasks reopen",
         "vb tasks unblock",
     ];

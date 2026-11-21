@@ -2,6 +2,7 @@
 
 use crate::board::{BOARD_CALL_SECONDS_MAX, LABELS_MAX, ListedTask, TaskId, TaskState, Timestamp};
 use crate::feed::{BoardEvent, Cursor, EventKind};
+use crate::harness::Usage;
 use crate::roles::{AGENTS_MAX, BUILDERS_DEFAULT, RoleSpec};
 use crate::settle::Verdict;
 
@@ -42,6 +43,8 @@ pub const STOP_TRIES_MAX: u8 = 3;
 pub const PENDING_CLAIMS_MAX: usize = 2 * AGENTS_MAX as usize;
 /// Upper bound on the distinct untracked tasks the core counts.
 pub const UNTRACKED_MAX: usize = 4 * TASKS_MAX;
+pub const PROJECTS_MAX: usize = 64;
+pub const TASK_USAGES_MAX: usize = TASKS_MAX;
 /// Upper bound on the closed tasks the core remembers until a snapshot covers their closing.
 pub const CLOSED_MAX: usize = TASKS_MAX;
 pub const WAITING_MAX: usize = TASKS_MAX;
@@ -319,6 +322,13 @@ pub struct TaskRow {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskUsage {
+    pub id: TaskId,
+    pub project: Option<String>,
+    pub usage: Usage,
+}
+
 /// What `status` answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusView {
@@ -328,6 +338,9 @@ pub struct StatusView {
     pub limit: u8,
     pub untracked: Untracked,
     pub tasks: Vec<TaskRow>,
+    pub usage: Usage,
+    pub projects: Vec<(Option<String>, Usage)>,
+    pub task_usages: Vec<TaskUsage>,
 }
 
 /// One run as `agents` shows it.
@@ -424,6 +437,7 @@ pub enum Event {
     Judged {
         run: RunId,
         verdict: Verdict,
+        usage: Option<Usage>,
     },
     Renewed {
         run: RunId,
@@ -529,6 +543,9 @@ pub struct State {
     closed_unrecorded: Cursor,
     runs: Vec<Run>,
     pending_claims: Vec<PendingClaim>,
+    usage: Usage,
+    projects: Vec<(Option<String>, Usage)>,
+    task_usages: Vec<TaskUsage>,
     next_run: u64,
     board: BoardHealth,
     stopping: Stopping,
@@ -574,6 +591,9 @@ impl State {
             closed_unrecorded: Cursor(0),
             runs: Vec::new(),
             pending_claims: Vec::new(),
+            usage: Usage::default(),
+            projects: Vec::new(),
+            task_usages: Vec::new(),
             next_run: 1,
             board: BoardHealth::Up,
             stopping: Stopping::No,
@@ -781,8 +801,15 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         Event::PrepareWaiting { run, of } => prepare_waiting(state, run, of, actions),
         Event::AgentExited(run) => on_agent_exited(state, run, actions),
         Event::StopDone(_) => {}
-        Event::Judged { run, verdict } => {
+        Event::Judged {
+            run,
+            verdict,
+            usage,
+        } => {
             if let Some(index) = run_in(state, run, Phase::Judging) {
+                if let Some(usage) = usage {
+                    count_usage(state, state.runs[index].task, usage);
+                }
                 begin_settle(state, index, Settlement::Verdict(verdict), actions);
             }
         }
@@ -996,10 +1023,38 @@ fn status_view(state: &State) -> StatusView {
         limit: state.config.agents_max,
         untracked: state.untracked(),
         tasks: tasks.collect(),
+        usage: state.usage,
+        projects: state.projects.clone(),
+        task_usages: state.task_usages.clone(),
     };
     assert!(view.running <= usize::from(view.limit));
     assert!(view.tasks.len() <= state.config.tasks_max);
     view
+}
+
+// The oldest task's usage gives way to a new task's once `TASK_USAGES_MAX` are kept.
+fn count_usage(state: &mut State, id: TaskId, usage: Usage) {
+    let task = state.tasks.iter().find(|task| task.id == id);
+    let project = task.and_then(|task| task.project.clone());
+    state.usage = state.usage.plus(usage);
+    match state.projects.iter().position(|(name, _)| *name == project) {
+        Some(index) => state.projects[index].1 = state.projects[index].1.plus(usage),
+        None if state.projects.len() < PROJECTS_MAX => {
+            state.projects.push((project.clone(), usage));
+        }
+        None => {}
+    }
+    match state.task_usages.iter_mut().find(|entry| entry.id == id) {
+        Some(entry) => entry.usage = entry.usage.plus(usage),
+        None => {
+            if state.task_usages.len() == TASK_USAGES_MAX {
+                state.task_usages.remove(0);
+            }
+            state.task_usages.push(TaskUsage { id, project, usage });
+        }
+    }
+    assert!(state.projects.len() <= PROJECTS_MAX);
+    assert!(state.task_usages.len() <= TASK_USAGES_MAX);
 }
 
 fn agent_rows(state: &State) -> Vec<AgentRow> {

@@ -21,8 +21,8 @@ pub const FILES: [(&str, &str); 6] = [
         include_str!("../../skills/ride-swarm/schemas/rider-finding.json"),
     ),
     (
-        "ride-swarm/schemas/rider-result@2.json",
-        include_str!("../../skills/ride-swarm/schemas/rider-result@2.json"),
+        "ride-swarm/schemas/rider-result@3.json",
+        include_str!("../../skills/ride-swarm/schemas/rider-result@3.json"),
     ),
     (
         "ship-swarm/SKILL.md",

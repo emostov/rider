@@ -128,6 +128,7 @@ impl Script {
         self.step(Event::Judged {
             run,
             verdict: complete(),
+            usage: None,
         })
     }
 
@@ -214,7 +215,11 @@ fn a_claim_lost_as_the_exited_agent_is_judged_writes_nothing() {
     assert!(!writes(&lost, run), "a claim lost while judging: {lost:?}");
     assert_eq!(script.phase(run), None);
     let verdict = complete();
-    let judged = script.step(Event::Judged { run, verdict });
+    let judged = script.step(Event::Judged {
+        run,
+        verdict,
+        usage: None,
+    });
     assert!(
         !writes(&judged, run),
         "a judgment after a lost claim: {judged:?}"
