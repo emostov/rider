@@ -830,7 +830,7 @@ fn prepare(
         false => worktree::dir_for(&brief, &env.home),
     };
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
-    let retry = fs::symlink_metadata(&dir).is_ok();
+    let retry = !brief.untrusted && fs::symlink_metadata(&dir).is_ok();
     let prompt = build_prompt(&brief, retry)?;
     let session = brief.resume.then(|| resume_session(&brief, &env.home));
     let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
@@ -845,6 +845,14 @@ fn prepare(
     let resume = session.and_then(Result::ok);
     let gh_config = untrusted_dir.join("gh-config");
     if brief.untrusted {
+        // Each start gets an empty directory: the agent CLI reads instructions and settings
+        // from its working directory, and a retry must not find what an earlier one copied.
+        if let Err(error) = fs::remove_dir_all(&untrusted_dir)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            let reason = format!("Rider cannot empty {}: {error}.", untrusted_dir.display());
+            return Err(Block::new("rider_error", reason).into());
+        }
         for made in [&gh_config, &dir] {
             fs::create_dir_all(made).map_err(|error| {
                 let reason = format!("Rider cannot create {}: {error}.", made.display());
@@ -870,6 +878,13 @@ fn prepare(
             cmd.untrusted = true;
             let dir = gh_config.to_string_lossy().into_owned();
             cmd.env.push(("GH_CONFIG_DIR".to_string(), dir));
+            let ceiling = untrusted_dir.to_string_lossy().into_owned();
+            cmd.env.extend([
+                ("GIT_CEILING_DIRECTORIES".to_string(), ceiling),
+                ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+                ("GIT_CONFIG_KEY_0".to_string(), "safe.bareRepository".to_string()),
+                ("GIT_CONFIG_VALUE_0".to_string(), "explicit".to_string()),
+            ]);
         }
         assert_eq!(cmd.untrusted, brief.untrusted);
         Ok::<CommandLine, Block>(cmd)
