@@ -2700,9 +2700,6 @@ fn an_onto_task_completes_after_a_crash_left_a_later_fix_holding_the_branch() {
         return;
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
-    given_a_running_daemon(&mut world);
-    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
     let first = when_the_lead_creates(
         &world,
         &a_fix(&world, "Fix the work.", &built, &built, false),
@@ -2711,10 +2708,13 @@ fn an_onto_task_completes_after_a_crash_left_a_later_fix_holding_the_branch() {
         &world,
         &a_fix(&world, "Fix it again.", &built, &first, false),
     );
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
     given_the_agent_will(&world, &first, &[Behaviour::Commit]);
     given_the_agent_will(&world, &second, &[Behaviour::Commit]);
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
     given_vb_waits_for_the_result_post(&world, &first, &posted, &release);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
     when_the_file_exists(&world, &posted);
     when_the_daemon_crashes(&mut world);
     fs::write(&release, "").expect("release the held post");
