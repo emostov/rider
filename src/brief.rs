@@ -57,6 +57,11 @@ pub enum BriefError {
     BadResume(String),
     BadRestack(String),
     RestackWithoutOnto,
+    /// An `onto` task on a role without commits, which names only a session to resume.
+    OntoWithoutResume {
+        onto: TaskId,
+        role: &'static str,
+    },
     /// The `base` task, which the task does not need.
     BaseNotNeeded(TaskId),
     /// The `of` task, which the task does not need.
@@ -130,6 +135,12 @@ impl fmt::Display for BriefError {
                 "Remove the `restack` label, or set `onto` to the task whose branch this task \
                  rebases."
             ),
+            BriefError::OntoWithoutResume { onto, role } => write!(
+                f,
+                "Set the `resume` label to 1 to continue the agent session of task #{}, or \
+                 remove the `onto` label: a {role} task works on no branch.",
+                onto.0
+            ),
             BriefError::BaseNotNeeded(base) => write!(
                 f,
                 "Add task #{} to this task's needs, or remove the `base` label: a task is cut \
@@ -198,6 +209,10 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     if restack && onto.is_none() {
         return Err(BriefError::RestackWithoutOnto);
     }
+    if let Some(onto) = onto.filter(|_| !role.commits_expected && !resume) {
+        let role = role.label;
+        return Err(BriefError::OntoWithoutResume { onto, role });
+    }
     check_git_repo(&repo)?;
     let brief = Brief {
         id: view.id,
@@ -213,6 +228,7 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     };
     assert!(brief.repo.is_absolute());
     assert!(!brief.restack || brief.onto.is_some());
+    assert!(brief.role.commits_expected || brief.onto.is_none() || brief.resume);
     assert!(brief.base.is_none_or(|base| view.needs.contains(&base)));
     assert!(!(brief.base.is_some() && brief.onto.is_some()));
     assert!(!brief.role.needs_of || brief.of.is_some());

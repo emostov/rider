@@ -52,6 +52,22 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   Fixture: `codex-reconnect.jsonl`, cut from a real review run, with the provider
   URL and `cf-ray` id redacted.
 
+- Resume (2026-11-20, codex-cli 0.170.0, `gpt-6.1-sol`): a fresh `codex exec ... -C <A>` run
+  was told to remember a word. Then, with `<A>` removed and the working directory set to
+  another repository `<B>`:
+  `codex exec resume --model <MODEL> --json --dangerously-bypass-approvals-and-sandbox -- <thread_id> "<prompt>"`
+  exits 0 and recalls the word. The subcommand has no `-C`; its shell commands ran in `<B>`
+  (`pwd` printed `<B>`), so Rider sets the child's working directory. The stream has the
+  same shape as a fresh run and its `thread.started` carries the same `thread_id`: Codex
+  continues the session in place, with no fork. `codex exec fork` exists but Rider does not
+  use it. Fixture: `codex-resume.jsonl`.
+- Resume of a missing session (same version):
+  `codex exec resume ... -- 00000000-0000-4000-8000-000000000000 "<prompt>"` exits 1 at once.
+  stdout is empty, with no `thread.started`; stderr is one line,
+  `Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)`.
+  Rider reads a failed run whose log has no `thread.started` as a refused resume and starts
+  fresh in the same attempt. Fixture: `codex-resume-refused.log` (the stderr; stdout was empty).
+
 ## tact
 
 Rider no longer supports tact; its observations and fixture were removed.

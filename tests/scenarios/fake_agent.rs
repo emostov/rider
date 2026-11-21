@@ -58,6 +58,8 @@ pub enum Behaviour {
     RefuseResumeThenHold,
     /// Switches to a new branch `elsewhere`, then commits like `Commit`.
     WanderBranch,
+    /// Like `RefuseResume`, but started without a session to resume it commits nothing.
+    RefuseResumeThenNothing,
     /// Detaches its worktree's `HEAD`, then commits like `Commit`.
     Detach,
     /// Commits like `Commit`, then exits `FAIL_EXIT_CODE`.
@@ -133,6 +135,7 @@ impl Behaviour {
             Behaviour::RebaseOntoMain => "rebase-onto-main",
             Behaviour::RefuseResumeThenHold => "refuse-resume-then-hold",
             Behaviour::WanderBranch => "wander-branch",
+            Behaviour::RefuseResumeThenNothing => "refuse-resume-then-nothing",
             Behaviour::Detach => "detach",
             Behaviour::CommitThenFail => "commit-then-fail",
             Behaviour::CommitThenBisect => "commit-then-bisect",
@@ -175,8 +178,9 @@ pub fn work_subject(task: &str, attempt: u32) -> String {
     format!("Work for task {task} attempt {attempt}")
 }
 
-/// The session id a fake `claude` reports in attempt `attempt` of `task`, unless it continues a
-/// session in place: started with `--resume <id>` and no `--fork-session`, it reports `<id>`.
+/// The session id a fake agent reports in attempt `attempt` of `task`, unless it continues a
+/// session in place: `claude --resume <id>` without `--fork-session`, or `codex exec resume`
+/// with `<id>` first after `--`, reports `<id>`.
 pub fn session(task: &str, attempt: u32) -> String {
     format!("fake-{task}-{attempt}")
 }
@@ -232,11 +236,14 @@ for arg in "$@"; do
   previous="$arg"
   printf '%s\n' "$arg" >> "$options"
 done
+if [ "$harness" = codex ] && [ "$2" = resume ]; then
+  resumed=$(printf '%s\n' "$@" | sed -n '/^--$/{{n;p;q;}}')
+fi
 [ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
 report() {{
   if [ "$harness" = codex ]; then
-    echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
+    echo '{{"type":"thread.started","thread_id":"'"$session"'"}}'
     echo '{{"type":"turn.started"}}'
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
     echo '{{"type":"item.completed",'"$item"'}}'
@@ -297,8 +304,12 @@ case "$behaviour" in
     n=0
     while [ $n -lt {lines} ]; do printf -- '-é%s %s\n' $n "$pad"; n=$((n + 1)); done
     exit {fail} ;;
-  refuse-resume|refuse-resume-slowly|refuse-resume-then-hold)
+  refuse-resume|refuse-resume-slowly|refuse-resume-then-hold|refuse-resume-then-nothing)
     [ "$behaviour" = refuse-resume-slowly ] && sleep {slow}
+    if [ -n "$resumed" ] && [ "$harness" = codex ]; then
+      echo "Error: thread/resume: thread/resume failed: no rollout found for thread id $resumed" >&2
+      exit 1
+    fi
     if [ -n "$resumed" ]; then
       echo "No conversation found with session ID: $resumed" >&2
       refused='"subtype":"error_during_execution","is_error":true,"num_turns":0'
@@ -306,7 +317,7 @@ case "$behaviour" in
       [ "$behaviour" = refuse-resume-then-hold ] && hold
       exit 1
     fi
-    commit || exit 1 ;;
+    [ "$behaviour" = refuse-resume-then-nothing ] || commit || exit 1 ;;
   hold-then-nothing) hold ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM

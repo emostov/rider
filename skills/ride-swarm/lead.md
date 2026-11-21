@@ -79,9 +79,9 @@ worker take it again.
 | `repo` | you, required | absolute path of the target git repository |
 | `base` | you | id of the task whose branch this one is cut from |
 | `from` | you, required when `base` and `onto` are absent | the agreed base branch to cut from |
-| `onto` | you | id of a task whose existing branch this task works on directly |
+| `onto` | you | id of a task whose existing branch this task works on directly; on `review`, `security` or `qa` it names only the task whose session `resume=1` continues, and needs `resume=1` |
 | `of` | you, required for `review`, `security`, and `qa` | id of the task under review |
-| `resume` | you | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
+| `resume` | you | `1` on an `implement`, `light` or `review` task whose `onto` task ran on the same harness: the worker continues that task's session (Claude forks it; Codex continues it in place, so the next follow-up resumes the newest review), else it starts fresh and says why |
 | `restack` | you | `1` on a restack task: it may rebase its `onto` branch and leave the branch's starting commit behind |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |

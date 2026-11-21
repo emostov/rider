@@ -59,11 +59,12 @@ const ATTEMPT_DIGITS_MAX: usize = 3;
 const RESULT_SCHEMA: &str = "rider-result@2";
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
-// Beside a task's logs: the Claude session id of its latest completed attempt on one line,
-// then the repository it ran in.
+// Beside a task's logs: the harness and session id of its latest completed attempt on one
+// line, then the repository it ran in.
 const SESSION_FILE: &str = "session";
 const SESSION_FILE_BYTES_MAX: usize = 4096;
-const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
+const HARNESS_WORD_BYTES_MAX: usize = 6;
+const RESUMABLE_ROLES: [&str; 3] = ["implement", "light", "review"];
 const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as the \
                           last attempt left them, uncommitted changes included.";
 
@@ -227,8 +228,9 @@ impl Attempt {
         assert!(!self.cmd.program.is_empty());
         assert!(self.fresh_log.get().is_none(), "an attempt launches once");
         let launched = launch(&self.cmd, &self.checkout.dir, &self.log);
-        let refused =
-            !matches!(launched, Ok(Exit::Code(0))) && harness::ended_before_any_turn(&self.log);
+        let harness = self.brief.role.harness;
+        let refused = !matches!(launched, Ok(Exit::Code(0)))
+            && harness::ended_before_any_turn(harness, &self.log);
         let stopped = self.stopped.load(Ordering::SeqCst);
         match self.fallback.as_ref().filter(|_| refused && !stopped) {
             Some(fresh) => {
@@ -381,8 +383,9 @@ pub fn judge_attempt(
         && attempt.fresh_log.get().is_some()
     {
         let note = format!(
-            "Claude could not resume session {} before doing any work, so the attempt ran \
+            "{:?} could not resume session {} before doing any work, so the attempt ran \
              again starting fresh.",
+            attempt.brief.role.harness,
             fresh.session.as_str()
         );
         // The note only informs; losing it must not stop the attempt.
@@ -486,7 +489,7 @@ fn unneeded_on_branch(
     board: &dyn Board,
 ) -> Result<Option<BriefError>, RunError> {
     assert!(brief.id == view.id);
-    let Some(onto) = brief.onto else {
+    let Some(onto) = brief.onto.filter(|_| brief.role.commits_expected) else {
         return Ok(None);
     };
     let listing = board.list_open(SUBTREE)?;
@@ -597,7 +600,10 @@ fn prepare(
     let prompt = build_prompt(env, &brief, retry)?;
     let session = brief.resume.then(|| resume_session(&brief, &env.home));
     let resume_note = session.as_ref().map(|session| match (session, brief.onto) {
-        (Ok(_), Some(onto)) => format!("Resuming the Claude session of task #{}.", onto.0),
+        (Ok(_), Some(onto)) => format!(
+            "Resuming the {:?} session of task #{}.",
+            brief.role.harness, onto.0
+        ),
         (Ok(_), None) => panic!("a session is only resumed from an `onto` task"),
         (Err(why), _) => format!("Starting a fresh session despite `resume=1`: {why}."),
     });
@@ -654,14 +660,8 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     assert!(brief.resume && home.is_absolute());
     if !RESUMABLE_ROLES.contains(&brief.role.label) {
         return Err(format!(
-            "role {} is not implement or light",
+            "role {} is not implement, light or review",
             brief.role.label
-        ));
-    }
-    if brief.role.harness != Harness::Claude {
-        return Err(format!(
-            "role {} runs {:?}, and only Claude resumes a session",
-            brief.role.label, brief.role.harness
         ));
     }
     let onto = brief.onto.ok_or("the task has no `onto` label")?;
@@ -675,7 +675,7 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "task #{} has no completed Claude attempt with a recorded session",
+                "task #{} has no completed attempt with a recorded session",
                 onto.0
             ));
         }
@@ -691,7 +691,19 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     let (session, repo) = text.split_once('\n').ok_or_else(malformed)?;
     let repo = repo.strip_suffix('\n').filter(|repo| !repo.is_empty());
     let repo = Path::new(repo.ok_or_else(malformed)?);
+    let (harness, session) = session.split_once(' ').ok_or_else(malformed)?;
+    let harness = match harness {
+        "claude" => Harness::Claude,
+        "codex" => Harness::Codex,
+        _ => return Err(malformed()),
+    };
     let session = SessionId::parse(session).ok_or_else(malformed)?;
+    if harness != brief.role.harness {
+        return Err(format!(
+            "task #{}'s session was recorded by {harness:?}, and role {} runs {:?}",
+            onto.0, brief.role.label, brief.role.harness
+        ));
+    }
     if repo != brief.repo {
         return Err(format!(
             "task #{}'s session was recorded in repository {}, not this task's {}",
@@ -716,12 +728,16 @@ fn session_path(home: &Path, id: TaskId) -> PathBuf {
 
 fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     let path = session_path(home, attempt.brief.id);
-    let session = match attempt.brief.role.harness {
-        Harness::Claude => harness::session_id(attempt.log()),
-        Harness::Codex => None,
+    let harness = attempt.brief.role.harness;
+    let session = harness::session_id(harness, attempt.log());
+    let word = match harness {
+        Harness::Claude => "claude",
+        Harness::Codex => "codex",
     };
+    assert!(word.len() <= HARNESS_WORD_BYTES_MAX);
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
-    let fits = |repo: &&str| repo.len() < SESSION_FILE_BYTES_MAX - SESSION_BYTES_MAX - 2;
+    let room = SESSION_FILE_BYTES_MAX - HARNESS_WORD_BYTES_MAX - SESSION_BYTES_MAX - 3;
+    let fits = |repo: &&str| repo.len() < room;
     let repo = attempt
         .brief
         .repo
@@ -729,7 +745,9 @@ fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
         .filter(|repo| !repo.contains('\n'))
         .filter(fits);
     let written = match (&session, repo) {
-        (Some(session), Some(repo)) => fs::write(&path, format!("{}\n{repo}\n", session.as_str())),
+        (Some(session), Some(repo)) => {
+            fs::write(&path, format!("{word} {}\n{repo}\n", session.as_str()))
+        }
         (None, _) | (_, None) => match fs::remove_file(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             other => other,

@@ -256,13 +256,14 @@ fn an_oversized_prompt_is_an_error() {
 
 #[test]
 fn the_session_id_is_read_from_the_recorded_claude_stream() {
-    let id = session_id(Path::new("fixtures/harness/claude.jsonl"));
+    let id = session_id(Harness::Claude, Path::new("fixtures/harness/claude.jsonl"));
     let expected = SessionId::parse("20de60af-1a54-4519-8f52-8623adc5d76e");
     assert_eq!(id, expected);
-    assert_eq!(session_id(Path::new("fixtures/harness/codex.jsonl")), None);
+    let codex = Path::new("fixtures/harness/codex.jsonl");
+    assert_eq!(session_id(Harness::Claude, codex), None);
     let scratch = Scratch::new("session");
     let log = scratch.file("hostile", "{\"session_id\":\"--help\"}\n");
-    assert_eq!(session_id(&log), None);
+    assert_eq!(session_id(Harness::Claude, &log), None);
 }
 
 #[test]

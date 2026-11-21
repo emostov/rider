@@ -9,6 +9,7 @@ mod brief_settle;
 )]
 mod fake_agent;
 mod harness_cli;
+mod resume_review;
 mod run_task;
 mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
@@ -1398,7 +1399,7 @@ fn a_session_recorded_for_another_repository_is_not_resumed() {
 }
 
 #[test]
-fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
+fn a_resumed_fix_of_a_codex_implement_role_resumes_the_codex_session() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -1420,6 +1421,11 @@ fn a_resumed_fix_of_a_codex_implement_role_starts_fresh() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].harness, "codex");
     assert_eq!(agent_model(&world, &fix, 0), "gpt-test-implement");
+    let args = fake_agent::args(&world.root, &fix, 0);
+    let (options, rest) = args.split_once("\n--\n").expect("the prompt follows --");
+    assert!(options.starts_with("exec\nresume\n"), "{args}");
+    let session = fake_agent::session(&built, 0);
+    assert_eq!(rest.lines().next(), Some(session.as_str()));
 }
 
 /// An implement task whose agent will `behave`, given its role only then, so a running

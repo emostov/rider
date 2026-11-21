@@ -126,7 +126,7 @@ impl fmt::Display for HarnessError {
 /// Upper bound on a session id's length.
 pub const SESSION_BYTES_MAX: usize = 128;
 
-/// A Claude Code session id: ASCII letters, digits, and `-`, never starting with `-`.
+/// A Claude session or Codex thread id: ASCII letters, digits, and `-`, never starting with `-`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionId(String);
 
@@ -147,8 +147,8 @@ impl SessionId {
     }
 }
 
-/// The command line that runs `spec` on `prompt` in `dir`, starting from a fork of session
-/// `resume` when given (Claude only); the prompt is last, after `--`.
+/// The command line that runs `spec` on `prompt` in `dir`, continuing session `resume` of
+/// `spec`'s harness when given; the prompt is last, after `--`.
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,
@@ -156,10 +156,6 @@ pub fn command_for(
     resume: Option<&SessionId>,
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
-    assert!(
-        resume.is_none() || spec.harness == Harness::Claude,
-        "only Claude sessions are resumed"
-    );
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
     assert!(dir.to_str().is_some(), "worktree paths are UTF-8");
     if prompt.len() > PROMPT_BYTES_MAX {
@@ -173,7 +169,7 @@ pub fn command_for(
     }
     let dir = dir.to_string_lossy();
     let model = spec.model;
-    let (program, head) = match spec.harness {
+    let (program, mut args) = match spec.harness {
         Harness::Claude => (
             "claude",
             vec![
@@ -194,22 +190,24 @@ pub fn command_for(
                 model,
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
-                "-C",
-                &dir,
             ],
         ),
     };
-    let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
-    if let Some(session) = resume {
+    match (spec.harness, resume) {
         // Without `--fork-session` Claude appends to the resumed session in place.
-        args.extend([
-            "--resume".to_string(),
-            session.0.clone(),
-            "--fork-session".to_string(),
-        ]);
+        (Harness::Claude, Some(session)) => {
+            args.extend(["--resume", &session.0, "--fork-session", "--"]);
+        }
+        (Harness::Claude, None) => args.push("--"),
+        // `codex exec resume` has no `-C`: it runs in the child's working directory.
+        (Harness::Codex, Some(session)) => {
+            args.insert(1, "resume");
+            args.extend(["--", &session.0]);
+        }
+        (Harness::Codex, None) => args.extend(["-C", &dir, "--"]),
     }
-    args.push("--".to_string());
-    args.push(prompt.to_string());
+    args.push(prompt);
+    let args: Vec<String> = args.into_iter().map(String::from).collect();
     assert!(args.len() <= ARGS_MAX);
     assert!(args.iter().any(|a| a == model));
     let program = program.to_string();
@@ -614,6 +612,8 @@ struct SessionLine {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum CodexEvent {
+    #[serde(rename = "thread.started")]
+    ThreadStarted { thread_id: Option<Field<String>> },
     #[serde(rename = "item.completed")]
     ItemCompleted { item: Option<Field<CodexItem>> },
     #[serde(rename = "turn.failed")]
@@ -702,22 +702,39 @@ pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
     Some(text)
 }
 
-/// The session id of the first Claude event that carries one, or `None` when there is none.
-pub fn session_id(log: &Path) -> Option<SessionId> {
+/// The session id of the first event that carries one: a Claude event's `session_id`, or
+/// Codex's `thread.started` `thread_id`. `None` when there is none.
+pub fn session_id(harness: Harness, log: &Path) -> Option<SessionId> {
     let mut found: Option<Option<SessionId>> = None;
-    let _ = scan(log, |line: SessionLine| {
+    let mut first = |id: Option<String>| {
         if found.is_none() {
-            found = valid(line.session_id).map(|id| SessionId::parse(&id));
+            found = id.map(|id| SessionId::parse(&id));
         }
-    });
+    };
+    let _ = match harness {
+        Harness::Claude => scan(log, |line: SessionLine| first(valid(line.session_id))),
+        Harness::Codex => scan(log, |event| {
+            if let CodexEvent::ThreadStarted { thread_id } = event {
+                first(valid(thread_id));
+            }
+        }),
+    };
     let id = found.flatten();
     assert!(id.as_ref().is_none_or(|id| !id.0.is_empty()));
     id
 }
 
-/// Whether the Claude stream at `log` shows a run that ended in error before its first turn,
-/// as when `--resume` names a session Claude cannot open; false when the log is unreadable.
-pub fn ended_before_any_turn(log: &Path) -> bool {
+/// Whether the stream at `log` shows a run that ended before its first turn, as when a resume
+/// names a session the harness cannot open; false when the log is unreadable.
+pub fn ended_before_any_turn(harness: Harness, log: &Path) -> bool {
+    if harness == Harness::Codex {
+        // A refused `codex exec resume` prints only an error to stderr: no thread starts.
+        let mut started = false;
+        let read = scan(log, |event| {
+            started |= matches!(event, CodexEvent::ThreadStarted { .. });
+        });
+        return read && !started;
+    }
     let mut results = 0u64;
     let mut refused = false;
     let mut turned = false;
@@ -749,7 +766,9 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
         Harness::Codex => scan(log, |event| match event {
             CodexEvent::TurnFailed | CodexEvent::Error => last_turn_failed = true,
             CodexEvent::TurnCompleted => last_turn_failed = false,
-            CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
+            CodexEvent::ThreadStarted { .. }
+            | CodexEvent::ItemCompleted { .. }
+            | CodexEvent::Other => {}
         }),
         Harness::Claude => scan(log, |event| {
             if let ClaudeEvent::Result {
