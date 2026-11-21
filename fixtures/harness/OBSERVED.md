@@ -65,8 +65,9 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   `codex exec resume ... -- 00000000-0000-4000-8000-000000000000 "<prompt>"` exits 1 at once.
   stdout is empty, with no `thread.started`; stderr is one line,
   `Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)`.
-  Rider reads a failed run whose log has no `thread.started` as a refused resume and starts
-  fresh in the same attempt. Fixture: `codex-resume-refused.log` (the stderr; stdout was empty).
+  Rider reads a failed run whose log has no `thread.started` and holds `no rollout found for
+  thread id` as a refused resume and starts fresh in the same attempt; any other early
+  failure fails the attempt. Fixture: `codex-resume-refused.log` (the stderr; stdout was empty).
 
 ## Codex review
 
