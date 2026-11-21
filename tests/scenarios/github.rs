@@ -1025,3 +1025,33 @@ fn a_ci_failure_whose_owner_session_codex_recorded_goes_to_the_lead() {
         format!("codex {id}")
     });
 }
+
+#[test]
+fn a_review_task_on_the_branch_does_not_take_the_pr_from_its_implementer() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let task = given_a_completed_task(&mut world);
+    let security = NewTask::new("Check the work for security problems.")
+        .label("repo", world.repo_label())
+        .label("of", &task)
+        .needs(&task)
+        .role("security");
+    let security = when_the_lead_creates(&world, &security);
+    let settled = when_the_tasks_settle(&world, &[&security]);
+    assert!(SETTLED.contains(&settled[0].as_str()), "{settled:?}");
+    let branch = task_label(&world, &task, "branch").expect("the task's branch");
+    world.vb_lead(&["label", &security, &format!("branch={branch}")], None);
+    when_a_round_passes(&world);
+
+    given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
+    let records = when_records_reach(&world, &task, 1);
+
+    let fix = queued_fix(&records[0]);
+    then_the_fix_resumes(&world, &fix, &task);
+    assert_eq!(
+        task_records(&world, &security, "rider-github"),
+        Vec::<Value>::new()
+    );
+}

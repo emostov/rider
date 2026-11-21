@@ -328,7 +328,10 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
         ) else {
             continue;
         };
-        if branches.contains(&(repo, branch)) {
+        let commits = ROLES
+            .iter()
+            .any(|spec| spec.label == role && spec.commits_expected);
+        if !commits || branches.contains(&(repo, branch)) {
             continue;
         }
         if branches.len() >= TASKS_MAX {
