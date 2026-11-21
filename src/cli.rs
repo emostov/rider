@@ -1,11 +1,12 @@
 //! The command line: parse the arguments, read the environment once, and run one command.
 
+use std::borrow::Cow;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -643,7 +644,7 @@ fn logs(config: &Config, id: TaskId, follow: bool) -> Result<u8, CliError> {
                 for _ in 0..LOG_LINES_MAX {
                     match client.next_line().map_err(CliError::Client)? {
                         // A closed standard output ends nothing the daemon does.
-                        Some(line) => drop(writeln!(io::stdout().lock(), "{line}")),
+                        Some(line) => drop(writeln!(io::stdout().lock(), "{}", printable(&line))),
                         None => return Ok(0),
                     }
                 }
@@ -663,10 +664,25 @@ fn logs(config: &Config, id: TaskId, follow: bool) -> Result<u8, CliError> {
         message: error.to_string(),
     };
     let file = fs::File::open(&path).map_err(io)?;
+    let mut reader = BufReader::new(file.take(LOG_BYTES_MAX));
     let mut stdout = io::stdout().lock();
-    io::copy(&mut file.take(LOG_BYTES_MAX), &mut stdout).map_err(io)?;
-    stdout.flush().map_err(io)?;
-    Ok(0)
+    let mut line = Vec::new();
+    for _ in 0..LOG_LINES_MAX {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).map_err(io)? == 0 {
+            stdout.flush().map_err(io)?;
+            return Ok(0);
+        }
+        let (body, end) = match line.strip_suffix(b"\n") {
+            Some(body) => (body, "\n"),
+            None => (&line[..], ""),
+        };
+        let text = String::from_utf8_lossy(body);
+        write!(stdout, "{}{end}", printable(&text)).map_err(io)?;
+    }
+    Err(CliError::Client(ClientError::Malformed(format!(
+        "more than {LOG_LINES_MAX} lines"
+    ))))
 }
 
 fn kill(config: &Config, id: TaskId) -> Result<u8, CliError> {
@@ -689,7 +705,7 @@ fn status(config: &Config) -> Result<u8, CliError> {
     projects.sort_unstable();
     projects.dedup();
     for project in projects {
-        println!("{project}");
+        println!("{}", printable(project));
         let in_project = tasks
             .iter()
             .filter(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE) == project);
@@ -756,8 +772,25 @@ fn status_line(data: &serde_json::Value) -> String {
     line
 }
 
-fn text(value: &serde_json::Value) -> &str {
-    value.as_str().unwrap_or("-")
+fn text(value: &serde_json::Value) -> Cow<'_, str> {
+    printable(value.as_str().unwrap_or("-"))
+}
+
+fn printable(text: &str) -> Cow<'_, str> {
+    let shown = |c: &char| *c == '\t' || !c.is_control();
+    if text.chars().all(|c| shown(&c)) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if shown(&c) {
+            escaped.push(c);
+        } else {
+            escaped.extend(c.escape_default());
+        }
+    }
+    assert!(escaped.chars().all(|c| shown(&c)));
+    Cow::Owned(escaped)
 }
 
 fn age(value: &serde_json::Value) -> String {

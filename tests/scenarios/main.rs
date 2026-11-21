@@ -2364,12 +2364,11 @@ fn rider_kill_of_a_task_the_owner_canceled_writes_nothing_to_the_task() {
 
     assert_eq!(kill.code, Some(0), "{kill:?}");
     assert!(when_the_process_ends_within(run.pid, 10));
-    thread::sleep(Duration::from_secs(2));
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert_eq!(task_state(&world, &task), "canceled");
     assert_eq!(task_replies(&world, &task), replies);
     assert_eq!(task_labels(&world, &task), labels);
-    when_the_daemon_is_sent_sigterm(&world);
-    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
 
 const LOG_POLL_MILLIS: u64 = 50;

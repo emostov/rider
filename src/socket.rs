@@ -575,7 +575,13 @@ fn write_log_lines(stream: &mut UnixStream, id: u64, pending: &mut Vec<u8>, all:
         let (line, used) = match rest.iter().position(|byte| *byte == b'\n') {
             Some(end) if end <= LOG_LINE_BYTES_MAX => (&rest[..end], end + 1),
             _ if rest.len() > LOG_LINE_BYTES_MAX => {
-                (&rest[..LOG_LINE_BYTES_MAX], LOG_LINE_BYTES_MAX)
+                let starts_char = |at: &usize| rest[*at] & 0xc0 != 0x80;
+                let boundary = (0..4)
+                    .map(|back| LOG_LINE_BYTES_MAX - back)
+                    .find(starts_char);
+                let cut = boundary.unwrap_or(LOG_LINE_BYTES_MAX);
+                assert!(cut > 0 && cut <= LOG_LINE_BYTES_MAX);
+                (&rest[..cut], cut)
             }
             _ if all => (rest, rest.len()),
             _ => break,

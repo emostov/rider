@@ -23,6 +23,7 @@ const READ_SECONDS_MAX: u64 = 30;
 const READS_MAX: usize = 1 << 20;
 const LOG_LINES: usize = 8 * 1024;
 const LOG_LINE_BYTES: usize = 1024;
+const STREAM_LINE_BYTES_MAX: usize = 512 * 1024;
 const DAEMON_STARTS: usize = 20;
 const WATCH_POLLS_MAX: u64 = u64::MAX;
 const SEAT_PROBES_MAX: usize = 1000;
@@ -157,6 +158,68 @@ fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
         Vec::<&str>::new(),
         "left behind by a daemon that stopped"
     );
+}
+
+#[test]
+fn rider_logs_shows_control_characters_in_an_agents_output_escaped() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = "7";
+    given_a_log(
+        &world,
+        task,
+        "plain\tline\n\u{1b}[2Jcleared\u{9b}31m\rback\n",
+    );
+    given_a_running_daemon(&mut world);
+
+    let printed = when_rider_runs(&world, &["logs", task]);
+    let followed = when_rider_runs(&world, &["logs", "-f", task]);
+
+    let shown = "plain\tline\n\\u{1b}[2Jcleared\\u{9b}31m\\rback\n";
+    assert_eq!(
+        (printed.code, printed.stdout.as_str()),
+        (Some(0), shown),
+        "{printed:?}"
+    );
+    assert_eq!(
+        (followed.code, followed.stdout.as_str()),
+        (Some(0), shown),
+        "{followed:?}"
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn rider_logs_follow_splits_a_line_too_long_for_one_stream_line_between_characters() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = "7";
+    let line = format!("a{}", "\u{e9}".repeat(STREAM_LINE_BYTES_MAX));
+    given_a_log(&world, task, &format!("{line}\n"));
+    given_a_running_daemon(&mut world);
+
+    let followed = when_rider_runs(&world, &["logs", "-f", task]);
+
+    assert_eq!(followed.code, Some(0), "{}", followed.stderr);
+    assert!(
+        followed.stdout.lines().count() > 1,
+        "the line was not split"
+    );
+    assert!(
+        followed.stdout.replace('\n', "") == line,
+        "the split line changed"
+    );
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+fn given_a_log(world: &World, task: &str, text: &str) {
+    let dir = world.home.join("logs").join(task);
+    fs::create_dir_all(&dir).expect("create the task's log directory");
+    fs::write(dir.join("1.jsonl"), text).expect("write the log");
 }
 
 struct StopOnDrop<'a>(&'a AtomicBool);
