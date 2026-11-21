@@ -55,7 +55,6 @@ when you ask: the answer applies to every repository there.
 | `implement` | Opus 5.5 | `implement-<n>-opus-5-5` | Implement <n> (Opus 5.5) | yes |
 | `light` | Sonnet 5.5 | `light-<n>-sonnet-5-5` | Light <n> (Sonnet 5.5) | yes |
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
-| `polish` | Sonnet 5.5 | `polish-<n>-sonnet-5-5` | Polish <n> (Sonnet 5.5) | yes |
 | `native-review` | Sol 6.2 | `native-review-<n>-sol-6-2` | Native-review <n> (Sol 6.2) | no |
 | `final-review` | Mythos 5.2 | `final-review-<n>-mythos-5-2` | Final-review <n> (Mythos 5.2) | no |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
@@ -78,7 +77,7 @@ worker take it again.
 
 | Label | Set by | Value |
 |---|---|---|
-| `role` | you, required | `implement`, `light`, `review`, `polish`, `security`, or `qa` |
+| `role` | you, required | `implement`, `light`, `review`, `security`, or `qa` |
 | `repo` | you, required | absolute path of the target git repository |
 | `base` | you | id of the task whose branch this one is cut from |
 | `from` | you, required when `base` and `onto` are absent | the agreed base branch to cut from |
@@ -136,6 +135,8 @@ These rules are yours to keep. Rider does not check them:
   effective value. Size tasks well inside that.
 - Sizing: changes that each take under about ten minutes and touch the same files go in one
   task, not several.
+- Proof: a brief's proof names targeted tests (`cargo test --test scenarios <name>`,
+  `cargo test --test sim`), not the full suite; CI runs the full suite.
 - Review policy: reviews happen only at the end of each pull request, plus one review of a
   branch before other work is built on top of it. No task gets a review of its own while the
   work is going on; the PR's holistic review covers every task and fix on the branch, and you
@@ -159,15 +160,16 @@ These rules are yours to keep. Rider does not check them:
   and record the remaining findings in the project's deferred-work thread, or change the approach.
   Never start a third fix-and-review round on the same piece unchanged.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the
-  reviewed task>`, `resume=1` when the reviewed task is `implement` or `light`, needing every
+  reviewed task>`, always `resume=1` when the reviewed task is `implement` or `light`, needing every
   unfinished task on that branch, and no review of its own.
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.
-- `polish` is one task per branch, after that branch's blocking findings are fixed:
-  `onto=<the branch's task>`. Polish a stack from the bottom up.
-- `security` is one task per stack, after polish, and for any task you judge sensitive:
-  `of=<the top task>`, and `needs` every polish task in the stack, so it never runs while
-  polish still moves a branch. Name the range in the brief, such as `main..HEAD`.
+- There are no polish tasks: the implementer polishes its own diff against AGENTS.md.
+- `security` is one task per stack, and for any task you judge sensitive: `of=<the top
+  task>`, `needs` every unfinished task on the stack. Name the range in the brief, such as
+  `main..HEAD`.
+- Merge each PR to main as soon as it is green and reviewed, and cut the next work from main.
+  Never stack more than two PRs.
 - `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI.
   `of=<the task under test>`, and `needs` that task, plus the review of its branch when the
   branch was reviewed before stacking; otherwise only the task. Its brief names the flows to exercise and the unhappy paths that matter. It builds
@@ -339,8 +341,8 @@ By default, as work resolves an issue, close it or link it to the PR that closes
 
 ## Telling the owner where it stands
 
-When the work is done, or when they ask, say what is finished, what waits on them, and what
-failed, each with its task id: `vb tasks work/<project> --state all --json`.
+Report only decisions, PRs and failures, not each settled task. When the work is done, or when
+they ask, say what is finished, what waits on them, and what failed, each with its task id: `vb tasks work/<project> --state all --json`.
 
 Every message to the owner ends with one line starting `Your move:`, in exactly one form:
 

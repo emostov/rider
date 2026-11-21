@@ -30,6 +30,12 @@ before completing. A `[repo."<absolute path>".roles.<role>]` table sets only tha
 `skills`, for that repository's tasks only, and `rider config --repo <path>` prints the table
 they see.
 
+The built-in roles' prompts, and the slop rules the implement prompt carries, are built into
+`rider`, so they always match the installed binary; a role's `prompt` may instead name a file
+of your own. When the daemon starts, it registers Rider's board schemas (`rider-result@2`,
+`rider-finding@1`) on any board that lacks them. A `prompts/` directory an older Rider wrote
+under `<rider home>` is no longer read and can be deleted.
+
 ## Getting started
 
 Paste this into your coding agent:
@@ -37,8 +43,14 @@ Paste this into your coding agent:
 ```
 Install Rider: clone https://github.com/emostov/rider if you don't have it yet, then run
 `cargo install --locked --path <that clone>`, which installs the `rider` binary. Then run
-`npx skills add emostov/rider --skill ride-swarm --skill ship-swarm -g`.
+`rider skills install --into <your agent's skills directory>`, such as `~/.claude/skills`
+for Claude Code or `~/.codex/skills` for Codex.
 ```
+
+The skills are built into `rider`, so they match the binary. Rider records each directory it
+installed into and updates the skills there when a newer `rider up`, `rider daemon` or
+`rider skills install` runs; a skill edited by hand is left as it is and named. `rider skills
+list` and `rider skills show <name>` print the built-in skills.
 
 Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
@@ -53,35 +65,32 @@ that use them. Install the Board CLI where Rider looks for it:
 npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board
 ```
 
-1. Start the daemon. It starts the local board if none is running, then claims ready tasks on
-   every `work/<project>` channel:
+Open a coding-agent session in a terminal you keep open and say "ride a swarm to <goal>".
+The `ride-swarm` skill makes that session the lead. The lead starts the daemon with
+`rider up`, plans the goal into tasks on the board, and waits on the board with `rider wait`.
 
-   ```sh
-   rider up
-   ```
+- Say "check my swarm" for status.
+- Say "stop the swarm" to stop it. The lead runs `rider down`.
 
-2. Start the lead: open a coding-agent session in a terminal you keep open and say "ride a
-   swarm to <goal>". The `ride-swarm` skill makes that session the lead. It plans the goal
-   into tasks on the board and watches the board with `vb wait`. Say "check my swarm" for
-   status and "stop the swarm" to stop it.
+### For the curious
 
-3. Watch the work:
+Watching is optional. The lead keeps you updated, but you can look yourself:
 
-   ```sh
-   rider status        # the board, the running count, and every open task by project
-   rider agents        # every agent the daemon runs
-   rider logs <id>     # the newest attempt's log of a task; -f follows it
-   ```
+```sh
+rider status        # the board, the running count, and every open task by project
+rider agents        # every agent the daemon runs
+rider logs <id>     # the newest attempt's log of a task; -f follows it
+```
 
-   The board's web inspector is at <http://127.0.0.1:4100>.
-
-4. Stop: `rider down`.
+The board's web inspector is at <http://127.0.0.1:4100>.
 
 Agents run unsandboxed, with permission prompts skipped. Point Rider only at repositories you
 are prepared to have changed. Rider never pushes or merges; work stays on local branches named
 `rider/<task id>-<slug>`.
 
 ## Stopping
+
+The lead stops the swarm when you ask. To stop it by hand:
 
 - `rider down` drains: running agents finish and their tasks settle, and nothing new is
   claimed.

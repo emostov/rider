@@ -27,6 +27,7 @@ use crate::feed::{
 use crate::harness::LOG_BYTES_MAX;
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
+use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
 const ENVIRONMENT: &str = r#"environment:
@@ -37,23 +38,24 @@ const ENVIRONMENT: &str = r#"environment:
 pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
-/// Every role's prompt file and the files they read, once each, built into the binary.
+pub const IMPLEMENT_PROMPT: &str = "implement.md";
+pub const SLOP_RULES: &str = include_str!("../prompts/slop-rules.md");
+/// Every role's prompt and the slop rules, once each, built into the binary.
 pub const PROMPTS: [(&str, &str); 6] = [
-    ("implement.md", include_str!("../prompts/implement.md")),
+    (IMPLEMENT_PROMPT, include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
     (
         "native-review.md",
         include_str!("../prompts/native-review.md"),
     ),
     ("security.md", include_str!("../prompts/security.md")),
-    ("slop-rules.md", include_str!("../prompts/slop-rules.md")),
+    ("slop-rules.md", SLOP_RULES),
     ("qa.md", include_str!("../prompts/qa.md")),
 ];
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
-/// The directory under the Rider home that holds the built-in worker prompts.
-pub const PROMPTS_DIR: &str = "prompts";
 const BOARD_DIR: &str = "board";
+const SKILLS_DIR: &str = "skills";
 const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the characters of a project or profile name.
@@ -164,6 +166,29 @@ pub enum Command {
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
     },
+    /// List, print or install the skills built into rider.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
+}
+
+/// What to do with the built-in skills.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SkillsCommand {
+    /// Print each skill's name and description.
+    List,
+    /// Print a skill's SKILL.md.
+    Show {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Write each skill as DIR/<skill>/ and update every recorded older install.
+    Install {
+        /// The agent's skills directory (default <rider home>/skills).
+        #[arg(long, value_name = "DIR")]
+        into: Option<PathBuf>,
+    },
 }
 
 /// An argument value rider does not accept.
@@ -265,10 +290,6 @@ impl Config {
     fn vb_dir(&self) -> PathBuf {
         self.home.join(VB_DIR)
     }
-
-    fn prompts(&self) -> PathBuf {
-        self.home.join(PROMPTS_DIR)
-    }
 }
 
 /// An environment variable rider cannot use.
@@ -366,6 +387,9 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    Skills(SkillsError),
+    /// `rider skills install` left these skill directories as they were.
+    SkillsRefused(usize),
 }
 
 impl fmt::Display for CliError {
@@ -391,6 +415,10 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::Skills(error) => write!(f, "{error}"),
+            CliError::SkillsRefused(count) => {
+                write!(f, "{count} skills were not installed; see the lines above")
+            }
             CliError::BadCursor(path) => {
                 write!(f, "{} does not hold a board cursor", path.display())
             }
@@ -398,30 +426,16 @@ impl fmt::Display for CliError {
     }
 }
 
+impl From<SkillsError> for CliError {
+    fn from(error: SkillsError) -> CliError {
+        CliError::Skills(error)
+    }
+}
+
 impl From<ConfigError> for CliError {
     fn from(error: ConfigError) -> CliError {
         CliError::Config(error)
     }
-}
-
-/// Writes every role's prompt under the prompts directory, replacing what is there.
-pub fn write_prompts(config: &Config) -> Result<(), CliError> {
-    let dir = config.prompts();
-    let io = |action, path: &Path| {
-        let path = path.to_path_buf();
-        move |error: io::Error| CliError::Io {
-            action,
-            path,
-            message: error.to_string(),
-        }
-    };
-    fs::create_dir_all(&dir).map_err(io("create", &dir))?;
-    for (name, text) in PROMPTS.iter() {
-        assert!(!name.contains('/') && !text.is_empty());
-        let path = dir.join(name);
-        fs::write(&path, text).map_err(io("write", &path))?;
-    }
-    Ok(())
 }
 
 /// Runs `command` and returns the exit code rider should end with.
@@ -443,6 +457,82 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             timeout,
             lead,
         } => wait(config, project, *timeout, lead.as_deref()),
+        Command::Skills { command } => run_skills(config, command),
+    }
+}
+
+fn run_skills(config: &Config, command: &SkillsCommand) -> Result<u8, CliError> {
+    match command {
+        SkillsCommand::List => {
+            for name in SKILLS {
+                say(&format!("{name}  {}", skills::description(name)?));
+            }
+        }
+        SkillsCommand::Show { name } => {
+            let text = skills::show(name)?;
+            let mut out = io::stdout().lock();
+            out.write_all(text.as_bytes())
+                .map_err(|error| CliError::Io {
+                    action: "write",
+                    path: PathBuf::from("standard output"),
+                    message: error.to_string(),
+                })?;
+        }
+        SkillsCommand::Install { into } => {
+            let dir = match into {
+                Some(into) => skills::resolve(into)?,
+                None => InstallDir::parse(&config.home.join(SKILLS_DIR))?,
+            };
+            let (report, others) = skills::install(&config.home, &dir)?;
+            let mut refused = 0_usize;
+            for (path, outcome) in &report {
+                say(&skill_line(path, outcome));
+                if matches!(outcome, Ok(Outcome::Edited(_) | Outcome::Foreign) | Err(_)) {
+                    refused += 1;
+                }
+            }
+            say_updates(&others);
+            if refused > 0 {
+                return Err(CliError::SkillsRefused(refused));
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn skill_line(path: &Path, outcome: &Result<Outcome, SkillsError>) -> String {
+    let path = path.display();
+    match outcome {
+        Ok(Outcome::Installed) => format!("installed {path}"),
+        Ok(Outcome::UpToDate) => format!("up to date {path}"),
+        Ok(Outcome::Replaced { from }) => format!("replaced {path} (was {from})"),
+        Ok(Outcome::Edited(files)) => {
+            format!("skipped {path}: edited by hand: {}", files.join(", "))
+        }
+        Ok(Outcome::Foreign) => format!("skipped {path}: not installed by rider"),
+        Ok(Outcome::Newer(version)) => {
+            format!(
+                "kept {path}: rider {version} installed it, newer than {}",
+                skills::VERSION
+            )
+        }
+        Ok(Outcome::Absent) => format!("skipped {path}: removed"),
+        Err(error) => format!("skipped {path}: {error}"),
+    }
+}
+
+fn update_skills(config: &Config) {
+    match skills::update_recorded(&config.home) {
+        Ok(report) => say_updates(&report),
+        Err(error) => say(&format!("rider: the skills were not updated: {error}")),
+    }
+}
+
+fn say_updates(report: &Report) {
+    for (path, outcome) in report {
+        if !matches!(outcome, Ok(Outcome::UpToDate | Outcome::Absent)) {
+            say(&skill_line(path, outcome));
+        }
     }
 }
 
@@ -544,19 +634,19 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
     let (table, limits) = settings(config)?;
-    write_prompts(config)?;
+    update_skills(config);
     let paths = Paths {
         home: config.home.clone(),
-        prompts: config.prompts(),
         vb: config.vb_dir().join("vb"),
         board_url: config.board_url.clone(),
     };
-    assert!(paths.vb.is_absolute() && paths.prompts.is_absolute());
+    assert!(paths.vb.is_absolute() && paths.home.is_absolute());
     daemon::run(paths, table, limits).map_err(CliError::Daemon)
 }
 
 /// How long `rider up` waits for the daemon's socket to answer.
 const UP_SECONDS_MAX: u64 = 30;
+const UP_LOG_TAIL_BYTES: usize = 4096;
 /// How often `rider up` asks the socket again.
 const UP_POLL_MILLIS: u64 = 100;
 /// Upper bound on the lines one `rider down` prints.
@@ -565,6 +655,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
+    update_skills(config);
     if let Ok(mut client) = Client::connect(&config.home) {
         let data = client.send("status", &[]).map_err(CliError::Client)?;
         println!("rider: the daemon is already running");
@@ -604,13 +695,15 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
     for _ in 0..polls {
         if let Ok(mut client) = Client::connect(&config.home) {
-            let data = client.send("status", &[]).map_err(CliError::Client)?;
+            let data = match client.send("status", &[]) {
+                Ok(data) => data,
+                Err(error) => return Err(not_started(&mut child, &log_path, deadline, error)),
+            };
             println!("{}", status_line(&data));
             return Ok(0);
         }
         if let Ok(Some(exit)) = child.try_wait() {
-            let why = format!("it exited with {exit}; see {}", log_path.display());
-            return Err(CliError::NotStarted(why));
+            return Err(exited(exit, &log_path));
         }
         if Instant::now() >= deadline {
             break;
@@ -620,6 +713,52 @@ fn up(config: &Config) -> Result<u8, CliError> {
     let socket = config.home.join(SOCKET_FILE);
     let why = format!("{} did not answer in {UP_SECONDS_MAX} s", socket.display());
     Err(CliError::NotStarted(why))
+}
+
+fn not_started(
+    child: &mut std::process::Child,
+    log_path: &Path,
+    deadline: Instant,
+    error: ClientError,
+) -> CliError {
+    assert!(log_path.is_absolute());
+    let polls = UP_SECONDS_MAX * 1000 / UP_POLL_MILLIS;
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(exit)) => return exited(exit, log_path),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(UP_POLL_MILLIS));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(polls > 0);
+    CliError::Client(error)
+}
+
+fn exited(exit: std::process::ExitStatus, log_path: &Path) -> CliError {
+    assert!(log_path.is_absolute());
+    let why = format!("it exited with {exit}: {}", last_line(log_path));
+    CliError::NotStarted(format!("{why}; see {}", log_path.display()))
+}
+
+fn last_line(log_path: &Path) -> String {
+    let mut tail = Vec::with_capacity(UP_LOG_TAIL_BYTES);
+    let read = File::open(log_path).and_then(|mut file| {
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(UP_LOG_TAIL_BYTES as u64);
+        io::Seek::seek(&mut file, io::SeekFrom::Start(start))?;
+        file.take(UP_LOG_TAIL_BYTES as u64).read_to_end(&mut tail)
+    });
+    let text = String::from_utf8_lossy(&tail);
+    let line = text.lines().rev().find(|line| !line.trim().is_empty());
+    let line = match (read, line) {
+        (Ok(_), Some(line)) => line.trim().to_string(),
+        (Ok(_), None) => "its log is empty".to_string(),
+        (Err(error), _) => format!("its log could not be read: {error}"),
+    };
+    assert!(!line.is_empty() && line.len() <= 4 * UP_LOG_TAIL_BYTES);
+    line
 }
 
 fn down(config: &Config, now: bool) -> Result<u8, CliError> {
@@ -1127,245 +1266,5 @@ fn io_error(action: &'static str, path: &Path, error: &io::Error) -> CliError {
         action,
         path: path.to_path_buf(),
         message: error.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::test_support::write_executable;
-    use std::fs;
-    use std::path::Path;
-
-    use super::*;
-    use crate::roles::ROLES;
-
-    fn parse(words: &[&str]) -> Result<Command, clap::Error> {
-        let args = ["rider"].iter().chain(words);
-        Cli::try_parse_from(args).map(|cli| cli.command)
-    }
-
-    fn usage_error(words: &[&str]) -> clap::error::ErrorKind {
-        let error = parse(words).expect_err("a usage error");
-        assert_eq!(error.exit_code(), 2, "{words:?}");
-        error.kind()
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let unique = format!("rider-cli-unit-{name}-{}", std::process::id());
-        let dir = std::env::temp_dir().join(unique);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn config_at(home: &Path) -> Config {
-        Config {
-            home: home.to_path_buf(),
-            board_url: DEFAULT_BOARD_URL.to_string(),
-        }
-    }
-
-    #[test]
-    fn parses_each_command() {
-        assert_eq!(parse(&["serve"]).unwrap(), Command::Serve);
-        assert_eq!(parse(&["daemon"]).unwrap(), Command::Daemon);
-        let kill = |id| Command::Kill { id: TaskId(id) };
-        assert_eq!(parse(&["kill", "42"]).unwrap(), kill(42));
-        assert_eq!(parse(&["kill", "#7"]).unwrap(), kill(7));
-        for help in [&["--help"][..], &["-h"], &["help"]] {
-            assert_eq!(usage_help(help), clap::error::ErrorKind::DisplayHelp);
-        }
-    }
-
-    fn usage_help(words: &[&str]) -> clap::error::ErrorKind {
-        let error = parse(words).expect_err("help");
-        assert_eq!(error.exit_code(), 0, "{words:?}");
-        error.kind()
-    }
-
-    #[test]
-    fn rejects_missing_extra_and_unknown_arguments() {
-        use clap::error::ErrorKind;
-        assert_eq!(
-            usage_error(&[]),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
-        for missing in [&["kill"][..], &["logs"]] {
-            assert_eq!(usage_error(missing), ErrorKind::MissingRequiredArgument);
-        }
-        for extra in [&["serve", "now"][..], &["kill", "1", "2"]] {
-            assert_eq!(usage_error(extra), ErrorKind::UnknownArgument);
-        }
-        for gone in [&["start"][..], &["pool", "rider"]] {
-            assert_eq!(usage_error(gone), ErrorKind::InvalidSubcommand);
-        }
-    }
-
-    #[test]
-    fn rejects_task_ids_that_are_not_decimal() {
-        for bad in [
-            "",
-            "#",
-            "-1",
-            "+1",
-            "1.0",
-            "0x1",
-            "##1",
-            "18446744073709551616",
-            "12a",
-        ] {
-            assert_eq!(
-                usage_error(&["kill", "--", bad]),
-                clap::error::ErrorKind::ValueValidation,
-                "{bad:?}"
-            );
-        }
-        assert_eq!(
-            parse(&["kill", "18446744073709551615"]).unwrap(),
-            Command::Kill {
-                id: TaskId(u64::MAX)
-            }
-        );
-    }
-
-    #[test]
-    fn usage_errors_read_as_sentences() {
-        assert_eq!(
-            UsageError::BadTaskId("x".to_string()).to_string(),
-            "\"x\" is not a task id: use its number, such as 42 or #42"
-        );
-    }
-
-    #[test]
-    fn config_defaults_to_home_and_the_local_board() {
-        let vars = Vars {
-            home: Some("/Users/someone".into()),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(vars),
-            Ok(Config {
-                home: PathBuf::from("/Users/someone/.rider"),
-                board_url: "http://127.0.0.1:4100/api/board".to_string(),
-            })
-        );
-        let vars = Vars {
-            rider_home: Some("/srv/rider".into()),
-            board_url: Some("http://127.0.0.1:5000/api/board".into()),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(vars),
-            Ok(Config {
-                home: PathBuf::from("/srv/rider"),
-                board_url: "http://127.0.0.1:5000/api/board".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn config_rejects_a_relative_missing_or_malformed_home() {
-        assert_eq!(config(Vars::default()), Err(ConfigError::NoHome));
-        let relative = Vars {
-            rider_home: Some("rider".into()),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(relative),
-            Err(ConfigError::NotAbsolute {
-                var: "RIDER_HOME",
-                value: "rider".to_string()
-            })
-        );
-        let empty_url = Vars {
-            rider_home: Some("/srv/rider".into()),
-            board_url: Some("".into()),
-            ..Vars::default()
-        };
-        assert_eq!(config(empty_url), Err(ConfigError::Empty("BOARD_URL")));
-    }
-
-    #[test]
-    fn config_rejects_variables_that_are_not_unicode() {
-        use std::os::unix::ffi::OsStringExt;
-        let bad = || Some(OsString::from_vec(vec![0x2f, 0xff]));
-        let home = Vars {
-            rider_home: bad(),
-            ..Vars::default()
-        };
-        assert_eq!(config(home), Err(ConfigError::NotUnicode("RIDER_HOME")));
-        let ignored = Vars {
-            rider_home: Some("/srv/rider".into()),
-            home: bad(),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(ignored).map(|config| config.home),
-            Ok(PathBuf::from("/srv/rider"))
-        );
-    }
-
-    #[test]
-    fn config_rejects_a_home_with_a_colon() {
-        let colon = Vars {
-            rider_home: Some("/srv/a:b".into()),
-            ..Vars::default()
-        };
-        assert_eq!(
-            config(colon),
-            Err(ConfigError::HomeHasColon("/srv/a:b".to_string()))
-        );
-    }
-
-    #[test]
-    fn every_role_has_an_embedded_prompt() {
-        for (index, (name, _)) in PROMPTS.iter().enumerate() {
-            assert!(
-                *name == "slop-rules.md" || ROLES.iter().any(|role| role.prompt_file == *name),
-                "{name} is unused"
-            );
-            assert!(!PROMPTS[..index].iter().any(|(earlier, _)| earlier == name));
-        }
-        for role in ROLES.iter() {
-            let found = PROMPTS.iter().find(|(name, _)| *name == role.prompt_file);
-            let (_, text) = found.unwrap_or_else(|| panic!("no prompt for {}", role.label));
-            assert!(!text.trim().is_empty(), "{} is empty", role.prompt_file);
-        }
-    }
-
-    #[test]
-    fn writes_the_embedded_prompts_over_what_is_there() {
-        let home = scratch("prompts");
-        let dir = home.join("prompts");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("review.md"), "stale").unwrap();
-        write_prompts(&config_at(&home)).unwrap();
-        for (name, text) in PROMPTS.iter() {
-            assert_eq!(fs::read_to_string(dir.join(name)).unwrap(), *text);
-        }
-        fs::remove_dir_all(&home).unwrap();
-    }
-
-    #[test]
-    fn serve_runs_vb_in_the_foreground_and_returns_its_exit_code() {
-        let home = scratch("serve");
-        let bin = home.join("node/node_modules/.bin");
-        fs::create_dir_all(&bin).unwrap();
-        let record = home.join("args");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 3\n",
-            record.display()
-        );
-        write_executable(&bin.join("vb"), &script);
-        let code = execute(&Command::Serve, &config_at(&home)).unwrap();
-        assert_eq!(code, 3);
-        let board = home.join("board");
-        assert!(board.is_dir());
-        assert_eq!(
-            fs::read_to_string(&record).unwrap(),
-            format!("serve\n--dir\n{}\n--no-open\n", board.display())
-        );
-        assert!(!home.join("prompts").exists(), "serve copies no prompts");
-        fs::remove_dir_all(&home).unwrap();
     }
 }

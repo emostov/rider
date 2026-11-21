@@ -22,7 +22,7 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
     Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
-    parse_failure_reason,
+    parse_failure_reason, register_schemas,
 };
 use crate::cli::board_serve;
 use crate::config::Limits;
@@ -31,7 +31,7 @@ use crate::core::{
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
-use crate::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
+use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
@@ -139,7 +139,6 @@ exec "$@""#;
 /// Where the daemon's files are and how it reaches the board and its agents.
 pub struct Paths {
     pub home: PathBuf,
-    pub prompts: PathBuf,
     pub vb: PathBuf,
     pub board_url: String,
 }
@@ -168,6 +167,7 @@ pub enum DaemonError {
     NotAFile(PathBuf),
     /// The board's identity could not be read at start-up.
     Identity(IdentityUnknown),
+    Schemas(BoardError),
 }
 
 impl fmt::Display for DaemonError {
@@ -187,6 +187,12 @@ impl fmt::Display for DaemonError {
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
             DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
             DaemonError::Identity(error) => write!(f, "{error}"),
+            DaemonError::Schemas(error) => {
+                write!(
+                    f,
+                    "could not register Rider's schemas on the board: {error}"
+                )
+            }
         }
     }
 }
@@ -205,6 +211,7 @@ struct Timing {
     attempt_millis_max: u64,
     tick_millis: u64,
     grace_millis: u64,
+    runner_millis: u64,
 }
 
 impl Timing {
@@ -214,6 +221,7 @@ impl Timing {
             attempt_millis_max: ATTEMPT_MILLIS_MAX,
             tick_millis: TICK_SECONDS * 1000,
             grace_millis: GRACE_MILLIS,
+            runner_millis: ATTEMPT_SECONDS_MAX * 1000,
         };
         let pairs = setting
             .unwrap_or_default()
@@ -231,6 +239,7 @@ impl Timing {
                 "attempt" => (&mut timing.attempt_millis_max, 1, ATTEMPT_MILLIS_MAX),
                 "tick" => (&mut timing.tick_millis, 1, TICK_SECONDS * 1000),
                 "grace" => (&mut timing.grace_millis, 1, GRACE_MILLIS),
+                "runner" => (&mut timing.runner_millis, 1000, ATTEMPT_SECONDS_MAX * 1000),
                 _ => return Err(DaemonError::Setting(format!("unknown setting {key:?}"))),
             };
             *field = value
@@ -246,6 +255,8 @@ impl Timing {
         assert!(timing.lease_millis >= 3 && timing.lease_millis <= LEASE_MILLIS);
         assert!(timing.tick_millis > 0 && timing.attempt_millis_max > 0);
         assert!(timing.grace_millis > 0 && timing.grace_millis <= GRACE_MILLIS);
+        assert!(timing.runner_millis >= 1000);
+        assert!(timing.runner_millis <= ATTEMPT_SECONDS_MAX * 1000);
         Ok(timing)
     }
 }
@@ -348,6 +359,7 @@ struct Shared {
     events: SyncSender<Input>,
     lease_millis: u64,
     grace_millis: u64,
+    runner_seconds: u64,
     attempts: u8,
     feed: Mutex<FeedSlot>,
     /// The board process the daemon started, if it had to.
@@ -396,7 +408,6 @@ impl Shared {
         assert!(self.paths.home.is_absolute());
         Env {
             home: self.paths.home.clone(),
-            prompts: self.paths.prompts.clone(),
             profile: profile.to_string(),
             board_url: self.paths.board_url.clone(),
             attempts: self.attempts,
@@ -489,6 +500,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         socket,
         lease_millis,
         grace_millis: timing.grace_millis,
+        runner_seconds: timing.runner_millis / 1000,
         attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
         served: Mutex::new(ServedSlot::default()),
@@ -506,6 +518,17 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         shared.socket.close();
         drop(board);
         return Err(DaemonError::Identity(error));
+    }
+    match register_schemas(&shared.board(DAEMON_PROFILE)) {
+        Ok(registered) if registered.is_empty() => {}
+        Ok(registered) => (shared.log).write(&format!("registered {}", registered.join(", "))),
+        Err(error) => {
+            let error = DaemonError::Schemas(error);
+            shared.log.write(&error.to_string());
+            shared.socket.close();
+            drop(board);
+            return Err(error);
+        }
     }
     start_workers(queued, &shared.events)?;
     start_timer(shared.events.clone(), timing.tick_millis)?;
@@ -1095,6 +1118,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     let pid_text = pid_file.to_string_lossy().into_owned();
     let ack = ack_file(&pid_file);
     let ack_text = ack.to_string_lossy().into_owned();
+    let runner_seconds = shared.runner_seconds;
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
@@ -1111,7 +1135,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
             env,
             io: cmd.io.clone(),
         };
-        launch_agent(&wrapped, dir, log)
+        launch_agent(&wrapped, dir, log, runner_seconds)
     };
     // A full queue makes the worker wait: the recorder is never far behind.
     let _ = shared.recorder.send(Recorded::Started(task));
@@ -1372,6 +1396,12 @@ impl Board for Guarded<'_> {
     }
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
         self.board.blocking_findings(id)
+    }
+    fn schema_ids(&self) -> Result<Vec<String>, BoardError> {
+        self.board.schema_ids()
+    }
+    fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError> {
+        self.board.create_schema(id, json)
     }
 }
 

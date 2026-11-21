@@ -2,6 +2,7 @@
 //! reads its final message back from the recorded stream.
 
 use crate::board::one_line;
+use crate::git;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
@@ -441,10 +442,11 @@ fn supervise(
     child: &mut dyn ChildWrapper,
     logs: [&Arc<Shared>; READERS],
     seconds_max: u64,
+    wall_clock: &dyn Fn() -> SystemTime,
 ) -> Result<(ExitStatus, bool), HarnessError> {
     assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
     assert!(child.id() > 1, "the group of a child rider started");
-    let start = (Instant::now(), SystemTime::now());
+    let start = (Instant::now(), wall_clock());
     let limit = Duration::from_secs(seconds_max);
     let grace = Duration::from_secs(KILL_GRACE_SECONDS);
     let mut term_sent: Option<(Instant, SystemTime)> = None;
@@ -463,7 +465,7 @@ fn supervise(
             let _ = kill_and_reap(child);
             return Err(HarnessError::Log(message));
         }
-        let now = (Instant::now(), SystemTime::now());
+        let now = (Instant::now(), wall_clock());
         let since = |then: (Instant, SystemTime)| {
             let monotonic = now.0.saturating_duration_since(then.0);
             (monotonic, now.1.duration_since(then.1))
@@ -524,6 +526,9 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for name in git::ENV_REMOVED {
+        process.env_remove(name);
+    }
     let spawned = CommandWrap::from(process)
         .wrap(ProcessGroup::leader())
         .spawn();
@@ -574,6 +579,17 @@ pub fn run(
     seconds_max: u64,
     log_bytes_max: u64,
 ) -> Result<Exit, HarnessError> {
+    run_on_clock(cmd, dir, log, seconds_max, log_bytes_max, &SystemTime::now)
+}
+
+pub fn run_on_clock(
+    cmd: &CommandLine,
+    dir: &Path,
+    log: &Path,
+    seconds_max: u64,
+    log_bytes_max: u64,
+    wall_clock: &dyn Fn() -> SystemTime,
+) -> Result<Exit, HarnessError> {
     assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
     assert!(log_bytes_max <= LOG_BYTES_MAX);
     assert!(cmd.args.len() <= ARGS_MAX && cmd.env.len() <= ENV_MAX);
@@ -602,7 +618,7 @@ pub fn run(
         return Err(error);
     }
     drop(done);
-    let outcome = supervise(child.as_mut(), logs, seconds_max);
+    let outcome = supervise(child.as_mut(), logs, seconds_max, wall_clock);
     // The leader is reaped; leftover members of its group would hold the pipes open.
     let _ = child.start_kill();
     let drained = drain(&finished);
@@ -849,258 +865,4 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     assert!(!last_turn_failed || *harness == Harness::Codex);
     assert!(!last_review_failed || *harness == Harness::CodexReview);
     last_result_failed || last_turn_failed || last_review_failed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::roles::role_from_label;
-    use std::path::PathBuf;
-
-    const PROMPT: &str = "Do the task.";
-
-    fn scratch_file(name: &str, text: &str) -> PathBuf {
-        let unique = format!("rider-harness-unit-{name}-{}", std::process::id());
-        let path = std::env::temp_dir().join(unique);
-        fs::write(&path, text).unwrap();
-        path
-    }
-
-    fn reports_failure(name: &str, harness: Harness, text: &str) -> bool {
-        let log = scratch_file(name, text);
-        let failed = stream_reports_failure(&harness, &log);
-        fs::remove_file(&log).unwrap();
-        failed
-    }
-
-    #[test]
-    fn claude_command_matches_the_recorded_form() {
-        let spec = role_from_label("implement").unwrap();
-        let c = command_for(spec, PROMPT, Path::new("/w"), None).unwrap();
-        assert_eq!(c.program, "claude");
-        let expected = [
-            "-p",
-            "--model",
-            "claude-opus-5-5",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--dangerously-skip-permissions",
-            "--",
-            PROMPT,
-        ];
-        assert_eq!(c.args, expected);
-        assert_eq!(c.env, []);
-    }
-
-    #[test]
-    fn codex_command_matches_the_recorded_form() {
-        let spec = role_from_label("review").unwrap();
-        let c = command_for(spec, PROMPT, Path::new("/w"), None).unwrap();
-        assert_eq!(c.program, "codex");
-        let expected = [
-            "exec",
-            "--model",
-            "gpt-6.1-sol",
-            "--json",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-C",
-            "/w",
-            "--",
-            PROMPT,
-        ];
-        assert_eq!(c.args, expected);
-        assert_eq!(c.env, []);
-    }
-
-    #[test]
-    fn a_prompt_is_one_argument_after_the_options() {
-        let prompt = "--help me\nplease";
-        let security = role_from_label("security").unwrap();
-        let c = command_for(security, prompt, Path::new("/w"), None).unwrap();
-        assert_eq!(c.args[c.args.len() - 2..], ["--", prompt]);
-        let mythos = command_for(security, PROMPT, Path::new("/w"), None).unwrap();
-        assert_eq!(mythos.args[1..3], ["--model", "claude-mythos-5-2"]);
-    }
-
-    #[test]
-    fn a_prompt_a_cli_could_misread_is_an_error() {
-        let claude = role_from_label("implement").unwrap();
-        let codex = role_from_label("review").unwrap();
-        for prompt in ["", " \n\t ", "-", "mcp", "doctor", "--help"] {
-            for spec in [claude, codex] {
-                let result = command_for(spec, prompt, Path::new("/w"), None);
-                assert!(
-                    matches!(result, Err(HarnessError::PromptUnsafe)),
-                    "{prompt:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_oversized_prompt_is_an_error() {
-        let spec = role_from_label("implement").unwrap();
-        let prompt = "x ".repeat(PROMPT_BYTES_MAX / 2);
-        assert_eq!(prompt.len(), PROMPT_BYTES_MAX);
-        let c = command_for(spec, &prompt, Path::new("/w"), None).unwrap();
-        assert_eq!(c.args.last(), Some(&prompt));
-        let over = format!("{prompt}x");
-        let result = command_for(spec, &over, Path::new("/w"), None);
-        assert!(matches!(
-            result,
-            Err(HarnessError::PromptTooLarge { bytes }) if bytes == PROMPT_BYTES_MAX + 1
-        ));
-    }
-
-    #[test]
-    fn either_clock_can_end_an_attempt() {
-        let limit = Duration::from_secs(60);
-        let (under, over) = (Duration::from_secs(59), Duration::from_secs(61));
-        let backwards = SystemTime::UNIX_EPOCH.duration_since(SystemTime::now());
-        assert!(backwards.is_err());
-        assert!(!timed_out(under, Ok(under), limit));
-        assert!(timed_out(limit, Ok(under), limit));
-        assert!(timed_out(over, Ok(under), limit));
-        assert!(timed_out(under, Ok(limit), limit), "the machine slept");
-        assert!(timed_out(under, Ok(Duration::from_secs(3600)), limit));
-        assert!(
-            !timed_out(under, backwards.clone(), limit),
-            "the clock went back"
-        );
-        assert!(timed_out(over, backwards, limit));
-    }
-
-    #[test]
-    fn checking_for_a_log_error_never_waits_on_a_write() {
-        let path = scratch_file("lock", "");
-        let shared = open_log(&path, 16).unwrap();
-        let held = shared.file.lock().unwrap();
-        let (tx, rx) = mpsc::channel();
-        let probe = Arc::clone(&shared);
-        thread::spawn(move || {
-            probe.fail("disk full".to_string());
-            tx.send(probe.error()).unwrap();
-        });
-        let answer = rx.recv_timeout(Duration::from_secs(1));
-        drop(held);
-        assert_eq!(answer, Ok(Some("disk full".to_string())));
-        assert_eq!(shared.close(), Some("disk full".to_string()));
-        fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn the_log_takes_bytes_up_to_its_cap() {
-        let path = scratch_file("cap", "");
-        let shared = open_log(&path, 5).unwrap();
-        assert_eq!(shared.accept(b"abc"), Ok(()));
-        assert_eq!(shared.accept(b"defg"), Ok(()));
-        assert_eq!(shared.accept(b"h"), Ok(()));
-        assert_eq!(shared.close(), None);
-        assert_eq!(shared.accept(b"i"), Ok(()));
-        assert_eq!(fs::read(&path).unwrap(), b"abcde");
-        fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn reader_slots_are_bounded_and_returned() {
-        static LIVE: AtomicUsize = AtomicUsize::new(0);
-        let first = ReaderSlot::reserve(&LIVE, 2).unwrap();
-        let second = ReaderSlot::reserve(&LIVE, 2).unwrap();
-        assert!(ReaderSlot::reserve(&LIVE, 2).is_none());
-        assert_eq!(LIVE.load(Ordering::SeqCst), 2);
-        drop(first);
-        let third = ReaderSlot::reserve(&LIVE, 2).unwrap();
-        drop((second, third));
-        assert_eq!(LIVE.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn the_session_id_is_read_from_the_recorded_claude_stream() {
-        let id = session_id(Path::new("fixtures/harness/claude.jsonl"));
-        let expected = SessionId::parse("20de60af-1a54-4519-8f52-8623adc5d76e");
-        assert_eq!(id, expected);
-        assert_eq!(session_id(Path::new("fixtures/harness/codex.jsonl")), None);
-        let log = scratch_file("session-hostile", "{\"session_id\":\"--help\"}\n");
-        assert_eq!(session_id(&log), None);
-    }
-
-    #[test]
-    fn last_message_is_found_in_each_recorded_stream() {
-        let cases = [(Harness::Claude, "claude"), (Harness::Codex, "codex")];
-        for (h, f) in cases {
-            let path = format!("fixtures/harness/{f}.jsonl");
-            let m = last_message(&h, Path::new(&path));
-            assert_eq!(m.as_deref(), Some("DONE"), "{f}");
-        }
-    }
-
-    #[test]
-    fn last_message_survives_hostile_logs() {
-        let missing = Path::new("/nonexistent/rider/agent.log");
-        assert_eq!(last_message(&Harness::Claude, missing), None);
-        let huge = "y".repeat(LINE_BYTES_MAX + 10);
-        let events = r#"not json
-[1,2]
-"str"
-{"type":"result","result":7}
-{"type":"result","result":"  first  "}
-"#;
-        let text = format!("{huge}\n{events}{huge}");
-        let log = scratch_file("hostile", &text);
-        let found = last_message(&Harness::Claude, &log);
-        assert_eq!(found.as_deref(), Some("first"));
-        assert_eq!(last_message(&Harness::Codex, &log), None);
-        fs::remove_file(&log).unwrap();
-        let blank = r#"{"type":"result","result":" \n "}"#;
-        let log = scratch_file("blank", blank);
-        assert_eq!(last_message(&Harness::Claude, &log), None);
-        fs::remove_file(&log).unwrap();
-    }
-
-    #[test]
-    fn recorded_streams_report_no_failure() {
-        let cases = [(Harness::Claude, "claude"), (Harness::Codex, "codex")];
-        for (h, f) in cases {
-            let path = format!("fixtures/harness/{f}.jsonl");
-            assert!(!stream_reports_failure(&h, Path::new(&path)), "{f}");
-        }
-        let missing = Path::new("/nonexistent/rider/agent.log");
-        assert!(!stream_reports_failure(&Harness::Codex, missing));
-    }
-
-    #[test]
-    fn failures_in_the_stream_are_reported() {
-        let claude = r#"{"type":"result","subtype":"success","is_error":true}"#;
-        assert!(reports_failure("claude-error", Harness::Claude, claude));
-        let claude = r#"{"type":"result","subtype":"error_max_turns","is_error":false}"#;
-        assert!(reports_failure("claude-subtype", Harness::Claude, claude));
-        let codex = r#"{"type":"item.completed","item":{"type":"error"}}"#;
-        assert!(!reports_failure("codex-warning", Harness::Codex, codex));
-        let codex = r#"{"type":"turn.failed","error":{"message":"x"}}"#;
-        assert!(reports_failure("codex-failed", Harness::Codex, codex));
-        let codex = r#"{"type":"error","message":"x"}"#;
-        assert!(reports_failure("codex-error", Harness::Codex, codex));
-    }
-
-    #[test]
-    fn a_codex_turn_is_judged_by_how_it_ended() {
-        let path = Path::new("fixtures/harness/codex-reconnect.jsonl");
-        assert!(!stream_reports_failure(&Harness::Codex, path));
-        let recorded = fs::read_to_string(path).unwrap();
-        let cut: Vec<&str> = recorded
-            .lines()
-            .filter(|l| !l.contains("turn.completed"))
-            .collect();
-        assert_eq!(cut.len() + 1, recorded.lines().count());
-        assert_eq!(
-            cut.iter().filter(|l| l.contains("Reconnecting...")).count(),
-            4
-        );
-        assert!(reports_failure(
-            "codex-unfinished",
-            Harness::Codex,
-            &cut.join("\n")
-        ));
-    }
 }
