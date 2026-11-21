@@ -22,6 +22,7 @@ pub const FAIL_EXIT_CODE: i32 = 3;
 pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
+pub const PR_REF: &str = "refs/rider/pr/412";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,7 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    MergePr,
 }
 
 pub const TALK_LINES: usize = 300;
@@ -164,6 +166,7 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::MergePr => "merge-pr",
         }
     }
 }
@@ -334,6 +337,7 @@ case "$behaviour" in
     fi
     commit || exit 1 ;;
   hold-then-nothing) hold ;;
+  merge-pr) git merge -q --no-edit {PR_REF} || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'

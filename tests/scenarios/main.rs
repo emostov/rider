@@ -10,6 +10,8 @@ mod codex_review;
 )]
 mod fake_agent;
 mod harness_cli;
+mod queue_unclaimed;
+mod review_pr;
 mod run_task;
 mod skills;
 mod socket;
