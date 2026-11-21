@@ -924,6 +924,90 @@ fn rider_config_without_a_file_prints_the_built_in_table() {
 }
 
 #[test]
+fn rider_config_for_a_queued_repository_prints_its_queue_and_approve_keys() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let other = given_another_repository(&world);
+    let other = other.to_str().expect("UTF-8 path");
+    let toml = format!(
+        "[repo.\"{}\"]\nqueue = true\napprove = \"git approve-pr\"\n\n\
+         [repo.\"{other}\"]\nqueue = true\n",
+        world.repo_label()
+    );
+    given_a_rider_toml(&world, &toml);
+
+    let plain = when_rider_runs(&world, &["config"]);
+    let approving = when_rider_runs(&world, &["config", "--repo", world.repo_label()]);
+    let queued = when_rider_runs(&world, &["config", "--repo", other]);
+
+    let default = include_str!("rider-config-default.toml");
+    assert_eq!(plain.code, Some(0), "{plain:?}");
+    assert_eq!(plain.stdout, default);
+    assert_eq!(approving.code, Some(0), "{approving:?}");
+    let table = format!(
+        "\n[repo.\"{}\"]\nqueue = true\napprove = \"git approve-pr\"\n",
+        world.repo_label()
+    );
+    assert_eq!(approving.stdout, format!("{default}{table}"));
+    assert_eq!(queued.code, Some(0), "{queued:?}");
+    assert_eq!(
+        queued.stdout,
+        format!("{default}\n[repo.\"{other}\"]\nqueue = true\n")
+    );
+}
+
+#[test]
+fn rider_config_refuses_a_queue_that_is_not_a_boolean_naming_the_key() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    for value in ["\"yes\"", "1", "[true]"] {
+        let toml = format!("[repo.\"{}\"]\nqueue = {value}\n", world.repo_label());
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{value}: {output:?}");
+        let field = format!("repo.\"{}\".queue", world.repo_label());
+        assert!(output.stderr.contains(&field), "{value}: {output:?}");
+        assert!(output.stderr.contains("rider.toml"), "{value}: {output:?}");
+    }
+}
+
+#[test]
+fn rider_config_refuses_an_approve_command_it_cannot_print_safely_naming_the_key() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let nine = "git approve-pr a b c d e f g";
+    let cases = [
+        "queue = true\napprove = \"git approve-pr; rm x\"\n".to_string(),
+        "queue = true\napprove = \"git $(id)\"\n".to_string(),
+        "queue = true\napprove = \"git -c x approve-pr\"\n".to_string(),
+        format!("queue = true\napprove = \"{nine}\"\n"),
+        "queue = true\napprove = \"\"\n".to_string(),
+        "queue = true\napprove = 7\n".to_string(),
+        "approve = \"git approve-pr\"\n".to_string(),
+        "queue = false\napprove = \"git approve-pr\"\n".to_string(),
+    ];
+    assert_eq!(nine.split(' ').count(), 9);
+    for keys in cases {
+        given_a_rider_toml(
+            &world,
+            &format!("[repo.\"{}\"]\n{keys}", world.repo_label()),
+        );
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{keys}: {output:?}");
+        let field = format!("repo.\"{}\".approve", world.repo_label());
+        assert!(output.stderr.contains(&field), "{keys}: {output:?}");
+        assert!(output.stderr.contains("rider.toml"), "{keys}: {output:?}");
+    }
+}
+
+#[test]
 fn an_agent_running_past_a_third_of_a_shortened_lease_sees_the_claim_renewed() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;

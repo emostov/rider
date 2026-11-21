@@ -33,6 +33,7 @@ pub const REPOS_MAX: usize = 64;
 /// Upper bound on the skills one role runs.
 pub const SKILLS_MAX: usize = 8;
 const SKILL_LEN_MAX: usize = 64;
+pub const APPROVE_WORDS_MAX: usize = 8;
 const MISSING: &str = "is missing for a role that is not built in";
 const _: () = assert!(AGENTS_MAX < 100);
 
@@ -61,7 +62,51 @@ pub struct Settings {
 #[derive(Debug)]
 pub struct RepoSettings {
     pub roles: RepoRoles,
+    pub queue: Option<Queue>,
     pub toml: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queue {
+    pub approve: Option<ApproveCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveCommand {
+    words: Vec<String>,
+}
+
+impl ApproveCommand {
+    fn parse(text: &str) -> Result<ApproveCommand, String> {
+        let mut words: Vec<String> = Vec::with_capacity(APPROVE_WORDS_MAX);
+        for word in text.split(' ') {
+            if words.len() == APPROVE_WORDS_MAX {
+                return Err(format!(
+                    "has more than the {APPROVE_WORDS_MAX} words allowed"
+                ));
+            }
+            let plain = !word.is_empty()
+                && !word.starts_with('-')
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b));
+            if !plain {
+                return Err(format!(
+                    "{text:?} is not a command Rider prints: 1 to {APPROVE_WORDS_MAX} words \
+                     of letters, digits, '.', '_', '/' and '-', separated by single spaces, \
+                     none starting with '-'"
+                ));
+            }
+            words.push(word.to_string());
+        }
+        assert!(!words.is_empty() && words.len() <= APPROVE_WORDS_MAX);
+        Ok(ApproveCommand { words })
+    }
+
+    pub fn words(&self) -> &[String] {
+        assert!(!self.words.is_empty() && self.words.len() <= APPROVE_WORDS_MAX);
+        &self.words
+    }
 }
 
 /// A `rider.toml` that cannot be used.
@@ -128,6 +173,15 @@ struct FileShape {
 struct RepoShape {
     #[serde(default)]
     roles: BTreeMap<String, BTreeMap<String, toml::Value>>,
+    queue: Option<toml::Value>,
+    approve: Option<toml::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueShape {
+    queue: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approve: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -325,15 +379,62 @@ fn repo_settings(
             role.skills = Some(skills);
             specs.push(role_spec(path, home, &prefix, &label, role, limits.agents)?);
         }
-        let toml = render(path, limits, &merged)?;
+        let queue = queue_for(path, &prefix, repo.queue, repo.approve)?;
+        let mut toml = render(path, limits, &merged)?;
+        if let Some(queue) = &queue {
+            let approve = queue
+                .approve
+                .as_ref()
+                .map(|command| command.words().join(" "));
+            let shape = QueueShape {
+                queue: true,
+                approve,
+            };
+            let table = BTreeMap::from([("repo", BTreeMap::from([(key, shape)]))]);
+            toml.push_str(&format!("\n{}", to_toml(path, &table)?));
+        }
         let roles = RepoRoles {
             repo: canonical,
             roles: specs,
         };
-        out.push(RepoSettings { roles, toml });
+        out.push(RepoSettings { roles, queue, toml });
     }
     assert!(out.len() <= REPOS_MAX);
     Ok(out)
+}
+
+fn queue_for(
+    path: &Path,
+    prefix: &str,
+    queue: Option<toml::Value>,
+    approve: Option<toml::Value>,
+) -> Result<Option<Queue>, ConfigFileError> {
+    assert!(prefix.starts_with("repo.") && prefix.ends_with('.'));
+    let queued = match queue {
+        None => false,
+        Some(toml::Value::Boolean(queued)) => queued,
+        Some(_) => {
+            let problem = "must be true or false".to_string();
+            return Err(field_error(path, format!("{prefix}queue"), problem));
+        }
+    };
+    let field = format!("{prefix}approve");
+    let approve = match approve {
+        None => None,
+        Some(_) if !queued => {
+            let problem = "can be set only with `queue = true`".to_string();
+            return Err(field_error(path, field, problem));
+        }
+        Some(toml::Value::String(text)) => {
+            let command = ApproveCommand::parse(&text);
+            Some(command.map_err(|problem| field_error(path, field, problem))?)
+        }
+        Some(_) => {
+            let problem = "must be a string naming a command".to_string();
+            return Err(field_error(path, field, problem));
+        }
+    };
+    Ok(queued.then_some(Queue { approve }))
 }
 
 fn read(path: &Path) -> Result<Option<String>, ConfigFileError> {
