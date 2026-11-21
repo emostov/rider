@@ -442,3 +442,25 @@ fn stopping_the_daemon_ends_a_gh_call_in_flight() {
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
     assert!(!is_alive(pid), "gh {pid} outlived the daemon");
 }
+
+#[test]
+fn a_github_off_label_on_the_task_ends_the_watch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let task = given_a_completed_task(&mut world);
+    when_gh_is_called_past(&world, 0);
+
+    world.vb_lead(&["label", &task, "github=off"], None);
+    given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
+    thread::sleep(Duration::from_millis(QUIET_MILLIS));
+    let calls = gh_calls(&world);
+    thread::sleep(Duration::from_millis(QUIET_MILLIS));
+
+    assert_eq!(gh_calls(&world), calls);
+    assert_eq!(
+        task_records(&world, &task, "rider-github"),
+        Vec::<Value>::new()
+    );
+}

@@ -17,6 +17,8 @@ use crate::roles::ROLES;
 use crate::run_task::{RESUMABLE_ROLES, session_path};
 use crate::worktree::BRANCH_LABEL;
 
+pub const WATCH_LABEL: &str = "github";
+pub const WATCH_OFF: &str = "off";
 pub const SCHEMA: &str = "rider-github@1";
 pub const STATE_FILE: &str = "github.json";
 pub const WATCHES_MAX: usize = 64;
@@ -236,7 +238,8 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
             break;
         }
         let task = view.id;
-        if seen.keys.contains(&ended_key(task)) || !git::is_safe_ref(branch) {
+        let off = label(view, WATCH_LABEL) == Some(WATCH_OFF);
+        if off || seen.keys.contains(&ended_key(task)) || !git::is_safe_ref(branch) {
             branches.push(branch);
             continue;
         }

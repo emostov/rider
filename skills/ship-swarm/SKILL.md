@@ -164,7 +164,7 @@ A record with `route: lead` is yours:
 
 Agents never reply on GitHub.
 
-The watch ends when the PR is merged or closed. If `<cap>` (`ci.cap_minutes`, or the longest
+The watch ends when the PR is merged or closed, or when you label the owning task `github=off` (`vb label <task> github=off`). If `<cap>` (`ci.cap_minutes`, or the longest
 the workflows normally run, doubled) passes with no `checks` record for the head, read
 `gh pr checks <n> --json name,bucket,link` once:
 
