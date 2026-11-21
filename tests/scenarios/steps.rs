@@ -796,6 +796,36 @@ exec '{}' "$@"
     crate::world::write_executable(&world.vb, &script);
 }
 
+/// Given the first `vb read <task>` of each of `tasks` touches `marker-<task>` under the world's
+/// root and then waits, up to `HELD_TENTHS_MAX` tenths of a second, until `release` exists.
+pub fn given_vb_holds_the_first_read_of(world: &World, tasks: &[&str], release: &Path) {
+    assert!(!tasks.is_empty());
+    assert!(
+        tasks
+            .iter()
+            .all(|task| task.bytes().all(|b| b.is_ascii_digit()))
+    );
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let root = world.root.display();
+    let script = format!(
+        r#"#!/bin/sh
+case " {} " in *" $2 "*)
+  if [ "$1" = read ] && mkdir '{root}/held-'"$2" 2>/dev/null; then
+    : > '{root}/marker-'"$2"
+    n=0
+    while [ ! -e '{}' ] && [ $n -lt {HELD_TENTHS_MAX} ]; do sleep 0.1; n=$((n + 1)); done
+  fi;;
+esac
+exec '{}' "$@"
+"#,
+        tasks.join(" "),
+        release.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
 /// Given every `vb` call that names the board's identity channel fails, and no other.
 pub fn given_vb_fails_the_identity_read(world: &World) {
     let real = fs::read_link(&world.vb).expect("the Board CLI is a link");

@@ -2,6 +2,7 @@
 //! fake agents, each written as Given / When / Then.
 
 mod board_feed;
+mod brief_settle;
 #[expect(
     dead_code,
     reason = "behaviours and readers for the scenarios still to come"
