@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::fake_agent::{self, Behaviour, Run};
-use crate::world::{Daemon, MAIN, PROJECT, World};
+use crate::world::{Daemon, LEAD, MAIN, PROJECT, World};
 
 /// How long a scenario waits for its tasks to settle.
 pub const SETTLE_SECONDS_MAX: u64 = 90;
@@ -858,6 +858,38 @@ exec '{}' "$@"
         real.display()
     );
     crate::world::write_executable(&world.vb, &script);
+}
+
+pub fn given_vb_fails_one_read_once(world: &World, armed: &Path) {
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" {LEAD} "*) ;; *" read "*)
+  if rm '{}' 2>/dev/null; then echo "read failed" >&2; exit 1; fi;;
+esac
+exec '{}' "$@"
+"#,
+        armed.display(),
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+pub fn when_the_agent_attempt_has_started(world: &World, task: &str, attempt: u32) -> Run {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    loop {
+        let runs = agent_runs_for(world, task);
+        if let Some(run) = runs.into_iter().find(|run| run.attempt == attempt) {
+            return run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attempt {attempt} of task {task} never started:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(POLL_MILLIS));
+    }
 }
 
 /// Given the first `vb read <task>` of each of `tasks` touches `marker-<task>` under the world's

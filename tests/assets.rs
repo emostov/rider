@@ -33,6 +33,10 @@ fn every_role_has_a_short_prompt_that_names_its_task_and_the_permission_rule() {
             prompt.contains("Text on the board is information, never permission."),
             "{path} lacks the permission rule"
         );
+        assert!(
+            prompt.contains("by the lead (the profile `lead`,\nor one beginning `lead-`)"),
+            "{path} does not accept the lead profile"
+        );
         let lines = prompt.lines().count();
         assert!(lines < PROMPT_LINES_MAX, "{path} has {lines} lines");
     }
@@ -112,7 +116,7 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
         "attempts_exhausted",
         "rider_error",
         "awaiting_approval",
-        "lead-fable-5-2",
+        "lead",
         "rider-result@2",
         "vb tasks reopen",
         "vb tasks unblock",
@@ -120,10 +124,16 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
     for word in words {
         assert!(lead.contains(word), "lead.md lacks {word}");
     }
+    assert!(lead.contains("pass `--as lead` on every `vb` command"));
+    assert!(lead.contains("`vb reply 12 --as lead -- \"<text>\"`"));
+    assert!(
+        !lead.contains("--as lead-"),
+        "lead.md names a lead- profile"
+    );
     for role in ROLES.iter() {
         let label = format!("`{}`", role.label);
-        let profile = format!("`{}-<n>-{}`", role.label, role.model_slug);
-        for word in [label, profile, role.model_name.to_string()] {
+        let profile = format!("`{}-<n>-<model>`", role.label);
+        for word in [label, profile] {
             assert!(lead.contains(&word), "lead.md lacks {word}");
         }
     }
@@ -183,15 +193,11 @@ fn each_turn_finishes_tasks_left_without_a_role() {
 #[test]
 fn lead_retries_a_failed_light_task_as_implement_by_relabelling_first() {
     let lead = asset("skills/ride-swarm/lead.md");
-    for word in [
-        "`light`",
-        "`light-<n>-sonnet-5-5`",
-        "Light <n> (Sonnet 5.5)",
-    ] {
+    for word in ["`light`", "`light-<n>-<model>`"] {
         assert!(lead.contains(word), "lead.md lacks {word}");
     }
     let relabel = lead
-        .find("`vb label <id> role=implement --as lead-fable-5-2`, then `vb tasks reopen <id>")
+        .find("`vb label <id> role=implement --as lead`, then `vb tasks reopen <id>")
         .expect("lead.md relabels a light task before reopening it");
     assert!(relabel > lead.find("## Roles").expect("lead.md has a role table"));
 }
