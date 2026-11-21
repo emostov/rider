@@ -265,7 +265,7 @@ task of its own.
 | failed | the reason and the log tail are in the thread | Read them. Reply with what the next attempt must do, then `vb tasks reopen <id> --as lead-fable-5-2` retries in the same worktree. The next worker follows your latest reply over the brief, so make it a complete, specific instruction. If the correction changes what the task is, rewrite the brief instead: `vb edit <id> - --as lead-fable-5-2` with the new text on standard input, then reopen. Dependents keep waiting |
 | blocked `awaiting_approval`, in `decisions` | waiting for the owner | Nothing until they answer |
 | completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@2` record: branch, head, commits, summary, and `behind`, the stacked tasks whose branches lack the new head |
-| any, with a PR | the daemon posts a `rider-github@1` record for each finished CI run, review, review comment and PR comment on the branch's PR | `rider wait` wakes on it; act on it as `ship-swarm` section 2 says, never poll `gh` |
+| any, with a PR | the daemon posts a `rider-github@1` record for each finished CI run, review, review comment and PR comment on the branch's PR | `route: owner` records already queued a resumed fix task onto the branch's owner; act only on `route: lead` records, as `ship-swarm` section 2 says; never poll `gh` |
 
 `vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
 "<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.

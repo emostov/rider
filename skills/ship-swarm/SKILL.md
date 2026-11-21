@@ -144,12 +144,21 @@ CI is green.
 
 Do not poll `gh`. The daemon watches the pull request of every task whose `branch` label has
 one, and posts each change to that task's thread as a `rider-github@1` record; wait for it with
-`rider wait` (the rule in `lead.md` step 9). Act on each record kind:
+`rider wait` (the rule in `lead.md` step 9). The owner of a PR is the newest task whose
+`branch` label is the PR's branch. When that owner is an implement or light task with a recorded
+session, the daemon routes a change straight to it: it queues one fix task `onto` the owner with
+`resume=1` (the failing job, its URL and log tail, or the quoted comment with its file, line and
+URL) and posts the record with `route: owner` and the fix in `task`. Leave those to the swarm.
+A record with `route: lead` is yours:
 
 - `checks`, `state: passed`: CI is green on `head`; go on to review or merge.
-- `checks`, `state: failed`: `job` failed, its log at `url`; handle it as below.
-- `review`: a review, or a review comment on `file` at `line`; act on it as in section 3.
-- `comment`: a PR conversation comment; answer it or fix what it asks.
+- `checks`, `state: failed`: `job` failed, its log at `url`, and no owner could take it (no
+  session, or two fix rounds on this head already); handle it as below.
+- `review`: a review, or a question on `file` at `line`. A question or a decision is for you or
+  the owner; a change request whose owner is gone becomes a fix task you queue.
+- `comment`: a PR conversation comment; answer it on the board, or queue the fix it asks for.
+
+Agents never reply on GitHub.
 
 The watch ends when the PR is merged or closed. If `<cap>` (`ci.cap_minutes`, or the longest
 the workflows normally run, doubled) passes with no `checks` record for the head, read
