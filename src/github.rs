@@ -31,7 +31,7 @@ pub const POLL_TICKS: u64 = 12;
 pub const BACKOFF_MAX: u64 = 16;
 const ITEMS_MAX: usize = 200;
 const KEY_BYTES_MAX: usize = 512;
-const STATE_BYTES_MAX: u64 = (SEEN_MAX * (2 * KEY_BYTES_MAX + 3) + 64) as u64;
+const STATE_BYTES_MAX: u64 = (SEEN_MAX * (4 * KEY_BYTES_MAX + 32) + 64) as u64;
 const GH_SECONDS_MAX: u64 = 60;
 const ROUNDS_MAX: u64 = u64::MAX;
 pub const FIX_ROUNDS_MAX: usize = 2;
@@ -169,7 +169,53 @@ struct WirePermission {
 
 #[derive(Default, Serialize, Deserialize)]
 struct Seen {
-    keys: Vec<String>,
+    #[serde(default)]
+    entries: Vec<SeenKey>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SeenKey {
+    pr: String,
+    key: String,
+}
+
+impl Seen {
+    fn has(&self, key: &str) -> bool {
+        self.entries.iter().any(|entry| entry.key == key)
+    }
+
+    fn keys(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.key.as_str())
+    }
+
+    fn forget_pr(&mut self, pr: &str) {
+        assert!(!pr.is_empty());
+        self.entries.retain(|entry| entry.pr != pr);
+        assert!(self.entries.iter().all(|entry| entry.pr != pr));
+    }
+
+    fn make_room(&mut self, count: usize) -> Result<(), WatchError> {
+        assert!(count > 0 && count < SEEN_MAX);
+        for _ in 0..count {
+            if self.entries.len() + count <= SEEN_MAX {
+                break;
+            }
+            let Some(ended) = self.entries.iter().position(|entry| entry.pr.is_empty()) else {
+                return Err(WatchError::TooMany {
+                    what: "seen keys of watched pull requests",
+                    max: SEEN_MAX,
+                });
+            };
+            self.entries.remove(ended);
+        }
+        if self.entries.len() + count > SEEN_MAX {
+            return Err(WatchError::TooMany {
+                what: "seen keys of watched pull requests",
+                max: SEEN_MAX,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +321,7 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
         }
         let task = view.id;
         let off = label(view, WATCH_LABEL) == Some(WATCH_OFF);
-        if off || seen.keys.contains(&ended_key(task)) || !git::is_safe_ref(branch) {
+        if off || seen.has(&ended_key(task)) || !git::is_safe_ref(branch) {
             branches.push(branch);
             continue;
         }
@@ -342,7 +388,9 @@ fn watch_one(
         return Ok(0);
     };
     if pr.state != "OPEN" {
-        remember(seen, ended_key(watched.task));
+        seen.forget_pr(&pr.url);
+        seen.make_room(1)?;
+        remember(seen, "", ended_key(watched.task));
         return Ok(0);
     }
     let path = format!(
@@ -360,9 +408,10 @@ fn watch_one(
     let inline: Vec<WireInline> = pages.into_iter().flatten().collect();
     let mut posted = 0usize;
     for change in changes(&pr, &inline)? {
-        if seen.keys.contains(&change.key) {
+        if seen.has(&change.key) {
             continue;
         }
+        seen.make_room(3)?;
         let Change {
             key,
             mut record,
@@ -379,8 +428,7 @@ fn watch_one(
         match fix.filter(|_| watched.resumable && trusted) {
             Some(fix)
                 if seen
-                    .keys
-                    .iter()
+                    .keys()
                     .any(|seen| seen.starts_with(&format!("queued:{key}:")))
                     || fix_rounds(seen, watched.branch, &pr.head_ref_oid) < FIX_ROUNDS_MAX =>
             {
@@ -398,7 +446,7 @@ fn watch_one(
                 &format!("rider-github-{}-{key}", watched.task.0),
             )
             .map_err(|error| WatchError::State(error.to_string()))?;
-        remember(seen, key);
+        remember(seen, &pr.url, key);
         posted = posted.saturating_add(1);
     }
     Ok(posted)
@@ -446,10 +494,7 @@ fn trusts(
 
 fn fix_rounds(seen: &Seen, branch: &str, head: &str) -> usize {
     let prefix = format!("fix:{branch}:{head}:");
-    seen.keys
-        .iter()
-        .filter(|key| key.starts_with(&prefix))
-        .count()
+    seen.keys().filter(|key| key.starts_with(&prefix)).count()
 }
 
 fn queue_fix(
@@ -463,16 +508,14 @@ fn queue_fix(
     assert!(watched.resumable && !key.is_empty());
     let queued = format!("queued:{key}:");
     let earlier = seen
-        .keys
-        .iter()
+        .keys()
         .find_map(|seen| seen.strip_prefix(&queued)?.parse().ok());
     if let Some(id) = earlier {
         return Ok(TaskId(id));
     }
     let prefix = format!("fix:{}:", watched.branch);
     let after = seen
-        .keys
-        .iter()
+        .keys()
         .rev()
         .find_map(|seen| seen.strip_prefix(&prefix)?.rsplit(':').next()?.parse().ok())
         .map(TaskId)
@@ -501,8 +544,12 @@ fn queue_fix(
     let fix = board
         .create_task(&task)
         .map_err(|error| WatchError::State(error.to_string()))?;
-    remember(seen, format!("{prefix}{}:{}", pr.head_ref_oid, fix.0));
-    remember(seen, format!("{queued}{}", fix.0));
+    remember(
+        seen,
+        &pr.url,
+        format!("{prefix}{}:{}", pr.head_ref_oid, fix.0),
+    );
+    remember(seen, &pr.url, format!("{queued}{}", fix.0));
     assert!(fix.0 > 0);
     Ok(fix)
 }
@@ -689,17 +736,21 @@ fn excerpt(text: &str) -> &str {
     &text[..end]
 }
 
-fn remember(seen: &mut Seen, mut key: String) {
-    let mut end = key.len().min(KEY_BYTES_MAX);
-    while !key.is_char_boundary(end) {
-        end -= 1;
-    }
-    key.truncate(end);
-    if seen.keys.len() >= SEEN_MAX {
-        seen.keys.remove(0);
-    }
-    seen.keys.push(key);
-    assert!(seen.keys.len() <= SEEN_MAX);
+fn remember(seen: &mut Seen, pr: &str, key: String) {
+    assert!(
+        seen.entries.len() < SEEN_MAX,
+        "room is made before a change is handled"
+    );
+    let bounded = |text: &str| {
+        let mut end = text.len().min(KEY_BYTES_MAX);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_string()
+    };
+    let (pr, key) = (bounded(pr), bounded(&key));
+    seen.entries.push(SeenKey { pr, key });
+    assert!(seen.entries.len() <= SEEN_MAX);
 }
 
 fn parse<T: serde::de::DeserializeOwned>(text: &str, what: &'static str) -> Result<T, WatchError> {
@@ -755,7 +806,7 @@ fn read_seen(path: &Path) -> Result<Seen, WatchError> {
         Ok(_) => fs::read_to_string(path).map_err(|error| WatchError::State(error.to_string()))?,
     };
     let seen: Seen = parse(&text, "github state")?;
-    if seen.keys.len() > SEEN_MAX {
+    if seen.entries.len() > SEEN_MAX {
         return Err(WatchError::TooMany {
             what: "seen keys",
             max: SEEN_MAX,
@@ -765,7 +816,7 @@ fn read_seen(path: &Path) -> Result<Seen, WatchError> {
 }
 
 fn write_seen(path: &Path, seen: &Seen) -> Result<(), WatchError> {
-    assert!(seen.keys.len() <= SEEN_MAX);
+    assert!(seen.entries.len() <= SEEN_MAX);
     let text = serde_json::to_string(seen).map_err(|error| WatchError::State(error.to_string()))?;
     if text.len() as u64 > STATE_BYTES_MAX {
         return Err(WatchError::TooMany {

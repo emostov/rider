@@ -588,3 +588,57 @@ fn a_review_comment_on_a_second_page_reaches_the_board() {
         vec![&json!(format!("{url}1")), &json!(format!("{url}2"))]
     );
 }
+
+#[test]
+fn a_full_state_file_keeps_the_fix_round_cap_of_a_watched_pr() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-three.json");
+    given_a_completed_task(&mut world);
+    let records = when_project_records_reach(&world, 3);
+    let owned = |records: &[Value]| records.iter().filter(|r| r["route"] == "owner").count();
+    assert_eq!(owned(&records), 2);
+    let fixes: Vec<String> = records
+        .iter()
+        .filter(|record| record["route"] == "owner")
+        .map(queued_fix)
+        .collect();
+    let fixes: Vec<&str> = fixes.iter().map(String::as_str).collect();
+    assert_eq!(when_the_tasks_settle(&world, &fixes), vec!["completed"; 2]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    let path = world.home.join("github.json");
+    let mut state: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read the state")).expect("JSON");
+    let list = state
+        .as_object_mut()
+        .and_then(|object| object.values_mut().find(|value| value.is_array()))
+        .and_then(Value::as_array_mut)
+        .expect("the state holds a list");
+    let sample = list[0].clone();
+    for n in list.len()..4096 {
+        let key = format!("comment:{n}");
+        let filler = match &sample {
+            Value::String(_) => json!(key),
+            _ => json!({"pr": "https://github.com/example/repo/pull/9", "key": key}),
+        };
+        list.push(filler);
+    }
+    fs::write(&path, state.to_string()).expect("write the full state");
+    let mut four: Vec<Value> =
+        serde_json::from_str(&fixture("pulls-comments-three.json")).expect("the fixture parses");
+    let mut fourth = four[2].clone();
+    fourth["id"] = json!(4);
+    fourth["html_url"] = json!("https://github.com/example/repo/pull/7#discussion_r4");
+    fourth["body"] = json!("Bound this list too.");
+    four.push(fourth);
+    fs::write(world.root.join("gh-comments.json"), json!(four).to_string()).expect("write");
+
+    given_a_running_daemon_with(&mut world, &[FAST_POLL]);
+    when_gh_is_called_again(&world);
+    when_gh_is_called_again(&world);
+    thread::sleep(Duration::from_millis(QUIET_MILLIS));
+
+    assert_eq!(owned(&project_records(&world)), 2);
+}
