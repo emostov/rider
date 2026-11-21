@@ -644,6 +644,26 @@ pub fn branch_exists(repo: &Path, branch: &str) -> Result<bool, GitError> {
     }
 }
 
+pub fn keeps_refs_in_files(dir: &Path) -> Result<bool, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let args = ["rev-parse", "--show-ref-format"].map(OsStr::new);
+    let format = one_line(&args, &run_ok(dir, &args)?)?;
+    assert!(!format.contains('\n'));
+    Ok(format == "files")
+}
+
+// `ls-files -v` tags an assume-unchanged entry with a lowercase letter and a skip-worktree
+// entry with `S`; git status and an unforced worktree removal skip both.
+pub fn has_hidden_index_entries(dir: &Path) -> Result<bool, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let args = ["ls-files", "-v", "-z"].map(OsStr::new);
+    let stdout = run_ok(dir, &args)?;
+    let mut entries = stdout.split(|&b| b == 0).filter(|entry| !entry.is_empty());
+    let hidden = entries.any(|entry| entry[0] == b'S' || entry[0].is_ascii_lowercase());
+    assert!(stdout.len() <= OUTPUT_BYTES_MAX);
+    Ok(hidden)
+}
+
 /// The branch checked out in `dir`, or `None` when HEAD is detached.
 pub fn current_branch(dir: &Path) -> Result<Option<String>, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");

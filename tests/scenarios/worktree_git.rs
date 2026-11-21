@@ -244,6 +244,49 @@ fn a_finished_worktree_with_a_commit_only_its_head_reflog_reaches_is_kept() {
 }
 
 #[test]
+fn a_finished_worktree_hiding_an_edit_behind_an_index_flag_is_kept() {
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let Some(mut world) = given_a_board_and_a_repository() else {
+            return;
+        };
+
+        let task = when_a_held_agent_finishes_after(&mut world, |world, dir| {
+            fs::write(dir.join("input.txt"), "committed\n").expect("write the input");
+            git_in(world, dir, &["add", "--", "input.txt"]);
+            git_in(world, dir, &["commit", "-q", "-m", "Input."]);
+            git_in(world, dir, &["update-index", flag, "--", "input.txt"]);
+            fs::write(dir.join("input.txt"), "edited\n").expect("edit the input");
+        });
+
+        let why = "a tracked file is marked assume-unchanged or skip-worktree";
+        then_the_worktree_is_kept_because(&world, &task, why);
+    }
+}
+
+#[test]
+fn a_finished_worktree_in_a_repository_without_files_ref_storage_is_kept() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo.clone();
+    git_in(&world, &repo, &["refs", "migrate", "--ref-format=reftable"]);
+
+    let task = when_a_held_agent_finishes_after(&mut world, |world, dir| {
+        let branch = git_in(world, dir, &["symbolic-ref", "--short", "HEAD"]);
+        git_in(world, dir, &["checkout", "-q", "--detach"]);
+        git_in(
+            world,
+            dir,
+            &["commit", "-q", "--allow-empty", "-m", "Orphan."],
+        );
+        git_in(world, dir, &["checkout", "-q", &branch]);
+    });
+
+    let why = "its repository does not keep refs in files, so its HEAD reflog cannot be checked";
+    then_the_worktree_is_kept_because(&world, &task, why);
+}
+
+#[test]
 fn a_finished_worktree_holding_only_ignored_build_output_is_removed_and_its_branch_kept() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;

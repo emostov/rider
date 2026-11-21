@@ -572,6 +572,16 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
         return Err(refuse("moved from its start"));
     }
     // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
+    if git::has_hidden_index_entries(&dir)? {
+        return Err(refuse(
+            "a tracked file is marked assume-unchanged or skip-worktree",
+        ));
+    }
+    if !git::keeps_refs_in_files(&dir)? {
+        return Err(refuse(
+            "its repository does not keep refs in files, so its HEAD reflog cannot be checked",
+        ));
+    }
     if git::head_reflog_only_commit_count(&dir)? != 0 {
         return Err(refuse("commits only its HEAD reflog reaches"));
     }
