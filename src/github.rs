@@ -386,30 +386,7 @@ fn changes(pr: &WirePr, inline: &[WireInline]) -> Result<Vec<Change>, WatchError
     }
     let (number, head) = (pr.number, pr.head_ref_oid.as_str());
     let mut out = Vec::new();
-    let checks = checks_state(&pr.status_check_rollup);
-    if checks != Checks::Pending {
-        let failed = pr
-            .status_check_rollup
-            .iter()
-            .find(|check| is_failure(check));
-        let state = if checks == Checks::Passed {
-            "passed"
-        } else {
-            "failed"
-        };
-        let mut record = json!({"kind": "checks", "pr": number, "head": head, "state": state,
-            "url": pr.url});
-        if let Some(check) = failed {
-            record["job"] = json!(excerpt(&check.name));
-            record["url"] = json!(check.details_url);
-        }
-        let fix = (checks == Checks::Failed).then_some(Fix::Ci);
-        out.push(Change {
-            key: format!("checks:{number}:{head}"),
-            record,
-            fix,
-        });
-    }
+    out.extend(checks_change(pr));
     for review in pr.reviews.iter().filter(|review| !review.body.is_empty()) {
         let body = excerpt(&review.body);
         let record = json!({"kind": "review", "pr": number, "head": head,
@@ -453,6 +430,35 @@ fn changes(pr: &WirePr, inline: &[WireInline]) -> Result<Vec<Change>, WatchError
     }
     assert!(out.len() <= 1 + 3 * ITEMS_MAX);
     Ok(out)
+}
+
+fn checks_change(pr: &WirePr) -> Option<Change> {
+    let (number, head) = (pr.number, pr.head_ref_oid.as_str());
+    let checks = checks_state(&pr.status_check_rollup);
+    if checks == Checks::Pending {
+        return None;
+    }
+    let failed = pr
+        .status_check_rollup
+        .iter()
+        .find(|check| is_failure(check));
+    let state = if checks == Checks::Passed {
+        "passed"
+    } else {
+        "failed"
+    };
+    let mut record = json!({"kind": "checks", "pr": number, "head": head, "state": state,
+        "url": pr.url});
+    if let Some(check) = failed {
+        record["job"] = json!(excerpt(&check.name));
+        record["url"] = json!(check.details_url);
+    }
+    let fix = (checks == Checks::Failed).then_some(Fix::Ci);
+    Some(Change {
+        key: format!("checks:{number}:{head}"),
+        record,
+        fix,
+    })
 }
 
 fn change_brief(author: &str, url: &str, place: &str, body: &str) -> String {
