@@ -802,7 +802,11 @@ fn up(config: &Config) -> Result<u8, CliError> {
         }
     };
     let log = open_private(&log_path, fs::OpenOptions::new().append(true));
-    let log = log.map_err(io("open", &log_path))?;
+    let log = log.map_err(|error| CliError::Io {
+        action: "open",
+        path: log_path.clone(),
+        message: error.to_string(),
+    })?;
     let err = log.try_clone().map_err(io("open", &log_path))?;
     let exe = env::current_exe().map_err(io("find", Path::new("rider")))?;
     let mut child = Process::new(&exe)

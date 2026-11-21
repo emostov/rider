@@ -4,6 +4,7 @@
 use crate::board::one_line;
 use crate::git;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
+use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
@@ -345,27 +346,52 @@ impl Shared {
 // A FIFO would block a plain open and a symlink would redirect it, so the open neither waits
 // nor follows, and the descriptor is checked. A log readers may already hold open from before
 // it was private is replaced by a new file, not narrowed, so they see nothing written after.
-pub fn open_private(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
+pub enum PrivateOpenError {
+    NotAFile,
+    Replaced,
+    Io(io::Error),
+}
+
+impl fmt::Display for PrivateOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PrivateOpenError::NotAFile => write!(f, "it is not a regular file of the current user"),
+            PrivateOpenError::Replaced => write!(f, "it was replaced while it was opened"),
+            PrivateOpenError::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+pub fn open_private(path: &Path, options: &mut OpenOptions) -> Result<File, PrivateOpenError> {
     assert!(path.is_absolute());
     let flags = (OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits();
     options.create(true).mode(0o600).custom_flags(flags);
     let uid = rustix::process::getuid().as_raw();
     for _ in 0..OPEN_TRIES_MAX {
-        let file = options.open(path)?;
-        let metadata = file.metadata()?;
+        // A nonblocking open for writing fails with ENXIO on a FIFO no process reads, and
+        // O_NOFOLLOW fails with ELOOP on a symlink.
+        let file = options
+            .open(path)
+            .map_err(|error| match error.raw_os_error() {
+                Some(code) if code == Errno::ENXIO as i32 || code == Errno::ELOOP as i32 => {
+                    PrivateOpenError::NotAFile
+                }
+                _ => PrivateOpenError::Io(error),
+            })?;
+        let metadata = file.metadata().map_err(PrivateOpenError::Io)?;
         if !metadata.is_file() || metadata.uid() != uid {
-            let message = "it is not a regular file of the current user";
-            return Err(io::Error::new(ErrorKind::InvalidInput, message));
+            return Err(PrivateOpenError::NotAFile);
         }
         if metadata.mode() & 0o077 == 0 && metadata.nlink() == 1 {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            let private = fs::Permissions::from_mode(0o600);
+            file.set_permissions(private)
+                .map_err(PrivateOpenError::Io)?;
             return Ok(file);
         }
         drop(file);
-        fs::remove_file(path)?;
+        fs::remove_file(path).map_err(PrivateOpenError::Io)?;
     }
-    let message = "it was replaced while it was opened";
-    Err(io::Error::new(ErrorKind::InvalidInput, message))
+    Err(PrivateOpenError::Replaced)
 }
 
 fn open_log(log: &Path, log_bytes_max: u64) -> Result<Arc<Shared>, HarnessError> {
@@ -375,7 +401,8 @@ fn open_log(log: &Path, log_bytes_max: u64) -> Result<Arc<Shared>, HarnessError>
     if let Some(parent) = log.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(failed)?;
     }
-    let file = open_private(log, OpenOptions::new().write(true)).map_err(failed)?;
+    let file = open_private(log, OpenOptions::new().write(true));
+    let file = file.map_err(|error| HarnessError::Log(format!("{}: {error}", log.display())))?;
     file.set_len(0).map_err(failed)?;
     let cap = log_bytes_max;
     Ok(Arc::new(Shared {

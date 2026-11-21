@@ -364,7 +364,8 @@ case "$behaviour" in
   hold-then-nothing) hold ;;
   orphan-stops)
     stops="$world/{HEADS_DIR}/$task-stops"
-    /bin/sh -c 'set -m; ( sleep 1; "$RIDER_BIN" down --now > "$1.new" 2>&1; echo "down exit $?" >> "$1.new"; mv "$1.new" "$1" ) &' sh "$stops"
+    # dash, Linux's sh, ignores `set -m` without a terminal, so perl makes the new group.
+    ( perl -e 'setpgrp(0, 0); exec @ARGV' /bin/sh -c 'sleep 1; "$RIDER_BIN" down --now > "$1.new" 2>&1; echo "down exit $?" >> "$1.new"; mv "$1.new" "$1"' sh "$stops" & )
     hold
     commit || exit 1 ;;
   try-to-stop)
