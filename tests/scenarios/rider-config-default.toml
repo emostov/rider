@@ -40,10 +40,10 @@ needs_of = true
 builds = false
 skills = []
 
-[roles.quick-review]
+[roles.native-review]
 harness = "codex-review"
 model = "gpt-6.2-sol"
-title = "Quick-review"
+title = "Native-review"
 model_name = "Sol 6.2"
 model_slug = "sol-6-2"
 prompt = "review"

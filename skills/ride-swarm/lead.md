@@ -56,7 +56,7 @@ when you ask: the answer applies to every repository there.
 | `light` | Sonnet 5.5 | `light-<n>-sonnet-5-5` | Light <n> (Sonnet 5.5) | yes |
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
 | `polish` | Sonnet 5.5 | `polish-<n>-sonnet-5-5` | Polish <n> (Sonnet 5.5) | yes |
-| `quick-review` | Sol 6.2 | `quick-review-<n>-sol-6-2` | Quick-review <n> (Sol 6.2) | no |
+| `native-review` | Sol 6.2 | `native-review-<n>-sol-6-2` | Native-review <n> (Sol 6.2) | no |
 | `final-review` | Mythos 5.2 | `final-review-<n>-mythos-5-2` | Final-review <n> (Mythos 5.2) | no |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
 | `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
@@ -136,22 +136,23 @@ These rules are yours to keep. Rider does not check them:
   effective value. Size tasks well inside that.
 - Sizing: changes that each take under about ten minutes and touch the same files go in one
   task, not several.
-- Review policy: each pull request gets two holistic reviews of its whole diff, run in
+- Review policy: reviews happen only at the end of each pull request, plus one review of a
+  branch before other work is built on top of it. No task gets a review of its own while the
+  work is going on; the PR's holistic review covers every task and fix on the branch, and you
+  read each diff. A review's brief names the range itself, `git diff <base branch>...HEAD`,
+  and says what to attack. The end-of-PR flow: two holistic reviews of the whole diff, run in
   parallel, both `of=<the PR's top task>`: a `review` (`codex exec`: runs the tests and
-  mutation-tests coverage) and a `quick-review` (`codex review`: reads the diff). Then one fix
+  mutation-tests coverage) and a `native-review` (`codex review`: reads the diff). Then one fix
   task for the blocking findings of both. After that fix, a `final-review` (Mythos 5.2, may run
-  tests) of the whole PR is the backstop; its blocking findings get one more fix task. Each
-
-  `implement` task (design judgment) gets its own `review` task with `of` set to it, and three
-  or four specific things to attack. A `light` task, a fix task for a finding, and a mechanical
-  change get no review task of their own: the PR's holistic review covers them, and you read
-  the diff. Say what to attack. A task's review finds its range from the reviewed task's `start` label;
-  a holistic review's brief names the PR's range itself, `git diff <base branch>...HEAD`, so
-  earlier fixes on the branch are included.
+  tests) of the whole PR is the backstop; it is a general review, not security-only, and its
+  blocking findings get one more fix task. `security` stays for sensitive branches.
+- When a review on a non-Claude model is stopped by its provider's content filter for security
+  reasons (the turn fails with a cybersecurity flag), do not retry it on that model: run that
+  review again on Mythos 5.2 as a `final-review`.
 - Blocking means a failure reachable in normal operation, a leak of processes, files or claims,
   or a security hole. A finding that needs a rare combination is non-blocking.
 - At most two review rounds per piece of work: for a PR, the parallel `review` and
-  `quick-review` pair is the first round and the `final-review` the second. After the second
+  `native-review` pair is the first round and the `final-review` the second. After the second
   review, either accept the piece
   and record the remaining findings in the project's deferred-work thread, or change the approach.
   Never start a third fix-and-review round on the same piece unchanged.

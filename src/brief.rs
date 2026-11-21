@@ -79,13 +79,13 @@ impl fmt::Display for BriefError {
         match self {
             BriefError::NoRole => write!(
                 f,
-                "Set the `role` label to one of implement, light, review, quick-review, \
+                "Set the `role` label to one of implement, light, review, native-review, \
                  final-review, security or qa."
             ),
             BriefError::UnknownRole(value) => write!(
                 f,
                 "Change the `role` label from {value:?} to one of implement, light, \
-                 review, quick-review, final-review, security or qa."
+                 review, native-review, final-review, security or qa."
             ),
             BriefError::NoRepo => write!(
                 f,
@@ -432,13 +432,13 @@ mod tests {
     fn role_messages_name_every_role() {
         assert_eq!(
             BriefError::NoRole.to_string(),
-            "Set the `role` label to one of implement, light, review, quick-review, \
+            "Set the `role` label to one of implement, light, review, native-review, \
                  final-review, security or qa."
         );
         assert_eq!(
             BriefError::UnknownRole("lead".to_string()).to_string(),
             "Change the `role` label from \"lead\" to one of implement, light, review, \
-             quick-review, final-review, security or qa."
+             native-review, final-review, security or qa."
         );
         let message = BriefError::NoRole.to_string();
         for role in ROLES.iter() {

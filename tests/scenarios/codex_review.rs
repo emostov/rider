@@ -1,4 +1,4 @@
-//! A quick review runs as `codex review`, its prompt on standard input, settled by its exit
+//! A native review runs as `codex review`, its prompt on standard input, settled by its exit
 //! status and the final text on its standard output.
 
 use serde_json::json;
@@ -7,21 +7,21 @@ use crate::fake_agent::{self, Behaviour};
 use crate::steps::*;
 use crate::world::World;
 
-fn a_quick_review_of(world: &World, built: &str) -> NewTask {
+fn a_native_review_of(world: &World, built: &str) -> NewTask {
     NewTask::new("Review the work: git diff main...HEAD.")
         .label("repo", world.repo_label())
         .label("of", built)
         .needs(built)
-        .role("quick-review")
+        .role("native-review")
 }
 
 #[test]
-fn a_quick_review_runs_codex_review_with_its_prompt_on_stdin_and_completes_with_its_text() {
+fn a_native_review_runs_codex_review_with_its_prompt_on_stdin_and_completes_with_its_text() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    let review = when_the_lead_creates(&world, &a_quick_review_of(&world, &built));
+    let review = when_the_lead_creates(&world, &a_native_review_of(&world, &built));
     given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
@@ -61,12 +61,12 @@ approval_policy="never"
 }
 
 #[test]
-fn a_quick_review_whose_codex_review_exits_non_zero_fails() {
+fn a_native_review_whose_codex_review_exits_non_zero_fails() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
-    let review = when_the_lead_creates(&world, &a_quick_review_of(&world, &built));
+    let review = when_the_lead_creates(&world, &a_native_review_of(&world, &built));
     given_the_agent_will(&world, &review, &[Behaviour::ExitNonZero]);
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
