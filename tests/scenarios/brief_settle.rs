@@ -1,4 +1,6 @@
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -384,4 +386,241 @@ fn an_onto_task_whose_branch_has_too_many_tasks_to_check_is_blocked_naming_the_o
         Some(("invalid_brief".to_string(), reason.to_string()))
     );
     assert_eq!(agent_runs(&world), vec![]);
+}
+
+#[test]
+fn a_lead_reply_posted_while_the_agent_runs_resumes_its_session_and_changes_the_result() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    world.vb_lead(
+        &["reply", &task, "-"],
+        Some("Decision blue: use the blue name."),
+    );
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(
+        task_result(&world, &task),
+        Some(fake_agent::heard(&["blue"]))
+    );
+    let session = fake_agent::session(&task, 0);
+    let mut resumed = fake_agent::options(&world.root, &task, 0);
+    resumed.extend(["--resume".to_string(), session]);
+    assert_eq!(fake_agent::options(&world.root, &task, 1), resumed);
+    let prompt = agent_prompt(&world, &task, 1);
+    assert!(
+        prompt.contains("Decision blue: use the blue name."),
+        "{prompt}"
+    );
+    let replies = task_replies(&world, &task);
+    let noted = replies.iter().filter_map(|reply| reply["text"].as_str());
+    let noted: Vec<&str> = noted.filter(|text| text.contains("posted while")).collect();
+    assert_eq!(noted.len(), 1, "{replies:?}");
+}
+
+#[test]
+fn a_reply_from_another_worker_is_not_delivered_to_the_running_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    let note = world.vb_as(
+        "implement-9-other",
+        &["reply", &task, "-"],
+        Some("Decision red."),
+    );
+    assert_eq!(note.code, Some(0), "{note:?}");
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(
+        task_result(&world, &task),
+        Some(fake_agent::summary(&task, 0))
+    );
+    assert_eq!(agent_runs_for(&world, &task).len(), 1);
+}
+
+fn when_the_lead_replies(world: &World, task: &str, text: &str) {
+    world.vb_lead(&["reply", task, "-"], Some(text));
+}
+
+fn rider_notes(world: &World, task: &str, words: &str) -> usize {
+    let replies = task_replies(world, task);
+    let texts = replies.iter().filter_map(|reply| reply["text"].as_str());
+    texts.filter(|text| text.contains(words)).count()
+}
+
+#[test]
+fn a_reply_from_a_worker_whose_profile_is_named_like_a_lead_is_not_delivered() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+
+    let note = world.vb_as(
+        "lead-impostor",
+        &["reply", &task, "-"],
+        Some("Decision red."),
+    );
+    assert_eq!(note.code, Some(0), "{note:?}");
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(
+        task_result(&world, &task),
+        Some(fake_agent::summary(&task, 0))
+    );
+    assert_eq!(agent_runs_for(&world, &task).len(), 1);
+}
+
+#[test]
+fn a_task_canceled_while_rider_announces_a_reply_delivery_starts_no_second_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+    when_the_lead_replies(&world, &task, "Decision blue.");
+    let (marker, release) = (world.root.join("reply-held"), world.root.join("reply-go"));
+    given_vb_waits_for(&world, "reply", &marker, &release);
+
+    world.release_agent(&task);
+    when_the_file_exists(&world, &marker);
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+    fs::write(&release, "").expect("release the held reply");
+    let states = when_the_tasks_settle(&world, &[&task]);
+    thread::sleep(Duration::from_secs(3));
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["canceled".to_string()]);
+    assert_eq!(agent_runs_for(&world, &task).len(), 1);
+}
+
+#[test]
+fn a_reply_is_delivered_though_the_first_thread_read_after_the_agent_fails() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::ReportDecision]);
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &task);
+    when_the_lead_replies(&world, &task, "Decision blue.");
+    let armed = world.root.join("fail-next-read");
+    given_vb_fails_one_read_once(&world, &armed);
+    fs::write(&armed, "").expect("arm the failing read");
+
+    world.release_agent(&task);
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert!(!armed.exists(), "no read failed");
+    assert_eq!(
+        task_result(&world, &task),
+        Some(fake_agent::heard(&["blue"]))
+    );
+}
+
+#[test]
+fn a_codex_agent_run_again_gets_every_reply_so_far_and_stops_after_three_rounds() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.implement]\nharness = \"codex\"\n");
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::HoldAttempt]);
+    given_a_running_daemon(&mut world);
+
+    for (attempt, word) in (0..4).zip(["one", "two", "three", "four"]) {
+        when_the_agent_attempt_has_started(&world, &task, attempt);
+        when_the_lead_replies(&world, &task, &format!("Decision {word}."));
+        fake_agent::release_attempt(&world.root, &task, attempt);
+    }
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["failed".to_string()]);
+    assert_eq!(agent_runs_for(&world, &task).len(), 4);
+    let prompt = agent_prompt(&world, &task, 3);
+    for decision in ["Decision one.", "Decision two.", "Decision three."] {
+        assert!(prompt.contains(decision), "{decision} missing: {prompt}");
+    }
+    assert!(!prompt.contains("Decision four."), "{prompt}");
+    then_the_task_failed_with(&world, &task, "were not delivered to it");
+}
+
+#[test]
+fn a_reply_delivered_to_a_qa_agent_asks_for_a_report_and_no_commit() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let qa = when_the_lead_creates(&world, &a_qa_task(&world, &built, "Check the work."));
+    given_the_agent_will(
+        &world,
+        &qa,
+        &[Behaviour::HoldThenNothing, Behaviour::ReportDecision],
+    );
+    given_a_running_daemon(&mut world);
+    when_the_agent_has_started(&world, &qa);
+
+    when_the_lead_replies(&world, &qa, "Decision green.");
+    world.release_agent(&qa);
+    let states = when_the_tasks_settle(&world, &[&built, &qa]);
+
+    assert_eq!(
+        states,
+        vec!["completed".to_string(); 2],
+        "{}",
+        task_text(&world, &qa)
+    );
+    assert_eq!(
+        agent_prompt(&world, &qa, 1),
+        "These replies were posted in your task's thread while you worked. They amend the \
+         brief, and the latest wins. Act on them without committing, and end with a new final \
+         report.\n\nFrom lead:\nDecision green.\n"
+    );
+}
+
+#[test]
+fn a_reply_posted_while_rider_completes_the_task_is_noted_as_undelivered() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let (marker, release) = (
+        world.root.join("complete-held"),
+        world.root.join("complete-go"),
+    );
+    given_vb_waits_for(&world, "complete", &marker, &release);
+    given_a_running_daemon(&mut world);
+
+    when_the_file_exists(&world, &marker);
+    when_the_lead_replies(&world, &task, "Decision late.");
+    fs::write(&release, "").expect("release the held completion");
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    assert_eq!(
+        rider_notes(&world, &task, "landed while rider completed"),
+        1
+    );
 }

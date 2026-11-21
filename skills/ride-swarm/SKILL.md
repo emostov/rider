@@ -10,11 +10,9 @@ daemon runs one agent per ready task in its own git worktree, and a lead plans t
 into tasks. When the user rides a swarm from this session, **this session is the lead**.
 
 `<skill>` is the directory that contains this SKILL.md. It holds `lead.md`, the lead's
-instructions, and `schemas/`, which Rider registers on the board itself. The board is reached with `vb`, which needs:
-
-```sh
-export BOARD_URL=http://127.0.0.1:4100/api/board PATH="$HOME/.rider/node/node_modules/.bin:$PATH"
-```
+instructions, and `schemas/`, which Rider registers on the board itself. The board is
+reached with `rider vb`, which runs the Board CLI on the local board, installing it first
+if it is missing.
 
 ## Swarm status
 
@@ -26,11 +24,11 @@ answer from memory.
 | Is the board up? | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4100` (`000` is down) |
 | Is the daemon up, and what is open? | `rider status` (board, running count, open tasks by project) |
 | Which agents run? | `rider agents` |
-| Which projects exist? | `vb channels list work/` |
-| A project's tasks, with each result's summary | `vb tasks work/<project> --state all` |
-| Why tasks are blocked | `vb tasks work/<project> --state blocked` |
-| Questions waiting on the user | `vb tasks decisions --state blocked` ("Couldn't find channel" means none) |
-| One task in full | `vb read <id>` |
+| Which projects exist? | `rider vb channels list work/` |
+| A project's tasks, with each result's summary | `rider vb tasks work/<project> --state all` |
+| Why tasks are blocked | `rider vb tasks work/<project> --state blocked` |
+| Questions waiting on the user | `rider vb tasks decisions --state blocked` ("Couldn't find channel" means none) |
+| One task in full | `rider vb read <id>` |
 
 1. What needs the user: open decisions, and tasks blocked as `rider_error`, `branch_busy`,
    or `attempts_exhausted`.
@@ -52,7 +50,6 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
      `rider skills install --into <this agent's skills directory>` (`~/.claude/skills` for
      Claude Code, `~/.codex/skills` for Codex), which installs these skills from the binary
      and keeps them updated with it.
-   - `vb` (the Board CLI): `npm install --prefix "${RIDER_HOME:-$HOME/.rider}/node" @vercel/board`
    - `claude`, `codex`, `jq`, Node 22, and Rust cannot be installed for the user: name the
      missing ones and stop. `claude` and `codex` must be signed in.
 2. **Agree the shape.** Ask in one question only for what the request and the repository do
@@ -65,7 +62,7 @@ Old blocked tasks the user did not mention are theirs to keep or cancel: list th
 4. **Workers.** One daemon serves every project. Check `rider status`; if no daemon runs,
    run `rider up`, which starts it in the background, and check `rider status` again.
 5. **Lead.** Read `<skill>/lead.md` in full and follow it for the rest of the session, as
-   `lead-fable-5-2`. Answer the user before anything else.
+   `lead`. Answer the user before anything else.
 
 To send a finished branch for the owner's review, open its PR, and get CI green, follow the
 `ship-swarm` skill. Its loops follow the owner's settings in `<rider home>/ship.toml`.

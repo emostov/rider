@@ -5,26 +5,33 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
+use std::process::{Command as Process, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use fs4::{FileExt, TryLockError};
-use signal_hook::consts::{SIGINT, SIGTERM};
+use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, kill_process_group};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::flag;
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, TaskId, VbCli};
+use crate::board::{self, Board, BoardError, Listing, NEEDS_MAX, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
 use crate::harness::LOG_BYTES_MAX;
+use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
@@ -36,8 +43,11 @@ const ENVIRONMENT: &str = r#"environment:
 
 /// Upper bound on the boards one `rider reap` names.
 pub const REAP_URLS_MAX: usize = 8;
+/// Upper bound on the arguments `rider vb` passes on: a full needs list with its words and options.
+pub const VB_ARGS_MAX: usize = NEEDS_MAX + 64;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
-pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
+pub const ARGS_MAX: usize = VB_ARGS_MAX + 1;
+const _: () = assert!(ARGS_MAX >= 2 * REAP_URLS_MAX + 2);
 pub const IMPLEMENT_PROMPT: &str = "implement.md";
 pub const SLOP_RULES: &str = include_str!("../prompts/slop-rules.md");
 /// Every role's prompt and the slop rules, once each, built into the binary.
@@ -55,8 +65,31 @@ pub const PROMPTS: [(&str, &str); 6] = [
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
 const BOARD_DIR: &str = "board";
+const NODE_DIR: &str = "node";
+/// The Board CLI rider installs under its home when it finds none there, every package locked.
+const BOARD_PACKAGE: [(&str, &str); 2] = [
+    ("package.json", include_str!("../board-cli/package.json")),
+    (
+        "package-lock.json",
+        include_str!("../board-cli/package-lock.json"),
+    ),
+];
+const NPM_FLAGS: [&str; 5] = [
+    "--ignore-scripts",
+    "--no-global",
+    "--no-audit",
+    "--no-fund",
+    "--loglevel=error",
+];
+/// The only variables npm gets from rider's environment.
+const NPM_VARS: [&str; 2] = ["PATH", "HOME"];
+const INSTALL_SECONDS_MAX: u64 = 600;
+const INSTALL_SIGNALS: [i32; 4] = [SIGTERM, SIGINT, SIGHUP, SIGQUIT];
+const INSTALL_LOCK: &str = "node.lock";
+const INSTALL_POLL_MILLIS: u64 = 100;
+/// Upper bound on the bytes of npm's error output that rider shows.
+const INSTALL_OUTPUT_BYTES_MAX: u64 = 64 * 1024;
 const SKILLS_DIR: &str = "skills";
-const VB_DIR: &str = "node/node_modules/.bin";
 const ID_DIGITS_MAX: usize = 20;
 /// Upper bound on the characters of a project or profile name.
 const NAME_CHARS_MAX: usize = 64;
@@ -67,9 +100,13 @@ const WAIT_MINUTES_MAX: u32 = 60;
 const WAIT_MINUTES_DEFAULT: u32 = 54;
 /// The directory under the Rider home that holds each project's wait cursor.
 const WAIT_DIR: &str = "wait";
+/// The failure reason of a read of a channel that does not exist yet.
+const CHANNEL_NOT_FOUND: &str = "channel_not_found";
+/// The profile `rider queue` reads the board as.
+const QUEUE_PROFILE: &str = "rider-queue";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
-/// The profile prefix of a lead, as the ride-swarm skill names it.
+const LEAD_PROFILE: &str = "lead";
 const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
@@ -117,6 +154,12 @@ pub enum Command {
     Status,
     /// Print every agent the daemon runs.
     Agents,
+    /// Print the owner's review queue, then the work the daemon runs.
+    Queue {
+        /// Print the items with every label as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the newest attempt's log of a task; -f follows it until the agent exits.
     Logs {
         #[arg(value_name = "ID", value_parser = parse_task_id)]
@@ -162,9 +205,21 @@ pub enum Command {
             value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
         )]
         timeout: u32,
-        /// The lead's profile, whose own events never end the wait; by default any lead-*.
+        /// The lead's profile, whose own events never end the wait.
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
+    },
+    /// Run the Board CLI on rider's board, passing every argument on as given.
+    ///
+    /// BOARD_URL is set to rider's board unless it is already set.
+    #[command(disable_help_flag = true)]
+    Vb {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<OsString>,
     },
     /// List, print or install the skills built into rider.
     Skills {
@@ -288,7 +343,7 @@ impl Config {
     }
 
     fn vb_dir(&self) -> PathBuf {
-        self.home.join(VB_DIR)
+        self.home.join(NODE_DIR).join("node_modules/.bin")
     }
 }
 
@@ -387,6 +442,11 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    /// The Board CLI is missing and there is no `npm` to install it with.
+    NoNpm,
+    /// `npm install` of the Board CLI failed or left no `vb`.
+    NotInstalled(String),
+    Queue(QueueError),
     Skills(SkillsError),
     /// `rider skills install` left these skill directories as they were.
     SkillsRefused(usize),
@@ -415,6 +475,12 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::NoNpm => write!(
+                f,
+                "the Board CLI is missing and npm is not on PATH: install Node 22, then retry"
+            ),
+            CliError::NotInstalled(why) => write!(f, "could not install the Board CLI: {why}"),
+            CliError::Queue(error) => write!(f, "{error}"),
             CliError::Skills(error) => write!(f, "{error}"),
             CliError::SkillsRefused(count) => {
                 write!(f, "{count} skills were not installed; see the lines above")
@@ -448,6 +514,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Down { now } => down(config, *now),
         Command::Status => status(config),
         Command::Agents => agents(config),
+        Command::Queue { json } => queue(config, *json),
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
@@ -457,6 +524,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             timeout,
             lead,
         } => wait(config, project, *timeout, lead.as_deref()),
+        Command::Vb { args } => vb(config, args),
         Command::Skills { command } => run_skills(config, command),
     }
 }
@@ -536,6 +604,177 @@ fn say_updates(report: &Report) {
     }
 }
 
+fn vb(config: &Config, args: &[OsString]) -> Result<u8, CliError> {
+    assert!(args.len() <= VB_ARGS_MAX);
+    let vb = install_vb(config)?;
+    assert!(vb.is_absolute() && !config.board_url.is_empty());
+    let error = Process::new(&vb)
+        .args(args)
+        .env("BOARD_URL", &config.board_url)
+        .exec();
+    Err(io_error("run", &vb, &error))
+}
+
+fn install_vb(config: &Config) -> Result<PathBuf, CliError> {
+    let vb = config.vb_dir().join("vb");
+    if vb.is_file() {
+        return Ok(vb);
+    }
+    let prefix = config.home.join(NODE_DIR);
+    assert!(prefix.is_absolute() && vb.starts_with(&prefix));
+    fs::create_dir_all(&prefix).map_err(|error| io_error("create", &prefix, &error))?;
+    let lock_path = config.home.join(INSTALL_LOCK);
+    let lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path);
+    let lock = lock.map_err(|error| io_error("open", &lock_path, &error))?;
+    lock.lock()
+        .map_err(|error| io_error("lock", &lock_path, &error))?;
+    if vb.is_file() {
+        return Ok(vb);
+    }
+    for (name, text) in BOARD_PACKAGE {
+        let path = prefix.join(name);
+        fs::write(&path, text).map_err(|error| io_error("write", &path, &error))?;
+    }
+    eprintln!("rider: installing the Board CLI into {}", prefix.display());
+    let mut npm = Process::new("npm");
+    npm.env_clear()
+        .args(["ci", "--prefix"])
+        .arg(&prefix)
+        .args(NPM_FLAGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for var in NPM_VARS {
+        if let Some(value) = env::var_os(var) {
+            npm.env(var, value);
+        }
+    }
+    let handlers = InstallSignals::register()?;
+    let spawned = CommandWrap::from(npm).wrap(ProcessGroup::leader()).spawn();
+    let child = match spawned {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err(CliError::NoNpm),
+        Err(error) => return Err(io_error("run", Path::new("npm"), &error)),
+        Ok(child) => child,
+    };
+    let (status, shown) = supervise_npm(child, &handlers.stopped)?;
+    drop(handlers);
+    if !status.success() {
+        let text: String = String::from_utf8_lossy(&shown)
+            .chars()
+            .map(|c| {
+                if c.is_control() && !matches!(c, '\n' | '\t') {
+                    '?'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let _ = io::stderr().write_all(text.as_bytes());
+        return Err(CliError::NotInstalled(format!("npm {status}")));
+    }
+    if !vb.is_file() {
+        let why = format!("npm left no {}", vb.display());
+        return Err(CliError::NotInstalled(why));
+    }
+    Ok(vb)
+}
+
+struct InstallSignals {
+    stopped: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl InstallSignals {
+    fn register() -> Result<InstallSignals, CliError> {
+        let handlers = InstallSignals {
+            stopped: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        let signals = Path::new("signals");
+        for signal in INSTALL_SIGNALS {
+            flag::register_conditional_default(signal, Arc::clone(&handlers.done))
+                .and_then(|_| flag::register(signal, Arc::clone(&handlers.stopped)))
+                .map_err(|error| io_error("handle", signals, &error))?;
+        }
+        assert!(!handlers.done.load(Ordering::SeqCst));
+        Ok(handlers)
+    }
+}
+
+impl Drop for InstallSignals {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+fn supervise_npm(
+    mut child: Box<dyn ChildWrapper>,
+    stopped: &AtomicBool,
+) -> Result<(ExitStatus, Vec<u8>), CliError> {
+    let npm = Path::new("npm");
+    let deadline = Instant::now() + Duration::from_secs(INSTALL_SECONDS_MAX);
+    let group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+    let group = group.ok_or_else(|| CliError::NotInstalled("npm has no process id".into()))?;
+    let stderr = child.stderr().take();
+    let (sender, shown) = sync_channel(1);
+    let reader = thread::Builder::new()
+        .name("npm-stderr".into())
+        .spawn(move || {
+            let mut text = Vec::new();
+            let Some(mut stderr) = stderr else {
+                let _ = sender.send(text);
+                return;
+            };
+            let _ = (&mut stderr)
+                .take(INSTALL_OUTPUT_BYTES_MAX)
+                .read_to_end(&mut text);
+            let _ = sender.send(text);
+            let _ = io::copy(&mut stderr, &mut io::sink());
+        });
+    reader.map_err(|error| io_error("read", npm, &error))?;
+    let polls = INSTALL_SECONDS_MAX * 1000 / INSTALL_POLL_MILLIS;
+    let mut ended = Err(CliError::NotInstalled(format!(
+        "npm ran longer than {INSTALL_SECONDS_MAX} s"
+    )));
+    for _ in 0..polls {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                ended = Ok(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ended = Err(io_error("wait for", npm, &error));
+                break;
+            }
+        }
+        if stopped.load(Ordering::SeqCst) {
+            ended = Err(CliError::Interrupted);
+            break;
+        }
+        thread::sleep(Duration::from_millis(INSTALL_POLL_MILLIS));
+    }
+    match kill_process_group(group, Signal::KILL) {
+        // Darwin refuses (EPERM) to signal a group whose only member is the exited leader.
+        Ok(()) | Err(Errno::SRCH | Errno::PERM) => {}
+        Err(error) => return Err(io_error("stop", npm, &error.into())),
+    }
+    if ended.is_err() {
+        child
+            .wait()
+            .map_err(|error| io_error("stop", npm, &error))?;
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    let shown = shown.recv_timeout(left.max(Duration::from_secs(1)));
+    let shown = shown.map_err(|_| CliError::NotInstalled("npm's output did not end".into()))?;
+    assert!(u64::try_from(shown.len()).is_ok_and(|len| len <= INSTALL_OUTPUT_BYTES_MAX));
+    ended.map(|status| (status, shown))
+}
+
 fn reap_leaks(urls: &[String], yes: bool, config: &Config) -> Result<u8, CliError> {
     if urls.len() > REAP_URLS_MAX {
         return Err(CliError::TooManyUrls);
@@ -610,7 +849,7 @@ fn serve(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    let vb = config.vb_dir().join("vb");
+    let vb = install_vb(config)?;
     let mut command = board_serve(&config.home, &vb).map_err(io("create", dir.clone()))?;
     // The board runs in the foreground, so it shares rider's terminal, standard input included.
     let status = command.status().map_err(io("run", vb))?;
@@ -662,6 +901,7 @@ fn up(config: &Config) -> Result<u8, CliError> {
         println!("{}", status_line(&data));
         return Ok(0);
     }
+    install_vb(config)?;
     fs::create_dir_all(&config.home).map_err(|error| CliError::Io {
         action: "create",
         path: config.home.clone(),
@@ -837,18 +1077,105 @@ fn status(config: &Config) -> Result<u8, CliError> {
             .iter()
             .filter(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE) == project);
         for task in in_project {
-            println!(
-                "  #{} {} {} {} {} {}",
-                task["id"],
-                text(&task["state"]),
-                text(&task["role"]),
-                text(&task["profile"]),
-                age(&task["age_ms"]),
-                text(&task["branch"]),
-            );
+            println!("{}", task_row(task));
         }
     }
     Ok(0)
+}
+
+fn task_row(task: &serde_json::Value) -> String {
+    format!(
+        "  #{} {} {} {} {} {}",
+        task["id"],
+        text(&task["state"]),
+        text(&task["role"]),
+        text(&task["profile"]),
+        age(&task["age_ms"]),
+        text(&task["branch"]),
+    )
+}
+
+fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
+    let repos = queue::opted_in(&config.home).map_err(CliError::Queue)?;
+    if repos.is_empty() {
+        let path = config.home.join(STAND_IN_FILE);
+        say(&format!(
+            "no repository is opted in to the queue; add to {}:",
+            path.display()
+        ));
+        say("[repo.\"/path/to/checkout\"]\nqueue = true");
+        return Ok(1);
+    }
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: QUEUE_PROFILE.to_string(),
+    };
+    let listings = thread::scope(|scope| {
+        let reads: Vec<_> = [QUEUE_CHANNEL, DECISIONS]
+            .map(|channel| scope.spawn(|| open_tasks(&board, channel)))
+            .into();
+        let joined = reads.into_iter().map(|read| {
+            let read = read.join();
+            read.unwrap_or_else(|_| Err(BoardError::Io("a board read panicked".into())))
+        });
+        joined.collect::<Result<Vec<_>, BoardError>>()
+    });
+    let mut tasks = Vec::new();
+    for listing in listings.map_err(CliError::Board)? {
+        let total = listing.tasks.len().saturating_add(listing.left_out);
+        if total.saturating_add(tasks.len()) > QUEUE_ITEMS_MAX {
+            return Err(CliError::Queue(QueueError::TooManyItems));
+        }
+        tasks.extend(listing.tasks);
+    }
+    let now = jiff::Timestamp::now().as_millisecond();
+    let now = u64::try_from(now).unwrap_or(0);
+    let view = queue::view(&tasks, now).map_err(CliError::Queue)?;
+    if json {
+        say(&view.json.to_string());
+        return Ok(0);
+    }
+    let mut lines = view.lines;
+    lines.push(String::new());
+    lines.extend(running(config));
+    let mut out = io::stdout().lock();
+    let written = lines.iter().try_for_each(|line| writeln!(out, "{line}"));
+    written
+        .and_then(|()| out.flush())
+        .map_err(|error| io_error("write", Path::new("standard output"), &error))?;
+    Ok(0)
+}
+
+// The open tasks in `channel`; none when the channel does not exist yet.
+fn open_tasks(board: &VbCli, channel: &str) -> Result<Listing, BoardError> {
+    match board.list_labelled(channel, "board.task", &OPEN_STATES) {
+        Err(BoardError::Exit { stderr, .. })
+            if board::parse_failure_reason(&stderr).as_deref() == Some(CHANNEL_NOT_FOUND) =>
+        {
+            Ok(Listing {
+                tasks: Vec::new(),
+                cursor: Cursor(0),
+                left_out: 0,
+            })
+        }
+        listed => listed,
+    }
+}
+
+fn running(config: &Config) -> Vec<String> {
+    let Ok(mut client) = Client::connect(&config.home) else {
+        return vec!["daemon not running".to_string()];
+    };
+    let Ok(data) = client.send("status", &[]) else {
+        return vec!["running work unavailable: the daemon did not answer".to_string()];
+    };
+    let mut lines = vec![format!("running {} of {}", data["running"], data["limit"])];
+    let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
+    let claimed = tasks.iter().filter(|task| task["state"] == "claimed");
+    lines.extend(claimed.map(task_row));
+    assert!(!lines.is_empty());
+    lines
 }
 
 fn agents(config: &Config) -> Result<u8, CliError> {
@@ -942,7 +1269,7 @@ impl Watch<'_> {
             .and_then(|actor| actor.rsplit_once('+'));
         let by_lead = profile.is_some_and(|(_, profile)| match self.lead {
             Some(lead) => profile == lead,
-            None => profile.starts_with(LEAD_PREFIX),
+            None => profile == LEAD_PROFILE || profile.starts_with(LEAD_PREFIX),
         });
         if by_lead {
             return None;

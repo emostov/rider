@@ -890,7 +890,7 @@ impl World {
             Event::Prepared { run, .. } => (*run, "prepared"),
             Event::PrepareBlocked { run, .. } => (*run, "blocked"),
             Event::Judged { run, .. } => (*run, "judged"),
-            Event::ClaimLost(run) => (*run, "lost"),
+            Event::ClaimLost(run) | Event::CloseLost(run) => (*run, "lost"),
             Event::BoardFailed(Call::Settle(run) | Call::Release(run)) => (*run, "failure"),
             _ => return,
         };
@@ -1228,7 +1228,7 @@ impl World {
             return Ok(());
         }
         let Some(index) = self.holds(run, task) else {
-            self.reply(id, Event::ClaimLost(run));
+            self.reply(id, Event::CloseLost(run));
             return Ok(());
         };
         if !self.settled_epochs.insert((task.0, epoch)) {

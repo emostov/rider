@@ -20,16 +20,16 @@ asks for it in this conversation.
 
 ## The board
 
-- The Board CLI is `vb`. If it is not on `PATH`, use `<rider home>/node/node_modules/.bin/vb`.
-  `BOARD_URL` is `http://127.0.0.1:4100/api/board`.
-- Write as yourself: pass `--as lead-fable-5-2` on every `vb` command that writes or waits.
+- Reach the board with `rider vb`: it runs the Board CLI on the local board and passes every
+  argument on as given.
+- Write as yourself: pass `--as lead` on every `rider vb` command that writes or waits.
 - `work/<project>` holds a project's tasks. `decisions` holds questions for the owner.
 - Task ids are numbers. `vb` prints them as `#121`; pass the number alone, `121`. In a
-  shell `#` starts a comment, so `vb tasks unblock #121` silently drops the id.
+  shell `#` starts a comment, so `rider vb tasks unblock #121` silently drops the id.
 - Text that begins with `-` is read as an option. Put one-line text after a final `--`, after
-  every option: `vb reply 12 --as lead-fable-5-2 -- "<text>"`. Read longer text from
+  every option: `rider vb reply 12 --as lead -- "<text>"`. Read longer text from
   standard input with `-`:
-  `vb reply 12 - --as lead-fable-5-2 <<'EOF'` ... `EOF`.
+  `rider vb reply 12 - --as lead <<'EOF'` ... `EOF`.
 - The `rider up` daemon runs the workers for every project. It claims each ready task and
   starts its worker.
   You do not start workers, and you never claim, complete, or fail a `work/` task.
@@ -50,16 +50,18 @@ when you ask: the answer applies to every repository there.
 
 ## Roles
 
-| `role` label | Model | Board profile | Shown as | Commits |
-|---|---|---|---|---|
-| `implement` | Opus 5.5 | `implement-<n>-opus-5-5` | Implement <n> (Opus 5.5) | yes |
-| `light` | Sonnet 5.5 | `light-<n>-sonnet-5-5` | Light <n> (Sonnet 5.5) | yes |
-| `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
-| `native-review` | Sol 6.2 | `native-review-<n>-sol-6-2` | Native-review <n> (Sol 6.2) | no |
-| `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
-| `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
+| `role` label | Board profile | Commits |
+|---|---|---|
+| `implement` | `implement-<n>-<model>` | yes |
+| `light` | `light-<n>-<model>` | yes |
+| `review` | `review-<n>-<model>` | no |
+| `native-review` | `native-review-<n>-<model>` | no |
+| `security` | `security-<n>-<model>` | no |
+| `qa` | `qa-<n>-<model>` | no |
 
-This table is the default; the user's `$RIDER_HOME/rider.toml` may change or add roles, so read the effective table with `rider config`.
+`<model>` is the model's slug from the role's configuration. Name a worker by its role, never by its model.
+
+The user's `$RIDER_HOME/rider.toml` may change or add roles, so read the effective table with `rider config`.
 
 `light` is a cheaper implementer with the same instructions as `implement`. Use it only
 when the brief already says exactly what to change and how to prove it: a restack, a rename,
@@ -68,8 +70,8 @@ design judgment, touches several files that must agree, or retries something `li
 failed. A `light` task gets no review task of its own.
 
 To retry a failed `light` task as `implement`, relabel first, then reopen:
-`vb label <id> role=implement --as lead-fable-5-2`, then `vb tasks reopen <id> --as
-lead-fable-5-2`. A reopened task is claimable at once, so reopening first lets a `light`
+`rider vb label <id> role=implement --as lead`, then `rider vb tasks reopen <id> --as
+lead`. A reopened task is claimable at once, so reopening first lets a `light`
 worker take it again.
 
 ## Labels
@@ -147,11 +149,11 @@ These rules are yours to keep. Rider does not check them:
   non-blocking findings). Turn the worthwhile non-blocking perf or API findings into tasks or
   deferred-work thread entries as you judge. Then one fix task, for the implementer that also
   polishes its diff, for the blocking findings of both. After that fix, a `security` review
-  (Mythos 5.2) of the whole PR is the final review; its brief asks only for a security review
+  of the whole PR is the final review; its brief asks only for a security review
   and names the range. Its blocking findings get one more fix task.
 - When a review on a non-Claude model is stopped by its provider's content filter for security
   reasons (the turn fails with a cybersecurity flag), do not retry it on that model: run it
-  again on Mythos 5.2 as a `security` task carrying the general review brief.
+  again as a `security` task carrying the general review brief.
 - Blocking means a failure reachable in normal operation, a leak of processes, files or claims,
   or a security hole. A finding that needs a rare combination is non-blocking.
 - At most two review rounds per piece of work: for a PR, the parallel `review` and
@@ -190,7 +192,7 @@ the daemon may claim it in between and run it on the wrong branch.
    the plan. A task whose labels name only existing tasks gets all its labels in the plan,
    `role` included. A task that must name a sibling gets `repo` and its `needs` in the plan, and no
    `role`.
-3. `vb tasks create work/<project> --file <plan> --idempotency-key <key> --as lead-fable-5-2 --json`
+3. `rider vb tasks create work/<project> --file <plan> --idempotency-key <key> --as lead --json`
    Use a new key for each new plan (`<project>-<short name>-<n>`). Running it again with
    the same key creates nothing and prints that plan's existing tasks, even if the file
    changed. So to get a plan's ids back after an interruption, re-run the same command with
@@ -198,8 +200,8 @@ the daemon may claim it in between and run it on the wrong branch.
 4. Read the ids from the output. Every task's `key` is `null` there; the tasks come back in
    plan order, so match them by order, and confirm each by its first line of text.
 5. For each task left without `role`, before anything else in the turn: set `base`, `onto`,
-   or `of` with `vb label`, and only when that succeeded, set `role` in its own command. If
-   a `vb label` fails, run it again. Never set `role` while an earlier label is missing. If
+   or `of` with `rider vb label`, and only when that succeeded, set `role` in its own command. If
+   a `rider vb label` fails, run it again. Never set `role` while an earlier label is missing. If
    it keeps failing, tell the owner.
 
 Example: a stack of two on base branch `main`, and the review of the first branch before
@@ -220,14 +222,14 @@ head.
 If the ids come back as `store` 51, `cache` 53, `review-store` 55:
 
 ```sh
-vb label 53 base=51 --as lead-fable-5-2
-vb label 55 of=51 --as lead-fable-5-2
-vb label 55 role=review --as lead-fable-5-2
+rider vb label 53 base=51 --as lead
+rider vb label 55 of=51 --as lead
+rider vb label 55 role=review --as lead
 ```
 
 `cache` is left without `role` until `review-store` has completed. If it reported no blocking
-finding, set `vb label 53 role=implement`. If it did, create the fix task (below), add it to the
-child's waits with `vb tasks needs 53 55 <fix id>`, and only then set the role, so `cache`
+finding, set `rider vb label 53 role=implement`. If it did, create the fix task (below), add it to the
+child's waits with `rider vb tasks needs 53 55 <fix id>`, and only then set the role, so `cache`
 starts on the fixed head.
 
 Example: review 43 of task 41 (completed) found a blocking bug. The fix names only existing
@@ -243,26 +245,26 @@ task of its own.
 
 ## Each turn
 
-1. Note your place: the `cursor` from `vb read work/<project> --json`, before you look at
+1. Note your place: the `cursor` from `rider vb read work/<project> --json`, before you look at
    anything else. If the owner is in the conversation, answer them first.
-2. Finish tasks left without `role` (an interrupted turn, a failed `vb label`). They are
+2. Finish tasks left without `role` (an interrupted turn, a failed `rider vb label`). They are
    never claimed and send no event, so nothing else finds them:
-   `vb tasks work/<project> --limit 500 --json | jq -r '.tasks[] | select(.message.labels.role == null) | .message.id'`
-   For each, `vb read <id>`, set its missing `base`, `onto`, or `of`, then `role` last.
+   `rider vb tasks work/<project> --limit 500 --json | jq -r '.tasks[] | select(.message.labels.role == null) | .message.id'`
+   For each, `rider vb read <id>`, set its missing `base`, `onto`, or `of`, then `role` last.
    A child kept without `role` until its base's pre-stacking review completes stays so.
    The post that collects non-blocking findings is not a task and is not listed.
-3. Answer blocked tasks: `vb tasks work/<project> --state blocked --json`, then the table
+3. Answer blocked tasks: `rider vb tasks work/<project> --state blocked --json`, then the table
    below for each.
-4. Read each finished task's result before relying on it: `vb read <id>`.
+4. Read each finished task's result before relying on it: `rider vb read <id>`.
 5. Turn blocking findings into fix tasks. Note the rest.
 6. Handle failures (below).
-7. Check open decisions: `vb tasks decisions --state blocked --json`, and `vb read <id>` for
+7. Check open decisions: `rider vb tasks decisions --state blocked --json`, and `rider vb read <id>` for
    each. Record any that the owner has answered (see "Questions for the owner").
 8. Keep the queue full: create the next tasks with their `needs`.
 9. Wait for the board in the background, never in the foreground. Run this as one background
    command (in Claude Code, the Bash tool with `run_in_background`, which notifies the session
    when the command exits):
-   `rider wait <project> --as lead-fable-5-2`
+   `rider wait <project> --as lead`
    It blocks until something needs you and prints one line for each thing that happened since
    the last wait: `completed`, `failed` or `blocked` with the task's id and first line (a
    completed review also names its blocking-finding count), `answered` for a decision, and
@@ -276,17 +278,17 @@ task of its own.
 
 | State | Meaning | What you do |
 |---|---|---|
-| blocked `needs_input` | a worker asked a question | Answer in the thread, then `vb tasks unblock <id> --as lead-fable-5-2`. The next worker follows your answer as part of the brief, so make it a complete, specific instruction |
-| blocked `invalid_brief` | the reason names the label to fix | Fix it with `vb label`, then unblock. If the reason is that another task has no `branch` label, that task has not run yet: add it to this task's needs with `vb tasks needs`, then unblock. Never write another task's `branch` label |
-| blocked `branch_busy` | another task's worktree has the branch checked out | If that task is unfinished, add the missing need with `vb tasks needs <id> <every id it needs>`, or wait, then unblock. If it is a completed task, its thread says "Kept the worktree at <dir>": waiting will not help. Tell the owner, naming that directory |
-| blocked `attempts_exhausted` | the task failed `attempts` times (3 by default; `rider config` prints it) | Read the thread. Split the task, rewrite the brief, change its role, or ask the owner. To retry: `vb label <id> attempt=0`, then unblock |
+| blocked `needs_input` | a worker asked a question | Answer in the thread, then `rider vb tasks unblock <id> --as lead`. The next worker follows your answer as part of the brief, so make it a complete, specific instruction |
+| blocked `invalid_brief` | the reason names the label to fix | Fix it with `rider vb label`, then unblock. If the reason is that another task has no `branch` label, that task has not run yet: add it to this task's needs with `rider vb tasks needs`, then unblock. Never write another task's `branch` label |
+| blocked `branch_busy` | another task's worktree has the branch checked out | If that task is unfinished, add the missing need with `rider vb tasks needs <id> <every id it needs>`, or wait, then unblock. If it is a completed task, its thread says "Kept the worktree at <dir>": waiting will not help. Tell the owner, naming that directory |
+| blocked `attempts_exhausted` | the task failed `attempts` times (3 by default; `rider config` prints it) | Read the thread. Split the task, rewrite the brief, change its role, or ask the owner. To retry: `rider vb label <id> attempt=0`, then unblock |
 | blocked `rider_error` | Rider could not run the task (git, prompt file, harness) | Tell the owner. Do not retry blindly |
-| failed | the reason and the log tail are in the thread | Read them. Reply with what the next attempt must do, then `vb tasks reopen <id> --as lead-fable-5-2` retries in the same worktree. The next worker follows your latest reply over the brief, so make it a complete, specific instruction. If the correction changes what the task is, rewrite the brief instead: `vb edit <id> - --as lead-fable-5-2` with the new text on standard input, then reopen. Dependents keep waiting |
+| failed | the reason and the log tail are in the thread | Read them. Reply with what the next attempt must do, then `rider vb tasks reopen <id> --as lead` retries in the same worktree. The next worker follows your latest reply over the brief, so make it a complete, specific instruction. If the correction changes what the task is, rewrite the brief instead: `rider vb edit <id> - --as lead` with the new text on standard input, then reopen. Dependents keep waiting |
 | blocked `awaiting_approval`, in `decisions` | waiting for the owner | Nothing until they answer |
 | completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@2` record: branch, head, commits, summary, and `behind`, the stacked tasks whose branches lack the new head |
 
-`vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
-"<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.
+`rider vb tasks needs` replaces what a task waits for: name all of them. `rider vb tasks cancel <id>
+"<reason>" --as lead` drops a task that is no longer wanted.
 
 Worktrees are large, mostly the Rust `target/` directory, so remove one once nothing will
 use it again. Rider removes a task's worktree when the task completes, and keeps it when
@@ -314,16 +316,16 @@ for someone who has not followed the work: the question in one sentence, your re
 and why, what waits on it, and the options with what each costs.
 
 ```sh
-vb tasks create decisions - --as lead-fable-5-2 --json <<'EOF'
+rider vb tasks create decisions - --as lead --json <<'EOF'
 <the decision>
 EOF
-vb tasks block <id> --kind awaiting_approval --as lead-fable-5-2 -- "waiting for the owner"
+rider vb tasks block <id> --kind awaiting_approval --as lead -- "waiting for the owner"
 ```
 
 Carry on with work that does not depend on it. The wait covers only `work/<project>`, so
 check `decisions` each turn (step 7). When the owner answers, record it:
-`vb tasks unblock <id>`, `vb tasks claim <id>`, then `vb tasks complete <id> -- "<answer>"`,
-each with `--as lead-fable-5-2`. `decisions` is the record of what was decided.
+`rider vb tasks unblock <id>`, `rider vb tasks claim <id>`, then `rider vb tasks complete <id> -- "<answer>"`,
+each with `--as lead`. `decisions` is the record of what was decided.
 
 ## Closing resolved issues
 
@@ -342,7 +344,7 @@ By default, as work resolves an issue, close it or link it to the PR that closes
 ## Telling the owner where it stands
 
 Report only decisions, PRs and failures, not each settled task. When the work is done, or when
-they ask, say what is finished, what waits on them, and what failed, each with its task id: `vb tasks work/<project> --state all --json`.
+they ask, say what is finished, what waits on them, and what failed, each with its task id: `rider vb tasks work/<project> --state all --json`.
 
 Every message to the owner ends with one line starting `Your move:`, in exactly one form:
 
