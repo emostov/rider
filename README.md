@@ -21,13 +21,20 @@ channel while the rest of the work goes on.
 **The swarm** is the `rider up` daemon. It runs agents in roles you configure in
 `<rider home>/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
 at once. `rider config` prints the settings in effect: the built-in roles and limits with the
-file's over them. Rider spawns agents through `claude` (Claude Code) or `codex` (Codex CLI),
-chosen per role with `harness` in `rider.toml`; each must be installed and signed in
+file's over them. Rider spawns agents through `claude` (Claude Code), `codex` (Codex CLI, `codex exec`), or
+`codex-review` (Codex's built-in reviewer, `codex review`, which reads code and runs no event
+stream), chosen per role with `harness` in `rider.toml`; each must be installed and signed in
 for the roles that use it. A role may list `skills = ["<name>", ...]`; its
 worker runs each one, in order, over the task's whole PR range and fixes what it reports
 before completing. A `[repo."<absolute path>".roles.<role>]` table sets only that role's
 `skills`, for that repository's tasks only, and `rider config --repo <path>` prints the table
 they see.
+
+The built-in roles' prompts, and the slop rules the implement prompt carries, are built into
+`rider`, so they always match the installed binary; a role's `prompt` may instead name a file
+of your own. When the daemon starts, it registers Rider's board schemas (`rider-result@2`,
+`rider-finding@1`) on any board that lacks them. A `prompts/` directory an older Rider wrote
+under `<rider home>` is no longer read and can be deleted.
 
 ## Getting started
 
@@ -36,18 +43,18 @@ Paste this into your coding agent:
 ```
 Install Rider: clone https://github.com/emostov/rider if you don't have it yet, then run
 `cargo install --locked --path <that clone>`, which installs the `rider` binary. Then run
-`npx skills add emostov/rider --skill ride-swarm --skill ship-swarm --skill review-queue -g`.
+`rider skills install --into <your agent's skills directory>`, such as `~/.claude/skills`
+for Claude Code or `~/.codex/skills` for Codex.
 ```
+
+The skills are built into `rider`, so they match the binary. Rider records each directory it
+installed into and updates the skills there when a newer `rider up`, `rider daemon` or
+`rider skills install` runs; a skill edited by hand is left as it is and named. `rider skills
+list` and `rider skills show <name>` print the built-in skills.
 
 Then say "ride a swarm to <goal>" in a new session. The first time `ship-swarm` opens a
 pull request, it asks how you like its loops to run (a review packet first, comments, CI,
 review threads) and saves the answers in `<rider home>/ship.toml`.
-
-The `review-queue` skill keeps one ordered list of the pull requests that wait on you: those
-that request your review by name, and your own where someone else spoke last. A repository
-opts in with `queue = true`; `rider queue` prints the list and tells you how to opt in when
-nothing has. Agents merge each PR into current main, review it, and hand you a card with a
-verdict and one next action. Nothing is posted on GitHub until you name the item.
 
 ## Quickstart
 

@@ -68,6 +68,43 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   Rider reads a failed run whose log has no `thread.started` as a refused resume and starts
   fresh in the same attempt. Fixture: `codex-resume-refused.log` (the stderr; stdout was empty).
 
+## Codex review
+
+```
+codex review -c model="gpt-6.2-sol" -c sandbox_mode="danger-full-access" -c approval_policy="never" - < <prompt>
+```
+
+- codex-cli 0.170.0. `codex review` refuses a `[PROMPT]` together with `--base`, `--commit` or
+  `--uncommitted` (exit 2, "the argument '--base <BRANCH>' cannot be used with '[PROMPT]'"), so
+  the brief names the range itself (`git diff <base>...HEAD`). `-` reads the prompt from stdin.
+- It has no `--model`, `--json` or bypass flag: the model and the sandbox and approval settings
+  go in `-c`. The review itself runs in a subagent that takes the top-level config key
+  `review_model` when one is set (in `~/.codex/config.toml` or `-c`) and `model` otherwise, so
+  Rider passes both `-c model="<m>"` and `-c review_model="<m>"`. `review_model` is a known
+  top-level key in 0.170.0: `--strict-config -c review_model="..."` is accepted.
+- When the review delegate fails to start, Codex (per its 0.170.0 source and binary) prints `Review was interrupted. Please re-run
+  /review and wait for it to complete.` as the final text and still exits 0; Rider fails such a
+  run, and one with no final text. A fatal turn error (such as a provider's content-filter
+  stop) is printed only on stderr, and the exit is non-zero; Rider's failure reply tails the
+  stderr transcript, then the final text. Without `danger-full-access` its sandbox blocks the network, so `vb` cannot post.
+- Exit code on success: 0. stdout holds only the final text, a short verdict then
+  `[P1]`/`[P2]` items with absolute `file:line` paths. Fixture: `codex-review.txt` (scratch
+  path replaced with `/tmp/repo`).
+- stderr is the transcript: a header (`OpenAI Codex v0.170.0`, workdir, model, provider,
+  approval, sandbox, reasoning effort, `session id: <uuid>`), the prompt after `user`,
+  config warnings, `exec` blocks with each command and its output, and at the end a line
+  `codex` followed by the final text again. No token counts are printed. Rider logs stdout as
+  the agent log and stderr beside it as `<log>.stderr`. The stderr transcript is not
+  committed: it held instruction text from installed skills.
+- Token usage is only in the session files under `~/.codex/sessions/<yyyy>/<mm>/<dd>/`: the
+  parent rollout (its first line's `payload.source` is `"exec"`, id = the printed session id)
+  has no `token_count` event; a second rollout with `payload.source == {"subagent":"review"}`
+  carries `event_msg` `token_count` events whose last `payload.info.total_token_usage` is the
+  total (recorded run: 106,127 input, 82,700 cached, 1,325 output tokens, 34 s).
+- Posting: with a prompt that tells it to, it ran `vb post "$BOARD_TASK" --schema
+  rider-finding@1 -` itself on a scratch `vb serve` board and the record was accepted, so a
+  worker on this harness posts findings and its result with `vb` as a `codex exec` review does.
+
 ## tact
 
 Rider no longer supports tact; its observations and fixture were removed.

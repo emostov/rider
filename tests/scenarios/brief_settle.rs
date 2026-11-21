@@ -310,7 +310,7 @@ fn a_role_removed_or_changed_after_the_claim_is_blocked_naming_every_role() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let roles = "one of implement, light, review, security or qa.";
+    let roles = "one of implement, light, review, native-review, security or qa.";
     let long = "x".repeat(128);
     let cut = format!("{}…", "x".repeat(80));
     let cases = [

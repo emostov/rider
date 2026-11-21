@@ -55,6 +55,7 @@ when you ask: the answer applies to every repository there.
 | `implement` | Opus 5.5 | `implement-<n>-opus-5-5` | Implement <n> (Opus 5.5) | yes |
 | `light` | Sonnet 5.5 | `light-<n>-sonnet-5-5` | Light <n> (Sonnet 5.5) | yes |
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
+| `native-review` | Sol 6.2 | `native-review-<n>-sol-6-2` | Native-review <n> (Sol 6.2) | no |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
 | `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
@@ -135,16 +136,27 @@ These rules are yours to keep. Rider does not check them:
   task, not several.
 - Proof: a brief's proof names targeted tests (`cargo test --test scenarios <name>`,
   `cargo test --test sim`), not the full suite; CI runs the full suite.
-- Review policy: one review per PR. A PR of one task gets only its holistic `review` of the
-  whole diff (`git diff <base branch>...HEAD`, so earlier fixes are included). Only a PR of
-  several `implement` tasks (design judgment) gives each its own `review` task with `of` set
-  to it and three or four specific things to attack; its holistic review then reads the diff
-  only. A `light` task, a fix task for a finding, and a mechanical change get no review task of
-  their own: you read the diff. Say what to attack. A task's review finds its range from the
-  reviewed task's `start` label.
+- Review policy: reviews happen only at the end of each pull request, plus one review of a
+  branch before other work is built on top of it. No task gets a review of its own while the
+  work is going on; the PR's holistic review covers every task and fix on the branch, and you
+  read each diff. A review's brief names the range itself, `git diff <base branch>...HEAD`,
+  and says what to attack. The end-of-PR flow: two holistic reviews of the whole diff, run in
+  parallel, both `of=<the PR's top task>`: a `review` (`codex exec`: correctness and
+  coverage; runs the tests and mutation-tests coverage) and a `native-review` (`codex
+  review`: reads the diff; correctness plus simpler APIs and faster code, reported as
+  non-blocking findings). Turn the worthwhile non-blocking perf or API findings into tasks or
+  deferred-work thread entries as you judge. Then one fix task, for the implementer that also
+  polishes its diff, for the blocking findings of both. After that fix, a `security` review
+  (Mythos 5.2) of the whole PR is the final review; its brief asks only for a security review
+  and names the range. Its blocking findings get one more fix task.
+- When a review on a non-Claude model is stopped by its provider's content filter for security
+  reasons (the turn fails with a cybersecurity flag), do not retry it on that model: run it
+  again on Mythos 5.2 as a `security` task carrying the general review brief.
 - Blocking means a failure reachable in normal operation, a leak of processes, files or claims,
   or a security hole. A finding that needs a rare combination is non-blocking.
-- At most two review rounds per piece of work. After the second review, either accept the piece
+- At most two review rounds per piece of work: for a PR, the parallel `review` and
+  `native-review` pair is the first round and the final `security` review the second. After the second
+  review, either accept the piece
   and record the remaining findings in the project's deferred-work thread, or change the approach.
   Never start a third fix-and-review round on the same piece unchanged.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the
@@ -153,14 +165,14 @@ These rules are yours to keep. Rider does not check them:
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.
 - There are no polish tasks: the implementer polishes its own diff against AGENTS.md.
-- `security` is one task per stack, and for any task you judge sensitive: `of=<the top
-  task>`, `needs` every unfinished task on the stack. Name the range in the brief, such as
+- `security` is the final review of every PR, one task per stack: `of=<the top task>`,
+  `needs` every unfinished task on the stack, including the fix of the first round. Name the range in the brief, such as
   `main..HEAD`.
 - Merge each PR to main as soon as it is green and reviewed, and cut the next work from main.
   Never stack more than two PRs.
-- `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI. It
-  runs after the task's review: `of=<the task under test>`, and `needs` that task and its
-  review. Its brief names the flows to exercise and the unhappy paths that matter. It builds
+- `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI.
+  `of=<the task under test>`, and `needs` that task, plus the review of its branch when the
+  branch was reviewed before stacking; otherwise only the task. Its brief names the flows to exercise and the unhappy paths that matter. It builds
   the work and uses it from the outside, and reports `rider-finding@1` records like a review.
 - A completed task is a claim, not proof. Its review, or its proof command, is the check.
 
@@ -190,14 +202,16 @@ the daemon may claim it in between and run it on the wrong branch.
    a `vb label` fails, run it again. Never set `role` while an earlier label is missing. If
    it keeps failing, tell the owner.
 
-Example: a stack of two on base branch `main`, and a review of the first.
+Example: a stack of two on base branch `main`, and the review of the first branch before
+the second is built on it. The child needs that review, so it never starts on an unreviewed
+head.
 
 ```json
 [
   {"key": "store", "text": "Extract the session store ...",
    "labels": {"role": "implement", "repo": "/abs/repo", "from": "main"}},
   {"key": "cache", "text": "Cache session lookups ...",
-   "labels": {"repo": "/abs/repo"}, "needs": [{"key": "store"}]},
+   "labels": {"repo": "/abs/repo"}, "needs": [{"key": "store"}, {"key": "review-store"}]},
   {"key": "review-store", "text": "Review the session store: attack ...",
    "labels": {"repo": "/abs/repo", "from": "main"}, "needs": [{"key": "store"}]}
 ]
@@ -207,10 +221,14 @@ If the ids come back as `store` 51, `cache` 53, `review-store` 55:
 
 ```sh
 vb label 53 base=51 --as lead-fable-5-2
-vb label 53 role=implement --as lead-fable-5-2
 vb label 55 of=51 --as lead-fable-5-2
 vb label 55 role=review --as lead-fable-5-2
 ```
+
+`cache` is left without `role` until `review-store` has completed. If it reported no blocking
+finding, set `vb label 53 role=implement`. If it did, create the fix task (below), add it to the
+child's waits with `vb tasks needs 53 55 <fix id>`, and only then set the role, so `cache`
+starts on the fixed head.
 
 Example: review 43 of task 41 (completed) found a blocking bug. The fix names only existing
 tasks, so it is complete in the plan; it has `onto`, so it needs no `from`. It gets no review
@@ -231,6 +249,7 @@ task of its own.
    never claimed and send no event, so nothing else finds them:
    `vb tasks work/<project> --limit 500 --json | jq -r '.tasks[] | select(.message.labels.role == null) | .message.id'`
    For each, `vb read <id>`, set its missing `base`, `onto`, or `of`, then `role` last.
+   A child kept without `role` until its base's pre-stacking review completes stays so.
    The post that collects non-blocking findings is not a task and is not listed.
 3. Answer blocked tasks: `vb tasks work/<project> --state blocked --json`, then the table
    below for each.
