@@ -22,6 +22,7 @@ pub const FAIL_EXIT_CODE: i32 = 3;
 pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
+pub const PR_REF: &str = "refs/rider/pr/412";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +118,7 @@ pub enum Behaviour {
     /// Prints the first of `STREAM_MESSAGES` as a Claude message, then `STDERR_ERROR` on
     /// standard error, and exits `FAIL_EXIT_CODE`.
     StreamThenStderr,
+    MergePr,
 }
 
 /// What a `StreamThenStderr` agent prints on standard error before it exits.
@@ -188,6 +190,7 @@ impl Behaviour {
             Behaviour::StreamError => "stream-error",
             Behaviour::StreamForged => "stream-forged",
             Behaviour::StreamThenStderr => "stream-then-stderr",
+            Behaviour::MergePr => "merge-pr",
         }
     }
 }
@@ -386,6 +389,7 @@ case "$behaviour" in
     echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said0}"}}]}}}}'
     echo "{stderr_error}" >&2
     exit {fail} ;;
+  merge-pr) git merge -q --no-edit {PR_REF} || exit 1 ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'

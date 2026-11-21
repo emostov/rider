@@ -60,6 +60,7 @@ pub struct Settings {
 #[derive(Debug)]
 pub struct RepoSettings {
     pub roles: RepoRoles,
+    pub queue: bool,
     pub toml: String,
 }
 
@@ -127,6 +128,12 @@ struct FileShape {
 struct RepoShape {
     #[serde(default)]
     roles: BTreeMap<String, BTreeMap<String, toml::Value>>,
+    queue: Option<toml::Value>,
+}
+
+#[derive(Serialize)]
+struct QueueShape {
+    queue: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -327,12 +334,25 @@ fn repo_settings(
             role.skills = Some(skills);
             specs.push(role_spec(path, home, &prefix, &label, role, limits.agents)?);
         }
-        let toml = render(path, limits, &merged)?;
+        let mut toml = render(path, limits, &merged)?;
+        let queue = match repo.queue {
+            None => false,
+            Some(toml::Value::Boolean(true)) => true,
+            Some(_) => {
+                let problem = "must be true, or left out".to_string();
+                return Err(field_error(path, format!("{prefix}queue"), problem));
+            }
+        };
+        if queue {
+            let section = BTreeMap::from([("repo", BTreeMap::from([(key, QueueShape { queue })]))]);
+            toml.push('\n');
+            toml.push_str(&to_toml(path, &section)?);
+        }
         let roles = RepoRoles {
             repo: canonical,
             roles: specs,
         };
-        out.push(RepoSettings { roles, toml });
+        out.push(RepoSettings { roles, queue, toml });
     }
     assert!(out.len() <= REPOS_MAX);
     Ok(out)

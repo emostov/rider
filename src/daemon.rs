@@ -91,6 +91,7 @@ const BOARD_POLLS_MAX: u64 = u64::MAX;
 /// How long a board the daemon started is given to end after SIGTERM before SIGKILL.
 const BOARD_STOP_MILLIS_MAX: u64 = 10_000;
 const AGENTS_DIR: &str = "agents";
+const LEFT_EXTENSION: &str = "left";
 /// The directory under the Rider home holding each task's attempt logs.
 pub const LOGS_DIR: &str = "logs";
 const LOCK_BYTES_MAX: u64 = 256;
@@ -1289,7 +1290,7 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
         Ok(()) => Event::Settled(run),
         Err(RunError::Board(error)) if call_failed(&error) => Event::BoardFailed(Call::Settle(run)),
         Err(RunError::Board(BoardError::ClaimLost { .. }) | RunError::LostClaim(_)) => {
-            Event::ClaimLost(run)
+            Event::CloseLost(run)
         }
         Err(RunError::Board(_)) => Event::BoardFailed(Call::Settle(run)),
     };
@@ -1409,7 +1410,7 @@ impl Board for Guarded<'_> {
 fn release(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     let event = match shared.board(profile).release(task) {
         Ok(()) => Event::Settled(run),
-        Err(BoardError::ClaimLost { .. }) => Event::ClaimLost(run),
+        Err(BoardError::ClaimLost { .. }) => Event::CloseLost(run),
         Err(_) => Event::BoardFailed(Call::Release(run)),
     };
     Input::plain(event)
@@ -1774,7 +1775,8 @@ fn read_pid_files(home: &Path) -> Result<Vec<PidFile>, String> {
             return Err(format!("more than {AGENT_FILES_MAX} files"));
         }
         let path = entry.map_err(|error| error.to_string())?.path();
-        if path.extension().is_none_or(|extension| extension != "pid") {
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if !matches!(extension, Some("pid" | LEFT_EXTENSION)) {
             continue;
         }
         let stem = path.file_stem().and_then(|stem| stem.to_str());
@@ -1782,8 +1784,10 @@ fn read_pid_files(home: &Path) -> Result<Vec<PidFile>, String> {
             return Err(format!("{} names no task", path.display()));
         };
         let group = agent_group(&path).map(|group| group.as_raw_nonzero().get());
-        let ack =
-            read_ack(&ack_file(&path)).map(|(group, start)| AgentRecord { task, group, start });
+        let acked = (extension == Some("pid")).then(|| read_ack(&ack_file(&path)));
+        let ack = acked
+            .flatten()
+            .map(|(group, start)| AgentRecord { task, group, start });
         files.push(PidFile { task, group, ack });
     }
     assert!(files.len() <= AGENT_FILES_MAX);
@@ -1855,13 +1859,15 @@ fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
             }
         }
     }
-    clear_agents(home, log);
+    clear_agents(home, &recovery.unaccounted, log);
     assert!(groups.len() <= LEFTOVERS_MAX);
     recovery.unaccounted
 }
 
-// Removes the agents file and every pid and ack file, which name no agent of this daemon.
-fn clear_agents(home: &Path, log: &Log) {
+// Removes the agents file and every pid, left and ack file, which name no agent of this daemon,
+// but keeps the pid file of an unaccounted task as its left file, apart from the pid file a new
+// attempt writes, which the next start reads while that agent may live.
+fn clear_agents(home: &Path, unaccounted: &Unaccounted, log: &Log) {
     let agents = home.join(AGENTS_FILE);
     if let Err(error) = fs::remove_file(&agents)
         && error.kind() != io::ErrorKind::NotFound
@@ -1873,11 +1879,22 @@ fn clear_agents(home: &Path, log: &Log) {
     };
     for entry in entries.take(AGENT_FILES_MAX).flatten() {
         let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "pid" || extension == "ack")
-        {
-            let _ = fs::remove_file(&path);
+        let task = path
+            .file_stem()
+            .and_then(|stem| stem.to_str()?.parse::<u64>().ok());
+        let kept = match unaccounted {
+            Unaccounted::Every => true,
+            Unaccounted::Tasks(tasks) => task.is_some_and(|task| tasks.contains(&TaskId(task))),
+        };
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        let removed = match extension {
+            Some("ack") => fs::remove_file(&path),
+            Some("pid" | LEFT_EXTENSION) if !kept => fs::remove_file(&path),
+            Some("pid") if task.is_some() => fs::rename(&path, path.with_extension(LEFT_EXTENSION)),
+            _ => Ok(()),
+        };
+        if let Err(error) = removed {
+            log.write(&format!("could not clear {}: {error}", path.display()));
         }
     }
 }
