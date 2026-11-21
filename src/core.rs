@@ -2001,7 +2001,7 @@ pub struct PidFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unaccounted {
     Tasks(Vec<TaskId>),
-    /// Neither the agents file nor the pid files could be read.
+    /// The pid files could not be read.
     Every,
 }
 
@@ -2035,8 +2035,7 @@ pub fn recover(
         }
     }
     let unaccounted = match pid_files {
-        None if records.is_none() => Unaccounted::Every,
-        None => Unaccounted::Tasks(Vec::new()),
+        None => Unaccounted::Every,
         Some(files) => {
             let mut tasks: Vec<TaskId> = Vec::new();
             for file in files {

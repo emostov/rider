@@ -2529,6 +2529,11 @@ fn a_second_restart_within_the_lease_leaves_an_unidentified_live_agent_s_task_al
 
     given_a_running_daemon(&mut world);
     when_the_daemon_log_shows(&world, &left);
+    let pid_file = world.home.join("agents").join(format!("{task}.pid"));
+    assert!(
+        !pid_file.exists(),
+        "a new attempt's pid file names the leftover agent"
+    );
     when_the_daemon_crashes(&mut world);
     given_a_running_daemon(&mut world);
     when_the_daemon_log_shows_twice(&world, &left);
@@ -2543,7 +2548,37 @@ fn a_second_restart_within_the_lease_leaves_an_unidentified_live_agent_s_task_al
     assert!(when_the_process_ends_within(leftover.pid, 10));
 }
 
-/// Waits until the daemon's log contains `text` at least twice.
+#[test]
+fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_be_read() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::Commit]);
+    given_a_running_daemon(&mut world);
+    let leftover = when_the_agent_has_started(&world, &task);
+    when_agents_json_names(&world, leftover.pid);
+    when_the_daemon_crashes(&mut world);
+    fs::write(world.home.join("agents.json"), "{").expect("corrupt agents.json");
+    fs::write(world.home.join("agents").join("bad.pid"), "1").expect("add a bad pid file");
+    let left = "leaving every held claim to its lease";
+
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows(&world, left);
+    when_the_daemon_crashes(&mut world);
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows_twice(&world, left);
+    thread::sleep(Duration::from_secs(RESUME_SECONDS));
+
+    let runs = agent_runs_for(&world, &task);
+    assert!(is_alive(leftover.pid), "the leftover agent was stopped");
+    world.release_agent(&task);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(runs.len(), 1, "{}", world.daemon_log());
+    assert!(when_the_process_ends_within(leftover.pid, 10));
+}
+
 fn when_the_daemon_log_shows_twice(world: &World, text: &str) {
     let log = world.home.join("daemon.log");
     let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
