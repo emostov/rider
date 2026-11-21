@@ -56,7 +56,6 @@ when you ask: the answer applies to every repository there.
 | `light` | Sonnet 5.5 | `light-<n>-sonnet-5-5` | Light <n> (Sonnet 5.5) | yes |
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
 | `native-review` | Sol 6.2 | `native-review-<n>-sol-6-2` | Native-review <n> (Sol 6.2) | no |
-| `final-review` | Mythos 5.2 | `final-review-<n>-mythos-5-2` | Final-review <n> (Mythos 5.2) | no |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
 | `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
@@ -142,20 +141,21 @@ These rules are yours to keep. Rider does not check them:
   work is going on; the PR's holistic review covers every task and fix on the branch, and you
   read each diff. A review's brief names the range itself, `git diff <base branch>...HEAD`,
   and says what to attack. The end-of-PR flow: two holistic reviews of the whole diff, run in
-  parallel, both `of=<the PR's top task>`: a `review` (`codex exec`: correctness and coverage; runs the tests and
-  mutation-tests coverage) and a `native-review` (`codex review`: reads the diff; correctness
-  plus simpler APIs and faster code, reported as non-blocking findings). Turn the worthwhile
-  non-blocking perf or API findings into tasks or deferred-work thread entries as you judge. Then one fix
-  task for the blocking findings of both. After that fix, a `final-review` (Mythos 5.2, may run
-  tests) of the whole PR is the backstop; it is a general review, not security-only, and its
-  blocking findings get one more fix task. `security` stays for sensitive branches.
+  parallel, both `of=<the PR's top task>`: a `review` (`codex exec`: correctness and
+  coverage; runs the tests and mutation-tests coverage) and a `native-review` (`codex
+  review`: reads the diff; correctness plus simpler APIs and faster code, reported as
+  non-blocking findings). Turn the worthwhile non-blocking perf or API findings into tasks or
+  deferred-work thread entries as you judge. Then one fix task, for the implementer that also
+  polishes its diff, for the blocking findings of both. After that fix, a `security` review
+  (Mythos 5.2) of the whole PR is the final review; its brief asks only for a security review
+  and names the range. Its blocking findings get one more fix task.
 - When a review on a non-Claude model is stopped by its provider's content filter for security
-  reasons (the turn fails with a cybersecurity flag), do not retry it on that model: run that
-  review again on Mythos 5.2 as a `final-review`.
+  reasons (the turn fails with a cybersecurity flag), do not retry it on that model: run it
+  again on Mythos 5.2 as a `security` task carrying the general review brief.
 - Blocking means a failure reachable in normal operation, a leak of processes, files or claims,
   or a security hole. A finding that needs a rare combination is non-blocking.
 - At most two review rounds per piece of work: for a PR, the parallel `review` and
-  `native-review` pair is the first round and the `final-review` the second. After the second
+  `native-review` pair is the first round and the final `security` review the second. After the second
   review, either accept the piece
   and record the remaining findings in the project's deferred-work thread, or change the approach.
   Never start a third fix-and-review round on the same piece unchanged.
@@ -165,8 +165,8 @@ These rules are yours to keep. Rider does not check them:
   Collect non-blocking findings as replies in one thread per project, a post in
   `work/<project>` you start once.
 - There are no polish tasks: the implementer polishes its own diff against AGENTS.md.
-- `security` is one task per stack, and for any task you judge sensitive: `of=<the top
-  task>`, `needs` every unfinished task on the stack. Name the range in the brief, such as
+- `security` is the final review of every PR, one task per stack: `of=<the top task>`,
+  `needs` every unfinished task on the stack, including the fix of the first round. Name the range in the brief, such as
   `main..HEAD`.
 - Merge each PR to main as soon as it is green and reviewed, and cut the next work from main.
   Never stack more than two PRs.

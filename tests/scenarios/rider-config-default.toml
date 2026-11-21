@@ -52,18 +52,6 @@ needs_of = true
 builds = false
 skills = []
 
-[roles.final-review]
-harness = "claude"
-model = "claude-mythos-5-2"
-title = "Final-review"
-model_name = "Mythos 5.2"
-model_slug = "mythos-5-2"
-prompt = "review"
-commits = false
-needs_of = true
-builds = true
-skills = []
-
 [roles.security]
 harness = "claude"
 model = "claude-mythos-5-2"

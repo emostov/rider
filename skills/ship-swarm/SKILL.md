@@ -118,12 +118,12 @@ still live can be.
 
 1. Check the branch is settled: no unfinished task is `onto` it or reviews it
    (`vb tasks work/<project> --state all`), and its reviews report nothing blocking. Every
-   PR gets the owner's review flow (ride-swarm's Review policy): a `review` and a
-   `native-review` in parallel, both `of` the PR's top task; one fix task for the blocking
-   findings of both; then a `final-review` of the whole PR, whose blocking findings get one
-   more fix task. That is the two-round limit; tasks get no reviews of their own during the work. A review
-   stopped by a non-Claude provider's content filter is run again as a `final-review`.
-   `security` stays for sensitive branches.
+   PR gets the review flow in ride-swarm's Review policy: a `review` and a `native-review` in
+   parallel, both `of` the PR's top task; one fix task for the blocking findings of both; then
+   the Mythos `security` review of the whole PR as the final review, whose blocking findings
+   get one more fix task. That is the two-round limit; tasks get no reviews of their own
+   during the work. A review stopped by a non-Claude provider's content filter is run again
+   on Mythos as a `security` task with the general review brief.
 2. `git -C <repo> push -u origin <branch>`. If the remote branch exists and the push is
    rejected as non-fast-forward, stop and tell the owner: it may not be the swarm's.
 3. Fill the repository's template (`.github/pull_request_template.md`, or a file in
