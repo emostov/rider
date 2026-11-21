@@ -56,6 +56,8 @@ when you ask: the answer applies to every repository there.
 | `light` | Sonnet 5.5 | `light-<n>-sonnet-5-5` | Light <n> (Sonnet 5.5) | yes |
 | `review` | Sol 6.1 | `review-<n>-sol-6-1` | Review <n> (Sol 6.1) | no |
 | `polish` | Sonnet 5.5 | `polish-<n>-sonnet-5-5` | Polish <n> (Sonnet 5.5) | yes |
+| `quick-review` | Sol 6.2 | `quick-review-<n>-sol-6-2` | Quick-review <n> (Sol 6.2) | no |
+| `final-review` | Mythos 5.2 | `final-review-<n>-mythos-5-2` | Final-review <n> (Mythos 5.2) | no |
 | `security` | Mythos 5.2 | `security-<n>-mythos-5-2` | Security <n> (Mythos 5.2) | no |
 | `qa` | Opus 5.5 | `qa-<n>-opus-5-5` | QA <n> (Opus 5.5) | no |
 
