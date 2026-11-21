@@ -68,6 +68,8 @@ const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the Claude session id of its latest completed attempt on one line,
 // then the repository it ran in.
 const SESSION_FILE: &str = "session";
+const RESULT_FILE: &str = "result.json";
+pub const RESULT_FILE_BYTES_MAX: u64 = 64 * 1024;
 const SESSION_FILE_BYTES_MAX: usize = 4096;
 const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const DELIVERY_NOTE: &str = "These replies were posted in your task's thread while you worked. \
@@ -152,6 +154,15 @@ struct ResultRecord<'a> {
     commits: u64,
     head: &'a str,
     summary: &'a str,
+}
+
+#[derive(Serialize)]
+struct Settlement<'a> {
+    repo: &'a str,
+    branch: Option<&'a str>,
+    head: &'a str,
+    summary: &'a str,
+    base: Option<&'a str>,
 }
 
 struct Evidence {
@@ -870,6 +881,13 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     Ok(session)
 }
 
+pub fn result_path(home: &Path, id: TaskId) -> PathBuf {
+    assert!(home.is_absolute());
+    let path = home.join(LOGS_DIR).join(id.0.to_string()).join(RESULT_FILE);
+    assert!(path.starts_with(home));
+    path
+}
+
 fn session_path(home: &Path, id: TaskId) -> PathBuf {
     assert!(home.is_absolute());
     let path = home
@@ -1224,6 +1242,26 @@ fn complete(
         let _ = board.reply(id, &one_line(&note));
     }
     // The record and the note below only inform; losing them must not undo finished work.
+    let settlement = attempt.brief.repo.to_str().map(|repo| Settlement {
+        repo,
+        branch: record.branch,
+        head: record.head,
+        summary: record.summary,
+        base: attempt.checkout.base.as_deref(),
+    });
+    let path = result_path(&env.home, id);
+    let written = match settlement.map(|settlement| serde_json::to_string(&settlement)) {
+        Some(Ok(json)) => fs::write(&path, json).map_err(|error| error.to_string()),
+        Some(Err(error)) => Err(error.to_string()),
+        None => Err("the repository path is not UTF-8".to_string()),
+    };
+    if let Err(error) = written {
+        let note = format!(
+            "Rider could not record the result in {}: {error}.",
+            path.display()
+        );
+        let _ = board.reply(id, &one_line(&note));
+    }
     if let Ok(record) = serde_json::to_string(&record)
         && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
     {

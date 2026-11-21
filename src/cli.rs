@@ -1,7 +1,7 @@
 //! The command line: parse the arguments, read the environment once, and run one command.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -20,20 +20,25 @@ use fs4::{FileExt, TryLockError};
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process_group};
+use serde::Deserialize;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::flag;
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, Listing, NEEDS_MAX, TaskId, VbCli};
+use crate::board::{
+    self, Board, BoardError, Listing, NEEDS_MAX, TaskId, TaskState, TaskView, VbCli,
+};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
+use crate::git::{self, GitError};
 use crate::harness::LOG_BYTES_MAX;
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
+use crate::run_task::{RESULT_FILE_BYTES_MAX, result_path};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
 
@@ -108,6 +113,11 @@ const QUEUE_PROFILE: &str = "rider-queue";
 const WAIT_PROFILE: &str = "rider-wait";
 const LEAD_PROFILE: &str = "lead";
 const LEAD_PREFIX: &str = "lead-";
+const PR_PROFILE: &str = "rider-pr";
+const PR_TITLE_CHARS_MAX: usize = 200;
+const PR_LIST_MAX: usize = 20;
+const BASE_CHAIN_MAX: usize = 16;
+const PR_FIELDS: &str = "--json=url,headRefName,headRepository,headRepositoryOwner";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
 /// How long the feed must stay quiet after an event before the wait reports it.
@@ -189,6 +199,13 @@ pub enum Command {
         /// Stop the listed processes.
         #[arg(long)]
         yes: bool,
+    },
+    /// Push a completed task's branch to origin and open its draft PR; print the PR's URL.
+    ///
+    /// Never forces: a branch that moved on origin is refused. An open PR is reused.
+    Pr {
+        #[arg(value_name = "ID", value_parser = parse_task_id)]
+        id: TaskId,
     },
     /// Block until something needs the lead, then print what happened since the last wait.
     ///
@@ -442,6 +459,12 @@ pub enum CliError {
     },
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
+    NotPushable {
+        id: TaskId,
+        why: &'static str,
+    },
+    Git(GitError),
+    BadGh(String),
     /// The Board CLI is missing and there is no `npm` to install it with.
     NoNpm,
     /// `npm install` of the Board CLI failed or left no `vb`.
@@ -475,6 +498,15 @@ impl fmt::Display for CliError {
                 write!(f, "{} is held by {holder}", path.display())
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
+            CliError::NotPushable { id, why } => write!(f, "task #{} {why}", id.0),
+            CliError::Git(error) => write!(f, "{error}"),
+            CliError::BadGh(output) => {
+                write!(
+                    f,
+                    "gh printed output rider cannot use: {}",
+                    board::one_line(output)
+                )
+            }
             CliError::NoNpm => write!(
                 f,
                 "the Board CLI is missing and npm is not on PATH: install Node 22, then retry"
@@ -519,6 +551,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
         Command::Reap { urls, yes } => reap_leaks(urls, *yes, config),
+        Command::Pr { id } => pr(config, *id),
         Command::Wait {
             project,
             timeout,
@@ -1594,4 +1627,317 @@ fn io_error(action: &'static str, path: &Path, error: &io::Error) -> CliError {
         path: path.to_path_buf(),
         message: error.to_string(),
     }
+}
+
+struct Finished {
+    repo: PathBuf,
+    branch: String,
+    head: String,
+    title: String,
+    summary: String,
+    base: Option<String>,
+}
+
+struct GitHub {
+    host: String,
+    owner: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePr {
+    url: String,
+    #[serde(rename = "headRefName")]
+    head_ref: String,
+    #[serde(rename = "headRepository")]
+    head_repository: Option<WireRepoName>,
+    #[serde(rename = "headRepositoryOwner")]
+    head_owner: Option<WireOwner>,
+}
+
+#[derive(Deserialize)]
+struct WireRepoName {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct WireOwner {
+    login: String,
+}
+
+fn label<'a>(view: &'a TaskView, key: &str) -> Option<&'a str> {
+    let found = view.labels.iter().find(|(name, _)| name == key);
+    found.map(|(_, value)| value.as_str())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettledRecord {
+    repo: String,
+    branch: Option<String>,
+    head: String,
+    summary: String,
+    base: Option<String>,
+}
+
+fn settled(home: &Path, id: TaskId) -> Result<SettledRecord, CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    let path = result_path(home, id);
+    let io = |error: io::Error| CliError::Io {
+        action: "read",
+        path: path.clone(),
+        message: error.to_string(),
+    };
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(refuse(
+                "has no result Rider recorded when it settled the task",
+            ));
+        }
+        Err(error) => return Err(io(error)),
+    };
+    let mut bytes = Vec::new();
+    file.take(RESULT_FILE_BYTES_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > RESULT_FILE_BYTES_MAX {
+        return Err(refuse("has a recorded result larger than Rider writes"));
+    }
+    let record: SettledRecord = serde_json::from_slice(&bytes)
+        .map_err(|_| refuse("has a recorded result Rider cannot read"))?;
+    assert!(bytes.len() as u64 <= RESULT_FILE_BYTES_MAX);
+    Ok(record)
+}
+
+fn finished(view: &TaskView, home: &Path) -> Result<Finished, CliError> {
+    let id = view.id;
+    let refuse = |why| CliError::NotPushable { id, why };
+    if view.state != TaskState::Completed {
+        return Err(refuse("is not completed"));
+    }
+    let record = settled(home, id)?;
+    let repo = PathBuf::from(record.repo);
+    if !repo.is_absolute() {
+        return Err(refuse(
+            "has a recorded repository that is not an absolute path",
+        ));
+    }
+    let branch = record.branch.filter(|branch| git::is_plain_branch(branch));
+    let branch = branch.ok_or_else(|| refuse("has no result branch naming one branch"))?;
+    if label(view, "branch") != Some(branch.as_str()) {
+        return Err(refuse(
+            "has a branch label that differs from its result's branch",
+        ));
+    }
+    if !git::is_commit_id(&record.head) {
+        return Err(refuse("has a result head that is not a commit id"));
+    }
+    let first = view.text.lines().next().unwrap_or_default().trim();
+    let title: String = first.chars().take(PR_TITLE_CHARS_MAX).collect();
+    if title.is_empty() || record.summary.trim().is_empty() {
+        return Err(refuse("has no first line or no result summary for its PR"));
+    }
+    assert!(repo.is_absolute() && git::is_plain_branch(&branch));
+    assert!(title.chars().count() <= PR_TITLE_CHARS_MAX);
+    Ok(Finished {
+        repo,
+        branch,
+        head: record.head,
+        title,
+        summary: record.summary,
+        base: record.base,
+    })
+}
+
+struct Chain {
+    root: TaskId,
+    base: String,
+}
+
+fn chain(
+    board: &dyn Board,
+    view: &TaskView,
+    home: &Path,
+    task: &Finished,
+) -> Result<Chain, CliError> {
+    let refuse = |why| CliError::NotPushable { id: view.id, why };
+    let mut root = view.id;
+    let mut steps = 0_usize;
+    let mut current = view.clone();
+    while let Some(onto) = label(&current, "onto") {
+        let onto = parse_task_id(onto).map_err(|_| refuse("has a bad onto"))?;
+        steps += 1;
+        if steps > BASE_CHAIN_MAX {
+            return Err(refuse("has an onto chain longer than rider pr follows"));
+        }
+        current = board.read_task(onto).map_err(CliError::Board)?;
+        root = current.id;
+    }
+    let base = match &task.base {
+        Some(base) => base.clone(),
+        None if root != view.id => {
+            let settled = settled(home, root)?;
+            if Path::new(&settled.repo) != task.repo {
+                return Err(refuse("has an onto chain in another repository"));
+            }
+            settled
+                .base
+                .ok_or_else(|| refuse("has an onto chain without a recorded base"))?
+        }
+        None => return Err(refuse("has no base branch Rider recorded")),
+    };
+    if !git::is_plain_branch(&base) {
+        return Err(refuse("has a recorded base that is not one plain branch"));
+    }
+    assert!(steps <= BASE_CHAIN_MAX);
+    assert!(git::is_plain_branch(&base));
+    Ok(Chain { root, base })
+}
+
+fn github(repo: &Path, id: TaskId) -> Result<GitHub, CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    let url = git::origin_url(repo).map_err(CliError::Git)?;
+    let url = url.ok_or_else(|| {
+        refuse("has an origin whose configured, fetch and push URLs are not one and the same")
+    })?;
+    let rest = ["https://", "ssh://git@"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))
+        .and_then(|rest| rest.split_once('/'))
+        .or_else(|| {
+            url.strip_prefix("git@")
+                .and_then(|rest| rest.split_once(':'))
+        });
+    let (host, path) = rest.ok_or_else(|| refuse("has an origin that is not a GitHub URL"))?;
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let word = |text: &str| {
+        !text.is_empty()
+            && !text.starts_with(['-', '.'])
+            && (text.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    let parsed = path
+        .split_once('/')
+        .filter(|(owner, name)| word(owner) && word(name));
+    let Some((owner, name)) = parsed.filter(|_| word(host) && !host.contains('@')) else {
+        return Err(refuse("has an origin that is not a GitHub URL"));
+    };
+    assert!(word(owner) && word(name));
+    Ok(GitHub {
+        host: host.to_string(),
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+fn publish(task: &Finished, id: TaskId) -> Result<(), CliError> {
+    let refuse = |why| CliError::NotPushable { id, why };
+    let (repo, branch, head) = (&task.repo, &task.branch, &task.head);
+    if !git::commit_exists(repo, head).map_err(CliError::Git)? {
+        return Err(refuse("has a result head this repository does not hold"));
+    }
+    let local = git::commit_of(repo, &format!("refs/heads/{branch}")).map_err(CliError::Git)?;
+    if !git::is_ancestor(repo, head, &local).map_err(CliError::Git)? {
+        return Err(refuse("has a result head that is not on its local branch"));
+    }
+    match git::remote_branch(repo, branch).map_err(CliError::Git)? {
+        Some(tip) if tip == *head => return Ok(()),
+        Some(tip) => {
+            let seen = git::tracking_branch(repo, branch).map_err(CliError::Git)?;
+            if seen.as_deref() != Some(tip.as_str()) {
+                return Err(refuse(
+                    "has a branch that moved on origin since this repository saw it",
+                ));
+            }
+            if !git::is_ancestor(repo, &tip, head).map_err(CliError::Git)? {
+                return Err(refuse(
+                    "has a branch on origin that its result does not contain",
+                ));
+            }
+        }
+        None => {}
+    }
+    assert!(git::is_commit_id(head));
+    git::push_commit(repo, head, branch).map_err(CliError::Git)
+}
+
+fn pr(config: &Config, id: TaskId) -> Result<u8, CliError> {
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: PR_PROFILE.to_string(),
+    };
+    let view = board.read_task(id).map_err(CliError::Board)?;
+    let task = finished(&view, config.home())?;
+    let Chain { root, base } = chain(&board, &view, config.home(), &task)?;
+    let own = format!("rider/{}-", root.0);
+    let default = git::default_branch(&task.repo).map_err(CliError::Git)?;
+    if !task.branch.starts_with(&own)
+        || base == task.branch
+        || default.as_ref() == Some(&task.branch)
+    {
+        let why = "has a branch that is not the one Rider made for it";
+        return Err(CliError::NotPushable { id, why });
+    }
+    let hub = github(&task.repo, id)?;
+    publish(&task, id)?;
+    let repo_arg = format!("--repo={}/{}/{}", hub.host, hub.owner, hub.name);
+    let head_arg = format!("--head={}", task.branch);
+    let limit = format!("--limit={PR_LIST_MAX}");
+    let list = [
+        "pr",
+        "list",
+        &repo_arg,
+        &head_arg,
+        "--state=open",
+        PR_FIELDS,
+        &limit,
+    ];
+    let listed = git::gh(&task.repo, &list.map(OsStr::new), None).map_err(CliError::Git)?;
+    let bad = |bytes: &[u8]| CliError::BadGh(String::from_utf8_lossy(bytes).into_owned());
+    let open: Vec<WirePr> = serde_json::from_slice(&listed).map_err(|_| bad(&listed))?;
+    if open.len() >= PR_LIST_MAX {
+        return Err(bad(&listed));
+    }
+    let ours = |pr: &WirePr| {
+        pr.head_ref == task.branch
+            && (pr.head_owner.as_ref()).is_some_and(|o| o.login.eq_ignore_ascii_case(&hub.owner))
+            && (pr.head_repository.as_ref()).is_some_and(|r| r.name.eq_ignore_ascii_case(&hub.name))
+    };
+    let mut matching = open.into_iter().filter(ours);
+    let found = matching.next();
+    if matching.next().is_some() {
+        return Err(bad(&listed));
+    }
+    let url = match found {
+        Some(found) => found.url,
+        None => {
+            let title = format!("--title={}", task.title);
+            let head = format!("--head={}:{}", hub.owner, task.branch);
+            let base = format!("--base={base}");
+            let create = [
+                "pr",
+                "create",
+                &repo_arg,
+                "--draft",
+                &head,
+                &title,
+                &base,
+                "--body-file",
+                "-",
+            ];
+            let body = Some(task.summary.into_bytes());
+            let args = create.map(OsStr::new);
+            let created = git::gh(&task.repo, &args, body).map_err(CliError::Git)?;
+            String::from_utf8_lossy(&created).trim().to_string()
+        }
+    };
+    if !url.starts_with("https://") || url.contains(char::is_whitespace) {
+        return Err(CliError::BadGh(url));
+    }
+    assert!(!url.is_empty());
+    say(&url);
+    Ok(0)
 }
