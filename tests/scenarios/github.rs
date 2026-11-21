@@ -58,17 +58,20 @@ fn given_gh_prints(world: &World, pr_list: &str, comments: &str) {
         r#"#!/bin/sh
 echo "$*" >> '{root}/gh-calls.log'
 echo "$GH_REPO $GH_HOST" >> '{root}/gh-repos.log'
+slug=$(basename "$GH_REPO")
 case "$1 $2" in
   pr*)
     case " $* " in
       *" --state open "*) cat '{root}/gh-open.json' 2>/dev/null || echo '[]' ;;
       *" rider/999-orphan "*) cat '{root}/gh-orphan.json' ;;
-      *" view "*) cat '{root}/gh-pr-view.json' ;;
+      *" view "*) cat "{root}/gh-pr-view-$slug.json" 2>/dev/null || cat '{root}/gh-pr-view.json' ;;
       *) cat '{root}/gh-pr.json' ;;
     esac ;;
   api*/permission)
     login=$(basename "$(dirname "$2")")
-    cat "{root}/gh-permission-$login.json" 2>/dev/null || {{ echo 'HTTP 404' >&2; exit 1; }} ;;
+    cat "{root}/gh-permission-$slug-$login.json" 2>/dev/null \
+      || cat "{root}/gh-permission-$login.json" 2>/dev/null \
+      || {{ echo 'HTTP 404' >&2; exit 1; }} ;;
   "api --paginate")
     if [ -e '{root}/gh-pages.json' ]; then cat '{root}/gh-pages.json'
     else printf '['; cat '{root}/gh-comments.json'; printf ']'; fi ;;
@@ -889,5 +892,77 @@ fn a_recorded_pr_of_another_repository_is_not_watched() {
     assert_eq!(
         task_records(&world, &task, "rider-github"),
         Vec::<Value>::new()
+    );
+}
+
+#[test]
+fn write_access_to_one_repository_does_not_trust_an_author_in_another() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-review.json", "pulls-comments-empty.json");
+    let other = world.root.join("other");
+    let git = |args: &[&str]| {
+        let output = Command::new("git").args(args).stdin(Stdio::null()).output();
+        let output = output.expect("run git");
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&[
+        "clone",
+        "-q",
+        world.repo_label(),
+        &other.display().to_string(),
+    ]);
+    let other_label = other.display().to_string();
+    git(&[
+        "-C",
+        &other_label,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/example/other.git",
+    ]);
+    let other_pr = "https://github.com/example/other/pull/7";
+    let root = world.root.clone();
+    let view_other = |name: &str| {
+        let mut viewed: Value = serde_json::from_str(&fixture(name)).expect("the fixture parses");
+        viewed[0]["url"] = json!(other_pr);
+        viewed[0]["comments"] = json!([]);
+        let path = root.join("gh-pr-view-other.json");
+        fs::write(path, viewed[0].to_string()).expect("write the other repository's pr");
+    };
+    view_other("pr-list-pending.json");
+    given_gh_grants(&world, "other-reviewer", "permission-read.json");
+    let in_other = NewTask::new("Add one work file.")
+        .label("repo", &other_label)
+        .label("from", "main")
+        .label("pr", other_pr)
+        .role("implement");
+    let in_other = when_the_lead_creates(&world, &in_other);
+    given_the_agent_will(&world, &in_other, &[Behaviour::CommitThenFail]);
+    let in_repo = an_implement_task(&world, "Add one work file.").label("pr", PR_URL);
+    let in_repo = when_the_lead_creates(&world, &in_repo);
+    given_the_agent_will(&world, &in_repo, &[Behaviour::Hold]);
+    given_a_running_daemon_with(&mut world, &[FAST_POLL]);
+    assert_eq!(when_the_tasks_settle(&world, &[&in_other]), vec!["failed"]);
+    when_the_agent_has_started(&world, &in_repo);
+    world.vb_lead(&["label", &in_repo, "checked=1"], None);
+    when_a_round_passes(&world);
+    view_other("pr-list-review.json");
+
+    let records = when_records_reach(&world, &in_other, 1);
+
+    let trust: Vec<(&Value, &Value, &Value)> = records
+        .iter()
+        .map(|record| (&record["url"], &record["route"], &record["trust"]))
+        .collect();
+    assert_eq!(
+        trust,
+        vec![(&json!(other_pr), &json!("lead"), &json!("untrusted"))]
+    );
+    world.release_agent(&in_repo);
+    assert_eq!(
+        when_the_tasks_settle(&world, &[&in_repo]),
+        vec!["completed"]
     );
 }
