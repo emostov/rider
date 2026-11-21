@@ -1314,3 +1314,49 @@ pub fn task_logs(world: &World, task: &str) -> Vec<String> {
     names.sort();
     names
 }
+
+/// Given the first `times` `vb tasks <verb>` calls each fail, logged as lines in `calls`.
+pub fn given_vb_fails_the_first(world: &World, verb: &str, times: u32, calls: &Path) {
+    assert!(!verb.is_empty() && verb.bytes().all(|b| b.is_ascii_lowercase()));
+    assert!(times > 0);
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = tasks ] && [ "$2" = {verb} ]; then
+  echo {verb} >> '{calls}'
+  if [ "$(wc -l < '{calls}')" -le {times} ]; then
+    echo 'injected {verb} failure' >&2
+    exit 1
+  fi
+fi
+exec '{real}' "$@"
+"#,
+        calls = calls.display(),
+        real = real.display(),
+    );
+    crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given every `vb read <task>` by an implement worker after its first fails, printing `words`
+/// words of error text.
+pub fn given_vb_fails_later_reads_of(world: &World, task: &str, words: usize) {
+    assert!(!task.is_empty() && task.bytes().all(|b| b.is_ascii_digit()));
+    assert!(words > 0);
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let root = world.root.display();
+    let text = vec!["injected"; words].join(" ");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" --as implement"*) worker=1;; *) worker=0;; esac
+if [ $worker = 1 ] && [ "$1" = read ] && [ "$2" = {task} ] && ! mkdir '{root}/read-{task}' 2>/dev/null; then
+  echo '{text}' >&2
+  exit 1
+fi
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    crate::world::write_executable(&world.vb, &script);
+}

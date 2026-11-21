@@ -755,3 +755,110 @@ fn a_task_whose_branch_is_checked_out_elsewhere_is_blocked_as_branch_busy() {
         Some(("branch_busy".to_string(), reason.to_string()))
     );
 }
+
+#[test]
+fn a_task_canceled_before_rider_first_reads_it_gets_no_writes_and_no_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let release = world.root.join("release");
+    given_vb_holds_the_first_read_of(&world, &[&task], &release);
+    given_a_running_daemon(&mut world);
+    when_the_file_exists(&world, &world.root.join(format!("marker-{task}")));
+
+    world.vb_lead(&["tasks", "cancel", &task, "superseded", "--json"], None);
+    let (replies, labels) = (task_replies(&world, &task), task_labels(&world, &task));
+    std::fs::write(&release, "").expect("release the held read");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    when_the_daemon_is_sent_sigterm(&world);
+
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(task_state(&world, &task), "canceled");
+    assert_eq!(task_replies(&world, &task), replies);
+    assert_eq!(task_labels(&world, &task), labels);
+    assert_eq!(agent_runs(&world), vec![]);
+    assert!(!worktree_dir(&world, &task).exists());
+}
+
+#[test]
+fn a_fail_that_fails_twice_is_retried_and_counts_the_attempt_and_replies_its_log_once() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::ExitNonZero]);
+    let fails = world.root.join("fails");
+    given_vb_fails_the_first(&world, "fail", 2, &fails);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["failed".to_string()], Some(0)));
+    let fails = std::fs::read_to_string(&fails).expect("the logged fail calls");
+    assert_eq!(fails, "fail\nfail\nfail\n");
+    assert_eq!(task_label(&world, &task, "attempt"), Some("1".to_string()));
+    let text = task_text(&world, &task);
+    assert_eq!(text.matches("The whole log: ").count(), 1, "{text}");
+    assert_eq!(agent_runs(&world).len(), 1);
+}
+
+#[test]
+fn a_task_from_a_missing_branch_is_blocked_naming_the_git_command_that_failed() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = NewTask::new("Add the work.")
+        .label("repo", world.repo_label())
+        .label("from", "missing-branch")
+        .role("implement");
+    let task = when_the_lead_creates(&world, &task);
+
+    let (kind, reason) = then_it_is_blocked_before_any_agent_runs(&mut world, &task);
+
+    let reason_wanted = "Rider cannot prepare the worktree: git rev-parse --verify --end-of-options \
+                         missing-branch^{commit} failed: fatal: Needed a single revision.";
+    assert_eq!(
+        (kind.as_str(), reason.as_str()),
+        ("rider_error", reason_wanted)
+    );
+}
+
+#[test]
+fn a_board_read_failing_while_the_worktree_is_prepared_blocks_with_vbs_error_cut_short() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_vb_fails_later_reads_of(&world, &task, 200);
+
+    let (kind, reason) = then_it_is_blocked_before_any_agent_runs(&mut world, &task);
+
+    let words = "injected ".repeat(200);
+    let uncut = format!("Rider cannot prepare the worktree: vb exited with code 1: {words}");
+    let wanted: String = uncut.chars().take(500).collect();
+    assert_eq!((kind, reason), ("rider_error".to_string(), wanted));
+}
+
+#[test]
+fn a_task_onto_a_task_with_too_many_labels_is_blocked_as_a_rider_error() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let mut crowded = NewTask::new("Hold many labels.");
+    for n in 0..33 {
+        crowded = crowded.label(&format!("k{n}"), "v");
+    }
+    let crowded = when_the_lead_creates(&world, &crowded);
+    given_the_lead_completes(&world, &crowded);
+    let fix = NewTask::new("Fix the work.")
+        .label("repo", world.repo_label())
+        .label("onto", &crowded)
+        .needs(&crowded)
+        .role("implement");
+    let fix = when_the_lead_creates(&world, &fix);
+
+    let block = then_it_is_blocked_before_any_agent_runs(&mut world, &fix);
+
+    let reason = "Rider could not prepare the attempt: the task has more than 32 labels.";
+    assert_eq!(block, ("rider_error".to_string(), reason.to_string()));
+}
