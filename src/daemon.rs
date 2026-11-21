@@ -1133,6 +1133,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
             program: "/bin/sh".to_string(),
             args,
             env,
+            io: cmd.io.clone(),
         };
         launch_agent(&wrapped, dir, log, runner_seconds)
     };

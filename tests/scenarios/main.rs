@@ -3,6 +3,7 @@
 
 mod board_feed;
 mod brief_settle;
+mod codex_review;
 #[expect(
     dead_code,
     reason = "behaviours and readers for the scenarios still to come"

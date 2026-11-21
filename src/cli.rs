@@ -41,9 +41,13 @@ pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
 pub const IMPLEMENT_PROMPT: &str = "implement.md";
 pub const SLOP_RULES: &str = include_str!("../prompts/slop-rules.md");
 /// Every role's prompt and the slop rules, once each, built into the binary.
-pub const PROMPTS: [(&str, &str); 5] = [
+pub const PROMPTS: [(&str, &str); 6] = [
     (IMPLEMENT_PROMPT, include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
+    (
+        "native-review.md",
+        include_str!("../prompts/native-review.md"),
+    ),
     ("security.md", include_str!("../prompts/security.md")),
     ("slop-rules.md", SLOP_RULES),
     ("qa.md", include_str!("../prompts/qa.md")),
