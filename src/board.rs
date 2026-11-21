@@ -285,6 +285,15 @@ pub trait Board {
     ) -> Result<Listing, BoardError>;
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
+    fn create_task(&self, task: &NewTask) -> Result<TaskId, BoardError>;
+}
+
+pub struct NewTask<'a> {
+    pub channel: &'a str,
+    pub text: &'a str,
+    pub labels: &'a [(&'a str, &'a str)],
+    pub needs: Option<TaskId>,
+    pub key: &'a str,
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -356,6 +365,13 @@ enum Command<'a> {
         id: TaskId,
         reason: &'a str,
         kind: &'a str,
+    },
+    Create {
+        channel: &'a str,
+        text: &'a str,
+        labels: &'a [(&'a str, &'a str)],
+        needs: Option<TaskId>,
+        key: &'a str,
     },
 }
 
@@ -497,6 +513,23 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             let words = to_strings(&["tasks", "block", &id.0.to_string(), "--kind", kind]);
             (words, Some(one_line(reason)))
         }
+        Command::Create {
+            channel,
+            labels,
+            needs,
+            key,
+            ..
+        } => {
+            let mut words = to_strings(&["tasks", "create", channel, "-"]);
+            words.extend(to_strings(&["--idempotency-key", key]));
+            for (name, value) in labels {
+                words.extend(["--label".to_string(), format!("{name}={value}")]);
+            }
+            if let Some(need) = needs {
+                words.extend(["--needs".to_string(), need.0.to_string()]);
+            }
+            (words, None)
+        }
     };
     assert!(
         VERBS.contains(&words[0].as_str()),
@@ -530,10 +563,10 @@ fn command_args(command: &Command, url: &str, profile: &str) -> Vec<String> {
 /// The text `command` sends on stdin, if any. Only a reply does: it may span many lines.
 fn command_stdin<'a>(command: &Command<'a>) -> Option<&'a str> {
     let stdin = match *command {
-        Command::Reply { text, .. } => Some(text),
+        Command::Reply { text, .. } | Command::Create { text, .. } => Some(text),
         _ => None,
     };
-    assert!(stdin.is_none() || matches!(command, Command::Reply { .. }));
+    assert!(stdin.is_none() || matches!(command, Command::Reply { .. } | Command::Create { .. }));
     stdin
 }
 
@@ -555,6 +588,7 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
         Command::Complete { .. } => ("tasks complete", 0),
         Command::Fail { .. } => ("tasks fail", 0),
         Command::Block { .. } => ("tasks block", 0),
+        Command::Create { .. } => ("tasks create", 0),
     };
     assert!(
         wait_seconds <= WAIT_SECONDS_MAX,
@@ -575,6 +609,7 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
         | Command::Cursor { .. }
         | Command::Channel { .. }
         | Command::PostRoot { .. }
+        | Command::Create { .. }
         | Command::List { .. } => None,
         Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
@@ -1438,6 +1473,20 @@ impl Board for VbCli {
         self.write(&Command::Post { id, schema, json })
     }
 
+    fn create_task(&self, task: &NewTask) -> Result<TaskId, BoardError> {
+        assert!(!task.text.is_empty() && !task.key.is_empty());
+        assert!(task.labels.len() <= LABELS_MAX);
+        check_message(task.text)?;
+        let stdout = self.read(&Command::Create {
+            channel: task.channel,
+            text: task.text,
+            labels: task.labels,
+            needs: task.needs,
+            key: task.key,
+        })?;
+        parse_write(&stdout).map(|(_, id)| id)
+    }
+
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError> {
         assert!(
             !result.trim().is_empty(),
@@ -1694,6 +1743,11 @@ pub mod testing {
 
         fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError> {
             self.record(format!("complete {} {result}", id.0))
+        }
+
+        fn create_task(&self, task: &super::NewTask) -> Result<TaskId, BoardError> {
+            self.record(format!("create_task {} {}", task.channel, task.text))?;
+            Ok(TaskId(0))
         }
 
         fn fail(&self, id: TaskId, reason: &str) -> Result<(), BoardError> {

@@ -63,7 +63,7 @@ const LOGS_DIR: &str = "logs";
 // then the repository it ran in.
 const SESSION_FILE: &str = "session";
 const SESSION_FILE_BYTES_MAX: usize = 4096;
-const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
+pub(crate) const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const RETRY_NOTE: &str = "This is a retry: the worktree and branch are reused exactly as the \
                           last attempt left them, uncommitted changes included.";
 
@@ -704,7 +704,7 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     Ok(session)
 }
 
-fn session_path(home: &Path, id: TaskId) -> PathBuf {
+pub(crate) fn session_path(home: &Path, id: TaskId) -> PathBuf {
     assert!(home.is_absolute());
     let path = home
         .join(LOGS_DIR)

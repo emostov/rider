@@ -1,7 +1,7 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["kind", "pr", "head", "url"],
+  "required": ["kind", "pr", "head", "url", "route"],
   "properties": {
     "kind": {
       "enum": ["checks", "review", "comment"],
@@ -15,6 +15,11 @@
     "file": { "type": ["string", "null"] },
     "line": { "type": ["integer", "null"] },
     "excerpt": { "type": "string", "maxLength": 300 },
-    "url": { "type": "string", "minLength": 1 }
+    "url": { "type": "string", "minLength": 1 },
+    "route": {
+      "enum": ["owner", "lead"],
+      "description": "owner: a fix task was queued in the session of the task that owns the branch; lead: the lead decides"
+    },
+    "task": { "type": "integer", "minimum": 1, "description": "The fix task queued, when route is owner" }
   }
 }

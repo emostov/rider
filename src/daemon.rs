@@ -21,7 +21,7 @@ use signal_hook::iterator::Signals;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::board::{
-    Board, BoardError, Listing, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
+    Board, BoardError, Listing, NewTask, TaskId, TaskState, TaskView, Timestamp, VbCli, one_line,
     parse_failure_reason,
 };
 use crate::cli::board_serve;
@@ -1350,6 +1350,10 @@ impl Board for Guarded<'_> {
     fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError> {
         self.gate(false)?;
         self.board.post_structured(id, schema, json)
+    }
+    fn create_task(&self, task: &NewTask) -> Result<TaskId, BoardError> {
+        self.gate(true)?;
+        self.board.create_task(task)
     }
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError> {
         self.gate(true)?;

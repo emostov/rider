@@ -1,0 +1,6 @@
+test	Run tests	2026-11-21T05:20:14.6064161Z 
+test	Run tests	2026-11-21T05:20:14.6064519Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test	Run tests	2026-11-21T05:20:14.6064980Z 
+test	Run tests	2026-11-21T05:20:14.6079733Z error: 1 target failed:
+test	Run tests	2026-11-21T05:20:14.6080077Z     `--test scenarios`
+test	Run tests	2026-11-21T05:20:14.6117117Z ##[error]Process completed with exit code 101.

@@ -6,11 +6,14 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::board::{Board, ListedTask, TaskId};
+use crate::board::{Board, ListedTask, NewTask, TaskId, TaskState};
+use crate::brief::label;
 use crate::git::{self, ENV_REMOVED};
 use crate::roles::ROLES;
+use crate::run_task::{RESUMABLE_ROLES, session_path};
+use crate::worktree::BRANCH_LABEL;
 
 pub const SCHEMA: &str = "rider-github@1";
 pub const STATE_FILE: &str = "github.json";
@@ -23,6 +26,9 @@ const ITEMS_MAX: usize = 200;
 const STATE_BYTES_MAX: u64 = 512 * 1024;
 const GH_SECONDS_MAX: u64 = 60;
 const ROUNDS_MAX: u64 = u64::MAX;
+pub const FIX_ROUNDS_MAX: usize = 2;
+const LOG_TAIL_BYTES_MAX: usize = 2000;
+const NEVER_GITHUB: &str = "Never reply on GitHub.";
 const PR_FIELDS: &str = "number,url,headRefOid,state,statusCheckRollup,reviews,comments";
 const RATE_LIMITED: [&str; 2] = ["rate limit", "API rate"];
 
@@ -120,8 +126,22 @@ enum Checks {
 
 struct Watched<'a> {
     task: TaskId,
+    channel: &'a str,
+    role: &'a str,
     repo: &'a Path,
     branch: &'a str,
+    resumable: bool,
+}
+
+struct Change {
+    key: String,
+    record: Value,
+    fix: Option<Fix>,
+}
+
+enum Fix {
+    Ci,
+    Change(String),
 }
 
 pub fn start(
@@ -137,14 +157,13 @@ pub fn start(
 }
 
 fn watch(board: &dyn Board, home: &Path, tick_millis: u64, log: &dyn Fn(&str)) {
-    let state_path = home.join(STATE_FILE);
     let mut backoff: u64 = 1;
     for _ in 0..ROUNDS_MAX {
         let wait = tick_millis
             .saturating_mul(POLL_TICKS)
             .saturating_mul(backoff);
         thread::sleep(Duration::from_millis(wait));
-        backoff = match round(board, &state_path, log) {
+        backoff = match round(board, home, log) {
             Ok(0) => backoff.saturating_mul(2).min(BACKOFF_MAX),
             Ok(_) => 1,
             Err(error) => {
@@ -156,34 +175,45 @@ fn watch(board: &dyn Board, home: &Path, tick_millis: u64, log: &dyn Fn(&str)) {
     }
 }
 
-fn round(board: &dyn Board, state_path: &Path, log: &dyn Fn(&str)) -> Result<usize, WatchError> {
-    let mut seen = read_seen(state_path)?;
+fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, WatchError> {
+    let state_path = home.join(STATE_FILE);
+    let mut seen = read_seen(&state_path)?;
     let roles = ROLES.map(|role| role.label);
     let listing = board
         .list_labelled(crate::daemon::SUBTREE, "role", &roles)
         .map_err(|error| WatchError::State(error.to_string()))?;
     let mut tasks: Vec<&ListedTask> = listing.tasks.iter().collect();
     tasks.sort_by_key(|task| std::cmp::Reverse(task.view.id.0));
+    let mut branches: Vec<&str> = Vec::new();
     let mut posted = 0usize;
-    for listed in tasks.iter().take(WATCHES_MAX) {
-        let labels = &listed.view.labels;
-        let find = |key: &str| {
-            labels
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-        };
-        let (Some(repo), Some(branch)) = (find("repo"), find("branch")) else {
+    for listed in tasks {
+        let view = &listed.view;
+        let (Some(repo), Some(branch), Some(role)) = (
+            label(view, "repo"),
+            label(view, BRANCH_LABEL),
+            label(view, "role"),
+        ) else {
             continue;
         };
-        let task = listed.view.id;
-        if seen.keys.contains(&ended_key(task)) || !git::is_safe_ref(branch) {
+        if branches.contains(&branch) {
+            continue;
+        }
+        if branches.len() >= WATCHES_MAX {
+            break;
+        }
+        branches.push(branch);
+        let task = view.id;
+        let running = matches!(view.state, TaskState::Ready | TaskState::Claimed);
+        if running || seen.keys.contains(&ended_key(task)) || !git::is_safe_ref(branch) {
             continue;
         }
         let watched = Watched {
             task,
+            channel: &listed.channel,
+            role,
             repo: Path::new(repo),
             branch,
+            resumable: RESUMABLE_ROLES.contains(&role) && session_path(home, task).is_file(),
         };
         if !watched.repo.is_absolute() {
             continue;
@@ -191,13 +221,14 @@ fn round(board: &dyn Board, state_path: &Path, log: &dyn Fn(&str)) -> Result<usi
         match watch_one(board, &watched, &mut seen) {
             Ok(count) => posted = posted.saturating_add(count),
             Err(WatchError::RateLimited) => {
-                write_seen(state_path, &seen)?;
+                write_seen(&state_path, &seen)?;
                 return Err(WatchError::RateLimited);
             }
             Err(error) => log(&format!("github watch #{}: {error}", task.0)),
         }
-        write_seen(state_path, &seen)?;
+        write_seen(&state_path, &seen)?;
     }
+    assert!(branches.len() <= WATCHES_MAX);
     Ok(posted)
 }
 
@@ -229,11 +260,23 @@ fn watch_one(board: &dyn Board, watched: &Watched, seen: &mut Seen) -> Result<us
     }
     let path = format!("repos/{{owner}}/{{repo}}/pulls/{}/comments", pr.number);
     let inline: Vec<WireInline> = parse(&gh(watched.repo, &["api", &path])?, "gh api")?;
-    let records = records(&pr, &inline)?;
     let mut posted = 0usize;
-    for (key, record) in records {
-        if seen.keys.contains(&key) {
+    for change in changes(&pr, &inline)? {
+        if seen.keys.contains(&change.key) {
             continue;
+        }
+        let Change {
+            key,
+            mut record,
+            fix,
+        } = change;
+        match fix.filter(|_| watched.resumable) {
+            Some(fix) if fix_rounds(seen, watched.branch, &pr.head_ref_oid) < FIX_ROUNDS_MAX => {
+                let fix = queue_fix(board, watched, seen, &key, fix, &pr)?;
+                record["route"] = json!("owner");
+                record["task"] = json!(fix.0);
+            }
+            _ => record["route"] = json!("lead"),
         }
         board
             .post_structured(watched.task, SCHEMA, &record.to_string())
@@ -244,10 +287,90 @@ fn watch_one(board: &dyn Board, watched: &Watched, seen: &mut Seen) -> Result<us
     Ok(posted)
 }
 
-fn records(
+fn fix_rounds(seen: &Seen, branch: &str, head: &str) -> usize {
+    let prefix = format!("fix:{branch}:{head}:");
+    seen.keys
+        .iter()
+        .filter(|key| key.starts_with(&prefix))
+        .count()
+}
+
+fn queue_fix(
+    board: &dyn Board,
+    watched: &Watched,
+    seen: &mut Seen,
+    key: &str,
+    fix: Fix,
     pr: &WirePr,
-    inline: &[WireInline],
-) -> Result<Vec<(String, serde_json::Value)>, WatchError> {
+) -> Result<TaskId, WatchError> {
+    assert!(watched.resumable && !key.is_empty());
+    let prefix = format!("fix:{}:", watched.branch);
+    let after = seen
+        .keys
+        .iter()
+        .rev()
+        .find_map(|seen| seen.strip_prefix(&prefix)?.rsplit(':').next()?.parse().ok())
+        .map(TaskId);
+    let text = match fix {
+        Fix::Ci => ci_brief(watched, pr),
+        Fix::Change(brief) => brief,
+    };
+    let onto = watched.task.0.to_string();
+    let repo = watched.repo.to_string_lossy();
+    let labels = [
+        ("repo", repo.as_ref()),
+        ("onto", onto.as_str()),
+        ("resume", "1"),
+        ("role", watched.role),
+    ];
+    let idempotency = format!("rider-github-{key}");
+    let task = NewTask {
+        channel: watched.channel,
+        text: &text,
+        labels: &labels,
+        needs: after,
+        key: &idempotency,
+    };
+    let fix = board
+        .create_task(&task)
+        .map_err(|error| WatchError::State(error.to_string()))?;
+    remember(seen, format!("{prefix}{}:{}", pr.head_ref_oid, fix.0));
+    Ok(fix)
+}
+
+fn ci_brief(watched: &Watched, pr: &WirePr) -> String {
+    let failed = pr
+        .status_check_rollup
+        .iter()
+        .find(|check| is_failure(check));
+    let (job, url) = failed.map_or(("", ""), |check| (check.name.as_str(), &check.details_url));
+    let tail = match url.rsplit_once("/job/") {
+        Some((_, id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+            let args = ["run", "view", "--job", id, "--log-failed"];
+            gh(watched.repo, &args).unwrap_or_else(|error| format!("(no log: {error})"))
+        }
+        _ => "(no job log)".to_string(),
+    };
+    format!(
+        "CI failed on head {head} of pull request {pr_url}: job `{job}`, {url}.\n\nThe end \
+         of its log:\n\n```\n{tail}\n```\n\nFix the failure and commit. {NEVER_GITHUB}",
+        head = pr.head_ref_oid,
+        pr_url = pr.url,
+        job = excerpt(job),
+        tail = tail_of(tail.trim_end()),
+    )
+}
+
+fn tail_of(text: &str) -> &str {
+    let mut start = text.len().saturating_sub(LOG_TAIL_BYTES_MAX);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    assert!(text.len() - start <= LOG_TAIL_BYTES_MAX);
+    &text[start..]
+}
+
+fn changes(pr: &WirePr, inline: &[WireInline]) -> Result<Vec<Change>, WatchError> {
     for (len, what) in [
         (pr.status_check_rollup.len(), "checks"),
         (pr.reviews.len(), "reviews"),
@@ -280,28 +403,68 @@ fn records(
             record["job"] = json!(excerpt(&check.name));
             record["url"] = json!(check.details_url);
         }
-        out.push((format!("checks:{number}:{head}"), record));
+        let fix = (checks == Checks::Failed).then_some(Fix::Ci);
+        out.push(Change {
+            key: format!("checks:{number}:{head}"),
+            record,
+            fix,
+        });
     }
     for review in pr.reviews.iter().filter(|review| !review.body.is_empty()) {
+        let body = excerpt(&review.body);
         let record = json!({"kind": "review", "pr": number, "head": head,
-            "state": review.state, "author": review.author.login,
-            "excerpt": excerpt(&review.body), "url": pr.url});
-        out.push((format!("review:{}", review.id), record));
+            "state": review.state, "author": review.author.login, "excerpt": body,
+            "url": pr.url});
+        let asks = review.state == "CHANGES_REQUESTED" && !body.contains('?');
+        let fix = asks.then(|| Fix::Change(change_brief(&review.author.login, &pr.url, "", body)));
+        out.push(Change {
+            key: format!("review:{}", review.id),
+            record,
+            fix,
+        });
     }
     for comment in &pr.comments {
         let record = json!({"kind": "comment", "pr": number, "head": head,
             "author": comment.author.login, "excerpt": excerpt(&comment.body),
             "url": comment.url});
-        out.push((format!("comment:{}", comment.id), record));
+        out.push(Change {
+            key: format!("comment:{}", comment.id),
+            record,
+            fix: None,
+        });
     }
     for comment in inline {
+        let body = excerpt(&comment.body);
         let record = json!({"kind": "review", "pr": number, "head": head,
             "author": comment.user.login, "file": comment.path, "line": comment.line,
-            "excerpt": excerpt(&comment.body), "url": comment.html_url});
-        out.push((format!("inline:{}", comment.id), record));
+            "excerpt": body, "url": comment.html_url});
+        let place = match (&comment.path, comment.line) {
+            (Some(path), Some(line)) => format!(" at {path}:{line}"),
+            (Some(path), None) => format!(" in {path}"),
+            _ => String::new(),
+        };
+        let brief = change_brief(&comment.user.login, &comment.html_url, &place, body);
+        let fix = (!body.contains('?')).then_some(Fix::Change(brief));
+        out.push(Change {
+            key: format!("inline:{}", comment.id),
+            record,
+            fix,
+        });
     }
     assert!(out.len() <= 1 + 3 * ITEMS_MAX);
     Ok(out)
+}
+
+fn change_brief(author: &str, url: &str, place: &str, body: &str) -> String {
+    assert!(!url.is_empty());
+    let quoted = body
+        .lines()
+        .map(|line| format!("> {line}\n"))
+        .collect::<String>();
+    format!(
+        "{author} asked for a change on the pull request{place}, {url}:\n\n{quoted}\nMake \
+         the change and commit, or say in this task's thread why not. {NEVER_GITHUB}"
+    )
 }
 
 fn is_failure(check: &WireCheck) -> bool {

@@ -16,3 +16,9 @@ bodies and ids replaced with `example/repo`, `reviewer`, `commenter` and short n
   repos/{owner}/{repo}/pulls/<n>/comments` prints them with `id` (a number), `user.login`,
   `path`, `line` (null when outdated) and `html_url`; `gh api` fills `{owner}/{repo}` from the
   repository in the current directory.
+- `pulls-comments-three.json` is `pulls-comments.json` with its one comment repeated three times
+  under new ids, lines and bodies, to pin the cap on fix rounds per head.
+- `gh run view --job <id> --log-failed` prints the failed steps' log lines as
+  `<job>\t<step>\t<timestamp> <text>`; the job id is the last segment of a check's
+  `detailsUrl` after `/job/`. `run-log-failed.txt` is the last lines of a real failed `test`
+  job, with its terminal colour codes removed.
