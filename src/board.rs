@@ -73,8 +73,6 @@ pub const TASKS_PAGE_MAX: usize = 200;
 pub const LISTING_PAGES_MAX: usize = 16;
 /// Upper bound on the replies one thread read takes.
 pub const REPLIES_MAX: usize = 10_000;
-/// The profile prefix of a lead, as the ride-swarm skill names it.
-pub const LEAD_PREFIX: &str = "lead-";
 /// The schema a reviewer posts each finding under.
 const FINDING_SCHEMA: &str = "rider-finding";
 /// The reasons a fenced write gives when its claim is over or was never held.
@@ -147,22 +145,18 @@ pub struct Listing {
     pub left_out: usize,
 }
 
-/// A reply in a task's thread that amends its brief: one by the owner or a lead profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Amendment {
     pub id: Cursor,
-    /// The lead's profile, or `None` for the owner.
     pub profile: Option<String>,
     pub text: String,
 }
 
-/// A task's thread as rider reads it while the task's agent works.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thread {
     pub state: TaskState,
-    /// The board's cursor when the thread was read: every later reply has a larger id.
+    pub epoch: u64,
     pub cursor: Cursor,
-    /// At most `REPLIES_MAX`, oldest first.
     pub amendments: Vec<Amendment>,
 }
 
@@ -306,7 +300,6 @@ pub trait Board {
     ) -> Result<Listing, BoardError>;
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
-    /// Task `id`'s state, the board's cursor, and the replies in its thread that amend it.
     fn thread(&self, id: TaskId) -> Result<Thread, BoardError>;
 }
 
@@ -686,12 +679,27 @@ struct WireRead {
     message: WireMessage,
 }
 
-/// `vb read <id> --json` read for the replies that amend the task.
 #[derive(Deserialize)]
 struct WireTaskThread {
     message: WireMessage,
     replies: Vec<WireTextReply>,
     cursor: String,
+}
+
+#[derive(Deserialize)]
+struct WireThreadAuthors {
+    message: WireAuthoredTask,
+}
+
+#[derive(Deserialize)]
+struct WireAuthoredTask {
+    by: WireBy,
+    task: WireOwnedTask,
+}
+
+#[derive(Deserialize)]
+struct WireOwnedTask {
+    owner: String,
 }
 
 #[derive(Deserialize)]
@@ -701,9 +709,10 @@ struct WireTextReply {
     by: WireBy,
 }
 
-/// Who wrote a message: `profile` is null for the owner.
 #[derive(Deserialize)]
 struct WireBy {
+    actor: String,
+    principal: String,
     #[serde(deserialize_with = "nullable")]
     profile: Option<String>,
 }
@@ -987,9 +996,15 @@ pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
     Ok(blocking)
 }
 
-/// Task `id`'s thread from the output of `vb read <id> --json`.
 pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     let thread: WireTaskThread = parse(json)?;
+    let authors: WireThreadAuthors = parse(json)?;
+    let (owner, creator) = (authors.message.task.owner, authors.message.by.actor);
+    if owner.is_empty() || creator.is_empty() {
+        return Err(BoardError::Parse(
+            "a task without its owner or creator".into(),
+        ));
+    }
     if thread.replies.len() > REPLIES_MAX {
         let count = thread.replies.len();
         return Err(BoardError::Parse(format!(
@@ -1006,12 +1021,10 @@ pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     let cursor = Cursor(parse_id_text(&thread.cursor)?.0);
     let mut amendments: Vec<Amendment> = Vec::new();
     for reply in thread.replies {
-        let by_lead = reply
-            .by
-            .profile
-            .as_deref()
-            .is_some_and(|p| p.starts_with(LEAD_PREFIX));
-        if reply.by.profile.is_some() && !by_lead {
+        let by = &reply.by;
+        // The board verifies `actor` and `principal`; a profile is only a name its login picks.
+        let amends = by.principal == owner && (by.actor == owner || by.actor == creator);
+        if !amends {
             continue;
         }
         let id = Cursor(parse_id_text(&reply.id)?.0);
@@ -1021,6 +1034,7 @@ pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     assert!(amendments.len() <= REPLIES_MAX);
     Ok(Thread {
         state: view.state,
+        epoch: view.epoch,
         cursor,
         amendments,
     })
@@ -1854,10 +1868,11 @@ pub mod testing {
 
         fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
             let view = self.read_task(id)?;
-            let (state, cursor) = (view.state, view.version);
+            let (state, epoch, cursor) = (view.state, view.epoch, view.version);
             let amendments = Vec::new();
             Ok(Thread {
                 state,
+                epoch,
                 cursor,
                 amendments,
             })

@@ -147,17 +147,12 @@ impl SessionId {
     }
 }
 
-/// How a Claude agent picks up an earlier session.
 #[derive(Debug, Clone, Copy)]
 pub enum Resume<'a> {
-    /// Starts a new session from a copy of another task's, which stays as it was.
     Fork(&'a SessionId),
-    /// Goes on in the attempt's own session.
     InPlace(&'a SessionId),
 }
 
-/// The command line that runs `spec` on `prompt` in `dir`, picking up a session when `resume`
-/// says so (Claude only); the prompt is last, after `--`.
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,

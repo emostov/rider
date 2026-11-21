@@ -18,7 +18,7 @@ use fs4::{FileExt, TryLockError};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, LEAD_PREFIX, TaskId, VbCli};
+use crate::board::{self, Board, BoardError, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
@@ -63,6 +63,8 @@ const WAIT_MINUTES_DEFAULT: u32 = 54;
 const WAIT_DIR: &str = "wait";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
+/// The profile prefix of a lead, as the ride-swarm skill names it.
+const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
 /// How long the feed must stay quiet after an event before the wait reports it.
