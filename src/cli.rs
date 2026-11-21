@@ -24,13 +24,14 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::flag;
 use signal_hook::iterator::Signals;
 
-use crate::board::{self, Board, BoardError, NEEDS_MAX, TaskId, VbCli};
+use crate::board::{self, Board, BoardError, Listing, NEEDS_MAX, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
 use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
 use crate::harness::LOG_BYTES_MAX;
+use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
@@ -99,9 +100,13 @@ const WAIT_MINUTES_MAX: u32 = 60;
 const WAIT_MINUTES_DEFAULT: u32 = 54;
 /// The directory under the Rider home that holds each project's wait cursor.
 const WAIT_DIR: &str = "wait";
+/// The failure reason of a read of a channel that does not exist yet.
+const CHANNEL_NOT_FOUND: &str = "channel_not_found";
+/// The profile `rider queue` reads the board as.
+const QUEUE_PROFILE: &str = "rider-queue";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
-/// The profile prefix of a lead, as the ride-swarm skill names it.
+const LEAD_PROFILE: &str = "lead";
 const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
 const DECISIONS: &str = "decisions";
@@ -149,6 +154,12 @@ pub enum Command {
     Status,
     /// Print every agent the daemon runs.
     Agents,
+    /// Print the owner's review queue, then the work the daemon runs.
+    Queue {
+        /// Print the items with every label as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the newest attempt's log of a task; -f follows it until the agent exits.
     Logs {
         #[arg(value_name = "ID", value_parser = parse_task_id)]
@@ -194,7 +205,7 @@ pub enum Command {
             value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
         )]
         timeout: u32,
-        /// The lead's profile, whose own events never end the wait; by default any lead-*.
+        /// The lead's profile, whose own events never end the wait.
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
     },
@@ -435,6 +446,7 @@ pub enum CliError {
     NoNpm,
     /// `npm install` of the Board CLI failed or left no `vb`.
     NotInstalled(String),
+    Queue(QueueError),
     Skills(SkillsError),
     /// `rider skills install` left these skill directories as they were.
     SkillsRefused(usize),
@@ -468,6 +480,7 @@ impl fmt::Display for CliError {
                 "the Board CLI is missing and npm is not on PATH: install Node 22, then retry"
             ),
             CliError::NotInstalled(why) => write!(f, "could not install the Board CLI: {why}"),
+            CliError::Queue(error) => write!(f, "{error}"),
             CliError::Skills(error) => write!(f, "{error}"),
             CliError::SkillsRefused(count) => {
                 write!(f, "{count} skills were not installed; see the lines above")
@@ -501,6 +514,7 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Down { now } => down(config, *now),
         Command::Status => status(config),
         Command::Agents => agents(config),
+        Command::Queue { json } => queue(config, *json),
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
@@ -1063,18 +1077,105 @@ fn status(config: &Config) -> Result<u8, CliError> {
             .iter()
             .filter(|task| task["project"].as_str().unwrap_or(daemon::SUBTREE) == project);
         for task in in_project {
-            println!(
-                "  #{} {} {} {} {} {}",
-                task["id"],
-                text(&task["state"]),
-                text(&task["role"]),
-                text(&task["profile"]),
-                age(&task["age_ms"]),
-                text(&task["branch"]),
-            );
+            println!("{}", task_row(task));
         }
     }
     Ok(0)
+}
+
+fn task_row(task: &serde_json::Value) -> String {
+    format!(
+        "  #{} {} {} {} {} {}",
+        task["id"],
+        text(&task["state"]),
+        text(&task["role"]),
+        text(&task["profile"]),
+        age(&task["age_ms"]),
+        text(&task["branch"]),
+    )
+}
+
+fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
+    let repos = queue::opted_in(&config.home).map_err(CliError::Queue)?;
+    if repos.is_empty() {
+        let path = config.home.join(STAND_IN_FILE);
+        say(&format!(
+            "no repository is opted in to the queue; add to {}:",
+            path.display()
+        ));
+        say("[repo.\"/path/to/checkout\"]\nqueue = true");
+        return Ok(1);
+    }
+    let board = VbCli {
+        vb: config.vb_dir().join("vb"),
+        url: config.board_url.clone(),
+        profile: QUEUE_PROFILE.to_string(),
+    };
+    let listings = thread::scope(|scope| {
+        let reads: Vec<_> = [QUEUE_CHANNEL, DECISIONS]
+            .map(|channel| scope.spawn(|| open_tasks(&board, channel)))
+            .into();
+        let joined = reads.into_iter().map(|read| {
+            let read = read.join();
+            read.unwrap_or_else(|_| Err(BoardError::Io("a board read panicked".into())))
+        });
+        joined.collect::<Result<Vec<_>, BoardError>>()
+    });
+    let mut tasks = Vec::new();
+    for listing in listings.map_err(CliError::Board)? {
+        let total = listing.tasks.len().saturating_add(listing.left_out);
+        if total.saturating_add(tasks.len()) > QUEUE_ITEMS_MAX {
+            return Err(CliError::Queue(QueueError::TooManyItems));
+        }
+        tasks.extend(listing.tasks);
+    }
+    let now = jiff::Timestamp::now().as_millisecond();
+    let now = u64::try_from(now).unwrap_or(0);
+    let view = queue::view(&tasks, now).map_err(CliError::Queue)?;
+    if json {
+        say(&view.json.to_string());
+        return Ok(0);
+    }
+    let mut lines = view.lines;
+    lines.push(String::new());
+    lines.extend(running(config));
+    let mut out = io::stdout().lock();
+    let written = lines.iter().try_for_each(|line| writeln!(out, "{line}"));
+    written
+        .and_then(|()| out.flush())
+        .map_err(|error| io_error("write", Path::new("standard output"), &error))?;
+    Ok(0)
+}
+
+// The open tasks in `channel`; none when the channel does not exist yet.
+fn open_tasks(board: &VbCli, channel: &str) -> Result<Listing, BoardError> {
+    match board.list_labelled(channel, "board.task", &OPEN_STATES) {
+        Err(BoardError::Exit { stderr, .. })
+            if board::parse_failure_reason(&stderr).as_deref() == Some(CHANNEL_NOT_FOUND) =>
+        {
+            Ok(Listing {
+                tasks: Vec::new(),
+                cursor: Cursor(0),
+                left_out: 0,
+            })
+        }
+        listed => listed,
+    }
+}
+
+fn running(config: &Config) -> Vec<String> {
+    let Ok(mut client) = Client::connect(&config.home) else {
+        return vec!["daemon not running".to_string()];
+    };
+    let Ok(data) = client.send("status", &[]) else {
+        return vec!["running work unavailable: the daemon did not answer".to_string()];
+    };
+    let mut lines = vec![format!("running {} of {}", data["running"], data["limit"])];
+    let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
+    let claimed = tasks.iter().filter(|task| task["state"] == "claimed");
+    lines.extend(claimed.map(task_row));
+    assert!(!lines.is_empty());
+    lines
 }
 
 fn agents(config: &Config) -> Result<u8, CliError> {
@@ -1168,7 +1269,7 @@ impl Watch<'_> {
             .and_then(|actor| actor.rsplit_once('+'));
         let by_lead = profile.is_some_and(|(_, profile)| match self.lead {
             Some(lead) => profile == lead,
-            None => profile.starts_with(LEAD_PREFIX),
+            None => profile == LEAD_PROFILE || profile.starts_with(LEAD_PREFIX),
         });
         if by_lead {
             return None;
