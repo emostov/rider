@@ -74,9 +74,10 @@ pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
 const SCHEMAS_LISTED_MAX: usize = 1024;
 /// The number of global arguments: `--json --url <url> --as <profile>`.
 const GLOBAL_ARGS_LEN: usize = 5;
-/// The most labels and needs `create_task` writes, so its arguments stay within `ARGS_MAX`.
 pub const CREATE_LABELS_MAX: usize = 4;
 pub const CREATE_NEEDS_MAX: usize = 1;
+pub const SET_NEEDS_MAX: usize = 12;
+const _: () = assert!(3 + SET_NEEDS_MAX + GLOBAL_ARGS_LEN <= ARGS_MAX);
 const _: () =
     assert!(6 + 2 * CREATE_LABELS_MAX + 1 + CREATE_NEEDS_MAX + GLOBAL_ARGS_LEN + 2 <= ARGS_MAX);
 /// The longest decimal ID that fits a `u64`.
@@ -175,6 +176,7 @@ pub struct Thread {
     pub epoch: u64,
     pub cursor: Cursor,
     pub amendments: Vec<Amendment>,
+    pub others: Vec<Amendment>,
 }
 
 #[derive(Debug)]
@@ -320,8 +322,7 @@ pub trait Board {
     fn thread(&self, id: TaskId) -> Result<Thread, BoardError>;
     fn schema_ids(&self) -> Result<Vec<String>, BoardError>;
     fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError>;
-    /// Creates a task in `channel` that waits for `needs`, or returns the one an earlier call
-    /// with the same `key` created.
+    fn set_needs(&self, id: TaskId, needs: &[TaskId]) -> Result<(), BoardError>;
     fn create_task(
         &self,
         channel: &str,
@@ -419,6 +420,10 @@ enum Command<'a> {
     CreateSchema {
         id: &'a str,
         json: &'a str,
+    },
+    Needs {
+        id: TaskId,
+        needs: &'a [TaskId],
     },
     Create {
         channel: &'a str,
@@ -572,6 +577,11 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
         Command::CreateSchema { id, .. } => {
             (to_strings(&["schemas", "create", id, "--file", "-"]), None)
         }
+        Command::Needs { id, needs } => {
+            let mut words = to_strings(&["tasks", "needs", &id.0.to_string()]);
+            words.extend(needs.iter().map(|need| need.0.to_string()));
+            (words, None)
+        }
         // The task's text goes on stdin; `-` tells `vb` to read it there.
         Command::Create {
             channel,
@@ -661,6 +671,7 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
         Command::Schemas => ("schemas list", 0),
         Command::CreateSchema { .. } => ("schemas create", 0),
         Command::Create { .. } => ("tasks create", 0),
+        Command::Needs { .. } => ("tasks needs", 0),
     };
     assert!(
         wait_seconds <= WAIT_SECONDS_MAX,
@@ -684,7 +695,8 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
         | Command::List { .. }
         | Command::Schemas
         | Command::CreateSchema { .. }
-        | Command::Create { .. } => None,
+        | Command::Create { .. }
+        | Command::Needs { .. } => None,
         Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
         Command::Reply { id, .. } | Command::Post { id, .. } => Some(("posted", id)),
@@ -1128,23 +1140,23 @@ pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
     }
     let cursor = Cursor(parse_id_text(&thread.cursor)?.0);
     let mut amendments: Vec<Amendment> = Vec::new();
+    let mut others: Vec<Amendment> = Vec::new();
     for reply in thread.replies {
         let by = &reply.by;
         // The board verifies `actor` and `principal`; a profile is only a name its login picks.
         let amends = by.principal == owner && (by.actor == owner || by.actor == creator);
-        if !amends {
-            continue;
-        }
         let id = Cursor(parse_id_text(&reply.id)?.0);
         let (profile, text) = (reply.by.profile, reply.text);
-        amendments.push(Amendment { id, profile, text });
+        let to = if amends { &mut amendments } else { &mut others };
+        to.push(Amendment { id, profile, text });
     }
-    assert!(amendments.len() <= REPLIES_MAX);
+    assert!(amendments.len() + others.len() <= REPLIES_MAX);
     Ok(Thread {
         state: view.state,
         epoch: view.epoch,
         cursor,
         amendments,
+        others,
     })
 }
 
@@ -1759,15 +1771,23 @@ impl Board for VbCli {
         assert!(!channel.is_empty() && !channel.starts_with('-'));
         assert!(!key.is_empty() && !key.starts_with('-'));
         assert!(labels.len() <= CREATE_LABELS_MAX && needs.len() <= CREATE_NEEDS_MAX);
+        // `vb` drops one final newline from text read on stdin.
+        let text = format!("{text}\n");
         let command = Command::Create {
             channel,
-            text,
+            text: &text,
             labels,
             needs,
             key,
         };
         let (_, id) = parse_write(&self.read(&command)?)?;
         Ok(id)
+    }
+
+    fn set_needs(&self, id: TaskId, needs: &[TaskId]) -> Result<(), BoardError> {
+        assert!(!needs.is_empty() && needs.len() <= SET_NEEDS_MAX);
+        assert!(!needs.contains(&id));
+        self.read(&Command::Needs { id, needs }).map(drop)
     }
 }
 
@@ -1992,6 +2012,10 @@ pub mod testing {
             Err(BoardError::Parse("the fake board creates no tasks".into()))
         }
 
+        fn set_needs(&self, id: TaskId, _: &[TaskId]) -> Result<(), BoardError> {
+            self.record(format!("set_needs {}", id.0))
+        }
+
         fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
             self.record(format!("list_open {subtree}"))?;
             let closed = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
@@ -2036,12 +2060,12 @@ pub mod testing {
         fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
             let view = self.read_task(id)?;
             let (state, epoch, cursor) = (view.state, view.epoch, view.version);
-            let amendments = Vec::new();
             Ok(Thread {
                 state,
                 epoch,
                 cursor,
-                amendments,
+                amendments: Vec::new(),
+                others: Vec::new(),
             })
         }
     }

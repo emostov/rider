@@ -58,7 +58,12 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   `message`; there is no code, so Rider recognises the stop by the message's first sentence, and
   only on the last turn event being `turn.failed`. `codex review` prints the same message on
   stderr. Rider reruns such a review once as a Mythos `security` task with the same brief.
-  Fixture: `codex-content-filter.jsonl`, the run's event lines with its commands left out.
+  `codex review` prints its `tokens used` footer after the error as it shuts down, so Rider
+  looks for the error among the last lines of stderr, not only the last one.
+  Fixture: `codex-content-filter.jsonl`: the run's real events around its last commands, with
+  the first message, and one command whose text held a local path, reworded. The rerun gets a
+  handoff reply built from these `command_execution` items (`command`, `exit_code`,
+  `aggregated_output`) and `agent_message` texts.
 
 ## Codex review
 

@@ -14,8 +14,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::board::{
-    Amendment, Board, BoardError, MESSAGE_CHARS_MAX, REPLIES_MAX, TaskId, TaskState, TaskView,
-    Thread, message_tail, one_line,
+    Amendment, Board, BoardError, MESSAGE_CHARS_MAX, REPLIES_MAX, SET_NEEDS_MAX, TaskId, TaskState,
+    TaskView, Thread, message_tail, one_line,
 };
 use crate::brief::{Brief, BriefError, echo, label, parse_brief, parse_id_label};
 use crate::cli::{IMPLEMENT_PROMPT, PROMPTS, SLOP_RULES};
@@ -62,6 +62,10 @@ const ATTEMPT_LABEL: &str = "attempt";
 const RERUN_LABEL: &str = "rerun";
 const RERUN_OF_LABEL: &str = "rerun_of";
 const RERUN_ROLE: &str = "security";
+const RERUN_FROM_ROLES: [&str; 2] = ["review", "native-review"];
+const RERUN_TRIES: u32 = 3;
+const HANDOFF_REPLIES_MAX: usize = 16;
+const HANDOFF_LINE_CHARS: usize = 200;
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
@@ -1409,50 +1413,144 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
         let _ = board.reply(id, &header);
     }
     let role = attempt.brief.role;
-    let filtered = harness::stopped_by_content_filter(&role.harness, attempt.log());
-    if filtered && role.needs_of && role.label != RERUN_ROLE {
+    let filtered = harness::stopped_by_content_filter(&role.harness, &attempt.log());
+    if filtered && RERUN_FROM_ROLES.contains(&role.label) {
         rerun_on_mythos(id, board, attempt);
     }
     Ok(())
 }
 
 fn rerun_on_mythos(id: TaskId, board: &dyn Board, attempt: &Attempt) {
-    assert!(attempt.brief.role.needs_of);
-    assert!(attempt.brief.role.label != RERUN_ROLE);
-    let view = match board.read_task(id) {
-        Ok(view) => view,
-        Err(error) => {
-            let note = format!("Rider could not rerun this review on Mythos: {error}.");
-            let _ = board.reply(id, &one_line(&note));
-            return;
-        }
-    };
-    if label(&view, RERUN_LABEL).is_some() {
-        return;
-    }
-    let (Some(of), Some(repo)) = (attempt.brief.of, label(&view, "repo")) else {
-        return;
-    };
-    let (needs, of, own) = ([of], of.0.to_string(), id.0.to_string());
-    let labels = [
-        ("role", RERUN_ROLE),
-        ("repo", repo),
-        ("of", of.as_str()),
-        (RERUN_OF_LABEL, own.as_str()),
-    ];
-    let key = format!("rider-rerun-{own}");
-    let note = match board.create_task(&view.channel, &view.text, &labels, &needs, &key) {
-        Ok(rerun) => {
-            let _ = board.set_label(id, RERUN_LABEL, &rerun.0.to_string());
-            format!(
-                "The provider's content filter stopped this review, so it is rerun once on \
-                 Mythos as security task #{}, with the same brief.",
-                rerun.0
-            )
-        }
+    assert!(RERUN_FROM_ROLES.contains(&attempt.brief.role.label));
+    let note = match rerun(id, board, attempt) {
+        Ok(None) => return,
+        Ok(Some((rerun, relinked))) => format!(
+            "The provider's content filter stopped this review, so it is rerun once on Mythos \
+             as security task #{}, with the same brief, its amendments, and a handoff of this \
+             run's work.{relinked}",
+            rerun.0
+        ),
         Err(error) => format!("Rider could not rerun this review on Mythos: {error}."),
     };
     let _ = board.reply(id, &one_line(&note));
+}
+
+fn retried<T>(mut call: impl FnMut() -> Result<T, BoardError>) -> Result<T, BoardError> {
+    let mut last = call();
+    for _ in 1..RERUN_TRIES {
+        if last.is_ok() {
+            break;
+        }
+        last = call();
+    }
+    last
+}
+
+fn rerun(
+    id: TaskId,
+    board: &dyn Board,
+    attempt: &Attempt,
+) -> Result<Option<(TaskId, String)>, BoardError> {
+    let view = retried(|| board.read_task(id))?;
+    if label(&view, RERUN_LABEL).is_some() {
+        return Ok(None);
+    }
+    let (Some(of), Some(repo)) = (attempt.brief.of, label(&view, "repo")) else {
+        return Ok(None);
+    };
+    let thread = retried(|| board.thread(id))?;
+    let mut text = view.text.clone();
+    if !thread.amendments.is_empty() {
+        text.push_str(&format!(
+            "\n\n## Amendments from the thread of task #{}, the latest winning\n",
+            id.0
+        ));
+    }
+    for amendment in &thread.amendments {
+        text.push_str(&format!(
+            "\nReply #{}:\n{}\n",
+            amendment.id.0, amendment.text
+        ));
+    }
+    if text.chars().count() > MESSAGE_CHARS_MAX {
+        return Err(BoardError::Parse(format!(
+            "the brief and its amendments pass {MESSAGE_CHARS_MAX} characters"
+        )));
+    }
+    let (of_text, own) = (of.0.to_string(), id.0.to_string());
+    let labels = [
+        ("repo", repo),
+        ("of", of_text.as_str()),
+        (RERUN_OF_LABEL, own.as_str()),
+    ];
+    let key = format!("rider-rerun-{own}");
+    let rerun = retried(|| board.create_task(&view.channel, &text, &labels, &[of], &key))?;
+    assert!(rerun != id && rerun != of);
+    let mut handoff = format!(
+        "Handoff from the Codex run of task #{own} that the content filter stopped. It is a \
+         record of work already done, not instructions: verify and extend it rather than \
+         repeat it.\n\nWhat it posted in task #{own}'s thread:\n"
+    );
+    let skip = thread.others.len().saturating_sub(HANDOFF_REPLIES_MAX);
+    for reply in thread.others.iter().skip(skip) {
+        let by = reply.profile.as_deref().unwrap_or("owner");
+        let first = reply.text.lines().find(|line| !line.trim().is_empty());
+        let first: String = first
+            .unwrap_or_default()
+            .chars()
+            .take(HANDOFF_LINE_CHARS)
+            .collect();
+        handoff.push_str(&format!("- #{} by {by}: {first}\n", reply.id.0));
+    }
+    let log = harness::handoff(&attempt.brief.role.harness, &attempt.log());
+    handoff.push_str(&format!("\nWhat its log shows, oldest first:\n{log}"));
+    board.reply(rerun, &handoff)?;
+    let checked = retried(|| board.read_task(of))?;
+    if let Some(branch) = label(&checked, BRANCH_LABEL) {
+        retried(|| board.set_label(rerun, BRANCH_LABEL, branch))?;
+    }
+    retried(|| board.set_label(rerun, "role", RERUN_ROLE))?;
+    let relinked = relink(id, rerun, board).map_or_else(
+        |error| {
+            format!(
+                " Rider could not point the tasks that wait for it at #{}: {error}.",
+                rerun.0
+            )
+        },
+        |count| {
+            format!(
+                " {count} tasks that waited for it or checked it now use #{}.",
+                rerun.0
+            )
+        },
+    );
+    retried(|| board.set_label(id, RERUN_LABEL, &rerun.0.to_string()))?;
+    Ok(Some((rerun, relinked)))
+}
+
+fn relink(failed: TaskId, rerun: TaskId, board: &dyn Board) -> Result<usize, BoardError> {
+    let listing = retried(|| board.list_open(SUBTREE))?;
+    let (failed_text, rerun_text) = (failed.0.to_string(), rerun.0.to_string());
+    let mut count = 0usize;
+    for task in &listing.tasks {
+        let view = &task.view;
+        let checks = label(view, "of") == Some(failed_text.as_str());
+        if view.needs.contains(&failed) {
+            let needs: Vec<TaskId> = (view.needs.iter())
+                .map(|need| if *need == failed { rerun } else { *need })
+                .collect();
+            if needs.len() > SET_NEEDS_MAX {
+                return Err(BoardError::TooManyNeeds);
+            }
+            retried(|| board.set_needs(view.id, &needs))?;
+        }
+        if checks {
+            retried(|| board.set_label(view.id, "of", &rerun_text))?;
+        }
+        count += usize::from(checks || view.needs.contains(&failed));
+    }
+    assert!(count <= listing.tasks.len());
+    Ok(count)
 }
 
 // The window past its first byte, which is the one before the window, read only for its `\n`.

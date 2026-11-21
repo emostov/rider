@@ -178,10 +178,9 @@ impl Behaviour {
 /// What Codex's interruption message for a review that never started begins with.
 pub const REVIEW_INTERRUPTED: &str =
     "Review was interrupted. Please re-run /review and wait for it to complete.";
-/// The error a `ContentFilterStop` agent prints on stderr as `codex review`.
+pub const CONTENT_FILTER_PLAN: &str = "Plan: check the sandbox profile first.";
 pub const CONTENT_FILTER_ERROR: &str = "ERROR: This content was flagged for possible cybersecurity risk. If this seems wrong, try \
      rephrasing your request.";
-/// The events a `ContentFilterStop` agent prints as `codex exec`, recorded from a real run.
 const CONTENT_FILTER_EVENTS: &str =
     include_str!("../../fixtures/harness/codex-content-filter.jsonl");
 
@@ -251,6 +250,7 @@ attempt=$( (grep "^start $task " "$runs" 2>/dev/null || true) | wc -l | tr -d ' 
 plan="$world/{BEHAVIOURS_DIR}/$task"
 behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=$(tail -n 1 "$plan" 2>/dev/null)
+[ -n "$behaviour" ] || behaviour=$(tail -n 1 "$world/{BEHAVIOURS_DIR}/default" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
@@ -315,11 +315,13 @@ case "$behaviour" in
   review-nothing) exit 0 ;;
   review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
   content-filter-stop)
+    vb reply "$task" -- "{CONTENT_FILTER_PLAN}" > /dev/null || exit 2
     if [ "$harness" = codex ]; then
       cat <<'EVENTS'
 {CONTENT_FILTER_EVENTS}EVENTS
     else
-      echo "{CONTENT_FILTER_ERROR}" >&2
+      printf 'exec\n/bin/zsh -lc ls\n succeeded in 5ms:\nsrc\n' >&2
+      printf '%s\ntokens used\n4,080\n' "{CONTENT_FILTER_ERROR}" >&2
     fi
     exit 1 ;;
   wander-branch) git switch -q -c elsewhere && commit || exit 1 ;;

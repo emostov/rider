@@ -8,6 +8,7 @@ use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -47,6 +48,11 @@ const REVIEW_INTERRUPTED: &str = "Review was interrupted.";
 // Codex's content-filter error has no code: its message's first sentence names it.
 const CONTENT_FILTER: &str = "This content was flagged for possible cybersecurity risk.";
 const STDERR_TAIL_BYTES: u64 = 64 * 1024;
+const STDERR_FINAL_LINES: usize = 8;
+pub const HANDOFF_BYTES_MAX: usize = 6 * 1024;
+const HANDOFF_LINES_MAX: usize = 24;
+const CLIP_CHARS: usize = 160;
+const _: () = assert!(HANDOFF_LINES_MAX * (CLIP_CHARS * 8 + 32) > HANDOFF_BYTES_MAX);
 const POISONED: &str = "the log lock was poisoned";
 
 const _: () = {
@@ -708,6 +714,8 @@ struct SessionLine {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum CodexEvent {
+    #[serde(rename = "item.started")]
+    ItemStarted { item: Option<Field<CodexItem>> },
     #[serde(rename = "item.completed")]
     ItemCompleted { item: Option<Field<CodexItem>> },
     #[serde(rename = "turn.failed")]
@@ -730,6 +738,9 @@ struct CodexItem {
     #[serde(rename = "type")]
     kind: Option<Field<String>>,
     text: Option<Field<String>>,
+    command: Option<Field<String>>,
+    exit_code: Option<Field<i64>>,
+    aggregated_output: Option<Field<String>>,
 }
 
 // Visits each line of `log` that is an `E`; skips other lines and those over `LINE_BYTES_MAX`.
@@ -848,9 +859,6 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
     before
 }
 
-/// Whether the provider's content filter ended the run at `log`: for Codex, its last turn event
-/// is a `turn.failed` whose error is the filter's; for `codex review`, its stderr transcript
-/// ends with that error.
 pub fn stopped_by_content_filter(harness: &Harness, log: &Path) -> bool {
     let stopped = match harness {
         Harness::Claude => false,
@@ -862,28 +870,110 @@ pub fn stopped_by_content_filter(harness: &Harness, log: &Path) -> bool {
                     stopped = message.is_some_and(|text| text.starts_with(CONTENT_FILTER));
                 }
                 CodexEvent::TurnCompleted => stopped = false,
-                CodexEvent::ItemCompleted { .. } | CodexEvent::Error | CodexEvent::Other => {}
+                CodexEvent::ItemStarted { .. }
+                | CodexEvent::ItemCompleted { .. }
+                | CodexEvent::Error
+                | CodexEvent::Other => {}
             });
             stopped
         }
-        Harness::CodexReview => {
-            let stderr = stderr_log(log);
-            let Ok(mut file) = File::open(&stderr) else {
-                return false;
-            };
-            let len = file.metadata().map_or(0, |metadata| metadata.len());
-            let mut tail = Vec::new();
-            let read = file
-                .seek(SeekFrom::Start(len.saturating_sub(STDERR_TAIL_BYTES)))
-                .and_then(|_| file.take(STDERR_TAIL_BYTES).read_to_end(&mut tail));
-            let text = String::from_utf8_lossy(&tail);
-            let last = text.lines().rev().find(|line| !line.trim().is_empty());
-            let error = last.and_then(|line| line.trim().strip_prefix("ERROR: "));
-            read.is_ok() && error.is_some_and(|text| text.starts_with(CONTENT_FILTER))
-        }
+        // Codex prints its token-usage footer after the terminal error as it shuts down.
+        Harness::CodexReview => stderr_tail(log).is_some_and(|text| {
+            let lines = text.lines().rev().filter(|line| !line.trim().is_empty());
+            let mut last = lines.take(STDERR_FINAL_LINES);
+            last.any(|line| {
+                let error = line.trim().strip_prefix("ERROR: ");
+                error.is_some_and(|error| error.starts_with(CONTENT_FILTER))
+            })
+        }),
     };
     assert!(!stopped || *harness != Harness::Claude);
     stopped
+}
+
+fn stderr_tail(log: &Path) -> Option<String> {
+    let mut file = File::open(stderr_log(log)).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut tail = Vec::new();
+    file.seek(SeekFrom::Start(len.saturating_sub(STDERR_TAIL_BYTES)))
+        .and_then(|_| file.take(STDERR_TAIL_BYTES).read_to_end(&mut tail))
+        .ok()?;
+    assert!(u64::try_from(tail.len()).is_ok_and(|n| n <= STDERR_TAIL_BYTES));
+    Some(String::from_utf8_lossy(&tail).into_owned())
+}
+
+fn clip(text: &str, chars_max: usize, from_end: bool) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = line.chars().count();
+    let clipped: String = if from_end {
+        line.chars().skip(count.saturating_sub(chars_max)).collect()
+    } else {
+        line.chars().take(chars_max).collect()
+    };
+    assert!(clipped.chars().count() <= chars_max);
+    clipped
+}
+
+// What a stopped run did, from its own log: the commands it ran with their exit codes and a
+// tail of their output, its last message, and what it was running when it stopped.
+pub fn handoff(harness: &Harness, log: &Path) -> String {
+    let mut lines: VecDeque<String> = VecDeque::new();
+    let mut push = |line: String| {
+        if lines.len() == HANDOFF_LINES_MAX {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    };
+    match harness {
+        Harness::Claude => {}
+        Harness::Codex => {
+            let mut running: Option<String> = None;
+            let _ = scan(log, |event| {
+                let (started, item) = match event {
+                    CodexEvent::ItemStarted { item } => (true, item),
+                    CodexEvent::ItemCompleted { item } => (false, item),
+                    _ => return,
+                };
+                let Some(item) = valid(item) else { return };
+                let kind = valid(item.kind);
+                let command = valid(item.command).map(|text| clip(&text, CLIP_CHARS, false));
+                match (kind.as_deref(), command, started) {
+                    (Some("command_execution"), Some(command), true) => running = Some(command),
+                    (Some("command_execution"), Some(command), false) => {
+                        running = None;
+                        let code = valid(item.exit_code)
+                            .map_or_else(|| "none".to_string(), |code| code.to_string());
+                        let output = valid(item.aggregated_output).unwrap_or_default();
+                        let output = clip(&output, CLIP_CHARS, true);
+                        push(format!("- ran `{command}`, exit {code}: {output}"));
+                    }
+                    (Some("agent_message"), _, false) => {
+                        let text = valid(item.text).unwrap_or_default();
+                        push(format!("- said: {}", clip(&text, CLIP_CHARS, false)));
+                    }
+                    _ => {}
+                }
+            });
+            if let Some(command) = running {
+                push(format!("- was running `{command}` when it stopped"));
+            }
+        }
+        Harness::CodexReview => {
+            let tail = stderr_tail(log).unwrap_or_default();
+            let kept = tail.lines().filter(|line| !line.trim().is_empty());
+            kept.for_each(|line| push(format!("    {}", clip(line, CLIP_CHARS, false))));
+        }
+    }
+    let mut text = String::new();
+    for line in lines {
+        if text.len() + line.len() + 1 > HANDOFF_BYTES_MAX {
+            break;
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    assert!(text.len() <= HANDOFF_BYTES_MAX);
+    text
 }
 
 /// Whether the stream at `log` records a failed run; false when the log is unreadable.
@@ -898,7 +988,9 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
         Harness::Codex => scan(log, |event| match event {
             CodexEvent::TurnFailed { .. } | CodexEvent::Error => last_turn_failed = true,
             CodexEvent::TurnCompleted => last_turn_failed = false,
-            CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
+            CodexEvent::ItemStarted { .. }
+            | CodexEvent::ItemCompleted { .. }
+            | CodexEvent::Other => {}
         }),
         // Without an event stream, a run that exits 0 still failed when it printed no review or
         // Codex's own message for a review delegate that never started.
