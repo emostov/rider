@@ -60,7 +60,18 @@ const CLAIM_LEASE: &str = "1h";
 /// Failure reasons that mean a claim found nothing, not that it went wrong.
 const CLAIM_EMPTY_REASONS: [&str; 2] = ["timeout", "nothing_ready"];
 /// The first word of every command `vb` is run with.
-const VERBS: [&str; 5] = ["read", "tasks", "label", "reply", "post"];
+const VERBS: [&str; 6] = ["read", "tasks", "label", "reply", "post", "schemas"];
+pub const RIDER_SCHEMAS: [(&str, &str); 2] = [
+    (
+        "rider-result@2",
+        include_str!("../skills/ride-swarm/schemas/rider-result@2.json"),
+    ),
+    (
+        "rider-finding@1",
+        include_str!("../skills/ride-swarm/schemas/rider-finding.json"),
+    ),
+];
+const SCHEMAS_LISTED_MAX: usize = 1024;
 /// The number of global arguments: `--json --url <url> --as <profile>`.
 const GLOBAL_ARGS_LEN: usize = 5;
 /// The longest decimal ID that fits a `u64`.
@@ -301,6 +312,21 @@ pub trait Board {
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
     fn thread(&self, id: TaskId) -> Result<Thread, BoardError>;
+    fn schema_ids(&self) -> Result<Vec<String>, BoardError>;
+    fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError>;
+}
+
+pub fn register_schemas(board: &dyn Board) -> Result<Vec<&'static str>, BoardError> {
+    let known = board.schema_ids()?;
+    let mut registered = Vec::with_capacity(RIDER_SCHEMAS.len());
+    for (id, json) in RIDER_SCHEMAS {
+        if !known.iter().any(|known| known == id) {
+            board.create_schema(id, json)?;
+            registered.push(id);
+        }
+    }
+    assert!(registered.len() <= RIDER_SCHEMAS.len());
+    Ok(registered)
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -372,6 +398,11 @@ enum Command<'a> {
         id: TaskId,
         reason: &'a str,
         kind: &'a str,
+    },
+    Schemas,
+    CreateSchema {
+        id: &'a str,
+        json: &'a str,
     },
 }
 
@@ -513,6 +544,11 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             let words = to_strings(&["tasks", "block", &id.0.to_string(), "--kind", kind]);
             (words, Some(one_line(reason)))
         }
+        Command::Schemas => (to_strings(&["schemas", "list"]), None),
+        // The schema's JSON goes on stdin; `--file -` tells `vb` to read it there.
+        Command::CreateSchema { id, .. } => {
+            (to_strings(&["schemas", "create", id, "--file", "-"]), None)
+        }
     };
     assert!(
         VERBS.contains(&words[0].as_str()),
@@ -543,13 +579,21 @@ fn command_args(command: &Command, url: &str, profile: &str) -> Vec<String> {
     args
 }
 
-/// The text `command` sends on stdin, if any. Only a reply does: it may span many lines.
+/// The text `command` sends on stdin, if any: a reply's text or a schema's JSON, either of
+/// which may span many lines.
 fn command_stdin<'a>(command: &Command<'a>) -> Option<&'a str> {
     let stdin = match *command {
         Command::Reply { text, .. } => Some(text),
+        Command::CreateSchema { json, .. } => Some(json),
         _ => None,
     };
-    assert!(stdin.is_none() || matches!(command, Command::Reply { .. }));
+    assert!(
+        stdin.is_none()
+            || matches!(
+                command,
+                Command::Reply { .. } | Command::CreateSchema { .. }
+            )
+    );
     stdin
 }
 
@@ -571,6 +615,8 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
         Command::Complete { .. } => ("tasks complete", 0),
         Command::Fail { .. } => ("tasks fail", 0),
         Command::Block { .. } => ("tasks block", 0),
+        Command::Schemas => ("schemas list", 0),
+        Command::CreateSchema { .. } => ("schemas create", 0),
     };
     assert!(
         wait_seconds <= WAIT_SECONDS_MAX,
@@ -591,7 +637,9 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
         | Command::Cursor { .. }
         | Command::Channel { .. }
         | Command::PostRoot { .. }
-        | Command::List { .. } => None,
+        | Command::List { .. }
+        | Command::Schemas
+        | Command::CreateSchema { .. } => None,
         Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
         Command::Reply { id, .. } | Command::Post { id, .. } => Some(("posted", id)),
@@ -798,6 +846,16 @@ struct WireTaskRef {
 struct WireMessageRef {
     id: String,
     re: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireSchemas {
+    schemas: Vec<WireSchema>,
+}
+
+#[derive(Deserialize)]
+struct WireSchema {
+    id: String,
 }
 
 /// A write's output: `{task, outcome}` or `{message, outcome}`.
@@ -1623,6 +1681,27 @@ impl Board for VbCli {
     fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
         parse_thread(id, &self.read(&Command::Read { id })?)
     }
+
+    fn schema_ids(&self) -> Result<Vec<String>, BoardError> {
+        let listed: WireSchemas = parse(&self.read(&Command::Schemas)?)?;
+        if listed.schemas.len() > SCHEMAS_LISTED_MAX {
+            return Err(BoardError::Parse(format!(
+                "more than {SCHEMAS_LISTED_MAX} schemas listed"
+            )));
+        }
+        let ids: Vec<String> = listed.schemas.into_iter().map(|schema| schema.id).collect();
+        assert!(ids.len() <= SCHEMAS_LISTED_MAX);
+        Ok(ids)
+    }
+
+    fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError> {
+        assert!(
+            id.contains('@') && !id.starts_with('-'),
+            "a schema is name@version"
+        );
+        assert!(!json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
+        self.read(&Command::CreateSchema { id, json }).map(drop)
+    }
 }
 
 impl VbCli {
@@ -1823,6 +1902,15 @@ pub mod testing {
         fn identity(&self) -> Result<String, BoardError> {
             self.scripted("identity")?;
             Ok("rider board 00000000000000000000000000000000".to_string())
+        }
+
+        fn schema_ids(&self) -> Result<Vec<String>, BoardError> {
+            self.record("schema_ids".to_string())?;
+            Ok(Vec::new())
+        }
+
+        fn create_schema(&self, id: &str, _: &str) -> Result<(), BoardError> {
+            self.record(format!("create_schema {id}"))
         }
 
         fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
