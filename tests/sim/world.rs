@@ -28,6 +28,7 @@ const RESULT_PAUSE_MAX: u64 = 20 * SECOND;
 const BRANCHES: [&str; 3] = ["stack-a", "stack-b", "stack-c"];
 /// One seed in this many tracks few tasks, so the untracked count is exercised.
 const SMALL_TASKS_EVERY: u64 = 4;
+const ROLE_OFF_EVERY: u64 = 3;
 /// The task bound those seeds run under.
 const SMALL_TASKS_MAX: usize = 6;
 /// Seeds that track every task cycle the builders limit through 1 to this, so it often binds.
@@ -209,6 +210,11 @@ impl World {
             config.tasks_max = SMALL_TASKS_MAX;
         } else {
             config.builders_max = u8::try_from(seed % BUILDERS_CYCLE + 1).expect("a small limit");
+        }
+        if seed.is_multiple_of(ROLE_OFF_EVERY) {
+            let off =
+                usize::try_from(seed / ROLE_OFF_EVERY).expect("a small seed") % config.roles.len();
+            config.roles[off].enabled = false;
         }
         let now = Timestamp(1_800_000_000_000);
         World {
@@ -1000,6 +1006,19 @@ impl World {
                 self.claim(run, task, profile);
             }
             Action::Resume { run, task, profile } => self.resume(run, task, &profile),
+            Action::Refuse { task, .. } => {
+                let id = self.expect(None, "refuse");
+                let index = self.tasks.iter().position(|fake| fake.id == task);
+                let ready = index.filter(|index| {
+                    let fake = &self.tasks[*index];
+                    fake.state == TaskState::Ready && fake.holder.is_none()
+                });
+                if let Some(index) = ready.filter(|_| !self.board_fails()) {
+                    self.tasks[index].state = TaskState::Blocked;
+                    self.publish(index, EventKind::TaskBlocked);
+                }
+                self.reply(id, Event::Refused(task));
+            }
             Action::Prepare { run, task } => {
                 let id = self.expect(Some(run), "prepare");
                 let branch = self.learn_branch(task);
@@ -1061,7 +1080,14 @@ impl World {
                     },
                     _ => Verdict::LeaveBlocked,
                 };
-                self.reply(id, Event::Judged { run, verdict });
+                self.reply(
+                    id,
+                    Event::Judged {
+                        run,
+                        verdict,
+                        usage: None,
+                    },
+                );
             }
             Action::Settle {
                 run,
@@ -1275,6 +1301,7 @@ impl World {
             .map(|fake| ListedTask {
                 view: TaskView {
                     id: fake.id,
+                    channel: fake.channel.to_string(),
                     text: String::new(),
                     state: fake.state,
                     labels: fake.labels.clone(),
@@ -1286,7 +1313,6 @@ impl World {
                     }),
                     version: Cursor(fake.version),
                 },
-                channel: fake.channel.to_string(),
             })
             .collect();
         // The cursor is read before the pages, so events may land between the two.
@@ -1406,7 +1432,20 @@ impl World {
                             "{action:?} retries a refused claim before a tick or news of its task"
                         ));
                     }
+                    if self.role_is_off(*task) != Some(false) {
+                        return Err(format!(
+                            "invariant 13: {action:?} claims a task of a role that is off"
+                        ));
+                    }
                     (*run, true)
+                }
+                Action::Refuse { task, .. } => {
+                    if blocked || self.role_is_off(*task) != Some(true) {
+                        return Err(format!(
+                            "invariant 13: {action:?} refuses a task of a role that is on"
+                        ));
+                    }
+                    continue;
                 }
                 Action::Resume { run, task, profile } => {
                     self.log.entry(*run).or_default().profile = Some(profile.clone());
@@ -1481,6 +1520,14 @@ impl World {
             }
         }
         Ok(())
+    }
+
+    /// Whether the role the core knows task `task` by is off; `None` when it knows no role.
+    fn role_is_off(&self, task: TaskId) -> Option<bool> {
+        let known = self.core.tasks().iter().find(|known| known.id == task)?;
+        known
+            .role
+            .map(|role| !self.core.config().roles[role].enabled)
     }
 
     /// Live agents of building roles, by the role each launched with, are within the limit.

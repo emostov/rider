@@ -83,10 +83,11 @@ worker take it again.
 | `repo` | you, required | absolute path of the target git repository |
 | `base` | you | id of the task whose branch this one is cut from |
 | `from` | you, required when `base` and `onto` are absent | the agreed base branch to cut from |
-| `onto` | you | id of a task whose existing branch this task works on directly |
+| `onto` | you | id of a task whose existing branch this task works on directly; on `review` it names only the task whose session `resume=1` continues, and needs `resume=1`; `security` and `qa` do not resume |
 | `of` | you, required for `review`, `security`, and `qa` | id of the task under review |
-| `resume` | you | `1` on a fix task for a blocking finding whose original task is `implement` or `light`: the worker continues that task's Claude session |
+| `resume` | you | `1` on an `implement`, `light` or `review` task whose `onto` task ran on the same harness: the worker continues that task's session (Claude forks it; Codex continues it in place, so only a `review` resumes a Codex session, one follow-up at a time, and the next follow-up resumes the newest review), else it starts fresh and says why |
 | `restack` | you | `1` on a restack task: it may rebase its `onto` branch and leave the branch's starting commit behind |
+| `untrusted` | you | `1` on a task that reads someone else's code or comments: its agent runs in an empty scratch directory, never a git worktree, with no branch or commit (Rider refuses `from`, `base`, `restack` and a branch `onto` on it, and does not need `of`), and starts with only an allowlist of variables (`HOME`, `PATH`, user, shell, locale, time zone, temporary directory), the board's variables and an empty `GH_CONFIG_DIR`; `HOME` stays the owner's, so the brief forbids running that code. A task a worker created is never trusted more than that worker |
 | `branch` | Rider | the branch the task works on |
 | `attempt` | Rider | failed attempts so far |
 | `start` | Rider | the commit the task's branch was at when the task first started |
@@ -174,6 +175,10 @@ These rules are yours to keep. Rider does not check them:
 - `security` is the final review of every PR, one task per stack: `of=<the top task>`,
   `needs` every unfinished task on the stack, including the fix of the first round. Name the range in the brief, such as
   `main..HEAD`.
+- A role turned off in `rider.toml` (`enabled = false`; `rider config` shows it) runs no
+  agents, and Rider blocks a task labelled with it. When a review role such as `review`,
+  `native-review` or `security` is off, skip that review step: create no task for it and judge
+  the PR on the reviews that remain.
 - Merge each PR to main as soon as it is green and reviewed, and cut the next work from main.
   Never stack more than two PRs.
 - `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI.
@@ -289,7 +294,7 @@ task of its own.
 | blocked `rider_error` | Rider could not run the task (git, prompt file, harness) | Tell the owner. Do not retry blindly |
 | failed | the reason and the log tail are in the thread | Read them. Reply with what the next attempt must do, then `rider vb tasks reopen <id> --as lead` retries in the same worktree. The next worker follows your latest reply over the brief, so make it a complete, specific instruction. If the correction changes what the task is, rewrite the brief instead: `rider vb edit <id> - --as lead` with the new text on standard input, then reopen. Dependents keep waiting |
 | blocked `awaiting_approval`, in `decisions` | waiting for the owner | Nothing until they answer |
-| completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@2` record: branch, head, commits, summary, and `behind`, the stacked tasks whose branches lack the new head |
+| completed | the worktree is removed, the branch stays, unless the thread says "Kept the worktree" | Read the `rider-result@3` record: branch, head, commits, summary, and `behind`, the stacked tasks whose branches lack the new head |
 
 `rider vb tasks needs` replaces what a task waits for: name all of them. `rider vb tasks cancel <id>
 "<reason>" --as lead` drops a task that is no longer wanted.
@@ -303,11 +308,11 @@ never touches one of an open task, and prints what it kept and why. Never `--for
 delete a branch: tell the owner about a kept worktree whose changes nobody understands.
 
 A branch moves after children were cut from it only when an `onto` task completes on it.
-The `behind` field of that task's `rider-result@2` record names the children whose branches
+The `behind` field of that task's `rider-result@3` record names the children whose branches
 lack its new head. Then restack each child branch, bottom up, one task at a time:
 `role=light` (or `implement`), `onto=<the child's task>`, `restack=1`, needing the task that
 moved its parent. Its brief names the commit to rebase onto (the parent's new head, from the
-`rider-result@2` record of
+`rider-result@3` record of
 the task that moved it) and the proof command. That head does not exist until the restack
 below completes, so create each restack only after the one below it has completed, never as
 one batch.

@@ -54,22 +54,32 @@ Never post a secret, token, or key you find. Name the file and line instead.
    line is a change to a tracked file: do not touch it; ask (see below).
 2. Read your brief and your whole thread: `vb read "$BOARD_TASK"`. The `of=<id>` label on
    your task names the task at the top of the change. Read its brief and thread:
-   `vb read <id>`. Its `rider-result@2` record gives its branch, head, and summary.
+   `vb read <id>`. Its `rider-result@3` record gives its branch, head, and summary.
 3. Find the change. Use the range the brief names: a security review usually covers a whole
    stack. If it names none, use the task's `start` label, the commit its branch was at when
    it first started: `start=$(vb read <id> --json | jq -r '.message.labels.start // empty')`,
    then `git diff "$start" HEAD`. If there is neither, ask (see below); do not guess. If
    `git rev-parse HEAD` is not the record's head, say so. If
    `git merge-base --is-ancestor "$start" HEAD` fails, the branch was rewritten: ask for it.
-4. Reply with your plan: the trust boundaries in the change and how you will test each.
-5. Attack the change, starting with the brief's points:
+4. Reply with your plan: the trust boundaries in the change and the probe you will run on each.
+5. Attack the change, starting with the brief's points. Do not stop at reading: build and run
+   the code to probe it, but run branch code only in isolation; building counts as running.
+   Copy the repository to `scratch=$(mktemp -d)` and work there, with `HOME`, `XDG_*` and any
+   state directory inside `$scratch`. Never give it real credentials, tokens, keys, or the
+   owner's configuration. It may reach only localhost, so build offline from existing package
+   caches (for Rust: `CARGO_HOME` at the real one, and `--offline`). Time-limit and stop every
+   command and service you start. These rules reduce accidents; they do not contain hostile
+   code, which runs as the owner. If a probe cannot be isolated, review it from the source.
+   In `$scratch`, feed it hostile inputs and throwaway exploits, with a scratch board or git
+   repository when the change talks to one. Try the attack rather than argue it from the code.
    - Trust boundaries: what comes from outside (users, files, the network, other processes,
      the board, environment variables) and where the code starts trusting it.
-   - Input handling: parsing, paths, injection into shells, queries, or other CLIs, sizes
-     and counts without bounds.
+   - Input handling: parsing, paths, injection into shells, queries or CLIs, unbounded sizes.
    - Secrets: tokens or keys in code, logs, errors, debug output, or test fixtures.
    - Privilege: what runs with more access than it needs, and what a caller can make it do.
-   A finding needs evidence: a command, an input, or a line of code that shows it.
+   A finding needs evidence: a command, an input, or a line of code that shows it. A
+   reproduction is stronger: give its command or script, and say which findings you
+   reproduced and which you only read.
 6. Post each finding as its own structured reply. `severity` is `blocking` when the change is
    exploitable or leaks a secret, otherwise `non-blocking`. `file` is relative to the
    repository root. `line` is a number, or `null` for the whole file.

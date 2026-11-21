@@ -33,6 +33,7 @@ pub struct RoleSpec {
     /// A file name under `prompts/`, or an absolute path to the user's own prompt.
     pub prompt_file: &'static str,
     pub skills: &'static [&'static str],
+    pub enabled: bool,
 }
 
 /// The roles one repository overrides, each merged over the role of the same label.
@@ -49,6 +50,8 @@ pub const BUILDERS_DEFAULT: u8 = 4;
 const _: () = assert!(BUILDERS_DEFAULT > 0 && BUILDERS_DEFAULT <= AGENTS_MAX);
 /// The longest profile name the board accepts.
 pub const PROFILE_LEN_MAX: usize = 32;
+pub const LEAD_PROFILE: &str = "lead";
+pub const LEAD_PREFIX: &str = "lead-";
 
 pub const ROLES: [RoleSpec; 6] = [
     RoleSpec {
@@ -65,6 +68,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 12,
         prompt_file: "implement.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "light",
@@ -80,6 +84,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 12,
         prompt_file: "implement.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "review",
@@ -95,6 +100,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 8,
         prompt_file: "review.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "native-review",
@@ -110,6 +116,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 8,
         prompt_file: "native-review.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "security",
@@ -125,6 +132,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 2,
         prompt_file: "security.md",
         skills: &[],
+        enabled: true,
     },
     RoleSpec {
         label: "qa",
@@ -140,6 +148,7 @@ pub const ROLES: [RoleSpec; 6] = [
         pool_slots: 2,
         prompt_file: "qa.md",
         skills: &[],
+        enabled: true,
     },
 ];
 
@@ -154,6 +163,7 @@ const _: () = {
         assert!(ROLES[index].pool_slots <= ROLES[index].slots);
         assert!(ROLES[index].commits_expected || ROLES[index].needs_of);
         assert!(ROLES[index].skills.is_empty());
+        assert!(ROLES[index].enabled);
         index += 1;
     }
 };

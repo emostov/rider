@@ -2,6 +2,7 @@
 
 use crate::board::{BOARD_CALL_SECONDS_MAX, LABELS_MAX, ListedTask, TaskId, TaskState, Timestamp};
 use crate::feed::{BoardEvent, Cursor, EventKind};
+use crate::harness::Usage;
 use crate::roles::{AGENTS_MAX, BUILDERS_DEFAULT, RoleSpec};
 use crate::settle::Verdict;
 
@@ -13,8 +14,13 @@ pub const ROLES_MAX: usize = 16;
 pub const CLIENTS_MAX: usize = 8;
 /// Upper bound on the actions one step emits: a few per run, a line per ended run for each
 /// client waiting on `down`, an end for each client following a log, plus a few of its own.
-pub const ACTIONS_MAX: usize =
-    6 * AGENTS_MAX as usize + CLIENTS_MAX * (AGENTS_MAX as usize + 1) + 2 * CLIENTS_MAX + 8;
+pub const ACTIONS_MAX: usize = 6 * AGENTS_MAX as usize
+    + CLIENTS_MAX * (AGENTS_MAX as usize + 1)
+    + 2 * CLIENTS_MAX
+    + REFUSALS_MAX
+    + 8;
+/// Upper bound on the tasks of off roles one step refuses.
+pub const REFUSALS_MAX: usize = AGENTS_MAX as usize;
 /// How long a claim holds its task, in milliseconds.
 pub const LEASE_MILLIS: u64 = 3600 * 1000;
 /// How long one attempt may run, in milliseconds.
@@ -42,6 +48,8 @@ pub const STOP_TRIES_MAX: u8 = 3;
 pub const PENDING_CLAIMS_MAX: usize = 2 * AGENTS_MAX as usize;
 /// Upper bound on the distinct untracked tasks the core counts.
 pub const UNTRACKED_MAX: usize = 4 * TASKS_MAX;
+pub const PROJECTS_MAX: usize = 64;
+pub const TASK_USAGES_MAX: usize = TASKS_MAX;
 /// Upper bound on the closed tasks the core remembers until a snapshot covers their closing.
 pub const CLOSED_MAX: usize = TASKS_MAX;
 pub const WAITING_MAX: usize = TASKS_MAX;
@@ -73,6 +81,8 @@ pub struct Role {
     pub model_slug: String,
     pub slots: u8,
     pub builds: bool,
+    /// An off role's ready tasks are refused unclaimed, never run.
+    pub enabled: bool,
 }
 
 /// The role table and limits the core runs under.
@@ -107,6 +117,7 @@ impl Config {
                 model_slug: spec.model_slug.to_string(),
                 slots: spec.slots,
                 builds: spec.builds,
+                enabled: spec.enabled,
             })
             .collect();
         Config {
@@ -319,6 +330,13 @@ pub struct TaskRow {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskUsage {
+    pub id: TaskId,
+    pub project: Option<String>,
+    pub usage: Usage,
+}
+
 /// What `status` answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusView {
@@ -328,6 +346,9 @@ pub struct StatusView {
     pub limit: u8,
     pub untracked: Untracked,
     pub tasks: Vec<TaskRow>,
+    pub usage: Usage,
+    pub projects: Vec<(Option<String>, Usage)>,
+    pub task_usages: Vec<TaskUsage>,
 }
 
 /// One run as `agents` shows it.
@@ -403,6 +424,8 @@ pub enum Event {
         until: Timestamp,
     },
     ClaimRefused(RunId),
+    /// The board answered a `Refuse`, whether or not the task was blocked.
+    Refused(TaskId),
     /// The worktree is ready; `branch` is the branch preparation found, if any, and `role` the
     /// label of the role the agent would launch as.
     Prepared {
@@ -425,6 +448,7 @@ pub enum Event {
     Judged {
         run: RunId,
         verdict: Verdict,
+        usage: Option<Usage>,
     },
     Renewed {
         run: RunId,
@@ -458,6 +482,12 @@ pub enum Action {
     Claim {
         run: RunId,
         task: TaskId,
+        profile: String,
+    },
+    /// Blocks, as its owner and unclaimed, a ready task whose role is off.
+    Refuse {
+        task: TaskId,
+        role: String,
         profile: String,
     },
     /// Renews, as `profile`, a claim the board shows held by it from before a restart; it is
@@ -531,6 +561,9 @@ pub struct State {
     closed_unrecorded: Cursor,
     runs: Vec<Run>,
     pending_claims: Vec<PendingClaim>,
+    usage: Usage,
+    projects: Vec<(Option<String>, Usage)>,
+    task_usages: Vec<TaskUsage>,
     next_run: u64,
     board: BoardHealth,
     stopping: Stopping,
@@ -576,6 +609,9 @@ impl State {
             closed_unrecorded: Cursor(0),
             runs: Vec::new(),
             pending_claims: Vec::new(),
+            usage: Usage::default(),
+            projects: Vec::new(),
+            task_usages: Vec::new(),
             next_run: 1,
             board: BoardHealth::Up,
             stopping: Stopping::No,
@@ -775,6 +811,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         }
         Event::Claimed { run, epoch, until } => on_claimed(state, run, epoch, until, actions),
         Event::ClaimRefused(run) => claim_refused(state, run),
+        Event::Refused(_) => {}
         Event::Prepared { run, branch, role } => on_prepared(state, run, branch, &role, actions),
         Event::PrepareBlocked { run, kind, reason } => {
             if let Some(index) = run_in(state, run, Phase::Preparing) {
@@ -784,8 +821,15 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
         Event::PrepareWaiting { run, of } => prepare_waiting(state, run, of, actions),
         Event::AgentExited(run) => on_agent_exited(state, run, actions),
         Event::StopDone(_) => {}
-        Event::Judged { run, verdict } => {
+        Event::Judged {
+            run,
+            verdict,
+            usage,
+        } => {
             if let Some(index) = run_in(state, run, Phase::Judging) {
+                if let Some(usage) = usage {
+                    count_usage(state, state.runs[index].task, usage);
+                }
                 begin_settle(state, index, Settlement::Verdict(verdict), actions);
             }
         }
@@ -999,10 +1043,38 @@ fn status_view(state: &State) -> StatusView {
         limit: state.config.agents_max,
         untracked: state.untracked(),
         tasks: tasks.collect(),
+        usage: state.usage,
+        projects: state.projects.clone(),
+        task_usages: state.task_usages.clone(),
     };
     assert!(view.running <= usize::from(view.limit));
     assert!(view.tasks.len() <= state.config.tasks_max);
     view
+}
+
+// The oldest task's usage gives way to a new task's once `TASK_USAGES_MAX` are kept.
+fn count_usage(state: &mut State, id: TaskId, usage: Usage) {
+    let task = state.tasks.iter().find(|task| task.id == id);
+    let project = task.and_then(|task| task.project.clone());
+    state.usage = state.usage.plus(usage);
+    match state.projects.iter().position(|(name, _)| *name == project) {
+        Some(index) => state.projects[index].1 = state.projects[index].1.plus(usage),
+        None if state.projects.len() < PROJECTS_MAX => {
+            state.projects.push((project.clone(), usage));
+        }
+        None => {}
+    }
+    match state.task_usages.iter_mut().find(|entry| entry.id == id) {
+        Some(entry) => entry.usage = entry.usage.plus(usage),
+        None => {
+            if state.task_usages.len() == TASK_USAGES_MAX {
+                state.task_usages.remove(0);
+            }
+            state.task_usages.push(TaskUsage { id, project, usage });
+        }
+    }
+    assert!(state.projects.len() <= PROJECTS_MAX);
+    assert!(state.task_usages.len() <= TASK_USAGES_MAX);
 }
 
 fn agent_rows(state: &State) -> Vec<AgentRow> {
@@ -1260,7 +1332,8 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
     let mut listed_untracked: usize = 0;
     // Tasks with a run go first, so a run's task stays known whatever the overflow.
     for with_run in [true, false] {
-        for ListedTask { view, channel } in tasks {
+        for ListedTask { view } in tasks {
+            let channel = &view.channel;
             let has_run = state.runs.iter().any(|run| run.task == view.id);
             let newer = state.tasks.iter().any(|task| task.id == view.id)
                 || (state.closed.iter()).any(|(id, at)| *id == view.id && *at >= view.version)
@@ -1827,6 +1900,7 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
     if state.board() != BoardHealth::Up || state.stopping != Stopping::No {
         return;
     }
+    refuse_off_roles(state, actions);
     let agents_max = usize::from(state.config.agents_max);
     loop {
         let claiming = state.runs.iter().filter(|run| run.phase == Phase::Claiming);
@@ -1844,6 +1918,31 @@ fn claim_ready(state: &mut State, actions: &mut Vec<Action>) {
         actions.push(Action::Claim { run, task, profile });
     }
     assert!(state.runs.len() <= agents_max);
+}
+
+/// Refuses up to `REFUSALS_MAX` ready tasks whose role is off, each once until the next tick.
+fn refuse_off_roles(state: &mut State, actions: &mut Vec<Action>) {
+    let before = actions.len();
+    for index in 0..state.tasks.len() {
+        if actions.len() - before >= REFUSALS_MAX {
+            break;
+        }
+        let task = &state.tasks[index];
+        let off = task.role.filter(|role| !state.config.roles[*role].enabled);
+        let ready = task.state == TaskState::Ready && task.project.is_some();
+        let Some(role) = off.filter(|_| ready && !task.claim_refused) else {
+            continue;
+        };
+        let (task, label) = (task.id, state.config.roles[role].label.clone());
+        let profile = state.profile(role, 1);
+        state.tasks[index].claim_refused = true;
+        actions.push(Action::Refuse {
+            task,
+            role: label,
+            profile,
+        });
+    }
+    assert!(actions.len() - before <= REFUSALS_MAX);
 }
 
 /// A new run claiming `task` as `role`'s `slot`, and the profile it claims as.
@@ -1945,6 +2044,13 @@ fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action
     resumed
 }
 
+fn onto_of_run(state: &State, run: &Run) -> Option<TaskId> {
+    let task = state.tasks.iter().find(|task| task.id == run.task);
+    let onto = task.and_then(|task| task.onto);
+    assert!(onto != Some(run.task));
+    onto
+}
+
 /// The oldest claimable task, its role, and the lowest free slot of that role; a task of a
 /// building role is claimable only while fewer than `builders_max` building runs exist.
 fn held_by_of(state: &State, task: &Task) -> bool {
@@ -2004,7 +2110,8 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     let mut best: Option<(usize, usize, u8)> = None;
     for (index, task) in state.tasks.iter().enumerate() {
         let role = task.role.filter(|role| {
-            task.project.is_some() && !task.claim_refused && !(builders_full && roles[*role].builds)
+            let builds = builders_full && roles[*role].builds;
+            task.project.is_some() && !task.claim_refused && roles[*role].enabled && !builds
         });
         let Some(role) = role else {
             continue;
@@ -2016,6 +2123,7 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
                 || (task.branch.is_some() && run.branch == task.branch)
                 || task.onto == Some(run.task)
                 || (task.onto.is_some() && closing(run) && run.branch.is_some())
+                || (task.onto.is_some() && onto_of_run(state, run) == task.onto)
         });
         let waiting = state.waiting.iter().any(|(id, _)| *id == task.id);
         if task.state != TaskState::Ready || taken || waiting || held_by_of(state, task) {

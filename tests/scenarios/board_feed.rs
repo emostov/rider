@@ -339,7 +339,16 @@ fn a_descendant_of_a_waiting_vb_is_killed_with_no_kill_command_on_path() {
         .display()
         .to_string();
     assert!(!Path::new(&vb_dir).join("kill").exists());
-    then_the_hung_identity_read_left_nothing(world, "wait", &vb_dir);
+    let git_only = world.root.join("git-only");
+    fs::create_dir_all(&git_only).expect("create the git-only directory");
+    let git = std::process::Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("find git");
+    let git = String::from_utf8(git.stdout).expect("a UTF-8 path");
+    std::os::unix::fs::symlink(git.trim(), git_only.join("git")).expect("link git");
+    let path = format!("{vb_dir}:{}", git_only.display());
+    then_the_hung_identity_read_left_nothing(world, "wait", &path);
 }
 
 const BURST_EVENTS: u64 = 400;
@@ -440,6 +449,36 @@ fi"#,
     then_the_daemon_stops_cleanly(world);
 }
 
+#[test]
+fn a_complete_refused_with_an_unknown_error_envelope_is_retried() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Commit]);
+    let completes = world.root.join("completes");
+    given_vb_first_runs(
+        &world,
+        &format!(
+            r#"if [ "$1 $2" = "tasks complete" ]; then
+  echo complete >> '{completes}'
+  if [ "$(wc -l < '{completes}')" -eq 1 ]; then
+    echo '{{"status":"unexpected","reason":"claim_lost"}}' >&2; exit 1
+  fi
+fi"#,
+            completes = completes.display()
+        ),
+    );
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    let tries = fs::read_to_string(&completes).expect("read the complete log");
+    assert_eq!(tries.lines().count(), 2, "{}", world.daemon_log());
+    then_the_daemon_stops_cleanly(world);
+}
+
 const LABELS_OVER_MAX: usize = 33;
 
 #[test]
@@ -537,5 +576,49 @@ fi"#,
         "{}",
         world.daemon_log()
     );
+    then_the_daemon_stops_cleanly(world);
+}
+
+const HELD_READ_SECONDS_MAX: u64 = 30;
+
+#[test]
+fn rider_kill_while_the_worker_reads_the_thread_before_launch_starts_no_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let held = world.root.join("read-held");
+    let released = world.root.join("read-released");
+    given_vb_first_runs(
+        &world,
+        &format!(
+            r#"case " $* " in " read {task} "*" --as implement-"*)
+  [ -d '{worktree}' ] || exec '{vb}' "$@"
+  : > '{held}'
+  n=0
+  while [ ! -e '{released}' ] && [ "$n" -lt 600 ]; do n=$((n + 1)); sleep 0.1; done ;;
+esac"#,
+            worktree = world.home.join("worktrees/repo").join(&task).display(),
+            vb = fs::read_link(&world.vb)
+                .expect("the Board CLI is a link")
+                .display(),
+            held = held.display(),
+            released = released.display(),
+        ),
+    );
+    given_a_running_daemon(&mut world);
+    let deadline = Instant::now() + Duration::from_secs(HELD_READ_SECONDS_MAX);
+    while !held.exists() {
+        assert!(Instant::now() < deadline, "{}", world.daemon_log());
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let kill = when_rider_runs(&world, &["kill", &task]);
+    fs::write(&released, "").expect("release the held read");
+
+    assert_eq!(kill.code, Some(0), "{kill:?}");
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+    let runs = agent_runs_for(&world, &task);
+    assert!(runs.is_empty(), "an agent started after the kill: {runs:?}");
     then_the_daemon_stops_cleanly(world);
 }

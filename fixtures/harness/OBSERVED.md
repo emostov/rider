@@ -8,7 +8,8 @@ All runs: exit 0, `ok.txt` committed, final message `DONE`.
 ## Claude Code
 
 ```
-claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-skip-permissions "<prompt>"
+claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-skip-permissions \
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}' -- "<prompt>"
 ```
 
 - Run with cwd set to the worktree. There is no working-directory flag in use.
@@ -23,6 +24,7 @@ claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-sk
 - Final message: the last line, `type == "result"`, `subtype == "success"`, field `result` (string, here `"DONE"`). `is_error` is `false` on success. The same text is also in the last `assistant` event at `message.content[].text`.
 - stderr prints `Warning: no stdin data received in 3s...` when stdin is not redirected. Spawn with stdin set to null (`< /dev/null`) to avoid the 3 s delay.
 - Fixture: `claude.jsonl` (opus run, 8.6 KB after redaction). The other three models give the same event shapes.
+- Usage: the `result` event carries `usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`) and `total_cost_usd`, the run's cost as Claude prices it. `input_tokens` excludes cached tokens.
 - Session id: every event carries `session_id`, the first `system` event (`hook_started`, or `init` without hooks) included.
 - Resume (2026-11-19, Claude Code 2.1.329, `--model haiku`): `claude -p --resume <id> --output-format stream-json --verbose -- "<prompt>"` run from a different directory than the session started in continues the session: it recalled the earlier reply. It still works after the original directory is removed. The `init` event shows the new cwd and the same `session_id`. So a fix task resumes from its own worktree; no same-path worktree is needed.
 - Fork (2026-11-19, Claude Code 2.1.329, `--model haiku`): `claude --help` lists `--fork-session`: "When resuming, create a new session ID instead of reusing the original (use with --resume or --continue)". `claude -p --resume <id> --fork-session ...` recalled the earlier reply, and its `init` and `result` events carried a new `session_id`. A later plain `--resume <id>` still reported `<id>`. Without the flag, Claude appends the resumed run to `<id>` in place, so a failed fix would become part of what later resumes see. Rider always forks, and records the fork's id for the fix task's own attempt.
@@ -31,7 +33,8 @@ claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-sk
 ## Codex
 
 ```
-codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox -C <DIR> "<prompt>"
+codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox \
+  --disable plugins --disable apps -C <DIR> -- "<prompt>"
 ```
 
 - Flags match the brief. `--skip-git-repo-check` also exists but was not needed.
@@ -41,7 +44,7 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
 - Items with `item.type == "error"` carry `item.message`, not `item.text`.
 - Stream events (`type`): `thread.started`, `turn.started`, `item.started`, `item.completed`, `turn.completed`.
 - The stream begins with two `item.completed` events of `item.type == "error"` (a deprecation warning from this machine's config). These are not failures. A parser must not treat `item.type == "error"` as a run failure.
-- Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`.
+- Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`: `input_tokens`, which includes `cached_input_tokens` and `cache_write_input_tokens`, and `output_tokens`. Codex reports no cost. Codex fills `usage` from its running total for the thread, so a log with several `turn.completed` events is read by its last (codex-rs `exec/src/event_processor_with_jsonl_output.rs`). The counts do not say which cache-write tier was used.
 - Fixture: `codex.jsonl` (4 KB).
 - Codex loads skills from `~/.codex/skills`, as Claude Code does from `~/.claude/skills`. Not re-observed yet.
 - During a provider outage Codex prints top-level events such as
@@ -51,6 +54,41 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
   `turn.failed`, or a top-level `error` after which no `turn.completed` comes (Codex gave up), fails.
   Fixture: `codex-reconnect.jsonl`, cut from a real review run, with the provider
   URL and `cf-ray` id redacted.
+- A provider's content filter ends a turn for good (2026-11-20, codex-cli 0.170.0, a `review`
+  run of sandboxing code on `gpt-6.1-sol`): a top-level `error` event, then
+  `{"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity
+  risk. If this seems wrong, try rephrasing your request. ..."}}`, then exit 1. `error` holds only
+  `message`; there is no code, so Rider recognises the stop by the message's first sentence, and
+  only on the last turn event being `turn.failed`. `codex review` prints the same message on
+  stderr. Rider reruns such a review once as a Mythos `security` task with the same brief.
+  `codex review` prints its `tokens used` footer after the error as it shuts down, so Rider
+  looks for the error among the last lines of stderr, not only the last one.
+  Fixture: `codex-content-filter.jsonl`: the run's real events around its last commands, with
+  the first message, and one command whose text held a local path, reworded. The rerun gets a
+  handoff reply built from these `command_execution` items (`command`, `exit_code`,
+  `aggregated_output`) and `agent_message` texts.
+  Known limits: the `codex review` transcript also holds command output, so a reviewed file
+  that prints the filter's `ERROR:` line near the end of a run that then fails can cause one
+  extra rerun (read-only, at most one per task). The handoff carries the last 160 characters
+  of each command's output, as the failure reply's log tail already does, so a secret a review
+  printed can reach the rerun's thread too.
+
+- Resume (2026-11-20, codex-cli 0.170.0, `gpt-6.1-sol`): a fresh `codex exec ... -C <A>` run
+  was told to remember a word. Then, with `<A>` removed and the working directory set to
+  another repository `<B>`:
+  `codex exec resume --model <MODEL> --json --dangerously-bypass-approvals-and-sandbox -- <thread_id> "<prompt>"`
+  exits 0 and recalls the word. The subcommand has no `-C`; its shell commands ran in `<B>`
+  (`pwd` printed `<B>`), so Rider sets the child's working directory. The stream has the
+  same shape as a fresh run and its `thread.started` carries the same `thread_id`: Codex
+  continues the session in place, with no fork. `codex exec fork` exists but Rider does not
+  use it. Fixture: `codex-resume.jsonl`.
+- Resume of a missing session (same version):
+  `codex exec resume ... -- 00000000-0000-4000-8000-000000000000 "<prompt>"` exits 1 at once.
+  stdout is empty, with no `thread.started`; stderr is one line,
+  `Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)`.
+  Rider reads a failed run whose log has no `thread.started` and holds `no rollout found for
+  thread id` as a refused resume and starts fresh in the same attempt; any other early
+  failure fails the attempt. Fixture: `codex-resume-refused.log` (the stderr; stdout was empty).
 
 ## Codex review
 
@@ -89,6 +127,29 @@ codex review -c model="gpt-6.2-sol" -c sandbox_mode="danger-full-access" -c appr
   rider-finding@1 -` itself on a scratch `vb serve` board and the record was accepted, so a
   worker on this harness posts findings and its result with `vb` as a `codex exec` review does.
 
+## MCP servers
+
+Observed on 2026-11-20 with Claude Code 2.1.x and codex-cli 0.170.0, prompt `Reply with the single word DONE.`, in a fresh empty git repo.
+
+- Claude: `claude --help` lists `--mcp-config <configs...>` ("Load MCP servers from JSON files or strings") and `--strict-mcp-config` ("Only use MCP servers from --mcp-config, ignoring all other MCP configurations"). The inline string `'{"mcpServers":{}}'` is accepted; no file is needed. `--mcp-config` takes several values, so the next argument must be an option or `--`. Built-in tools stay. Measured with `--model claude-haiku-5-5`:
+
+  | | init `tools` | init `mcp_servers` | first request input tokens |
+  | --- | --- | --- | --- |
+  | user's MCP setup | 333 | 27 | 41,036 |
+  | `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` | 27 | 0 | 29,666 |
+
+- Codex: `-c mcp_servers={}` does not remove servers. `codex -c 'mcp_servers={}' mcp list` still lists every server, because the override is merged into the config table instead of replacing it. Plugins and apps add servers of their own; `--disable plugins --disable apps` (the `-c features.<name>=false` shorthand) removes those: `codex --disable plugins --disable apps mcp list` lists only the servers declared under `[mcp_servers.*]` in `~/.codex/config.toml`. Turn input tokens for `codex exec`: 19,938 before, 17,281 after. `--ignore-user-config` also drops the model provider, so it is not used.
+
+  Re-checked on 2026-11-21 with codex-cli 0.170.0 and a scratch `CODEX_HOME` whose `config.toml` declares `[mcp_servers.alpha]` and `[mcp_servers.beta]`: `codex mcp list` and `codex -c 'mcp_servers={}' mcp list` show both `enabled`; `codex -c 'mcp_servers.alpha.enabled=false' mcp list` shows `alpha` `disabled` and `beta` `enabled`. Naming a server the configuration lacks (`-c 'mcp_servers.gamma.enabled=false'`) fails: `failed to load bootstrap configuration ... invalid transport in mcp_servers.gamma`. So Rider reads the server names from `$CODEX_HOME/config.toml` (`~/.codex/config.toml` when unset) and passes `-c mcp_servers.<name>.enabled=false` for each, to `codex exec` and to `codex review`, which takes `-c` the same way.
+
+  Re-checked on 2026-11-21 with codex-cli 0.170.0, `codex mcp list` only, in a linked worktree (`git worktree add --detach`) of a repository whose branch commits `.codex/config.toml` declaring a `command` server and a `url` server:
+  - With `[projects."<repo>"] trust_level = "trusted"` in the user's config (the path as `pwd -P` prints it), the worktree inherits the trust and both project servers are listed `enabled`. Without the trust entry they are not loaded.
+  - `-c 'projects."<repo or worktree>".trust_level="untrusted"'` does not stop them loading.
+  - `-c mcp_servers.<name>.enabled=false` turns a project server off when the project is trusted, but fails (`invalid transport`) when it is not, since no loaded layer declares the name. Adding a stand-in transport of the server's own kind holds either way: `-c mcp_servers.<name>.command="true"` for a `command` server, `-c mcp_servers.<name>.url="http://127.0.0.1:1/"` for a `url` server; giving a `url` server a `command` fails with `url is not supported for stdio`. So Rider reads `<worktree>/.codex/config.toml` after preparing the worktree and passes both settings for each server it declares.
+  - An empty `CODEX_HOME` is treated as unset: Codex warns `codex_home: <HOME>/.codex` and reads that, so Rider does too.
+  - `codex review --help` lists `--disable <FEATURE>`; `codex review` takes `--disable plugins --disable apps` as `codex exec` does.
+  - A `toml` parse error's text quotes the offending line, so Rider reports only the file and the line number.
+
 ## tact
 
 Rider no longer supports tact; its observations and fixture were removed.
@@ -101,6 +162,30 @@ Prompt: `Count slowly to 500, one number per message, running `sleep 2` between 
 | --- | --- | --- |
 | claude | 143 | no `result` event written |
 | codex | 143 | stream stops mid-turn |
+
+## sandbox-exec (macOS)
+
+Observed on macOS 26.7 with `/usr/bin/sandbox-exec -p <profile> -- <command>`, the profile
+being `(allow default)` plus a `deny network-outbound` of
+`(remote unix-socket (path-literal "<home>/rider.sock"))` and a `deny file-write*` of
+`literal` and `subpath` filters under the home:
+
+- `connect` to the denied socket fails with `EPERM` (`Operation not permitted`), also through a
+  symlink to it and through a relative path. A hard link to it cannot be made (`EPERM`).
+- Writing, removing, renaming or `chmod` of a denied path fails with `EPERM`. Denying the
+  `literal` home directory does not stop files being created inside it.
+- Children inherit the profile, including a background child in a process group of its own;
+  nothing a confined process starts can leave it.
+- Paths are matched after symlinks resolve, so the profile must name the real path (a temporary
+  directory is under `/private/var`, not `/var`).
+- `--` before the command is accepted. A `(param "X")` that no `-D X=...` defines fails the
+  profile with exit 65.
+- A command not found on `PATH` makes it print `sandbox-exec: execvp() of '<command>' failed:
+  No such file or directory` and exit 71.
+- A process already in a sandbox cannot apply another that denies anything: `sandbox-exec`
+  inside one prints `sandbox_apply: Operation not permitted` and exits 71. A nested profile of
+  only `(allow default)` is accepted and exits 0, so the daemon probes with a profile holding
+  one `deny`.
 
 ## Fixture redaction
 

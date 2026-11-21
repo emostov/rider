@@ -16,7 +16,7 @@ use crate::world::{Output, World, run_bounded};
 
 const MANIFEST: &str = ".rider-install.json";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const SKILLS: [&str; 2] = ["ride-swarm", "ship-swarm"];
+const SKILLS: [&str; 3] = ["review-queue", "ride-swarm", "ship-swarm"];
 const SOURCE_FILES_MAX: usize = 64;
 
 fn source_files() -> BTreeMap<String, Vec<u8>> {
@@ -165,7 +165,8 @@ fn an_older_unmodified_install_is_replaced() {
 
     assert_eq!(output.code, Some(0), "{output:?}");
     let expected = format!(
-        "replaced {} (was 0.0.1)\nup to date {}\n",
+        "up to date {}\nreplaced {} (was 0.0.1)\nup to date {}\n",
+        dir.join("review-queue").display(),
         dir.join("ride-swarm").display(),
         dir.join("ship-swarm").display()
     );

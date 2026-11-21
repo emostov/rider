@@ -10,9 +10,11 @@ use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
+use std::collections::VecDeque;
+use std::env;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -30,8 +32,19 @@ pub const LOG_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
-const ARGS_MAX: usize = 16;
+/// Upper bound on the MCP servers one Codex configuration file declares.
+pub const MCP_SERVERS_MAX: usize = 32;
+const MCP_NAME_BYTES_MAX: usize = 64;
+const CODEX_CONFIG_BYTES_MAX: u64 = 1024 * 1024;
+// Each user server takes one setting and each project server two.
+const MCP_SETTINGS_MAX: usize = 3 * MCP_SERVERS_MAX;
+const ARGS_MAX: usize = 28 + 2 * MCP_SETTINGS_MAX;
 const OPEN_TRIES_MAX: usize = 2;
+const UNTRUSTED_ENV_ALLOWED: [&str; 10] = [
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG", "LC_ALL", "LC_CTYPE",
+];
+const CODEX_REFUSAL_BYTES_MAX: usize = 64 * 1024;
+const CODEX_NO_ROLLOUT: &str = "no rollout found for thread id";
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
@@ -40,14 +53,22 @@ const CHUNK_BYTES: usize = 64 * 1024;
 const READS_MAX: u64 = 1 << 32;
 const READERS: usize = 2;
 const DRAIN_SECONDS_MAX: u64 = 5;
-// Reader threads alive across all runs: two per running agent, plus room for readers left
-// blocked on a pipe that a process outside the agent's group still holds open.
-const READER_THREADS_MAX: usize = 4 * READERS * AGENTS_MAX as usize;
+const STDIN_WRITERS: usize = 1;
+// Pipe threads alive across all runs: two readers and a stdin writer per running agent, plus
+// room for threads left blocked on a pipe that a process outside the agent's group holds open.
+const READER_THREADS_MAX: usize = 4 * (READERS + STDIN_WRITERS) * AGENTS_MAX as usize;
 const LINE_BYTES_MAX: usize = 4 * 1024 * 1024;
 // Every line holds at least its newline, so a log read up to `LOG_BYTES_MAX` has fewer lines.
 const LINES_MAX: u64 = LOG_BYTES_MAX + 1;
 const SKIP_READS_MAX: u64 = LOG_BYTES_MAX / LINE_BYTES_MAX as u64 + 2;
 const REVIEW_INTERRUPTED: &str = "Review was interrupted.";
+// Codex's content-filter error has no code: its message's first sentence names it.
+const CONTENT_FILTER: &str = "This content was flagged for possible cybersecurity risk.";
+const STDERR_TAIL_BYTES: u64 = 64 * 1024;
+const STDERR_FINAL_LINES: usize = 8;
+pub const HANDOFF_LINES_MAX: usize = 24;
+const CLIP_CHARS: usize = 160;
+pub const HANDOFF_LOG_LINE_CHARS_MAX: usize = 2 * CLIP_CHARS + 64;
 const POISONED: &str = "the log lock was poisoned";
 
 const _: () = {
@@ -55,7 +76,7 @@ const _: () = {
     assert!(SKIP_READS_MAX * LINE_BYTES_MAX as u64 > LOG_BYTES_MAX);
     assert!(DRAIN_SECONDS_MAX > 0 && POLL_MILLIS > 0);
     assert!(POLLS_MAX * POLL_MILLIS > (ATTEMPT_SECONDS_MAX + KILL_GRACE_SECONDS) * 1000);
-    assert!(READER_THREADS_MAX > READERS * AGENTS_MAX as usize);
+    assert!(READER_THREADS_MAX > (READERS + STDIN_WRITERS) * AGENTS_MAX as usize);
 };
 
 static READER_THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -67,6 +88,7 @@ pub struct CommandLine {
     pub args: Vec<String>,
     /// Set on top of the inherited environment.
     pub env: Vec<(String, String)>,
+    pub untrusted: bool,
     pub io: Io,
 }
 
@@ -115,6 +137,9 @@ pub enum HarnessError {
     PromptUnsafe,
     /// Too many reader threads are still blocked on pipes from earlier runs.
     ReadersExhausted,
+    /// The user's Codex configuration could not be read, or its MCP servers are not ones
+    /// Rider can turn off.
+    CodexConfig(String),
 }
 
 impl fmt::Display for HarnessError {
@@ -144,6 +169,9 @@ impl fmt::Display for HarnessError {
                 f,
                 "too many reader threads are still blocked on pipes from earlier runs"
             ),
+            HarnessError::CodexConfig(message) => {
+                write!(f, "the Codex configuration {}", one_line(message))
+            }
         }
     }
 }
@@ -151,7 +179,7 @@ impl fmt::Display for HarnessError {
 /// Upper bound on a session id's length.
 pub const SESSION_BYTES_MAX: usize = 128;
 
-/// A Claude Code session id: ASCII letters, digits, and `-`, never starting with `-`.
+/// A Claude session or Codex thread id: ASCII letters, digits, and `-`, never starting with `-`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionId(String);
 
@@ -178,18 +206,127 @@ pub enum Resume<'a> {
     InPlace(&'a SessionId),
 }
 
+/// The `-c` settings that turn off every MCP server the user's Codex configuration and the
+/// worktree's project configuration declare; none for Claude, which takes an empty strict MCP
+/// configuration instead.
+pub fn codex_mcp_overrides(
+    harness: &Harness,
+    dir: &Path,
+    untrusted: bool,
+) -> Result<Vec<String>, HarnessError> {
+    assert!(dir.is_absolute(), "agents run in absolute worktrees");
+    assert!(!UNTRUSTED_ENV_ALLOWED.contains(&"CODEX_HOME"));
+    if *harness == Harness::Claude {
+        return Ok(Vec::new());
+    }
+    // Codex takes an empty `CODEX_HOME` as unset.
+    let home = env::var_os("CODEX_HOME").filter(|home| !home.is_empty() && !untrusted);
+    let home = match home.map(PathBuf::from) {
+        Some(home) if !home.is_absolute() => {
+            let why = "CODEX_HOME is not an absolute path".to_string();
+            return Err(HarnessError::CodexConfig(why));
+        }
+        Some(home) => Some(home),
+        None => env::var_os("HOME").map(|home| Path::new(&home).join(".codex")),
+    };
+    let mut settings = Vec::new();
+    if let Some(home) = home {
+        for (name, _) in mcp_servers(&home.join("config.toml"))? {
+            settings.push(format!("mcp_servers.{name}.enabled=false"));
+        }
+    }
+    // A trusted repository's linked worktree loads the branch's `.codex/config.toml`, and naming
+    // a server no loaded layer declares is an error, so each project server is turned off and
+    // given a stand-in transport of its own kind, which holds whether the project is trusted.
+    for (name, url) in mcp_servers(&dir.join(".codex").join("config.toml"))? {
+        settings.push(format!("mcp_servers.{name}.enabled=false"));
+        settings.push(if url {
+            format!(r#"mcp_servers.{name}.url="http://127.0.0.1:1/""#)
+        } else {
+            format!(r#"mcp_servers.{name}.command="true""#)
+        });
+    }
+    assert!(settings.len() <= MCP_SETTINGS_MAX);
+    assert!(
+        settings
+            .iter()
+            .all(|setting| setting.starts_with("mcp_servers."))
+    );
+    Ok(settings)
+}
+
+/// The MCP servers the Codex configuration at `path` declares, each with whether it is reached
+/// by URL; none when there is no file. An error names the file and at most a line number,
+/// never its content, which may hold tokens.
+fn mcp_servers(path: &Path) -> Result<Vec<(String, bool)>, HarnessError> {
+    let error = |why: &str| HarnessError::CodexConfig(format!("{} {why}", path.display()));
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(missing) if missing.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(error("cannot be read")),
+    };
+    let mut text = String::new();
+    let read = file
+        .take(CODEX_CONFIG_BYTES_MAX + 1)
+        .read_to_string(&mut text);
+    read.map_err(|_| error("cannot be read as UTF-8 text"))?;
+    if u64::try_from(text.len()).map_or(true, |bytes| bytes > CODEX_CONFIG_BYTES_MAX) {
+        return Err(error(&format!("is over {CODEX_CONFIG_BYTES_MAX} bytes")));
+    }
+    let table: toml::Table = toml::from_str(&text).map_err(|bad| {
+        let at = bad.span().map_or(0, |span| span.start).min(text.len());
+        let line = text.as_bytes()[..at]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+            + 1;
+        error(&format!("is not valid TOML at line {line}"))
+    })?;
+    let servers = match table.get("mcp_servers") {
+        None => return Ok(Vec::new()),
+        Some(toml::Value::Table(servers)) => servers,
+        Some(_) => return Err(error("holds an `mcp_servers` that is not a table")),
+    };
+    if servers.len() > MCP_SERVERS_MAX {
+        return Err(error(&format!(
+            "declares over {MCP_SERVERS_MAX} MCP servers"
+        )));
+    }
+    let valid = |name: &str| {
+        !name.is_empty()
+            && name.len() <= MCP_NAME_BYTES_MAX
+            && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let mut found = Vec::with_capacity(servers.len());
+    for (name, server) in servers {
+        let toml::Value::Table(server) = server else {
+            return Err(error("declares an MCP server that is not a table"));
+        };
+        if !valid(name) {
+            let why = "names an MCP server with characters other than letters, digits, _ and -";
+            return Err(error(why));
+        }
+        found.push((name.clone(), server.contains_key("url")));
+    }
+    assert!(found.len() <= MCP_SERVERS_MAX);
+    assert!(found.iter().all(|(name, _)| valid(name)));
+    Ok(found)
+}
+
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,
     dir: &Path,
     resume: Option<Resume>,
+    mcp_overrides: &[String],
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
-    assert!(
-        resume.is_none() || spec.harness == Harness::Claude,
-        "only Claude sessions are resumed"
-    );
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
+    assert!(mcp_overrides.len() <= MCP_SETTINGS_MAX);
+    assert!(
+        mcp_overrides.is_empty() || spec.harness != Harness::Claude,
+        "Claude takes an empty strict MCP configuration instead"
+    );
     assert!(dir.to_str().is_some(), "worktree paths are UTF-8");
     if prompt.len() > PROMPT_BYTES_MAX {
         let bytes = prompt.len();
@@ -204,7 +341,7 @@ pub fn command_for(
     let model = spec.model;
     let model_setting = format!("model={model:?}");
     let review_model_setting = format!("review_model={model:?}");
-    let (program, head, io) = match spec.harness {
+    let (program, mut args, io) = match spec.harness {
         Harness::Claude => (
             "claude",
             vec![
@@ -215,8 +352,9 @@ pub fn command_for(
                 "stream-json",
                 "--verbose",
                 "--dangerously-skip-permissions",
-                "--",
-                prompt,
+                "--strict-mcp-config",
+                "--mcp-config",
+                r#"{"mcpServers":{}}"#,
             ],
             Io::Stream,
         ),
@@ -228,10 +366,10 @@ pub fn command_for(
                 model,
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
-                "-C",
-                &dir,
-                "--",
-                prompt,
+                "--disable",
+                "plugins",
+                "--disable",
+                "apps",
             ],
             Io::Stream,
         ),
@@ -250,25 +388,38 @@ pub fn command_for(
                 r#"sandbox_mode="danger-full-access""#,
                 "-c",
                 r#"approval_policy="never""#,
+                "--disable",
+                "plugins",
+                "--disable",
+                "apps",
                 "-",
             ],
             Io::PromptOnStdin(prompt.to_string()),
         ),
     };
-    let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
-    match resume {
+    // `-c mcp_servers={}` merges into the user's table instead of replacing it, so each
+    // declared server is turned off by name.
+    let off = (mcp_overrides.iter()).flat_map(|setting| ["-c", setting.as_str()]);
+    args.splice(1..1, off);
+    match (spec.harness, resume) {
         // Without `--fork-session` Claude appends to the resumed session in place.
-        Some(Resume::Fork(session)) => {
-            let at = args.len() - 2;
-            let fork = [session.0.clone(), "--fork-session".to_string()];
-            args.splice(at..at, ["--resume".to_string()].into_iter().chain(fork));
+        (Harness::Claude, Some(Resume::Fork(session))) => {
+            args.extend(["--resume", &session.0, "--fork-session", "--", prompt]);
         }
-        Some(Resume::InPlace(session)) => {
-            let at = args.len() - 2;
-            args.splice(at..at, ["--resume".to_string(), session.0.clone()]);
+        (Harness::Claude, Some(Resume::InPlace(session))) => {
+            args.extend(["--resume", &session.0, "--", prompt]);
         }
-        None => {}
+        (Harness::Claude, None) => args.extend(["--", prompt]),
+        // `codex exec resume` has no `-C` and no fork: it runs in the child's working
+        // directory and continues the session in place.
+        (Harness::Codex, Some(Resume::Fork(session) | Resume::InPlace(session))) => {
+            args.insert(1, "resume");
+            args.extend(["--", &session.0, prompt]);
+        }
+        (Harness::Codex, None) => args.extend(["-C", &dir, "--", prompt]),
+        (Harness::CodexReview, _) => {}
     }
+    let args: Vec<String> = args.into_iter().map(String::from).collect();
     assert!(args.len() <= ARGS_MAX);
     assert!(args.iter().any(|a| a == model || *a == model_setting));
     let program = program.to_string();
@@ -277,6 +428,7 @@ pub fn command_for(
         program,
         args,
         env,
+        untrusted: false,
         io,
     })
 }
@@ -584,6 +736,14 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
     assert!(cmd.args.len() <= ARGS_MAX && cmd.env.len() <= ENV_MAX);
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
     let mut process = Command::new(&cmd.program);
+    if cmd.untrusted {
+        process.env_clear();
+        for name in UNTRUSTED_ENV_ALLOWED {
+            if let Some(value) = env::var_os(name) {
+                process.env(name, value);
+            }
+        }
+    }
     process
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(key, value)| (key, value)))
@@ -619,11 +779,16 @@ fn start_readers(
     Ok(())
 }
 
-fn feed(child: &mut dyn ChildWrapper, io: &Io) -> Result<(), HarnessError> {
-    let Io::PromptOnStdin(prompt) = io else {
+fn feed(
+    child: &mut dyn ChildWrapper,
+    io: &Io,
+    slot: Option<ReaderSlot>,
+) -> Result<(), HarnessError> {
+    let (Io::PromptOnStdin(prompt), Some(slot)) = (io, slot) else {
         assert!(child.stdin().is_none());
         return Ok(());
     };
+    assert!(slot.live.load(Ordering::SeqCst) > 0);
     assert!(prompt.len() <= PROMPT_BYTES_MAX);
     let missing = || HarnessError::Spawn("the agent has no stdin".to_string());
     let mut stdin = child.stdin().take().ok_or_else(missing)?;
@@ -632,6 +797,7 @@ fn feed(child: &mut dyn ChildWrapper, io: &Io) -> Result<(), HarnessError> {
     // says what happened.
     let builder = thread::Builder::new().name("agent-stdin".to_string());
     let started = builder.spawn(move || {
+        let _slot = slot;
         let _ = stdin.write_all(prompt.as_bytes());
     });
     started.map_err(|error| HarnessError::Spawn(format!("starting the stdin writer: {error}")))?;
@@ -666,6 +832,10 @@ pub fn run_on_clock(
         slot.ok_or(HarnessError::ReadersExhausted)
     };
     let slots = [reserve()?, reserve()?];
+    let writer = match cmd.io {
+        Io::Stream => None,
+        Io::PromptOnStdin(_) => Some(reserve()?),
+    };
     let shared = open_log(log, log_bytes_max)?;
     let apart = match cmd.io {
         Io::Stream => None,
@@ -679,7 +849,7 @@ pub fn run_on_clock(
     let (done, finished) = mpsc::sync_channel(READERS);
     let logs = [&shared, apart.as_ref().unwrap_or(&shared)];
     let started = start_readers(child.as_mut(), slots, logs, &done);
-    if let Err(error) = started.and_then(|()| feed(child.as_mut(), &cmd.io)) {
+    if let Err(error) = started.and_then(|()| feed(child.as_mut(), &cmd.io, writer)) {
         let _ = kill_and_reap(child.as_mut());
         shared.close();
         apart.as_ref().map(|apart| apart.close());
@@ -760,6 +930,18 @@ enum ClaudeEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeUsageEvent {
+    #[serde(rename = "result")]
+    Result {
+        usage: Option<Field<ClaudeUsage>>,
+        total_cost_usd: Option<Field<f64>>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
 struct ClaudeMessage {
     content: Option<Field<Vec<Field<ClaudeBlock>>>>,
 }
@@ -793,16 +975,44 @@ struct SessionLine {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum CodexEvent {
+    #[serde(rename = "item.started")]
+    ItemStarted { item: Option<Field<CodexItem>> },
+    #[serde(rename = "thread.started")]
+    ThreadStarted { thread_id: Option<Field<String>> },
     #[serde(rename = "item.completed")]
     ItemCompleted { item: Option<Field<CodexItem>> },
     #[serde(rename = "turn.failed")]
     TurnFailed { error: Option<Field<CodexError>> },
     #[serde(rename = "turn.completed")]
-    TurnCompleted,
+    TurnCompleted { usage: Option<Field<CodexUsage>> },
     #[serde(rename = "error")]
     Error { message: Option<Field<String>> },
     #[serde(other)]
     Other,
+}
+
+#[derive(Deserialize)]
+struct ClaudeUsage {
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+}
+
+// Codex counts cached and cache-write tokens inside `input_tokens`.
+#[derive(Deserialize)]
+struct CodexUsage {
+    input_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    output_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct CodexError {
+    message: Option<Field<String>>,
 }
 
 #[derive(Deserialize)]
@@ -812,11 +1022,7 @@ struct CodexItem {
     text: Option<Field<String>>,
     command: Option<Field<String>>,
     exit_code: Option<Field<i64>>,
-}
-
-#[derive(Deserialize)]
-struct CodexError {
-    message: Option<Field<String>>,
+    aggregated_output: Option<Field<String>>,
 }
 
 // Visits each line of `log` that is an `E`; skips other lines and those over `LINE_BYTES_MAX`.
@@ -899,22 +1105,47 @@ pub fn last_message(harness: &Harness, log: &Path) -> Option<String> {
     Some(text)
 }
 
-/// The session id of the first Claude event that carries one, or `None` when there is none.
-pub fn session_id(log: &Path) -> Option<SessionId> {
+/// The session id of the first event that carries one: a Claude event's `session_id`, or
+/// Codex's `thread.started` `thread_id`. `None` when there is none.
+pub fn session_id(harness: Harness, log: &Path) -> Option<SessionId> {
     let mut found: Option<Option<SessionId>> = None;
-    let _ = scan(log, |line: SessionLine| {
+    let mut first = |id: Option<String>| {
         if found.is_none() {
-            found = valid(line.session_id).map(|id| SessionId::parse(&id));
+            found = id.map(|id| SessionId::parse(&id));
         }
-    });
+    };
+    let _ = match harness {
+        Harness::Claude => scan(log, |line: SessionLine| first(valid(line.session_id))),
+        Harness::Codex => scan(log, |event| {
+            if let CodexEvent::ThreadStarted { thread_id } = event {
+                first(valid(thread_id));
+            }
+        }),
+        Harness::CodexReview => false,
+    };
     let id = found.flatten();
     assert!(id.as_ref().is_none_or(|id| !id.0.is_empty()));
     id
 }
 
-/// Whether the Claude stream at `log` shows a run that ended in error before its first turn,
-/// as when `--resume` names a session Claude cannot open; false when the log is unreadable.
-pub fn ended_before_any_turn(log: &Path) -> bool {
+/// Whether the stream at `log` shows a run that ended before its first turn, as when a resume
+/// names a session the harness cannot open; false when the log is unreadable.
+pub fn ended_before_any_turn(harness: Harness, log: &Path) -> bool {
+    if harness == Harness::Codex {
+        // A refused `codex exec resume` prints only this error to stderr: no thread starts.
+        let mut started = false;
+        let read = scan(log, |event| {
+            started |= matches!(event, CodexEvent::ThreadStarted { .. });
+        });
+        let mut head = String::new();
+        let text = File::open(log).and_then(|file| {
+            let bound = u64::try_from(CODEX_REFUSAL_BYTES_MAX).unwrap_or(u64::MAX);
+            file.take(bound).read_to_string(&mut head)
+        });
+        let refused = text.is_ok() && head.contains(CODEX_NO_ROLLOUT);
+        assert!(head.len() <= CODEX_REFUSAL_BYTES_MAX);
+        return read && !started && refused;
+    }
     let mut results = 0u64;
     let mut refused = false;
     let mut turned = false;
@@ -935,6 +1166,127 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
     before
 }
 
+pub fn stopped_by_content_filter(harness: &Harness, log: &Path) -> bool {
+    let stopped = match harness {
+        Harness::Claude => false,
+        Harness::Codex => {
+            let mut stopped = false;
+            let _ = scan(log, |event| match event {
+                CodexEvent::TurnFailed { error } => {
+                    let message = valid(error).and_then(|error| valid(error.message));
+                    stopped = message.is_some_and(|text| text.starts_with(CONTENT_FILTER));
+                }
+                CodexEvent::TurnCompleted { .. } => stopped = false,
+                CodexEvent::ItemStarted { .. }
+                | CodexEvent::ThreadStarted { .. }
+                | CodexEvent::ItemCompleted { .. }
+                | CodexEvent::Error { .. }
+                | CodexEvent::Other => {}
+            });
+            stopped
+        }
+        // Codex prints its token-usage footer after the terminal error as it shuts down.
+        Harness::CodexReview => stderr_tail(log).is_some_and(|text| {
+            let lines = text.lines().rev().filter(|line| !line.trim().is_empty());
+            let mut last = lines.take(STDERR_FINAL_LINES);
+            last.any(|line| {
+                let error = line.trim().strip_prefix("ERROR: ");
+                error.is_some_and(|error| error.starts_with(CONTENT_FILTER))
+            })
+        }),
+    };
+    assert!(!stopped || *harness != Harness::Claude);
+    stopped
+}
+
+fn stderr_tail(log: &Path) -> Option<String> {
+    let mut file = File::open(stderr_log(log)).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut tail = Vec::new();
+    file.seek(SeekFrom::Start(len.saturating_sub(STDERR_TAIL_BYTES)))
+        .and_then(|_| file.take(STDERR_TAIL_BYTES).read_to_end(&mut tail))
+        .ok()?;
+    assert!(u64::try_from(tail.len()).is_ok_and(|n| n <= STDERR_TAIL_BYTES));
+    Some(String::from_utf8_lossy(&tail).into_owned())
+}
+
+pub fn clip(text: &str, chars_max: usize, from_end: bool) -> String {
+    let bidi = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let shown: String = (text.chars())
+        .map(|c| if c.is_control() || bidi(c) { ' ' } else { c })
+        .collect();
+    let line = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = line.chars().count();
+    let clipped: String = if from_end {
+        line.chars().skip(count.saturating_sub(chars_max)).collect()
+    } else {
+        line.chars().take(chars_max).collect()
+    };
+    assert!(clipped.chars().count() <= chars_max);
+    assert!(!clipped.chars().any(|c| c.is_control() || bidi(c)));
+    clipped
+}
+
+// What a stopped run did, from its own log: the commands it ran with their exit codes and a
+// tail of their output, its last message, and what it was running when it stopped.
+pub fn handoff(harness: &Harness, log: &Path) -> Vec<String> {
+    let mut lines: VecDeque<String> = VecDeque::new();
+    let mut push = |line: String| {
+        if lines.len() == HANDOFF_LINES_MAX {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    };
+    match harness {
+        Harness::Claude => {}
+        Harness::Codex => {
+            let mut running: Option<String> = None;
+            let _ = scan(log, |event| {
+                let (started, item) = match event {
+                    CodexEvent::ItemStarted { item } => (true, item),
+                    CodexEvent::ItemCompleted { item } => (false, item),
+                    _ => return,
+                };
+                let Some(item) = valid(item) else { return };
+                let kind = valid(item.kind);
+                let command = valid(item.command).map(|text| clip(&text, CLIP_CHARS, false));
+                match (kind.as_deref(), command, started) {
+                    (Some("command_execution"), Some(command), true) => running = Some(command),
+                    (Some("command_execution"), Some(command), false) => {
+                        running = None;
+                        let code = valid(item.exit_code)
+                            .map_or_else(|| "none".to_string(), |code| code.to_string());
+                        let output = valid(item.aggregated_output).unwrap_or_default();
+                        let output = clip(&output, CLIP_CHARS, true);
+                        push(format!("- ran `{command}`, exit {code}: {output}"));
+                    }
+                    (Some("agent_message"), _, false) => {
+                        let text = valid(item.text).unwrap_or_default();
+                        push(format!("- said: {}", clip(&text, CLIP_CHARS, false)));
+                    }
+                    _ => {}
+                }
+            });
+            if let Some(command) = running {
+                push(format!("- was running `{command}` when it stopped"));
+            }
+        }
+        Harness::CodexReview => {
+            let tail = stderr_tail(log).unwrap_or_default();
+            let kept = tail.lines().filter(|line| !line.trim().is_empty());
+            kept.for_each(|line| push(format!("    {}", clip(line, CLIP_CHARS, false))));
+        }
+    }
+    let lines: Vec<String> = lines.into();
+    assert!(lines.len() <= HANDOFF_LINES_MAX);
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.chars().count() <= HANDOFF_LOG_LINE_CHARS_MAX)
+    );
+    lines
+}
+
 /// Whether the stream at `log` records a failed run; false when the log is unreadable.
 pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut last_result_failed = false;
@@ -946,8 +1298,11 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
         // top-level `error` may be a reconnect attempt that a later `turn.completed` clears.
         Harness::Codex => scan(log, |event| match event {
             CodexEvent::TurnFailed { .. } | CodexEvent::Error { .. } => last_turn_failed = true,
-            CodexEvent::TurnCompleted => last_turn_failed = false,
-            CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
+            CodexEvent::TurnCompleted { .. } => last_turn_failed = false,
+            CodexEvent::ThreadStarted { .. }
+            | CodexEvent::ItemStarted { .. }
+            | CodexEvent::ItemCompleted { .. }
+            | CodexEvent::Other => {}
         }),
         // Without an event stream, a run that exits 0 still failed when it printed no review or
         // Codex's own message for a review delegate that never started.
@@ -971,6 +1326,131 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     assert!(!last_turn_failed || *harness == Harness::Codex);
     assert!(!last_review_failed || *harness == Harness::CodexReview);
     last_result_failed || last_turn_failed || last_review_failed
+}
+
+pub const TOKENS_MAX: u64 = 1 << 40;
+pub const COST_MICROS_MAX: u64 = 1 << 40;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+    pub cost_micros: u64,
+    pub unpriced: bool,
+}
+
+impl Usage {
+    pub fn plus(self, other: Usage) -> Usage {
+        let sum = Usage {
+            input: self.input.saturating_add(other.input),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            output: self.output.saturating_add(other.output),
+            cost_micros: self.cost_micros.saturating_add(other.cost_micros),
+            unpriced: self.unpriced || other.unpriced,
+        };
+        assert!(sum.input >= self.input && sum.output >= other.output);
+        sum
+    }
+}
+
+// Thousandths of a US dollar per million tokens: input, cache read, cache write, output.
+// Source: https://developers.openai.com/api/docs/pricing, Standard tier, prompts up to 272K
+// tokens, read 2026-11-20. Codex reports one cache-write count without its tier, so writes are
+// priced at the 30-minute rate, the lower of the two. Claude reports its own cost.
+const PRICES: [(&str, [u64; 4]); 2] = [
+    ("gpt-6.1-sol", [2_000, 100, 2_500, 10_000]),
+    ("gpt-6.2-sol", [2_000, 100, 2_500, 10_000]),
+];
+
+fn priced(model: &str, usage: &Usage) -> Option<u64> {
+    let (_, price) = PRICES.iter().find(|(name, _)| *name == model)?;
+    let tokens = [
+        usage.input,
+        usage.cache_read,
+        usage.cache_write,
+        usage.output,
+    ];
+    let mut nanos: u64 = 0;
+    for (count, rate) in tokens.iter().zip(price) {
+        nanos = nanos.checked_add(count.checked_mul(*rate)?)?;
+    }
+    let micros = nanos / 1000;
+    assert!(micros <= nanos);
+    (micros <= COST_MICROS_MAX).then_some(micros)
+}
+
+fn micros_of(dollars: f64) -> Option<u64> {
+    let micros = (dollars * 1e6).round();
+    let bound = COST_MICROS_MAX as f64;
+    let valid = micros.is_finite() && (0.0..=bound).contains(&micros);
+    let micros = valid.then_some(micros as u64);
+    assert!(micros.is_none_or(|micros| micros <= COST_MICROS_MAX));
+    micros
+}
+
+pub fn usage(harness: &Harness, model: &str, log: &Path) -> Option<Usage> {
+    assert!(!model.is_empty());
+    let mut found: Option<Usage> = None;
+    let mut reported: Option<u64> = None;
+    let complete = match harness {
+        Harness::Claude => scan(log, |event| {
+            if let ClaudeUsageEvent::Result {
+                usage,
+                total_cost_usd,
+            } = event
+                && let Some(usage) = valid(usage)
+            {
+                found = Some(Usage {
+                    input: usage.input_tokens,
+                    cache_read: usage.cache_read_input_tokens,
+                    cache_write: usage.cache_creation_input_tokens,
+                    output: usage.output_tokens,
+                    ..Usage::default()
+                });
+                reported = valid(total_cost_usd).and_then(micros_of);
+            }
+        }),
+        // Each `turn.completed` carries the run's running totals, not the turn's own.
+        Harness::Codex => scan(log, |event| {
+            let CodexEvent::TurnCompleted { usage } = event else {
+                return;
+            };
+            let snapshot = valid(usage).and_then(|turn| {
+                let cached = turn.cached_input_tokens;
+                let write = turn.cache_write_input_tokens;
+                let input = turn.input_tokens.checked_sub(cached)?.checked_sub(write)?;
+                Some(Usage {
+                    input,
+                    cache_read: cached,
+                    cache_write: write,
+                    output: turn.output_tokens,
+                    ..Usage::default()
+                })
+            });
+            found = snapshot;
+        }),
+        // `codex review` prints plain text and reports no usage.
+        Harness::CodexReview => return None,
+    };
+    let mut usage = found.filter(|_| complete)?;
+    let counts = [
+        usage.input,
+        usage.cache_read,
+        usage.cache_write,
+        usage.output,
+    ];
+    if counts.iter().any(|count| *count > TOKENS_MAX) {
+        return None;
+    }
+    match reported.or_else(|| priced(model, &usage)) {
+        Some(micros) => usage.cost_micros = micros,
+        None => usage.unpriced = true,
+    }
+    assert!(!usage.unpriced || usage.cost_micros == 0);
+    Some(usage)
 }
 
 pub fn failure_account(harness: &Harness, log: &Path, tail: &str) -> Option<String> {
@@ -1119,8 +1599,10 @@ impl Account {
                 self.error = piece(message).or_else(|| Some("(no message)".to_string()));
             }
             CodexEvent::Error { message } => self.error = piece(valid(message)),
-            CodexEvent::TurnCompleted => self.error = None,
-            CodexEvent::Other => {}
+            CodexEvent::TurnCompleted { .. } => self.error = None,
+            CodexEvent::ItemStarted { .. }
+            | CodexEvent::ThreadStarted { .. }
+            | CodexEvent::Other => {}
         }
     }
 }

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{ATTEMPT_MILLIS_MAX, ROLES_MAX};
 use crate::roles::{
-    AGENTS_MAX, BUILDERS_DEFAULT, Harness, PROFILE_LEN_MAX, ROLES, RepoRoles, RoleSpec,
+    AGENTS_MAX, BUILDERS_DEFAULT, Harness, LEAD_PREFIX, LEAD_PROFILE, PROFILE_LEN_MAX, ROLES,
+    RepoRoles, RoleSpec,
 };
 use crate::run_task::{ATTEMPTS_DEFAULT, ATTEMPTS_MAX};
 
@@ -162,6 +163,8 @@ enum HarnessName {
 #[serde(deny_unknown_fields)]
 struct RoleShape {
     #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     harness: Option<HarnessName>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -195,6 +198,7 @@ impl RoleShape {
         let prompt = spec.prompt_file.strip_suffix(PROMPT_SUFFIX);
         assert!(prompt.is_some(), "built-in prompts are .md files");
         RoleShape {
+            enabled: None,
             harness: Some(harness),
             model: Some(spec.model.to_string()),
             title: Some(spec.title.to_string()),
@@ -211,6 +215,7 @@ impl RoleShape {
 
     fn overlay(&mut self, over: RoleShape) {
         let RoleShape {
+            enabled,
             harness,
             model,
             title,
@@ -223,6 +228,7 @@ impl RoleShape {
             slots,
             skills,
         } = over;
+        self.enabled = enabled.or(self.enabled);
         self.harness = harness.or(self.harness);
         self.model = model.or(self.model.take());
         self.title = title.or(self.title.take());
@@ -459,6 +465,14 @@ fn role_spec(
             problem.into(),
         ));
     }
+    if label == LEAD_PROFILE || label.starts_with(LEAD_PREFIX) {
+        let problem = "is reserved for the lead's board profile";
+        return Err(field_error(
+            path,
+            format!("{prefix}roles.{label}"),
+            problem.into(),
+        ));
+    }
     let harness = match role.harness.ok_or_else(|| missing("harness"))? {
         HarnessName::Claude => Harness::Claude,
         HarnessName::Codex => Harness::Codex,
@@ -516,6 +530,7 @@ fn role_spec(
         pool_slots,
         prompt_file: String::leak(prompt_file),
         skills,
+        enabled: role.enabled.unwrap_or(true),
     })
 }
 

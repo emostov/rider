@@ -18,7 +18,7 @@ const BRANCH_PREFIX: &str = "rider/";
 const HEADS_PREFIX: &str = "refs/heads/";
 // A branch label must still be a safe ref once `HEADS_PREFIX` makes it a full ref.
 const BRANCH_BYTES_MAX: usize = REF_BYTES_MAX - HEADS_PREFIX.len();
-const WORKTREES_DIR: &str = "worktrees";
+pub const WORKTREES_DIR: &str = "worktrees";
 pub const TASK_DIRS_MAX: usize = 1024;
 const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
@@ -520,9 +520,10 @@ pub fn prepare(
             && held
                 .parent()
                 .is_some_and(|parent| parent.is_absolute() && same_dir(parent, project))
-            && let Some(owner) = held
-                .file_name()
-                .and_then(|name| name.to_str()?.parse().ok())
+            && let Some(owner) = held.file_name().and_then(|name| {
+                let name = name.to_str()?;
+                name.parse::<u64>().ok().filter(|id| id.to_string() == name)
+            })
             && recorded_board(&held).ok().flatten().as_deref() == Some(identity.0.as_str())
             && board.read_task(TaskId(owner))?.state == TaskState::Completed
         {

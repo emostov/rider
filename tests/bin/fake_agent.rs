@@ -1,20 +1,13 @@
 //! A stand-in agent for the harness tests. It prints, sleeps, and exits as its arguments say.
 //!
-//! Usage: `fake_agent <lines> <bytes_per_line> <sleep_seconds> <exit_code> [mode]`
+//! Usage: `fake_agent <lines> <bytes_per_line> <sleep_seconds> <exit_code>`
 //!
 //! It first writes `cwd=<dir>` to stderr, and `echo=<value>` to stdout when the environment
 //! holds `FAKE_AGENT_ECHO`. Then it prints `lines` lines of `bytes_per_line` bytes each,
-//! newline included, to stdout. Then, by `mode`:
-//! - none: sleeps `sleep_seconds`, then exits with `exit_code`;
-//! - `ignore-term`: becomes `sh`, which ignores SIGTERM and sleeps `sleep_seconds`;
-//! - `orphan`: starts `sleep <sleep_seconds>` holding stdout open, then exits at once;
-//! - `kill-self`: ends itself with SIGKILL;
-//! - `escape`: starts `sleep <sleep_seconds>` in a process group of its own, holding stdout
-//!   open, then exits at once.
+//! newline included, to stdout. Then it sleeps `sleep_seconds` and exits with `exit_code`.
 
 use std::io::Write;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
@@ -50,10 +43,7 @@ fn print_lines(lines: u64, bytes_per_line: u64) {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    assert!(
-        args.len() == 4 || args.len() == 5,
-        "usage: see the file header"
-    );
+    assert!(args.len() == 4, "usage: see the file header");
     let (lines, bytes_per_line) = (number(&args, 0), number(&args, 1));
     let seconds = number(&args, 2);
     let code = u8::try_from(number(&args, 3)).unwrap_or(u8::MAX);
@@ -64,28 +54,6 @@ fn main() -> ExitCode {
         println!("echo={value}");
     }
     print_lines(lines, bytes_per_line);
-    match args.get(4).map(String::as_str) {
-        None => thread::sleep(Duration::from_secs(seconds)),
-        Some("ignore-term") => {
-            let script = format!("trap '' TERM; sleep {seconds}");
-            let error = Command::new("sh").args(["-c", &script]).exec();
-            panic!("exec sh: {error}");
-        }
-        Some("orphan") => {
-            let spawned = Command::new("sleep").arg(seconds.to_string()).spawn();
-            assert!(spawned.is_ok(), "sleep did not start");
-        }
-        Some("escape") => {
-            let script = format!("set -m; sleep {seconds} &");
-            let status = Command::new("sh").args(["-c", &script]).status();
-            assert!(status.is_ok_and(|s| s.success()), "sh did not start sleep");
-        }
-        Some("kill-self") => {
-            let pid = std::process::id().to_string();
-            let _ = Command::new("kill").args(["-s", "KILL", &pid]).status();
-            thread::sleep(Duration::from_secs(seconds));
-        }
-        Some(other) => panic!("unknown mode {other}"),
-    }
+    thread::sleep(Duration::from_secs(seconds));
     ExitCode::from(code)
 }

@@ -27,8 +27,8 @@ const POLL_MILLIS: u64 = 200;
 const LIST_LIMIT: &str = "500";
 const SCHEMAS: [(&str, &str); 2] = [
     (
-        "rider-result@2",
-        "skills/ride-swarm/schemas/rider-result@2.json",
+        "rider-result@3",
+        "skills/ride-swarm/schemas/rider-result@3.json",
     ),
     (
         "rider-finding@1",
@@ -561,6 +561,18 @@ pub fn given_a_running_daemon(world: &mut World) {
 /// Given a running `rider daemon` with `env` added to the world's environment.
 pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
     when_the_daemon_is_started(world, env);
+    then_the_daemon_follows_the_board(world);
+}
+
+#[cfg(target_os = "macos")]
+pub fn given_a_running_daemon_in_a_sandbox(world: &mut World) {
+    let profile = "(version 1)\n(allow default)\n";
+    let sandbox = ["/usr/bin/sandbox-exec", "-p", profile, "--"];
+    start_daemon(world, &[], &sandbox);
+    then_the_daemon_follows_the_board(world);
+}
+
+fn then_the_daemon_follows_the_board(world: &World) {
     let deadline = Instant::now() + Duration::from_secs(DAEMON_START_SECONDS_MAX);
     while !world.daemon_log().contains(DAEMON_STARTED) {
         assert!(
@@ -574,13 +586,23 @@ pub fn given_a_running_daemon_with(world: &mut World, env: &[(&str, &str)]) {
 
 /// When `rider daemon` is spawned with `env` added, not waiting for it to start following.
 pub fn when_the_daemon_is_started(world: &mut World, env: &[(&str, &str)]) {
+    start_daemon(world, env, &[]);
+}
+
+fn start_daemon(world: &mut World, env: &[(&str, &str)], wrapper: &[&str]) {
     assert!(world.daemon.is_none(), "one daemon per world");
     let log =
         fs::File::create(world.root.join("daemon-output.log")).expect("create the daemon output");
     let err = log.try_clone().expect("share the daemon output");
-    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    let rider = env!("CARGO_BIN_EXE_rider");
+    let (program, args) = match wrapper.split_first() {
+        Some((program, args)) => (*program, [args, &[rider]].concat()),
+        None => (rider, Vec::new()),
+    };
+    let mut command = world.command(Path::new(program));
     command.envs(env.iter().copied());
     let child = command
+        .args(args)
         .arg("daemon")
         .stdout(log)
         .stderr(err)
@@ -836,7 +858,7 @@ pub fn given_vb_waits_for_the_result_post(
     release: &Path,
 ) {
     assert!(task.bytes().all(|b| b.is_ascii_digit()));
-    let pattern = format!("*\" post {task} --schema rider-result@2 \"*");
+    let pattern = format!("*\" post {task} --schema rider-result@3 \"*");
     given_vb_waits_on(world, &pattern, marker, release);
 }
 
@@ -1533,4 +1555,46 @@ exec '{}' "$@"
         real.display()
     );
     crate::world::write_executable(&world.vb, &script);
+}
+
+/// Given the user's Codex configuration declares an MCP server for each of `names`.
+pub fn given_the_users_codex_config_declares_mcp_servers(world: &World, names: &[&str]) {
+    let dir = world.root.join("user-home").join(".codex");
+    fs::create_dir_all(&dir).expect("create the user's Codex home");
+    let tables = names
+        .iter()
+        .map(|name| format!("[mcp_servers.{name}]\ncommand = \"true\"\n"));
+    fs::write(dir.join("config.toml"), tables.collect::<String>()).expect("write config.toml");
+    assert!(dir.join("config.toml").is_file());
+}
+
+/// Given the user's Codex configuration is `text`.
+pub fn given_the_users_codex_config(world: &World, text: &str) {
+    let dir = world.root.join("user-home").join(".codex");
+    fs::create_dir_all(&dir).expect("create the user's Codex home");
+    fs::write(dir.join("config.toml"), text).expect("write config.toml");
+    assert!(dir.join("config.toml").is_file());
+}
+
+/// Given the repository's main branch commits a project Codex configuration `text`.
+pub fn given_main_commits_a_codex_project_config(world: &World, text: &str) {
+    let dir = world.repo.join(".codex");
+    fs::create_dir_all(&dir).expect("create the project's .codex");
+    fs::write(dir.join("config.toml"), text).expect("write the project config");
+    world.git_ok(&["add", ".codex/config.toml"]);
+    world.git_ok(&["commit", "-q", "-m", "Add a Codex project config"]);
+    assert_eq!(world.git_ok(&["branch", "--show-current"]), MAIN);
+}
+
+/// Given the lead pinned a PR's files and recorded a reviewed head, as `rider queue files` and
+/// `rider queue reviewed` do.
+pub fn given_pinned_pr_files_and_a_reviewed_head(world: &World) {
+    let pinned = world.home.join("prs").join("7-head");
+    let reviewed = world.home.join("queue").join("reviewed");
+    for dir in [&pinned, &reviewed] {
+        fs::create_dir_all(dir).expect("create the queue's directory");
+    }
+    fs::write(pinned.join("patch.diff"), "diff\n").expect("write the pinned diff");
+    fs::write(reviewed.join("7"), format!("{}\n", "a".repeat(40))).expect("write the record");
+    assert!(reviewed.join("7").is_file());
 }

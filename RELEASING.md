@@ -25,8 +25,9 @@ The workflow runs on every `v*` tag.
 
 - `validate` fails unless the tag is `v` plus the `swarm-rider` version in the manifest and the
   tagged commit is an ancestor of `refs/remotes/origin/main`.
-- `fmt`, `clippy`, `test`, and `package` then run the CI checks again. They use the Rust version
-  pinned in `rust-toolchain.toml`.
+- `checks` then calls `checks.yml`, the same workflow CI calls, so the release reruns exactly
+  CI's `fmt`, `clippy`, `test`, and `package` jobs. They use the Rust version pinned in
+  `rust-toolchain.toml`.
 - `release` creates the GitHub release with generated notes, only if all four pass.
 
 ## Publishing to crates.io
