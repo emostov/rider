@@ -75,17 +75,6 @@ rider logs <id>     # the newest attempt's log of a task; -f follows it
 
 The board's web inspector is at <http://127.0.0.1:4100>.
 
-To stop by hand, `rider down` lets running agents finish and claims nothing new.
-`rider down --now` stops every agent at once and releases its task. `rider kill <id>` stops
-one task's agent and fails the task.
-
-Agents run unsandboxed, with permission prompts skipped, as your user: they can read and
-change anything your account can, not only the repository. Run Rider only where you accept
-that. The daemon never pushes or merges; work stays on local branches
-named `rider/<task id>-<slug>` until you ship it.
-
-Maintaining Rider? See [MAINTAINERS.md](MAINTAINERS.md).
-
 ## How it's built
 
 - **A deterministic simulator.** The daemon's decisions are one pure function,
