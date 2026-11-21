@@ -28,11 +28,13 @@ pub const LOG_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub const PROMPT_BYTES_MAX: usize = 256 * 1024;
 /// How long an agent has to exit after SIGTERM before its group gets SIGKILL.
 pub const KILL_GRACE_SECONDS: u64 = 10;
-/// Upper bound on the MCP servers a user's Codex configuration declares.
+/// Upper bound on the MCP servers one Codex configuration file declares.
 pub const MCP_SERVERS_MAX: usize = 32;
 const MCP_NAME_BYTES_MAX: usize = 64;
 const CODEX_CONFIG_BYTES_MAX: u64 = 1024 * 1024;
-const ARGS_MAX: usize = 24 + 2 * MCP_SERVERS_MAX;
+// Each user server takes one setting and each project server two.
+const MCP_SETTINGS_MAX: usize = 3 * MCP_SERVERS_MAX;
+const ARGS_MAX: usize = 28 + 2 * MCP_SETTINGS_MAX;
 const ENV_MAX: usize = 16;
 const POLL_MILLIS: u64 = 50;
 // Every poll sleeps `POLL_MILLIS`, so the final kill comes before the last poll.
@@ -149,7 +151,7 @@ impl fmt::Display for HarnessError {
                 "too many reader threads are still blocked on pipes from earlier runs"
             ),
             HarnessError::CodexConfig(message) => {
-                write!(f, "the Codex configuration: {}", one_line(message))
+                write!(f, "the Codex configuration {}", one_line(message))
             }
         }
     }
@@ -185,56 +187,106 @@ pub enum Resume<'a> {
     InPlace(&'a SessionId),
 }
 
-/// The MCP servers the user's Codex configuration declares, for a Codex agent to turn off;
-/// none for Claude, which takes an empty strict MCP configuration instead.
-pub fn codex_mcp_servers(harness: &Harness) -> Result<Vec<String>, HarnessError> {
+/// The `-c` settings that turn off every MCP server the user's Codex configuration and the
+/// worktree's project configuration declare; none for Claude, which takes an empty strict MCP
+/// configuration instead.
+pub fn codex_mcp_overrides(harness: &Harness, dir: &Path) -> Result<Vec<String>, HarnessError> {
+    assert!(dir.is_absolute(), "agents run in absolute worktrees");
     if *harness == Harness::Claude {
         return Ok(Vec::new());
     }
-    let home = env::var_os("CODEX_HOME").map(PathBuf::from);
-    let home = home.or_else(|| env::var_os("HOME").map(|home| Path::new(&home).join(".codex")));
-    let Some(path) = home.map(|home| home.join("config.toml")) else {
-        return Ok(Vec::new());
+    // Codex takes an empty `CODEX_HOME` as unset.
+    let home = env::var_os("CODEX_HOME").filter(|home| !home.is_empty());
+    let home = match home.map(PathBuf::from) {
+        Some(home) if !home.is_absolute() => {
+            let why = "CODEX_HOME is not an absolute path".to_string();
+            return Err(HarnessError::CodexConfig(why));
+        }
+        Some(home) => Some(home),
+        None => env::var_os("HOME").map(|home| Path::new(&home).join(".codex")),
     };
-    let error = |why: String| HarnessError::CodexConfig(format!("{}: {why}", path.display()));
-    let file = match File::open(&path) {
+    let mut settings = Vec::new();
+    if let Some(home) = home {
+        for (name, _) in mcp_servers(&home.join("config.toml"))? {
+            settings.push(format!("mcp_servers.{name}.enabled=false"));
+        }
+    }
+    // A trusted repository's linked worktree loads the branch's `.codex/config.toml`, and naming
+    // a server no loaded layer declares is an error, so each project server is turned off and
+    // given a stand-in transport of its own kind, which holds whether the project is trusted.
+    for (name, url) in mcp_servers(&dir.join(".codex").join("config.toml"))? {
+        settings.push(format!("mcp_servers.{name}.enabled=false"));
+        settings.push(if url {
+            format!(r#"mcp_servers.{name}.url="http://127.0.0.1:1/""#)
+        } else {
+            format!(r#"mcp_servers.{name}.command="true""#)
+        });
+    }
+    assert!(settings.len() <= MCP_SETTINGS_MAX);
+    assert!(
+        settings
+            .iter()
+            .all(|setting| setting.starts_with("mcp_servers."))
+    );
+    Ok(settings)
+}
+
+/// The MCP servers the Codex configuration at `path` declares, each with whether it is reached
+/// by URL; none when there is no file. An error names the file and at most a line number,
+/// never its content, which may hold tokens.
+fn mcp_servers(path: &Path) -> Result<Vec<(String, bool)>, HarnessError> {
+    let error = |why: &str| HarnessError::CodexConfig(format!("{} {why}", path.display()));
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(missing) if missing.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(failed) => return Err(error(failed.to_string())),
+        Err(_) => return Err(error("cannot be read")),
     };
     let mut text = String::new();
     let read = file
         .take(CODEX_CONFIG_BYTES_MAX + 1)
         .read_to_string(&mut text);
-    read.map_err(|failed| error(failed.to_string()))?;
+    read.map_err(|_| error("cannot be read as UTF-8 text"))?;
     if u64::try_from(text.len()).map_or(true, |bytes| bytes > CODEX_CONFIG_BYTES_MAX) {
-        return Err(error(format!("over {CODEX_CONFIG_BYTES_MAX} bytes")));
+        return Err(error(&format!("is over {CODEX_CONFIG_BYTES_MAX} bytes")));
     }
-    let table: toml::Table = toml::from_str(&text).map_err(|bad| error(bad.to_string()))?;
+    let table: toml::Table = toml::from_str(&text).map_err(|bad| {
+        let at = bad.span().map_or(0, |span| span.start).min(text.len());
+        let line = text.as_bytes()[..at]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+            + 1;
+        error(&format!("is not valid TOML at line {line}"))
+    })?;
     let servers = match table.get("mcp_servers") {
         None => return Ok(Vec::new()),
         Some(toml::Value::Table(servers)) => servers,
-        Some(_) => return Err(error("`mcp_servers` is not a table".to_string())),
+        Some(_) => return Err(error("holds an `mcp_servers` that is not a table")),
     };
     if servers.len() > MCP_SERVERS_MAX {
-        return Err(error(format!("over {MCP_SERVERS_MAX} MCP servers")));
+        return Err(error(&format!(
+            "declares over {MCP_SERVERS_MAX} MCP servers"
+        )));
     }
     let valid = |name: &str| {
         !name.is_empty()
             && name.len() <= MCP_NAME_BYTES_MAX
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     };
-    if let Some(name) = servers.keys().find(|name| !valid(name)) {
-        return Err(error(format!(
-            "the MCP server name {name:?} is not one Rider can pass"
-        )));
+    let mut found = Vec::with_capacity(servers.len());
+    for (name, server) in servers {
+        let toml::Value::Table(server) = server else {
+            return Err(error("declares an MCP server that is not a table"));
+        };
+        if !valid(name) {
+            let why = "names an MCP server with characters other than letters, digits, _ and -";
+            return Err(error(why));
+        }
+        found.push((name.clone(), server.contains_key("url")));
     }
-    let names: Vec<String> = servers.keys().cloned().collect();
-    assert!(names.len() <= MCP_SERVERS_MAX);
-    assert!(names.iter().all(|name| valid(name)));
-    Ok(names)
+    assert!(found.len() <= MCP_SERVERS_MAX);
+    assert!(found.iter().all(|(name, _)| valid(name)));
+    Ok(found)
 }
 
 pub fn command_for(
@@ -242,7 +294,7 @@ pub fn command_for(
     prompt: &str,
     dir: &Path,
     resume: Option<Resume>,
-    mcp_servers: &[String],
+    mcp_overrides: &[String],
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
     assert!(
@@ -250,9 +302,9 @@ pub fn command_for(
         "only Claude sessions are resumed"
     );
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
-    assert!(mcp_servers.len() <= MCP_SERVERS_MAX);
+    assert!(mcp_overrides.len() <= MCP_SETTINGS_MAX);
     assert!(
-        mcp_servers.is_empty() || spec.harness != Harness::Claude,
+        mcp_overrides.is_empty() || spec.harness != Harness::Claude,
         "Claude takes an empty strict MCP configuration instead"
     );
     assert!(dir.to_str().is_some(), "worktree paths are UTF-8");
@@ -322,18 +374,19 @@ pub fn command_for(
                 r#"sandbox_mode="danger-full-access""#,
                 "-c",
                 r#"approval_policy="never""#,
+                "--disable",
+                "plugins",
+                "--disable",
+                "apps",
                 "-",
             ],
             Io::PromptOnStdin(prompt.to_string()),
         ),
     };
     let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
-    // `-c mcp_servers={}` merges into the user's table instead of replacing it, and naming a
-    // server the configuration lacks is an error, so each declared server is turned off.
-    let off = mcp_servers.iter().flat_map(|name| {
-        let setting = format!("mcp_servers.{name}.enabled=false");
-        ["-c".to_string(), setting]
-    });
+    // `-c mcp_servers={}` merges into the user's table instead of replacing it, so each
+    // declared server is turned off by name.
+    let off = (mcp_overrides.iter()).flat_map(|setting| ["-c".to_string(), setting.clone()]);
     args.splice(1..1, off);
     match resume {
         // Without `--fork-session` Claude appends to the resumed session in place.

@@ -1520,3 +1520,21 @@ pub fn given_the_users_codex_config_declares_mcp_servers(world: &World, names: &
     fs::write(dir.join("config.toml"), tables.collect::<String>()).expect("write config.toml");
     assert!(dir.join("config.toml").is_file());
 }
+
+/// Given the user's Codex configuration is `text`.
+pub fn given_the_users_codex_config(world: &World, text: &str) {
+    let dir = world.root.join("user-home").join(".codex");
+    fs::create_dir_all(&dir).expect("create the user's Codex home");
+    fs::write(dir.join("config.toml"), text).expect("write config.toml");
+    assert!(dir.join("config.toml").is_file());
+}
+
+/// Given the repository's main branch commits a project Codex configuration `text`.
+pub fn given_main_commits_a_codex_project_config(world: &World, text: &str) {
+    let dir = world.repo.join(".codex");
+    fs::create_dir_all(&dir).expect("create the project's .codex");
+    fs::write(dir.join("config.toml"), text).expect("write the project config");
+    world.git_ok(&["add", ".codex/config.toml"]);
+    world.git_ok(&["commit", "-q", "-m", "Add a Codex project config"]);
+    assert_eq!(world.git_ok(&["branch", "--show-current"]), MAIN);
+}

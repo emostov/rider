@@ -346,7 +346,7 @@ impl Attempt {
             Harness::Codex | Harness::CodexReview => None,
         };
         let dir = &self.checkout.dir;
-        let servers = harness::codex_mcp_servers(&self.brief.role.harness).ok()?;
+        let servers = harness::codex_mcp_overrides(&self.brief.role.harness, dir).ok()?;
         let (cmd, how) = match &session {
             Some(session) => {
                 let resume = Some(Resume::InPlace(session));
@@ -774,7 +774,10 @@ fn prepare(
         );
         Block::new("rider_error", reason)
     };
-    let servers = harness::codex_mcp_servers(&brief.role.harness).map_err(cannot)?;
+    let checkout = worktree::prepare(&brief, board, &env.home, identity);
+    let checkout = checkout.map_err(|error| worktree_block(&error))?;
+    assert!(checkout.dir == dir);
+    let servers = harness::codex_mcp_overrides(&brief.role.harness, &dir).map_err(cannot)?;
     let command = |resume: Option<&SessionId>| {
         let cmd = command_for(
             brief.role,
@@ -799,9 +802,6 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = worktree::prepare(&brief, board, &env.home, identity);
-    let checkout = checkout.map_err(|error| worktree_block(&error))?;
-    assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
     assert!(log.is_absolute());
     let start = start.filter(|value| git::commit_exists(&checkout.dir, value).unwrap_or(false));

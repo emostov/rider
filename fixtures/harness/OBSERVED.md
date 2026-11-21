@@ -106,6 +106,14 @@ Observed on 2026-11-20 with Claude Code 2.1.x and codex-cli 0.170.0, prompt `Rep
 
   Re-checked on 2026-11-21 with codex-cli 0.170.0 and a scratch `CODEX_HOME` whose `config.toml` declares `[mcp_servers.alpha]` and `[mcp_servers.beta]`: `codex mcp list` and `codex -c 'mcp_servers={}' mcp list` show both `enabled`; `codex -c 'mcp_servers.alpha.enabled=false' mcp list` shows `alpha` `disabled` and `beta` `enabled`. Naming a server the configuration lacks (`-c 'mcp_servers.gamma.enabled=false'`) fails: `failed to load bootstrap configuration ... invalid transport in mcp_servers.gamma`. So Rider reads the server names from `$CODEX_HOME/config.toml` (`~/.codex/config.toml` when unset) and passes `-c mcp_servers.<name>.enabled=false` for each, to `codex exec` and to `codex review`, which takes `-c` the same way.
 
+  Re-checked on 2026-11-21 with codex-cli 0.170.0, `codex mcp list` only, in a linked worktree (`git worktree add --detach`) of a repository whose branch commits `.codex/config.toml` declaring a `command` server and a `url` server:
+  - With `[projects."<repo>"] trust_level = "trusted"` in the user's config (the path as `pwd -P` prints it), the worktree inherits the trust and both project servers are listed `enabled`. Without the trust entry they are not loaded.
+  - `-c 'projects."<repo or worktree>".trust_level="untrusted"'` does not stop them loading.
+  - `-c mcp_servers.<name>.enabled=false` turns a project server off when the project is trusted, but fails (`invalid transport`) when it is not, since no loaded layer declares the name. Adding a stand-in transport of the server's own kind holds either way: `-c mcp_servers.<name>.command="true"` for a `command` server, `-c mcp_servers.<name>.url="http://127.0.0.1:1/"` for a `url` server; giving a `url` server a `command` fails with `url is not supported for stdio`. So Rider reads `<worktree>/.codex/config.toml` after preparing the worktree and passes both settings for each server it declares.
+  - An empty `CODEX_HOME` is treated as unset: Codex warns `codex_home: <HOME>/.codex` and reads that, so Rider does too.
+  - `codex review --help` lists `--disable <FEATURE>`; `codex review` takes `--disable plugins --disable apps` as `codex exec` does.
+  - A `toml` parse error's text quotes the offending line, so Rider reports only the file and the line number.
+
 ## tact
 
 Rider no longer supports tact; its observations and fixture were removed.
