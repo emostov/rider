@@ -911,7 +911,7 @@ fn rider_config_refuses_a_queue_value_other_than_true_naming_the_field() {
     };
     let field = format!("repo.\"{}\".queue", world.repo_label());
 
-    for value in ["false", "\"yes\"", "1"] {
+    for value in ["false", "\"true\"", "\"yes\"", "1"] {
         let toml = format!("[repo.\"{}\"]\nqueue = {value}\n", world.repo_label());
         given_a_rider_toml(&world, &toml);
 
