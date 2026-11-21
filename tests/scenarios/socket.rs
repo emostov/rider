@@ -283,3 +283,107 @@ fn first_mode_other_than_0600(path: &Path, done: &AtomicBool) -> Option<u32> {
     }
     None
 }
+
+const UP_REFUSAL_SECONDS_MAX: u64 = 5;
+
+#[test]
+fn rider_up_refuses_a_home_other_users_can_write_to_and_makes_no_socket() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    fs::set_permissions(&world.home, fs::Permissions::from_mode(0o777)).expect("open the home");
+
+    let up = when_rider_runs(&world, &["up"]);
+
+    assert_eq!(up.code, Some(1), "{up:?}");
+    let home = world.home.display().to_string();
+    assert!(up.stderr.contains(&home), "{up:?}");
+    assert!(!world.home.join("rider.sock").exists());
+    assert!(!world.home.join("daemon.log").exists());
+}
+
+#[test]
+fn rider_up_fails_fast_on_a_fifo_at_daemon_log() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let log = world.home.join("daemon.log");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&log)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success());
+
+    let started = Instant::now();
+    let up = when_rider_runs(&world, &["up"]);
+    let took = started.elapsed();
+
+    assert_eq!(up.code, Some(1), "{up:?}");
+    assert!(up.stderr.contains(&log.display().to_string()), "{up:?}");
+    assert!(
+        took < Duration::from_secs(UP_REFUSAL_SECONDS_MAX),
+        "took {took:?}"
+    );
+    assert!(!world.home.join("rider.sock").exists());
+}
+
+#[test]
+fn the_home_and_every_log_are_private_to_the_owner_after_a_run() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["completed"]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+
+    let mode = |path: &Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+    let attempt = world.home.join("logs").join(&task).join("1.jsonl");
+    let modes: Vec<u32> = [world.home.clone(), world.home.join("daemon.log"), attempt]
+        .iter()
+        .map(|path| mode(path))
+        .collect();
+    assert_eq!(modes, vec![0o700, 0o600, 0o600]);
+}
+
+#[test]
+fn a_kill_or_down_without_the_owners_control_token_is_refused_and_the_agent_keeps_running() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[crate::fake_agent::Behaviour::Hold]);
+    given_a_running_daemon(&mut world);
+    let run = when_the_agent_has_started(&world, &task);
+    let token = fs::metadata(world.home.join("control.token")).expect("the token exists");
+
+    let mut replies = Vec::new();
+    for request in [
+        json!({"v": 1, "id": 1, "cmd": "kill", "task": task.parse::<u64>().expect("an id")}),
+        json!({"v": 1, "id": 2, "cmd": "down", "now": true}),
+        json!({"v": 1, "id": 3, "cmd": "kill", "task": 1, "token": "guessed"}),
+    ] {
+        let mut client = given_a_client_on_the_socket(&world);
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .expect("send the request");
+        replies.push(then_the_client_reads_a_line(&client)["error"]["code"].clone());
+    }
+
+    assert_eq!(replies, vec![json!("forbidden"); 3]);
+    assert_eq!(token.permissions().mode() & 0o777, 0o600);
+    assert!(is_alive(run.pid), "the agent {} was stopped", run.pid);
+    let status = when_rider_runs(&world, &["status"]);
+    assert_eq!(status.code, Some(0), "{status:?}");
+    let kill = when_rider_runs(&world, &["kill", &task]);
+    assert_eq!(kill.code, Some(0), "{kill:?}");
+    assert!(
+        when_the_process_ends_within(run.pid, 10),
+        "the agent still runs"
+    );
+    assert_eq!(when_the_tasks_settle(&world, &[&task]), vec!["failed"]);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}

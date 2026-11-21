@@ -101,6 +101,12 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
 | `worktrees/<repository>/<task id>` | a task's worktree, removed when it completes |
 | `daemon.log`, `board.log` | what the daemon and the board it started printed |
 | `rider.sock` | the daemon's control socket |
+| `control.token` | a fresh token per daemon start that `rider down` and `rider kill` send |
+
+The home, its logs, the socket and the token are readable only by their owner, and the daemon
+refuses a home that other users can write to. `down` and `kill` requests without the token are
+refused. The token keeps agents from stopping work through the socket by accident; it is not a
+boundary against a process that runs as the same user and sets out to read the token file.
 
 ## Troubleshooting
 

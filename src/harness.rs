@@ -9,8 +9,9 @@ use rustix::process::Signal;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -279,6 +280,32 @@ impl Shared {
     }
 }
 
+// Opening a FIFO waits for a reader, so anything there but a regular file is refused first.
+pub fn open_private(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
+    assert!(path.is_absolute());
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "it is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() != ErrorKind::NotFound => return Err(error),
+        Ok(_) | Err(_) => {}
+    }
+    let file = options.create(true).mode(0o600).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "it is not a regular file",
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    assert!(file.metadata()?.permissions().mode() & 0o077 == 0);
+    Ok(file)
+}
+
 fn open_log(log: &Path, log_bytes_max: u64) -> Result<Arc<Shared>, HarnessError> {
     assert!(!log.as_os_str().is_empty());
     assert!(log_bytes_max <= LOG_BYTES_MAX);
@@ -286,7 +313,7 @@ fn open_log(log: &Path, log_bytes_max: u64) -> Result<Arc<Shared>, HarnessError>
     if let Some(parent) = log.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(failed)?;
     }
-    let file = File::create(log).map_err(failed)?;
+    let file = open_private(log, OpenOptions::new().write(true).truncate(true)).map_err(failed)?;
     let cap = log_bytes_max;
     Ok(Arc::new(Shared {
         file: Mutex::new(LogFile {

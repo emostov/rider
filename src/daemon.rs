@@ -31,7 +31,9 @@ use crate::core::{
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
-use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
+use crate::harness::{
+    ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, open_private,
+};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
@@ -164,8 +166,6 @@ pub enum DaemonError {
     QueueClosed,
     /// `TEST_MILLIS_VAR` is malformed.
     Setting(String),
-    /// The daemon's log exists and is not a regular file.
-    NotAFile(PathBuf),
     /// The board's identity could not be read at start-up.
     Identity(IdentityUnknown),
 }
@@ -185,7 +185,6 @@ impl fmt::Display for DaemonError {
             DaemonError::JobsFull => write!(f, "more than {JOBS_QUEUED_MAX} actions waited"),
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
-            DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
             DaemonError::Identity(error) => write!(f, "{error}"),
         }
     }
@@ -461,6 +460,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         }
     };
     let timing = Timing::parse(setting)?;
+    socket::secure_home(&paths.home).map_err(io_error("secure", &paths.home))?;
     let _lock = take_lock(&paths.home)?;
     let agents = paths.home.join(AGENTS_DIR);
     fs::create_dir_all(&agents).map_err(io_error("create", &agents))?;
@@ -582,7 +582,7 @@ fn start_board(shared: &Arc<Shared>) -> Result<(), DaemonError> {
     }
     let home = &shared.paths.home;
     let path = home.join(BOARD_LOG_FILE);
-    let log = OpenOptions::new().create(true).append(true).open(&path);
+    let log = open_private(&path, OpenOptions::new().append(true));
     let log = log.map_err(io_error("open", &path))?;
     let err = log.try_clone().map_err(io_error("share", &path))?;
     let vb = &shared.paths.vb;
@@ -1548,23 +1548,9 @@ struct Log {
 }
 
 impl Log {
-    // Anything there but a regular file is refused before opening, which would block on a FIFO.
     fn start(path: &Path) -> Result<Log, DaemonError> {
-        match fs::metadata(path) {
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(DaemonError::NotAFile(path.to_path_buf()));
-            }
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(io_error("inspect", path)(error));
-            }
-            Ok(_) | Err(_) => {}
-        }
-        let opened = OpenOptions::new().create(true).append(true).open(path);
-        let file = opened.map_err(io_error("open", path))?;
-        let metadata = file.metadata().map_err(io_error("inspect", path))?;
-        if !metadata.is_file() {
-            return Err(DaemonError::NotAFile(path.to_path_buf()));
-        }
+        let file = open_private(path, OpenOptions::new().append(true));
+        let file = file.map_err(io_error("open", path))?;
         let (lines, queued) = sync_channel::<String>(LOG_QUEUE_MAX);
         let dropped = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&dropped);

@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
@@ -27,6 +27,9 @@ pub const SOCKET_FILE: &str = "rider.sock";
 const BIND_DIR: &str = ".bind";
 /// The socket's file name inside `BIND_DIR`.
 const BIND_FILE: &str = "s";
+const TOKEN_FILE: &str = "control.token";
+const TOKEN_BYTES: usize = 32;
+const TOKEN_FILE_BYTES_MAX: u64 = 256;
 /// The protocol version a request names in `v`.
 pub const VERSION: u64 = 1;
 /// Upper bound on one request line; a longer one is refused and the connection closed.
@@ -88,6 +91,8 @@ struct WireRequest {
     task: Option<u64>,
     #[serde(default)]
     follow: Option<bool>,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 enum Outgoing {
@@ -167,11 +172,12 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
     fs::set_permissions(&bound, fs::Permissions::from_mode(0o600))?;
     fs::rename(&bound, path)?;
     fs::remove_dir(&private)?;
+    let token: Arc<str> = Arc::from(write_token(home)?);
     let clients = Arc::new(Mutex::new(Clients::default()));
     let shared = Arc::clone(&clients);
     thread::Builder::new()
         .name("socket".into())
-        .spawn(move || accept(&listener, &shared, &logs, &sink))?;
+        .spawn(move || accept(&listener, &shared, &logs, &sink, &token))?;
     assert!(path.exists());
     Ok(Socket {
         path: path.to_path_buf(),
@@ -179,7 +185,13 @@ pub fn listen(path: &Path, logs: PathBuf, sink: Sink) -> io::Result<Socket> {
     })
 }
 
-fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, sink: &Sink) {
+fn accept(
+    listener: &UnixListener,
+    clients: &Arc<Mutex<Clients>>,
+    logs: &Path,
+    sink: &Sink,
+    control: &Arc<str>,
+) {
     for _ in 0..ACCEPTS_MAX {
         let Ok(stream) = listener.accept().map(|(stream, _)| stream) else {
             continue;
@@ -237,11 +249,11 @@ fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, s
         });
         assert!(guard.slots.len() <= guard.live.len() && guard.live.len() <= CLIENTS_MAX);
         drop(guard);
-        let (held, sink) = (Arc::clone(clients), Arc::clone(sink));
+        let (held, sink, control) = (Arc::clone(clients), Arc::clone(sink), Arc::clone(control));
         let spawned = thread::Builder::new()
             .name("client-reader".into())
             .spawn(move || {
-                read_requests(reader, id, &held, &sink);
+                read_requests(reader, id, &held, &sink, &control);
                 drop(token);
             });
         if spawned.is_err() {
@@ -251,7 +263,13 @@ fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, s
 }
 
 // Reads requests until the client goes, then tells the core.
-fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sink: &Sink) {
+fn read_requests(
+    stream: UnixStream,
+    id: ClientId,
+    clients: &Mutex<Clients>,
+    sink: &Sink,
+    token: &str,
+) {
     let mut reader = BufReader::new(stream);
     for _ in 0..REQUESTS_MAX {
         let mut bytes = Vec::new();
@@ -261,13 +279,13 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
             Ok(0) | Err(_) => break,
             Ok(_) if bytes.len() > REQUEST_BYTES_MAX => {
                 let message = format!("a request is at most {REQUEST_BYTES_MAX} bytes");
-                refuse(clients, id, None, &message);
+                refuse(clients, id, None, "bad_request", &message);
                 lock(clients).slots.retain(|slot| slot.id != id);
                 break;
             }
             Ok(_) => {}
         }
-        match parse_request(&bytes) {
+        match parse_request(&bytes, token) {
             Ok((request_id, request)) => {
                 let mut guard = lock(clients);
                 let Some(slot) = guard.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -276,7 +294,7 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
                 if slot.request.is_some() {
                     drop(guard);
                     let message = "one command at a time per connection";
-                    refuse(clients, id, Some(request_id), message);
+                    refuse(clients, id, Some(request_id), "bad_request", message);
                     continue;
                 }
                 slot.request = Some(request_id);
@@ -288,7 +306,7 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
                     break;
                 }
             }
-            Err((request_id, message)) => refuse(clients, id, request_id, &message),
+            Err((request_id, code, message)) => refuse(clients, id, request_id, code, &message),
         }
     }
     remove(&mut lock(clients), id);
@@ -303,10 +321,10 @@ fn remove(guard: &mut Clients, id: ClientId) {
     assert!(guard.slots.iter().all(|slot| slot.id != id));
 }
 
-fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, message: &str) {
+fn refuse(clients: &Mutex<Clients>, id: ClientId, request: Option<u64>, code: &str, text: &str) {
     let mut guard = lock(clients);
     if let Some(index) = guard.slots.iter().position(|slot| slot.id == id) {
-        let line = error_line(request, "bad_request", message);
+        let line = error_line(request, code, text);
         queue(&mut guard, index, Outgoing::Refusal(line), request);
     }
 }
@@ -328,16 +346,34 @@ fn queue(guard: &mut Clients, index: usize, outgoing: Outgoing, request: Option<
     assert!(guard.slots.len() <= CLIENTS_MAX);
 }
 
-/// The request in `bytes`, or the request id, if readable, and why it is refused.
-fn parse_request(bytes: &[u8]) -> Result<(u64, Request), (Option<u64>, String)> {
+type Refused = (Option<u64>, &'static str, String);
+
+fn parse_request(bytes: &[u8], token: &str) -> Result<(u64, Request), Refused> {
+    assert!(token.len() == TOKEN_BYTES * 2);
     let wire: WireRequest = serde_json::from_slice(bytes).map_err(|error| {
         let id = serde_json::from_slice::<Value>(bytes)
             .ok()
             .and_then(|value| value.get("id").and_then(Value::as_u64));
-        (id, format!("malformed request: {error}"))
+        (id, "bad_request", format!("malformed request: {error}"))
     })?;
+    let bad = |message: String| Err((Some(wire.id), "bad_request", message));
     if wire.v != VERSION {
-        return Err((Some(wire.id), format!("unknown version {}", wire.v)));
+        return bad(format!("unknown version {}", wire.v));
+    }
+    let controls = matches!(wire.cmd.as_str(), "down" | "kill");
+    let held = wire.token.as_deref().unwrap_or("");
+    let matched = held.len() == token.len()
+        && held
+            .bytes()
+            .zip(token.bytes())
+            .fold(0, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if controls && !matched {
+        let message = format!("{:?} needs the owner's control token", wire.cmd);
+        return Err((Some(wire.id), "forbidden", message));
+    }
+    if !controls && wire.token.is_some() {
+        return bad(format!("wrong fields for {:?}", wire.cmd));
     }
     let fields = (wire.now, wire.task.map(TaskId), wire.follow);
     let request = match (wire.cmd.as_str(), fields) {
@@ -352,11 +388,72 @@ fn parse_request(bytes: &[u8]) -> Result<(u64, Request), (Option<u64>, String)> 
             follow: follow.unwrap_or(false),
         },
         (cmd @ ("status" | "agents" | "down" | "kill" | "logs"), _) => {
-            return Err((Some(wire.id), format!("wrong fields for {cmd:?}")));
+            return bad(format!("wrong fields for {cmd:?}"));
         }
-        (cmd, _) => return Err((Some(wire.id), format!("unknown command {cmd:?}"))),
+        (cmd, _) => return bad(format!("unknown command {cmd:?}")),
     };
     Ok((wire.id, request))
+}
+
+// Creates the home 0700 or narrows it to 0700, and refuses one that is not the user's own or
+// that other users can write to, since they could replace the socket or the token.
+pub fn secure_home(home: &Path) -> io::Result<()> {
+    assert!(home.is_absolute());
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)?;
+    let metadata = fs::metadata(home)?;
+    let uid = rustix::process::getuid().as_raw();
+    if !metadata.is_dir() || metadata.uid() != uid {
+        let message = "it is not a directory the current user owns";
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        let message = "other users can write to it";
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+    }
+    fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
+    assert!(fs::metadata(home)?.mode() & 0o077 == 0);
+    Ok(())
+}
+
+// A fresh token per start, in a file only the owner can read, which `down` and `kill` carry.
+fn write_token(home: &Path) -> io::Result<String> {
+    let mut random = [0u8; TOKEN_BYTES];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = home.join(TOKEN_FILE);
+    match fs::remove_file(&path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Ok(()) | Err(_) => {}
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(token.as_bytes())?;
+    assert!(token.len() == TOKEN_BYTES * 2);
+    Ok(token)
+}
+
+/// The control token the running daemon wrote under `home`.
+pub fn read_token(home: &Path) -> Result<String, ClientError> {
+    let path = home.join(TOKEN_FILE);
+    let failed = |error: io::Error| ClientError::Io(format!("{}: {error}", path.display()));
+    let mut text = String::new();
+    File::open(&path)
+        .and_then(|file| file.take(TOKEN_FILE_BYTES_MAX).read_to_string(&mut text))
+        .map_err(failed)?;
+    let token = text.trim();
+    if token.len() != TOKEN_BYTES * 2 {
+        return Err(ClientError::Malformed(format!(
+            "{} holds no token",
+            path.display()
+        )));
+    }
+    Ok(token.to_string())
 }
 
 impl Socket {

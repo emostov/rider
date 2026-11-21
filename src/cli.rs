@@ -24,7 +24,7 @@ use crate::daemon::{self, DaemonError, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
-use crate::harness::LOG_BYTES_MAX;
+use crate::harness::{LOG_BYTES_MAX, open_private};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
 use crate::socket::{self, Client, ClientError, SOCKET_FILE};
@@ -567,11 +567,6 @@ fn up(config: &Config) -> Result<u8, CliError> {
         println!("{}", status_line(&data));
         return Ok(0);
     }
-    fs::create_dir_all(&config.home).map_err(|error| CliError::Io {
-        action: "create",
-        path: config.home.clone(),
-        message: error.to_string(),
-    })?;
     let log_path = config.home.join(daemon::LOG_FILE);
     let io = |action: &'static str, path: &Path| {
         let path = path.to_path_buf();
@@ -581,10 +576,8 @@ fn up(config: &Config) -> Result<u8, CliError> {
             message: error.to_string(),
         }
     };
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path);
+    socket::secure_home(&config.home).map_err(io("secure", &config.home))?;
+    let log = open_private(&log_path, fs::OpenOptions::new().append(true));
     let log = log.map_err(io("open", &log_path))?;
     let err = log.try_clone().map_err(io("open", &log_path))?;
     let exe = env::current_exe().map_err(io("find", Path::new("rider")))?;
@@ -620,8 +613,9 @@ fn up(config: &Config) -> Result<u8, CliError> {
 
 fn down(config: &Config, now: bool) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
+    let token = socket::read_token(&config.home).map_err(CliError::Client)?;
     client
-        .send("down", &[("now", now.into())])
+        .send("down", &[("now", now.into()), ("token", token.into())])
         .map_err(CliError::Client)?;
     for _ in 0..DOWN_LINES_MAX {
         match client.next_line().map_err(CliError::Client)? {
@@ -671,7 +665,8 @@ fn logs(config: &Config, id: TaskId, follow: bool) -> Result<u8, CliError> {
 
 fn kill(config: &Config, id: TaskId) -> Result<u8, CliError> {
     let mut client = Client::connect(&config.home).map_err(CliError::Client)?;
-    let fields = [("task", id.0.into())];
+    let token = socket::read_token(&config.home).map_err(CliError::Client)?;
+    let fields = [("task", id.0.into()), ("token", token.into())];
     client.send("kill", &fields).map_err(CliError::Client)?;
     say(&format!("killed the agent of #{}", id.0));
     Ok(0)
