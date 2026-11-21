@@ -40,7 +40,7 @@ use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
 use crate::run_task::{RESULT_FILE_BYTES_MAX, result_path};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
-use crate::socket::{self, Client, ClientError, SOCKET_FILE};
+use crate::socket::{self, Client, ClientError, SocketPath};
 
 const ENVIRONMENT: &str = r#"environment:
   RIDER_HOME     rider's files, an absolute path (default $HOME/.rider)
@@ -905,10 +905,12 @@ pub fn board_serve(home: &Path, vb: &Path) -> io::Result<Process> {
 }
 
 fn daemon(config: &Config) -> Result<u8, CliError> {
+    let socket = SocketPath::under(&config.home).map_err(CliError::Client)?;
     let (table, limits) = settings(config)?;
     update_skills(config);
     let paths = Paths {
         home: config.home.clone(),
+        socket,
         vb: config.vb_dir().join("vb"),
         board_url: config.board_url.clone(),
     };
@@ -927,6 +929,7 @@ const DOWN_LINES_MAX: usize = 4096;
 const LOG_LINES_MAX: u64 = u64::MAX;
 
 fn up(config: &Config) -> Result<u8, CliError> {
+    let socket = SocketPath::under(&config.home).map_err(CliError::Client)?;
     update_skills(config);
     if let Ok(mut client) = Client::connect(&config.home) {
         let data = client.send("status", &[]).map_err(CliError::Client)?;
@@ -983,8 +986,10 @@ fn up(config: &Config) -> Result<u8, CliError> {
         }
         thread::sleep(Duration::from_millis(UP_POLL_MILLIS));
     }
-    let socket = config.home.join(SOCKET_FILE);
-    let why = format!("{} did not answer in {UP_SECONDS_MAX} s", socket.display());
+    let why = format!(
+        "{} did not answer in {UP_SECONDS_MAX} s",
+        socket.path().display()
+    );
     Err(CliError::NotStarted(why))
 }
 

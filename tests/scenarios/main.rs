@@ -2223,7 +2223,7 @@ fn rider_down_drains_the_running_agent_claims_nothing_new_and_the_daemon_exits()
         );
         let later = when_the_lead_creates(&world, &an_implement_task(&world, "Add more work."));
         assert_eq!(
-            when_the_task_leaves_ready_within(&world, &later, 3),
+            when_the_task_leaves_ready_within(&world, &later, 7),
             "ready"
         );
         world.release_agent(&running);
