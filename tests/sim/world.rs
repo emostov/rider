@@ -1099,6 +1099,10 @@ impl World {
                 run, task, epoch, ..
             } => self.close(run, task, epoch, None)?,
             Action::ListTasks => self.list(),
+            Action::ReleaseWorktree(_) => {
+                let id = self.expect(None, "worktree");
+                self.reply(id, Event::WorktreeChecked);
+            }
             Action::RestartBoard => {
                 let id = self.expect(None, "board");
                 let fails = self.now < self.spawn_fails_until;

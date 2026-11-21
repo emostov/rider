@@ -44,6 +44,7 @@ pub const ENV_REMOVED: [&str; 8] = [
     "GIT_NAMESPACE",
     "GIT_PREFIX",
 ];
+const PSEUDO_REFS: [&str; 2] = ["ORIG_HEAD", "REBASE_HEAD"];
 const GIT: &str = "git";
 const GH: &str = "gh";
 const WORKTREE_LIST: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
@@ -478,7 +479,16 @@ pub fn commit_of(repo: &Path, rev: &str) -> Result<String, GitError> {
 /// Whether `dir` has no modified, staged, or untracked files.
 pub fn is_clean(dir: &Path) -> Result<bool, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
-    let args = ["status", "--porcelain", "--untracked-files=normal"].map(OsStr::new);
+    let words = [
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+    ];
+    let args = words.map(OsStr::new);
     let stdout = run_ok(dir, &args)?;
     assert!(stdout.len() <= OUTPUT_BYTES_MAX);
     Ok(stdout.is_empty())
@@ -576,6 +586,44 @@ pub fn head_reflog_only_commit_count(dir: &Path) -> Result<u64, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
     let mut reached = head_reflog_ids(dir)?;
     reached.push(head(dir)?);
+    only_reached_count(dir, reached)
+}
+
+// A worktree's own pseudo-refs go with it, and git keeps no reflog for them.
+pub fn orig_head_only_commit_count(dir: &Path) -> Result<u64, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let mut reached = Vec::with_capacity(PSEUDO_REFS.len());
+    for name in PSEUDO_REFS {
+        let spec = format!("{name}^{{commit}}");
+        let words = [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &spec,
+        ];
+        let args = words.map(OsStr::new);
+        let output = run_fed(dir, &args, None)?;
+        match output.code {
+            Some(0) => {
+                let id = one_line(&args, &output.stdout)?;
+                if !is_commit_id(&id) {
+                    return Err(parse_error(&args, &output.stdout));
+                }
+                reached.push(id);
+            }
+            Some(1) => {}
+            _ => return Err(exit_error(&args, &output)),
+        }
+    }
+    assert!(reached.len() <= PSEUDO_REFS.len());
+    if reached.is_empty() {
+        return Ok(0);
+    }
+    only_reached_count(dir, reached)
+}
+
+fn only_reached_count(dir: &Path, mut reached: Vec<String>) -> Result<u64, GitError> {
     reached.sort_unstable();
     reached.dedup();
     assert!(!reached.is_empty());
@@ -650,6 +698,27 @@ pub fn branch_exists(repo: &Path, branch: &str) -> Result<bool, GitError> {
         Some(1) => Ok(false),
         _ => Err(exit_error(&args, &output)),
     }
+}
+
+pub fn keeps_refs_in_files(dir: &Path) -> Result<bool, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let args = ["rev-parse", "--show-ref-format"].map(OsStr::new);
+    let format = one_line(&args, &run_ok(dir, &args)?)?;
+    assert!(!format.contains('\n'));
+    Ok(format == "files")
+}
+
+// `ls-files -v` tags an assume-unchanged entry with a lowercase letter and a skip-worktree
+// entry with `S`; git status and an unforced worktree removal skip both.
+pub fn has_hidden_index_entries(dir: &Path) -> Result<bool, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let words = ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"];
+    let args = words.map(OsStr::new);
+    let stdout = run_ok(dir, &args)?;
+    let mut entries = stdout.split(|&b| b == 0).filter(|entry| !entry.is_empty());
+    let hidden = entries.any(|entry| entry[0] == b'S' || entry[0].is_ascii_lowercase());
+    assert!(stdout.len() <= OUTPUT_BYTES_MAX);
+    Ok(hidden)
 }
 
 /// The branch checked out in `dir`, or `None` when HEAD is detached.
@@ -763,6 +832,41 @@ fn parse_worktree_branches(stdout: &[u8]) -> Result<Vec<(PathBuf, String)>, GitE
 }
 
 /// Each worktree of `repo` on a local branch, the main checkout included, with that branch.
+pub fn worktree_dirs(repo: &Path) -> Result<Vec<PathBuf>, GitError> {
+    assert!(repo.is_absolute(), "git runs in absolute directories");
+    let args = WORKTREE_LIST.map(OsStr::new);
+    let stdout = run_ok(repo, &args)?;
+    let fields = stdout.split(|&byte| byte == 0);
+    let dirs: Vec<PathBuf> = (fields.take(WORKTREES_MAX * WORKTREE_FIELDS_MAX))
+        .filter_map(|field| field.strip_prefix(WORKTREE_FIELD))
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+        .collect();
+    if dirs.len() > WORKTREES_MAX || dirs.iter().any(|dir| !dir.is_absolute()) {
+        return Err(parse_error(&args, &stdout));
+    }
+    assert!(stdout.len() <= OUTPUT_BYTES_MAX);
+    Ok(dirs)
+}
+
+// A linked worktree's own refs go with it: those under refs/worktree, refs/bisect and
+// refs/rewritten.
+pub fn has_per_worktree_refs(dir: &Path) -> Result<bool, GitError> {
+    assert!(dir.is_absolute(), "git runs in absolute directories");
+    let words = [
+        "for-each-ref",
+        "--count=1",
+        "--format=%(refname)",
+        "--",
+        "refs/worktree",
+        "refs/bisect",
+        "refs/rewritten",
+    ];
+    let args = words.map(OsStr::new);
+    let stdout = run_ok(dir, &args)?;
+    assert!(stdout.len() <= OUTPUT_BYTES_MAX);
+    Ok(!stdout.is_empty())
+}
+
 pub fn worktree_branches(repo: &Path) -> Result<Vec<(PathBuf, String)>, GitError> {
     assert!(repo.is_absolute(), "git runs in absolute directories");
     let args = WORKTREE_LIST.map(OsStr::new);
@@ -840,8 +944,27 @@ pub fn remove_worktree(repo: &Path, dir: &Path) -> Result<(), GitError> {
         "worktrees live under rider's absolute home"
     );
     assert!(repo.is_absolute(), "git runs in absolute directories");
-    let words = ["worktree", "remove", "--"].map(OsStr::new);
-    let args = [words[0], words[1], words[2], dir.as_os_str()];
+    let words = [
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "worktree",
+        "remove",
+        "--",
+    ]
+    .map(OsStr::new);
+    let [c1, fsmonitor, c2, cache, worktree, remove, end] = words;
+    let args = [
+        c1,
+        fsmonitor,
+        c2,
+        cache,
+        worktree,
+        remove,
+        end,
+        dir.as_os_str(),
+    ];
     run_ok(repo, &args).map(|_| ())
 }
 

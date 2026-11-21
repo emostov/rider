@@ -19,6 +19,7 @@ const HEADS_PREFIX: &str = "refs/heads/";
 // A branch label must still be a safe ref once `HEADS_PREFIX` makes it a full ref.
 const BRANCH_BYTES_MAX: usize = REF_BYTES_MAX - HEADS_PREFIX.len();
 const WORKTREES_DIR: &str = "worktrees";
+pub const TASK_DIRS_MAX: usize = 1024;
 const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
 pub const BRANCH_LABEL: &str = "branch";
@@ -74,6 +75,10 @@ pub enum WorktreeError {
     ForeignBoard {
         dir: PathBuf,
         record: Record,
+    },
+    Listing {
+        path: PathBuf,
+        why: String,
     },
     /// The worktree's record of its board could not be read or written.
     BoardRecord {
@@ -153,6 +158,9 @@ impl fmt::Display for WorktreeError {
                     Record::Different => "its .rider-board record names another board",
                 };
                 write!(f, "{} was not made for this board: {found}", dir.display())
+            }
+            WorktreeError::Listing { path, why } => {
+                write!(f, "could not list {}: {why}", path.display())
             }
             WorktreeError::BoardRecord { path, why } => {
                 write!(f, "the board record {} failed: {why}", path.display())
@@ -554,12 +562,22 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
     };
     let root = fs::canonicalize(home.join(WORKTREES_DIR));
     let root = root.map_err(|_| refuse("rider's worktrees directory is missing"))?;
+    let link = fs::symlink_metadata(&checkout.dir).map_err(|_| refuse("it does not exist"))?;
+    if link.file_type().is_symlink() {
+        return Err(refuse("it is a symlink"));
+    }
     let dir = fs::canonicalize(&checkout.dir).map_err(|_| refuse("it does not exist"))?;
     if dir == root || !dir.starts_with(&root) {
         return Err(refuse("it is outside rider's worktrees"));
     }
     if !is_checkout_of(&dir, repo)? {
         return Err(refuse("it is not a checkout of the repository"));
+    }
+    let listed = git::worktree_dirs(repo)?;
+    if !listed.iter().any(|listed| same_dir(listed, &dir)) {
+        return Err(refuse(
+            "git does not list it as a worktree of the repository",
+        ));
     }
     let git_dir = git::git_dir(&dir)?;
     if same_dir(&git_dir, &git::common_dir(&dir)?) {
@@ -578,11 +596,106 @@ pub fn release(checkout: &Checkout, repo: &Path, home: &Path) -> Result<(), Work
     if checkout.branch.is_none() && git::head(&dir)? != checkout.start_head {
         return Err(refuse("moved from its start"));
     }
-    // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
-    if git::head_reflog_only_commit_count(&dir)? != 0 {
-        return Err(refuse("commits only its HEAD reflog reaches"));
+    if let Some(reason) = work_lost_by_removal(&dir)? {
+        return Err(refuse(reason));
     }
     git::remove_worktree(repo, &dir)?;
     assert!(dir.starts_with(&root) && dir != root);
     Ok(())
+}
+
+fn work_lost_by_removal(dir: &Path) -> Result<Option<&'static str>, WorktreeError> {
+    assert!(dir.is_absolute());
+    let reason = if !git::is_clean(dir)? {
+        Some("it has modified or untracked files")
+    } else if git::has_hidden_index_entries(dir)? {
+        Some("a tracked file is marked assume-unchanged or skip-worktree")
+    } else if git::has_per_worktree_refs(dir)? {
+        Some("it holds per-worktree refs")
+    } else if !git::keeps_refs_in_files(dir)? {
+        Some("its repository does not keep refs in files, so its HEAD reflog cannot be checked")
+    // Removing the worktree deletes its HEAD reflog; branch reflogs live on in the repository.
+    } else if git::head_reflog_only_commit_count(dir)? != 0 {
+        Some("commits only its HEAD reflog reaches")
+    } else if git::orig_head_only_commit_count(dir)? != 0 {
+        Some("commits only its ORIG_HEAD reaches")
+    } else {
+        None
+    };
+    assert!(reason.is_none_or(|reason| !reason.is_empty()));
+    Ok(reason)
+}
+
+fn entries(dir: &Path) -> Result<Vec<PathBuf>, WorktreeError> {
+    let failed = |why: String| WorktreeError::Listing {
+        path: dir.to_path_buf(),
+        why,
+    };
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    let mut paths = Vec::new();
+    for entry in read {
+        if paths.len() == TASK_DIRS_MAX {
+            return Err(failed(format!(
+                "it holds more than {TASK_DIRS_MAX} entries"
+            )));
+        }
+        paths.push(entry.map_err(|error| failed(error.to_string()))?.path());
+    }
+    paths.sort_unstable();
+    assert!(paths.len() <= TASK_DIRS_MAX);
+    assert!(paths.iter().all(|path| path.starts_with(dir)));
+    Ok(paths)
+}
+
+pub fn task_dirs(home: &Path) -> Result<Vec<(PathBuf, TaskId)>, WorktreeError> {
+    assert!(home.is_absolute(), "rider's home is an absolute path");
+    let mut found = Vec::new();
+    for project in entries(&home.join(WORKTREES_DIR))? {
+        if !project.is_dir() {
+            continue;
+        }
+        for dir in entries(&project)? {
+            let name = dir.file_name().and_then(OsStr::to_str);
+            let id = name.filter(|name| name.bytes().all(|b| b.is_ascii_digit()));
+            if let Some(id) = id.and_then(|id| id.parse::<u64>().ok()) {
+                found.push((dir, TaskId(id)));
+            }
+        }
+    }
+    assert!(found.iter().all(|(dir, _)| dir.starts_with(home)));
+    Ok(found)
+}
+
+pub fn made_for(dir: &Path, identity: &BoardIdentity) -> Result<bool, WorktreeError> {
+    assert!(dir.is_absolute());
+    let made = recorded_board(dir)?.is_some_and(|found| found == identity.0);
+    assert!(!made || dir.exists());
+    Ok(made)
+}
+
+pub fn release_ended(brief: &Brief, view: &TaskView, home: &Path) -> Result<(), WorktreeError> {
+    assert!(brief.id == view.id);
+    let dir = dir_for(brief, home);
+    let branch = match brief.role.commits_expected {
+        true => match branch_label(view) {
+            Some(branch) => Some(branch.to_string()),
+            None => {
+                let reason = "its task has no usable `branch` label";
+                return Err(WorktreeError::NotReleasable { dir, reason });
+            }
+        },
+        false => None,
+    };
+    let start_head = git::head(&dir)?;
+    let checkout = Checkout {
+        dir,
+        branch,
+        start_head,
+        base: None,
+    };
+    release(&checkout, &brief.repo, home)
 }
