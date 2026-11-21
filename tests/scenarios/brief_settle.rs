@@ -1,12 +1,14 @@
 use std::fs;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::fake_agent::{self, BLOCK_QUESTION, Behaviour};
 use crate::steps::*;
 use crate::world::{MAIN, World};
+
+const NOTE_POLL_MILLIS: u64 = 200;
 
 fn task_result(world: &World, id: &str) -> Option<String> {
     let read: Value = serde_json::from_str(&task_text(world, id)).expect("vb read JSON");
@@ -456,10 +458,17 @@ fn when_the_lead_replies(world: &World, task: &str, text: &str) {
     world.vb_lead(&["reply", task, "-"], Some(text));
 }
 
-fn rider_notes(world: &World, task: &str, words: &str) -> usize {
-    let replies = task_replies(world, task);
-    let texts = replies.iter().filter_map(|reply| reply["text"].as_str());
-    texts.filter(|text| text.contains(words)).count()
+fn when_rider_notes(world: &World, task: &str, words: &str) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    loop {
+        let replies = task_replies(world, task);
+        let texts = replies.iter().filter_map(|reply| reply["text"].as_str());
+        let notes = texts.filter(|text| text.contains(words)).count();
+        if notes > 0 || Instant::now() >= deadline {
+            return notes;
+        }
+        thread::sleep(Duration::from_millis(NOTE_POLL_MILLIS));
+    }
 }
 
 #[test]
@@ -620,7 +629,7 @@ fn a_reply_posted_while_rider_completes_the_task_is_noted_as_undelivered() {
 
     assert_eq!(states, vec!["completed".to_string()]);
     assert_eq!(
-        rider_notes(&world, &task, "landed while rider completed"),
+        when_rider_notes(&world, &task, "landed while rider completed"),
         1
     );
 }
