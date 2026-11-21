@@ -383,8 +383,13 @@ case "$behaviour" in
     sleep {leftover} & echo $! > "$world/{LEFTOVERS_DIR}/$task"; exit 0 ;;
   commit-leaving-escapee)
     commit || exit 1; report
-    perl -e 'setpgrp(0, 0); exec "sleep", $ARGV[0]' {leftover} &
-    echo $! > "$world/{LEFTOVERS_DIR}/$task"
+    pidfile="$world/{LEFTOVERS_DIR}/$task"
+    perl -e 'setpgrp(0, 0); open(my $f, ">", $ARGV[1]) or exit 1; print $f "$$\n";
+      close($f); exec "sleep", $ARGV[0]' {leftover} "$pidfile" &
+    step=0
+    until [ -s "$pidfile" ]; do
+      step=$((step + 1)); [ "$step" -le {steps} ] || exit 1; sleep 0.1
+    done
     exit 0 ;;
   commit-flooding) commit || exit 1; report; yes | head -c {flood}; exit 0 ;;
   hold-attempt)
