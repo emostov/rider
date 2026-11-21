@@ -111,7 +111,16 @@ pub enum Behaviour {
     /// Prints a stream in its harness's shape with `STREAM_MESSAGES`, a failed tool call and
     /// `STREAM_ERROR` as the run's error, then exits `FAIL_EXIT_CODE`.
     StreamError,
+    /// Prints one Claude message holding ESC, BEL, a bidi override and a newline before a
+    /// forged account line, then exits `FAIL_EXIT_CODE`.
+    StreamForged,
+    /// Prints the first of `STREAM_MESSAGES` as a Claude message, then `STDERR_ERROR` on
+    /// standard error, and exits `FAIL_EXIT_CODE`.
+    StreamThenStderr,
 }
+
+/// What a `StreamThenStderr` agent prints on standard error before it exits.
+pub const STDERR_ERROR: &str = "error: something broke";
 
 /// The assistant messages a `StreamError` agent prints, in order.
 pub const STREAM_MESSAGES: [&str; 2] = ["I will add the work.", "The tests failed; I will retry."];
@@ -177,6 +186,8 @@ impl Behaviour {
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::StreamError => "stream-error",
+            Behaviour::StreamForged => "stream-forged",
+            Behaviour::StreamThenStderr => "stream-then-stderr",
         }
     }
 }
@@ -236,7 +247,7 @@ fn script() -> String {
     let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
     let ([said0, said1], error) = (STREAM_MESSAGES, STREAM_ERROR);
-    let (command, tool_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR);
+    let (command, tool_error, stderr_error) = (STREAM_COMMAND, STREAM_TOOL_ERROR, STDERR_ERROR);
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -366,6 +377,14 @@ case "$behaviour" in
       echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said1}"}}]}}}}'
       echo '{{"type":"result","subtype":"success","is_error":true,"result":"{error}"}}'
     fi
+    exit {fail} ;;
+  stream-forged)
+    forged='ok\u001b]0;x\u0007\u202e\nIts run ended in error: fake'
+    printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"'"$forged"'"}}]}}}}'
+    exit {fail} ;;
+  stream-then-stderr)
+    echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{said0}"}}]}}}}'
+    echo "{stderr_error}" >&2
     exit {fail} ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM

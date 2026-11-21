@@ -709,7 +709,12 @@ struct ClaudeBlock {
 #[serde(untagged)]
 enum ToolContent {
     Text(String),
-    Blocks(Vec<Field<ClaudeBlock>>),
+    Blocks(Vec<Field<ClaudeText>>),
+}
+
+#[derive(Deserialize)]
+struct ClaudeText {
+    text: Option<Field<String>>,
 }
 
 #[derive(Deserialize)]
@@ -900,7 +905,7 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     last_result_failed || last_turn_failed || last_review_failed
 }
 
-pub fn failure_account(harness: &Harness, log: &Path) -> Option<String> {
+pub fn failure_account(harness: &Harness, log: &Path, tail: &str) -> Option<String> {
     let mut account = Account::default();
     let _ = match harness {
         Harness::Claude => scan(log, |event| account.claude(event)),
@@ -910,10 +915,10 @@ pub fn failure_account(harness: &Harness, log: &Path) -> Option<String> {
     let mut text = String::new();
     if !account.messages.is_empty() {
         text.push_str("The agent's last messages:");
-        for message in &account.messages {
-            text.push('\n');
-            text.push_str(message);
-        }
+        account
+            .messages
+            .iter()
+            .for_each(|message| quote(&mut text, message));
     }
     let ends = [
         ("Its last failed tool call: ", &account.tool),
@@ -923,14 +928,39 @@ pub fn failure_account(harness: &Harness, log: &Path) -> Option<String> {
         if let Some(end) = end {
             text.push_str(if text.is_empty() { "" } else { "\n" });
             text.push_str(lead);
-            text.push_str(end);
+            text.push_str(&end.replace('\n', " "));
         }
     }
+    if text.is_empty() {
+        return None;
+    }
+    let plain = tail.lines().filter(|line| {
+        !line.trim().is_empty() && serde_json::from_str::<IgnoredAny>(line).is_err()
+    });
+    let plain: Vec<&str> = plain.collect();
+    let plain = &plain[plain.len().saturating_sub(ACCOUNT_PLAIN_LINES_MAX)..];
+    if !plain.is_empty() {
+        text.push_str("\nThe log's last lines that are not events:");
+        let plain = plain
+            .iter()
+            .filter_map(|line| piece(Some(line.to_string())));
+        plain.for_each(|line| quote(&mut text, &line));
+    }
     assert!(account.messages.len() <= ACCOUNT_MESSAGES_MAX);
-    assert!(text.chars().count() <= (ACCOUNT_MESSAGES_MAX + 3) * (ACCOUNT_PIECE_CHARS_MAX + 40));
-    (!text.is_empty()).then_some(text)
+    assert!(!text.is_empty());
+    Some(text)
 }
 
+fn quote(text: &mut String, piece: &str) {
+    assert!(!piece.is_empty());
+    for line in piece.lines() {
+        text.push_str("\n> ");
+        text.push_str(line.trim_end());
+    }
+    assert!(text.ends_with(piece.lines().last().unwrap_or_default().trim_end()));
+}
+
+const ACCOUNT_PLAIN_LINES_MAX: usize = 5;
 const ACCOUNT_MESSAGES_MAX: usize = 3;
 const ACCOUNT_PIECE_CHARS_MAX: usize = 2_000;
 
@@ -1036,8 +1066,20 @@ fn blocks(message: Option<Field<ClaudeMessage>>) -> impl Iterator<Item = ClaudeB
 }
 
 fn piece(text: Option<String>) -> Option<String> {
-    let text = text?;
+    let text: String = text?.chars().map(shown).collect();
     let text = message_tail(text.trim(), ACCOUNT_PIECE_CHARS_MAX).trim();
     assert!(text.chars().count() <= ACCOUNT_PIECE_CHARS_MAX);
+    assert!(!text.contains(|c: char| c != '\n' && shown(c) != c));
     (!text.is_empty()).then(|| text.to_string())
+}
+
+// Terminals act on control characters, and bidi overrides reorder the text a reader sees.
+fn shown(c: char) -> char {
+    let bidi =
+        matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    if c != '\n' && (c.is_control() || bidi) {
+        ' '
+    } else {
+        c
+    }
 }
