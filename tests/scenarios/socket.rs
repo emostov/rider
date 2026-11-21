@@ -25,6 +25,8 @@ const LOG_LINES: usize = 8 * 1024;
 const LOG_LINE_BYTES: usize = 1024;
 const DAEMON_STARTS: usize = 20;
 const WATCH_POLLS_MAX: u64 = u64::MAX;
+const SEAT_PROBES_MAX: usize = 1000;
+const SEAT_PROBE_MILLIS: u64 = 50;
 
 #[test]
 fn a_client_flooding_bad_requests_without_reading_never_holds_up_rider_status() {
@@ -63,13 +65,19 @@ fn a_client_that_half_closes_gets_no_more_of_a_log_it_stopped_reading() {
         .write_all(format!("{request}\n").as_bytes())
         .expect("send the logs request");
     let first = then_the_client_reads_a_line(&client);
+    let others: Vec<UnixStream> = (1..CLIENTS_MAX)
+        .map(|_| given_a_client_on_the_socket(&world))
+        .collect();
 
     client
         .shutdown(Shutdown::Write)
         .expect("half-close the client");
+    let freed = when_a_seat_frees_within(&world, DAEMON_WRITE_SECONDS / 2);
     let rest = then_the_client_reads_to_its_end(&client);
+    drop(others);
 
     assert_eq!(first, json!({"id": 1, "ok": true}));
+    assert!(freed, "the daemon kept the half-closed client's seat");
     let text = String::from_utf8_lossy(&rest);
     let lines = text.lines().count();
     assert!(
@@ -124,19 +132,39 @@ fn the_socket_is_never_seen_at_a_mode_other_than_0600() {
     let path = world.home.join("rider.sock");
     let done = AtomicBool::new(false);
 
-    let seen = thread::scope(|scope| {
+    let (seen, left) = thread::scope(|scope| {
         let watcher = scope.spawn(|| first_mode_other_than_0600(&path, &done));
+        let stop = StopOnDrop(&done);
+        let mut left = Vec::new();
         for _ in 0..DAEMON_STARTS {
             given_a_running_daemon(&mut world);
-            when_the_daemon_is_sent_sigterm(&world);
+            let down = when_rider_runs(&world, &["down"]);
+            assert_eq!(down.code, Some(0), "{down:?}");
             assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+            left.extend(
+                ["rider.sock", ".bind"]
+                    .into_iter()
+                    .filter(|name| fs::symlink_metadata(world.home.join(name)).is_ok()),
+            );
         }
-        done.store(true, Ordering::SeqCst);
-        watcher.join().expect("the watcher ends")
+        drop(stop);
+        (watcher.join().expect("the watcher ends"), left)
     });
 
     assert_eq!(seen, None, "the socket was seen at another mode");
-    assert!(!world.home.join(".bind").exists());
+    assert_eq!(
+        left,
+        Vec::<&str>::new(),
+        "left behind by a daemon that stopped"
+    );
+}
+
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn given_a_client_on_the_socket(world: &World) -> UnixStream {
@@ -148,6 +176,26 @@ fn given_a_log_larger_than_every_buffer(world: &World, task: u64) {
     fs::create_dir_all(&dir).expect("create the task's log directory");
     let line = format!("{}\n", "x".repeat(LOG_LINE_BYTES - 1));
     fs::write(dir.join("1.jsonl"), line.repeat(LOG_LINES)).expect("write the log");
+}
+
+fn when_a_seat_frees_within(world: &World, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let request = format!("{}\n", json!({"v": 1, "id": 1, "cmd": "status"}));
+    for _ in 0..SEAT_PROBES_MAX {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let mut probe = given_a_client_on_the_socket(world);
+        // A refused client may find the daemon's end closed before its request goes.
+        let _ = probe.write_all(request.as_bytes());
+        let reply = then_the_client_reads_a_line(&probe);
+        if reply["ok"] == json!(true) {
+            return true;
+        }
+        assert_eq!(reply["error"]["code"], json!("busy"), "{reply}");
+        thread::sleep(Duration::from_millis(SEAT_PROBE_MILLIS));
+    }
+    false
 }
 
 fn when_the_client_floods_bad_requests_without_reading(client: &mut UnixStream) {
