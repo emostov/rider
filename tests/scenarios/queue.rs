@@ -11,6 +11,7 @@ const MAIN_COMMIT: &str = "2222222222222222222222222222222222222222";
 const PR_URL: &str = "https://github.com/acme/widgets/pull/";
 const HEADER: &str = "  #  KIND     TURN    STATE       AGE  NEXT           PR";
 const CARD: &str = "Decide the cache key.\nEither the tenant or the session.";
+const CARD_SHOWN: &str = "| Decide the cache key.\n| Either the tenant or the session.";
 
 fn given_a_queue_toml(world: &World, repo: &str) {
     let text = format!("[repo.\"{repo}\"]\nqueue = true\n");
@@ -124,7 +125,7 @@ fn expected_items(decision: &str) -> String {
   -  review   agents  preparing   12m  -              {PR_URL}440
   -  review   author  waiting      2d  -              {PR_URL}377
 
-{CARD}
+{CARD_SHOWN}
 "
     )
 }
@@ -393,7 +394,7 @@ fn rider_queue_prints_the_items_when_the_daemon_drops_the_status_request() {
         "{HEADER}
   1  review   owner   concerns     1m  read-findings  {PR_URL}5
 
-Review a pull request of acme.
+| Review a pull request of acme.
 
 running work unavailable: the daemon did not answer
 "
@@ -457,7 +458,66 @@ fn rider_queue_reports_a_second_open_task_for_one_pr_as_invalid() {
   1  review   owner   concerns     1m  read-findings  {PR_URL}13
   !  invalid #{second}: label pr \"acme/widgets#13\" is also on #{first}
 
-Review a pull request of acme.
+| Review a pull request of acme.
+
+daemon not running
+"
+    );
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn rider_queue_ranks_one_pr_once_however_its_label_is_spelled_and_refuses_dot_names() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo_label().to_string();
+    given_a_queue_toml(&world, &repo);
+    let squatter = when_the_lead_creates_in(&world, "queue", "Squat.", &[("pr", "acme/widgets#1")]);
+    let item = an_owner_item(1, "review", &ago(60), "concerns", "read-findings");
+    let valid = given_an_item(&world, &item);
+    let zero = given_an_item(&world, &with(item.clone(), "pr", "acme/widgets#01"));
+    let case = given_an_item(&world, &with(item.clone(), "pr", "Acme/Widgets#1"));
+    let dots = given_an_item(&world, &with(item, "pr", "../..#7"));
+
+    let output = when_rider_runs(&world, &["queue"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = format!(
+        "{HEADER}
+  1  review   owner   concerns     1m  read-findings  {PR_URL}1
+  !  invalid #{squatter}: label kind is missing
+  !  invalid #{zero}: label pr \"acme/widgets#01\" is also on #{valid}
+  !  invalid #{case}: label pr \"Acme/Widgets#1\" is also on #{valid}
+  !  invalid #{dots}: label pr \"../..#7\" is not <owner>/<name>#<n>
+
+| Review a pull request of acme.
+
+daemon not running
+"
+    );
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn rider_queue_shows_bidi_and_zero_width_characters_in_the_card_as_marked_lines() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo_label().to_string();
+    given_a_queue_toml(&world, &repo);
+    let text = "bidi \u{202e}gnp.exe\u{200b} safe\nrunning 3 of 4";
+    let decision = when_the_lead_creates_in(&world, "decisions", text, &[("since", &ago(60))]);
+
+    let output = when_rider_runs(&world, &["queue"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = format!(
+        "{HEADER}
+  1  decide   owner   open         1m  decide         decisions #{decision}
+
+| bidi ?gnp.exe? safe
+| running 3 of 4
 
 daemon not running
 "
