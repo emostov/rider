@@ -344,7 +344,12 @@ fn watch_one(
             _ => record["route"] = json!("lead"),
         }
         board
-            .post_structured(watched.task, SCHEMA, &record.to_string())
+            .post_record(
+                watched.task,
+                SCHEMA,
+                &record.to_string(),
+                &format!("rider-github-{}-{key}", watched.task.0),
+            )
             .map_err(|error| WatchError::State(error.to_string()))?;
         remember(seen, key);
         posted = posted.saturating_add(1);

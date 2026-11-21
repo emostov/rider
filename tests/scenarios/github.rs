@@ -481,3 +481,37 @@ fn a_ci_failure_whose_owner_session_is_malformed_goes_to_the_lead() {
     assert_eq!(records, vec![failed_record("lead")]);
     then_no_fix_was_queued(&world, &task);
 }
+
+#[test]
+fn a_record_whose_post_reply_is_lost_is_posted_once() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let task = given_a_settled_task(&mut world, Behaviour::CommitThenFail, "failed");
+    let marker = world.root.join("lost-post");
+    let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
+    fs::remove_file(&world.vb).expect("remove the Board CLI link");
+    let script = format!(
+        r#"#!/bin/sh
+case " $* " in *" rider-github@1 "*)
+  if [ ! -e '{marker}' ]; then : > '{marker}'; '{real}' "$@" > /dev/null; exit 1; fi;;
+esac
+exec '{real}' "$@"
+"#,
+        marker = marker.display(),
+        real = real.display()
+    );
+    write_executable(&world.vb, &script);
+
+    given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
+    when_records_reach(&world, &task, 1);
+    when_gh_is_called_again(&world);
+    when_gh_is_called_again(&world);
+
+    assert!(marker.exists());
+    assert_eq!(
+        task_records(&world, &task, "rider-github"),
+        vec![failed_record("lead")]
+    );
+}

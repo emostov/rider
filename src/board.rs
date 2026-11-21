@@ -291,6 +291,13 @@ pub trait Board {
     fn set_label(&self, id: TaskId, key: &str, value: &str) -> Result<(), BoardError>;
     fn reply(&self, id: TaskId, text: &str) -> Result<(), BoardError>;
     fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError>;
+    fn post_record(
+        &self,
+        id: TaskId,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError>;
     fn complete(&self, id: TaskId, result: &str) -> Result<(), BoardError>;
     fn fail(&self, id: TaskId, reason: &str) -> Result<(), BoardError>;
     fn block(&self, id: TaskId, reason: &str, kind: &str) -> Result<(), BoardError>;
@@ -398,6 +405,7 @@ enum Command<'a> {
         id: TaskId,
         schema: &'a str,
         json: &'a str,
+        key: Option<&'a str>,
     },
     Complete {
         id: TaskId,
@@ -548,8 +556,16 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
         }
         // A reply's text goes on stdin; `-` tells `vb` to read it there.
         Command::Reply { id, .. } => (to_strings(&["reply", &id.0.to_string(), "-"]), None),
-        Command::Post { id, schema, json } => {
-            let words = to_strings(&["post", &id.0.to_string(), "--schema", schema]);
+        Command::Post {
+            id,
+            schema,
+            json,
+            key,
+        } => {
+            let mut words = to_strings(&["post", &id.0.to_string(), "--schema", schema]);
+            if let Some(key) = key {
+                words.extend(to_strings(&["--idempotency-key", key]));
+            }
             (words, Some(json.to_string()))
         }
         Command::Complete { id, result } => {
@@ -1630,7 +1646,32 @@ impl Board for VbCli {
         assert!(schema.contains('@'), "a schema is named as name@version");
         assert!(!json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
         check_message(json)?;
-        self.write(&Command::Post { id, schema, json })
+        let key = None;
+        self.write(&Command::Post {
+            id,
+            schema,
+            json,
+            key,
+        })
+    }
+
+    fn post_record(
+        &self,
+        id: TaskId,
+        schema: &str,
+        json: &str,
+        key: &str,
+    ) -> Result<(), BoardError> {
+        assert!(schema.contains('@'), "a schema is named as name@version");
+        assert!(!key.is_empty() && !json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
+        check_message(json)?;
+        let key = Some(key);
+        self.write(&Command::Post {
+            id,
+            schema,
+            json,
+            key,
+        })
     }
 
     fn create_task(&self, task: &NewTask) -> Result<TaskId, BoardError> {
@@ -1919,6 +1960,16 @@ pub mod testing {
         fn reply(&self, id: TaskId, text: &str) -> Result<(), BoardError> {
             self.record(format!("reply {} {text}", id.0))?;
             check_message(text)
+        }
+
+        fn post_record(
+            &self,
+            id: TaskId,
+            schema: &str,
+            json: &str,
+            _: &str,
+        ) -> Result<(), BoardError> {
+            self.post_structured(id, schema, json)
         }
 
         fn post_structured(&self, id: TaskId, schema: &str, json: &str) -> Result<(), BoardError> {
