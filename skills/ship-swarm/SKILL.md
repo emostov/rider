@@ -142,14 +142,18 @@ CI is green.
 
 ## 2. Watch CI
 
-`<cap>` is `ci.cap_minutes`, or when that is 0, the most minutes to wait for CI (the longest
-the workflows normally run, doubled). Run as one background command (the rule in `lead.md`
-step 9) a bounded poll: every `ci.poll_seconds` seconds read
-`gh pr checks <n> --json name,bucket,link`, and stop when a check has bucket `fail`, or when
-there are checks and none is `pending`, or when `<cap>` minutes have passed. No checks yet
-(right after a push) counts as still waiting. The cap is tested on every pass, so a check
-that stays queued or running cannot hold the poll open. When the poll ends, read the same
-output once more:
+Do not poll `gh`. The daemon watches the pull request of every task whose `branch` label has
+one, and posts each change to that task's thread as a `rider-github@1` record; wait for it with
+`rider wait` (the rule in `lead.md` step 9). Act on each record kind:
+
+- `checks`, `state: passed`: CI is green on `head`; go on to review or merge.
+- `checks`, `state: failed`: `job` failed, its log at `url`; handle it as below.
+- `review`: a review, or a review comment on `file` at `line`; act on it as in section 3.
+- `comment`: a PR conversation comment; answer it or fix what it asks.
+
+The watch ends when the PR is merged or closed. If `<cap>` (`ci.cap_minutes`, or the longest
+the workflows normally run, doubled) passes with no `checks` record for the head, read
+`gh pr checks <n> --json name,bucket,link` once:
 
 - Green is `pass`, and `skipping` only for a check that is not required
   (`gh pr checks <n> --required --json name,bucket` lists the required ones).
