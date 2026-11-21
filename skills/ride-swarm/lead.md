@@ -168,9 +168,9 @@ These rules are yours to keep. Rider does not check them:
 - `security` is one task per stack, after polish, and for any task you judge sensitive:
   `of=<the top task>`, and `needs` every polish task in the stack, so it never runs while
   polish still moves a branch. Name the range in the brief, such as `main..HEAD`.
-- `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI. It
-  runs after the task's review: `of=<the task under test>`, and `needs` that task and its
-  review. Its brief names the flows to exercise and the unhappy paths that matter. It builds
+- `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI.
+  `of=<the task under test>`, and `needs` that task, plus the review of its branch when the
+  branch was reviewed before stacking; otherwise only the task. Its brief names the flows to exercise and the unhappy paths that matter. It builds
   the work and uses it from the outside, and reports `rider-finding@1` records like a review.
 - A completed task is a claim, not proof. Its review, or its proof command, is the check.
 
@@ -200,14 +200,16 @@ the daemon may claim it in between and run it on the wrong branch.
    a `vb label` fails, run it again. Never set `role` while an earlier label is missing. If
    it keeps failing, tell the owner.
 
-Example: a stack of two on base branch `main`, and a review of the first.
+Example: a stack of two on base branch `main`, and the review of the first branch before
+the second is built on it. The child needs that review, so it never starts on an unreviewed
+head.
 
 ```json
 [
   {"key": "store", "text": "Extract the session store ...",
    "labels": {"role": "implement", "repo": "/abs/repo", "from": "main"}},
   {"key": "cache", "text": "Cache session lookups ...",
-   "labels": {"repo": "/abs/repo"}, "needs": [{"key": "store"}]},
+   "labels": {"repo": "/abs/repo"}, "needs": [{"key": "store"}, {"key": "review-store"}]},
   {"key": "review-store", "text": "Review the session store: attack ...",
    "labels": {"repo": "/abs/repo", "from": "main"}, "needs": [{"key": "store"}]}
 ]
@@ -217,10 +219,14 @@ If the ids come back as `store` 51, `cache` 53, `review-store` 55:
 
 ```sh
 vb label 53 base=51 --as lead-fable-5-2
-vb label 53 role=implement --as lead-fable-5-2
 vb label 55 of=51 --as lead-fable-5-2
 vb label 55 role=review --as lead-fable-5-2
 ```
+
+`cache` is left without `role` until `review-store` has completed. If it reported no blocking
+finding, set `vb label 53 role=implement`. If it did, create the fix task (below), add it to the
+child's waits with `vb tasks needs 53 55 <fix id>`, and only then set the role, so `cache`
+starts on the fixed head.
 
 Example: review 43 of task 41 (completed) found a blocking bug. The fix names only existing
 tasks, so it is complete in the plan; it has `onto`, so it needs no `from`. It gets no review
@@ -241,6 +247,7 @@ task of its own.
    never claimed and send no event, so nothing else finds them:
    `vb tasks work/<project> --limit 500 --json | jq -r '.tasks[] | select(.message.labels.role == null) | .message.id'`
    For each, `vb read <id>`, set its missing `base`, `onto`, or `of`, then `role` last.
+   A child kept without `role` until its base's pre-stacking review completes stays so.
    The post that collects non-blocking findings is not a task and is not listed.
 3. Answer blocked tasks: `vb tasks work/<project> --state blocked --json`, then the table
    below for each.

@@ -36,6 +36,14 @@ pub enum Behaviour {
     Block,
     /// Prints nothing and exits `FAIL_EXIT_CODE`.
     ExitNonZero,
+    /// As `codex review`, prints no final text and exits 0.
+    ReviewNothing,
+    /// As `codex review` whose review delegate never started: prints Codex's interruption
+    /// message and exits 0.
+    ReviewInterrupted,
+    /// As `codex review` stopped by the provider's content filter: prints `CONTENT_FILTER_ERROR`
+    /// on stderr and exits 1.
+    ContentFilterStop,
     /// Waits until the test releases its task, then commits like `Commit`.
     Hold,
     /// Like `Hold`, but ignores SIGTERM.
@@ -65,6 +73,9 @@ impl Behaviour {
             Behaviour::LeaveUncommitted => "leave-uncommitted",
             Behaviour::Block => "block",
             Behaviour::ExitNonZero => "exit-non-zero",
+            Behaviour::ReviewNothing => "review-nothing",
+            Behaviour::ReviewInterrupted => "review-interrupted",
+            Behaviour::ContentFilterStop => "content-filter-stop",
             Behaviour::Hold => "hold",
             Behaviour::HoldIgnoringTerm => "hold-ignoring-term",
             Behaviour::HoldTalking => "hold-talking",
@@ -76,6 +87,13 @@ impl Behaviour {
         }
     }
 }
+
+/// What Codex's interruption message for a review that never started begins with.
+pub const REVIEW_INTERRUPTED: &str =
+    "Review was interrupted. Please re-run /review and wait for it to complete.";
+/// The error a `ContentFilterStop` agent prints on stderr.
+pub const CONTENT_FILTER_ERROR: &str =
+    "ERROR: This content was flagged for possible cybersecurity risk.";
 
 /// The question a blocking agent asks.
 pub const BLOCK_QUESTION: &str = "The fake agent needs an answer.";
@@ -193,6 +211,9 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  review-nothing) exit 0 ;;
+  review-interrupted) echo "{REVIEW_INTERRUPTED}"; exit 0 ;;
+  content-filter-stop) echo "{CONTENT_FILTER_ERROR}" >&2; exit 1 ;;
   refuse-resume|refuse-resume-slowly|refuse-resume-then-hold)
     [ "$behaviour" = refuse-resume-slowly ] && sleep {slow}
     if [ -n "$resumed" ]; then

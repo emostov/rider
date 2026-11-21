@@ -62,7 +62,15 @@ codex review -c model="gpt-6.2-sol" -c sandbox_mode="danger-full-access" -c appr
   `--uncommitted` (exit 2, "the argument '--base <BRANCH>' cannot be used with '[PROMPT]'"), so
   the brief names the range itself (`git diff <base>...HEAD`). `-` reads the prompt from stdin.
 - It has no `--model`, `--json` or bypass flag: the model and the sandbox and approval settings
-  go in `-c`. Without `danger-full-access` its sandbox blocks the network, so `vb` cannot post.
+  go in `-c`. The review itself runs in a subagent that takes the top-level config key
+  `review_model` when one is set (in `~/.codex/config.toml` or `-c`) and `model` otherwise, so
+  Rider passes both `-c model="<m>"` and `-c review_model="<m>"`. `review_model` is a known
+  top-level key in 0.170.0: `--strict-config -c review_model="..."` is accepted.
+- When the review delegate fails to start, Codex (per its 0.170.0 source and binary) prints `Review was interrupted. Please re-run
+  /review and wait for it to complete.` as the final text and still exits 0; Rider fails such a
+  run, and one with no final text. A fatal turn error (such as a provider's content-filter
+  stop) is printed only on stderr, and the exit is non-zero; Rider's failure reply tails the
+  stderr transcript, then the final text. Without `danger-full-access` its sandbox blocks the network, so `vb` cannot post.
 - Exit code on success: 0. stdout holds only the final text, a short verdict then
   `[P1]`/`[P2]` items with absolute `file:line` paths. Fixture: `codex-review.txt` (scratch
   path replaced with `/tmp/repo`).

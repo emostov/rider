@@ -42,6 +42,7 @@ const LINE_BYTES_MAX: usize = 4 * 1024 * 1024;
 // Every line holds at least its newline, so a log read up to `LOG_BYTES_MAX` has fewer lines.
 const LINES_MAX: u64 = LOG_BYTES_MAX + 1;
 const SKIP_READS_MAX: u64 = LOG_BYTES_MAX / LINE_BYTES_MAX as u64 + 2;
+const REVIEW_INTERRUPTED: &str = "Review was interrupted.";
 const POISONED: &str = "the log lock was poisoned";
 
 const _: () = {
@@ -193,6 +194,7 @@ pub fn command_for(
     let dir = dir.to_string_lossy();
     let model = spec.model;
     let model_setting = format!("model={model:?}");
+    let review_model_setting = format!("review_model={model:?}");
     let (program, head, io) = match spec.harness {
         Harness::Claude => (
             "claude",
@@ -232,6 +234,9 @@ pub fn command_for(
                 "review",
                 "-c",
                 &model_setting,
+                // The review subagent runs `review_model` when one is configured, not `model`.
+                "-c",
+                &review_model_setting,
                 "-c",
                 r#"sandbox_mode="danger-full-access""#,
                 "-c",
@@ -812,6 +817,7 @@ pub fn ended_before_any_turn(log: &Path) -> bool {
 pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     let mut last_result_failed = false;
     let mut last_turn_failed = false;
+    let mut last_review_failed = false;
     // A log cut short still counts for what it showed.
     let _ = match harness {
         // `item.type == "error"` inside `item.completed` is a harmless warning, and a
@@ -821,8 +827,13 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
             CodexEvent::TurnCompleted => last_turn_failed = false,
             CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
         }),
-        // Without an event stream only the exit status tells.
-        Harness::CodexReview => true,
+        // Without an event stream, a run that exits 0 still failed when it printed no review or
+        // Codex's own message for a review delegate that never started.
+        Harness::CodexReview => {
+            last_review_failed =
+                last_message(harness, log).is_none_or(|text| text.starts_with(REVIEW_INTERRUPTED));
+            true
+        }
         Harness::Claude => scan(log, |event| {
             if let ClaudeEvent::Result {
                 subtype, is_error, ..
@@ -836,7 +847,8 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     };
     assert!(!last_result_failed || *harness == Harness::Claude);
     assert!(!last_turn_failed || *harness == Harness::Codex);
-    last_result_failed || last_turn_failed
+    assert!(!last_review_failed || *harness == Harness::CodexReview);
+    last_result_failed || last_turn_failed || last_review_failed
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
-    SESSION_BYTES_MAX, SessionId, command_for,
+    SESSION_BYTES_MAX, SessionId, command_for, stderr_log,
 };
 use crate::roles::{Harness, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
@@ -1162,8 +1162,23 @@ fn fail(id: TaskId, board: &dyn Board, attempt: &Attempt, reason: &str) -> Resul
         "a failure always states its reason"
     );
     assert!(attempt.failed < u16::from(ATTEMPTS_MAX));
-    let header = format!("The whole log: {}", attempt.log().display());
-    let tail = log_tail(attempt.log());
+    // `codex review` prints errors, such as a provider's content-filter stop, only on stderr.
+    let (header, tail) = match attempt.brief.role.harness {
+        Harness::Claude | Harness::Codex => {
+            let log = attempt.log();
+            (format!("The whole log: {}", log.display()), log_tail(log))
+        }
+        Harness::CodexReview => {
+            let stderr = stderr_log(attempt.log());
+            let header = format!(
+                "The final text: {}\nThe whole transcript: {}",
+                attempt.log().display(),
+                stderr.display()
+            );
+            let tail = format!("{}\n{}", log_tail(&stderr), log_tail(attempt.log()));
+            (header, tail)
+        }
+    };
     let budget = TAIL_REPLY_CHARS_MAX.saturating_sub(header.chars().count() + 1);
     let tail = if tail.trim().is_empty() {
         NO_OUTPUT
