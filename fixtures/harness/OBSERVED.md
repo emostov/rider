@@ -42,7 +42,7 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
 - Items with `item.type == "error"` carry `item.message`, not `item.text`.
 - Stream events (`type`): `thread.started`, `turn.started`, `item.started`, `item.completed`, `turn.completed`.
 - The stream begins with two `item.completed` events of `item.type == "error"` (a deprecation warning from this machine's config). These are not failures. A parser must not treat `item.type == "error"` as a run failure.
-- Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`: `input_tokens`, which includes `cached_input_tokens` and `cache_write_input_tokens`, and `output_tokens`. Codex reports no cost.
+- Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`: `input_tokens`, which includes `cached_input_tokens` and `cache_write_input_tokens`, and `output_tokens`. Codex reports no cost. Codex fills `usage` from its running total for the thread, so a log with several `turn.completed` events is read by its last (codex-rs `exec/src/event_processor_with_jsonl_output.rs`). The counts do not say which cache-write tier was used.
 - Fixture: `codex.jsonl` (4 KB).
 - Codex loads skills from `~/.codex/skills`, as Claude Code does from `~/.claude/skills`. Not re-observed yet.
 - During a provider outage Codex prints top-level events such as

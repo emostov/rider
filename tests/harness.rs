@@ -298,7 +298,7 @@ fn usage_is_read_from_each_recorded_stream() {
         cache_read: 61023,
         cache_write: 20835,
         output: 519,
-        cost_micros: 52986,
+        cost_micros: 63403,
         unpriced: false,
     };
     assert_eq!(usage(&Harness::Codex, "gpt-6.1-sol", codex), Some(priced));

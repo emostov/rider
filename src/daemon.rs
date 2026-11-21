@@ -1198,12 +1198,13 @@ fn judge(
     launched: Result<Exit, HarnessError>,
 ) -> Input {
     let board = shared.board(profile);
+    let usage = attempt.usage();
     match judge_attempt(task, &board, attempt, launched) {
         Ok(judgement) => Input {
             event: Event::Judged {
                 run,
                 verdict: judgement.verdict.clone(),
-                usage: judgement.usage,
+                usage,
             },
             extra: Extra::Judgement(Arc::new(judgement)),
         },
@@ -1212,7 +1213,7 @@ fn judge(
             Input::plain(Event::Judged {
                 run,
                 verdict: Verdict::Fail { reason },
-                usage: None,
+                usage,
             })
         }
         Err(_) => Input::plain(Event::ClaimLost(run)),

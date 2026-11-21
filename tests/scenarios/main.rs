@@ -91,8 +91,46 @@ fn the_usage_an_agent_reports_is_in_its_result_record_and_in_rider_status() {
     );
     let project = format!("{PROJECT} spent {spent}");
     assert!(lines.contains(&project.as_str()), "{status:?}");
+    let settled = format!("  #{task} spent {spent}");
+    assert!(
+        when_rider_status_shows_within(&world, &settled, SETTLE_SECONDS_MAX),
+        "{:?}",
+        when_rider_runs(&world, &["status"])
+    );
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn a_codex_review_on_sol_6_2_records_the_last_usage_snapshot_priced_with_cache_writes() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.review]\nmodel = \"gpt-6.2-sol\"\n");
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let review = NewTask::new("Review the work.")
+        .label("repo", world.repo_label())
+        .label("of", &built)
+        .needs(&built)
+        .role("review");
+    let review = when_the_lead_creates(&world, &review);
+    given_the_agent_will(&world, &review, &[Behaviour::CommitNothing]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&built, &review]);
+
+    assert_eq!(states, vec!["completed", "completed"]);
+    assert_eq!(exit, Some(0));
+    assert_eq!(agent_model(&world, &review, 0), "gpt-6.2-sol");
+    let records = task_records(&world, &review, "rider-result");
+    assert_eq!(records.len(), 1, "{records:?}");
+    let usage = json!({
+        "input": 100,
+        "cache_read": 600,
+        "cache_write": 300,
+        "output": 50,
+        "cost_usd": 0.00151,
+    });
+    assert_eq!(records[0]["usage"], usage);
 }
 
 #[test]

@@ -114,6 +114,9 @@ pub enum Behaviour {
 
 /// The input, cache write, cache read and output tokens a `CommitReportingUsage` agent reports.
 pub const USAGE: [u64; 4] = [4, 20, 300, 50];
+/// The input, cached, cache write and output tokens of each cumulative snapshot a fake `codex`
+/// reports, the last holding the run's totals.
+pub const CODEX_USAGE: [[u64; 4]; 2] = [[400, 200, 100, 20], [1000, 600, 300, 50]];
 /// The cost a `CommitReportingUsage` agent reports, in US dollars.
 pub const COST_USD: f64 = 0.25;
 
@@ -236,6 +239,12 @@ fn script() -> String {
          \"cache_read_input_tokens\":{read},\"output_tokens\":{output}}},\
          \"total_cost_usd\":{COST_USD}"
     );
+    let [early, last] = CODEX_USAGE.map(|[input, cached, write, output]| {
+        format!(
+            "\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\
+             \"cache_write_input_tokens\":{write},\"output_tokens\":{output}}}"
+        )
+    });
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -278,8 +287,8 @@ report() {{
     echo '{{"type":"turn.started"}}'
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
     echo '{{"type":"item.completed",'"$item"'}}'
-    usage='"usage":{{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}'
-    echo '{{"type":"turn.completed",'"$usage"'}}'
+    echo '{{"type":"turn.completed",{early}}}'
+    echo '{{"type":"turn.completed",{last}}}'
   else
     init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"'"$session"'","model":"fake"'
     echo '{{"type":"system",'"$init"'}}'

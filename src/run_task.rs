@@ -153,6 +153,21 @@ struct UsageRecord {
     cost_usd: Option<f64>,
 }
 
+impl From<Usage> for UsageRecord {
+    fn from(usage: Usage) -> UsageRecord {
+        assert!(!usage.unpriced || usage.cost_micros == 0);
+        let record = UsageRecord {
+            input: usage.input,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            output: usage.output,
+            cost_usd: (!usage.unpriced).then(|| usage.cost_micros as f64 / 1e6),
+        };
+        assert!(record.cost_usd.is_some() != usage.unpriced);
+        record
+    }
+}
+
 struct Evidence {
     clean: bool,
     on_branch: bool,
@@ -251,6 +266,11 @@ impl Attempt {
         }
     }
 
+    pub fn usage(&self) -> Option<Usage> {
+        let role = self.brief.role;
+        harness::usage(&role.harness, role.model, self.log())
+    }
+
     /// Keeps `launch` from starting any further agent, such as a refused resume's fresh start.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
@@ -272,8 +292,6 @@ pub enum Prepared {
 /// How an attempt's agent did, judged from its exit, its log and its worktree.
 pub struct Judgement {
     pub verdict: Verdict,
-    /// What the judged agent run reported it used, if it reported anything.
-    pub usage: Option<Usage>,
     work: Option<Work>,
 }
 
@@ -283,7 +301,6 @@ impl Judgement {
         assert!(matches!(verdict, Verdict::Fail { .. }));
         let judgement = Judgement {
             verdict,
-            usage: None,
             work: None,
         };
         assert!(judgement.work.is_none());
@@ -404,13 +421,7 @@ pub fn judge_attempt(
     }
     let (verdict, work) = inspect(id, board, attempt, launched)?;
     assert!(!matches!(verdict, Verdict::Complete { .. }) || work.is_some());
-    let role = attempt.brief.role;
-    let usage = harness::usage(&role.harness, role.model, attempt.log());
-    Ok(Judgement {
-        verdict,
-        usage,
-        work,
-    })
+    Ok(Judgement { verdict, work })
 }
 
 /// Writes a judged attempt to the board: completes or fails the task, or leaves it blocked.
@@ -424,7 +435,7 @@ pub fn settle_attempt(
     assert!(attempt.brief.id == id);
     match (&judgement.verdict, &judgement.work) {
         (Verdict::Complete { result }, Some(work)) => {
-            complete(id, env, board, attempt, result, work, judgement.usage)?
+            complete(id, env, board, attempt, result, work)?
         }
         (Verdict::Complete { .. }, None) => panic!("a completion always has inspected work"),
         (Verdict::Fail { reason }, _) => fail(id, board, attempt, reason)?,
@@ -1028,7 +1039,6 @@ fn complete(
     attempt: &Attempt,
     result: &str,
     work: &Work,
-    usage: Option<Usage>,
 ) -> Result<(), RunError> {
     assert!(
         !result.trim().is_empty(),
@@ -1060,13 +1070,7 @@ fn complete(
         commits: work.commits,
         head: &work.head,
         summary,
-        usage: usage.map(|usage| UsageRecord {
-            input: usage.input,
-            cache_read: usage.cache_read,
-            cache_write: usage.cache_write,
-            output: usage.output,
-            cost_usd: (!usage.unpriced).then(|| usage.cost_micros as f64 / 1e6),
-        }),
+        usage: attempt.usage().map(UsageRecord::from),
     };
     if let Err(error) = record_session(attempt, &env.home) {
         let note = format!("Rider could not record the agent's session: {error}.");

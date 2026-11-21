@@ -43,9 +43,8 @@ pub const STOP_TRIES_MAX: u8 = 3;
 pub const PENDING_CLAIMS_MAX: usize = 2 * AGENTS_MAX as usize;
 /// Upper bound on the distinct untracked tasks the core counts.
 pub const UNTRACKED_MAX: usize = 4 * TASKS_MAX;
-/// Upper bound on the projects whose usage the core totals apart; usage past it counts only in
-/// the overall total.
 pub const PROJECTS_MAX: usize = 64;
+pub const TASK_USAGES_MAX: usize = TASKS_MAX;
 /// Upper bound on the closed tasks the core remembers until a snapshot covers their closing.
 pub const CLOSED_MAX: usize = TASKS_MAX;
 /// How many feed restarts in a row are allowed before the board counts as down.
@@ -176,8 +175,6 @@ pub struct Task {
     pub seen: Cursor,
     /// A claim of the task was refused since it was last learned or the last tick.
     pub claim_refused: bool,
-    /// What the task's judged attempts since the daemon started reported they used.
-    pub usage: Usage,
 }
 
 /// Why a running agent is being stopped.
@@ -311,6 +308,12 @@ pub struct TaskRow {
     /// How long the run working it has run its attempt, in milliseconds.
     pub age_millis: Option<u64>,
     pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskUsage {
+    pub id: TaskId,
+    pub project: Option<String>,
     pub usage: Usage,
 }
 
@@ -323,10 +326,9 @@ pub struct StatusView {
     pub limit: u8,
     pub untracked: Untracked,
     pub tasks: Vec<TaskRow>,
-    /// What every judged attempt since the daemon started reported it used.
     pub usage: Usage,
-    /// The same, apart for each project, at most `PROJECTS_MAX`.
     pub projects: Vec<(Option<String>, Usage)>,
+    pub task_usages: Vec<TaskUsage>,
 }
 
 /// One run as `agents` shows it.
@@ -520,9 +522,9 @@ pub struct State {
     closed_unrecorded: Cursor,
     runs: Vec<Run>,
     pending_claims: Vec<PendingClaim>,
-    /// Usage of every judged attempt, overall and for each project, since the daemon started.
     usage: Usage,
     projects: Vec<(Option<String>, Usage)>,
+    task_usages: Vec<TaskUsage>,
     next_run: u64,
     board: BoardHealth,
     stopping: Stopping,
@@ -571,6 +573,7 @@ impl State {
             pending_claims: Vec::new(),
             usage: Usage::default(),
             projects: Vec::new(),
+            task_usages: Vec::new(),
             next_run: 1,
             board: BoardHealth::Up,
             stopping: Stopping::No,
@@ -982,7 +985,6 @@ fn status_view(state: &State) -> StatusView {
             profile: run.map(|run| state.profile(run.role, run.slot)),
             age_millis: run.map(|run| now.0.saturating_sub(run.attempt_start.0)),
             branch: task.branch.clone(),
-            usage: task.usage,
         }
     });
     let view = StatusView {
@@ -994,27 +996,36 @@ fn status_view(state: &State) -> StatusView {
         tasks: tasks.collect(),
         usage: state.usage,
         projects: state.projects.clone(),
+        task_usages: state.task_usages.clone(),
     };
     assert!(view.running <= usize::from(view.limit));
     assert!(view.tasks.len() <= state.config.tasks_max);
     view
 }
 
-// Adds a judged attempt's usage to its task, its project and the overall total.
+// The oldest task's usage gives way to a new task's once `TASK_USAGES_MAX` are kept.
 fn count_usage(state: &mut State, id: TaskId, usage: Usage) {
-    let task = state.tasks.iter_mut().find(|task| task.id == id);
-    let project = task.as_ref().and_then(|task| task.project.clone());
-    if let Some(task) = task {
-        task.usage = task.usage.plus(usage);
-    }
+    let task = state.tasks.iter().find(|task| task.id == id);
+    let project = task.and_then(|task| task.project.clone());
     state.usage = state.usage.plus(usage);
     match state.projects.iter().position(|(name, _)| *name == project) {
         Some(index) => state.projects[index].1 = state.projects[index].1.plus(usage),
-        None if state.projects.len() < PROJECTS_MAX => state.projects.push((project, usage)),
+        None if state.projects.len() < PROJECTS_MAX => {
+            state.projects.push((project.clone(), usage));
+        }
         None => {}
     }
+    match state.task_usages.iter_mut().find(|entry| entry.id == id) {
+        Some(entry) => entry.usage = entry.usage.plus(usage),
+        None => {
+            if state.task_usages.len() == TASK_USAGES_MAX {
+                state.task_usages.remove(0);
+            }
+            state.task_usages.push(TaskUsage { id, project, usage });
+        }
+    }
     assert!(state.projects.len() <= PROJECTS_MAX);
-    assert!(state.usage.output >= usage.output);
+    assert!(state.task_usages.len() <= TASK_USAGES_MAX);
 }
 
 fn agent_rows(state: &State) -> Vec<AgentRow> {
@@ -1128,13 +1139,9 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         project: project_of(&feed.channel),
         seen: feed.cursor,
         claim_refused: false,
-        usage: Usage::default(),
     };
     match index {
-        Some(index) if labels_are_task => {
-            let usage = state.tasks[index].usage;
-            state.tasks[index] = Task { usage, ..task };
-        }
+        Some(index) if labels_are_task => state.tasks[index] = task,
         Some(index) => {
             let entry = &mut state.tasks[index];
             entry.state = task_state;
@@ -1295,7 +1302,6 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
                 project: project_of(channel),
                 seen: view.version,
                 claim_refused: false,
-                usage: Usage::default(),
             });
         }
     }

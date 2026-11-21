@@ -888,12 +888,9 @@ pub fn stream_reports_failure(harness: &Harness, log: &Path) -> bool {
     last_result_failed || last_turn_failed || last_review_failed
 }
 
-/// Upper bound on the tokens of each kind one attempt may report.
 pub const TOKENS_MAX: u64 = 1 << 40;
-/// Upper bound on the cost one attempt may report, in millionths of a US dollar.
 pub const COST_MICROS_MAX: u64 = 1 << 40;
 
-/// Tokens and cost of one or more agent runs; `unpriced` when some run's cost is unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input: u64,
@@ -905,7 +902,6 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// The sum of two usages, held at `u64::MAX` rather than wrapping.
     pub fn plus(self, other: Usage) -> Usage {
         let sum = Usage {
             input: self.input.saturating_add(other.input),
@@ -921,9 +917,13 @@ impl Usage {
 }
 
 // Thousandths of a US dollar per million tokens: input, cache read, cache write, output.
-// Source: https://developers.openai.com/api/docs/pricing (standard tier, prompts up to 272K
-// tokens), read 2026-11-20. OpenAI bills cache writes as input. Claude reports its own cost.
-const PRICES: [(&str, [u64; 4]); 1] = [("gpt-6.1-sol", [2_000, 100, 2_000, 10_000])];
+// Source: https://developers.openai.com/api/docs/pricing, Standard tier, prompts up to 272K
+// tokens, read 2026-11-20. Codex reports one cache-write count without its tier, so writes are
+// priced at the 30-minute rate, the lower of the two. Claude reports its own cost.
+const PRICES: [(&str, [u64; 4]); 2] = [
+    ("gpt-6.1-sol", [2_000, 100, 2_500, 10_000]),
+    ("gpt-6.2-sol", [2_000, 100, 2_500, 10_000]),
+];
 
 fn priced(model: &str, usage: &Usage) -> Option<u64> {
     let (_, price) = PRICES.iter().find(|(name, _)| *name == model)?;
@@ -951,8 +951,6 @@ fn micros_of(dollars: f64) -> Option<u64> {
     micros
 }
 
-/// The tokens and cost the stream at `log` reports for a run of `model`, or `None` when it
-/// reports none or the log is unreadable; the cost is the harness's own, else from `PRICES`.
 pub fn usage(harness: &Harness, model: &str, log: &Path) -> Option<Usage> {
     assert!(!model.is_empty());
     let mut found: Option<Usage> = None;
@@ -976,28 +974,24 @@ pub fn usage(harness: &Harness, model: &str, log: &Path) -> Option<Usage> {
                 reported = valid(total_cost_usd).and_then(micros_of);
             }
         }),
+        // Each `turn.completed` carries the run's running totals, not the turn's own.
         Harness::Codex => scan(log, |event| {
             let CodexEvent::TurnCompleted { usage } = event else {
                 return;
             };
-            let Some(turn) = valid(usage) else {
-                return;
-            };
-            let cached = turn.cached_input_tokens;
-            let write = turn.cache_write_input_tokens;
-            let Some(input) =
-                (turn.input_tokens.checked_sub(cached)).and_then(|left| left.checked_sub(write))
-            else {
-                return;
-            };
-            let turn = Usage {
-                input,
-                cache_read: cached,
-                cache_write: write,
-                output: turn.output_tokens,
-                ..Usage::default()
-            };
-            found = Some(found.unwrap_or_default().plus(turn));
+            let snapshot = valid(usage).and_then(|turn| {
+                let cached = turn.cached_input_tokens;
+                let write = turn.cache_write_input_tokens;
+                let input = turn.input_tokens.checked_sub(cached)?.checked_sub(write)?;
+                Some(Usage {
+                    input,
+                    cache_read: cached,
+                    cache_write: write,
+                    output: turn.output_tokens,
+                    ..Usage::default()
+                })
+            });
+            found = snapshot;
         }),
         // `codex review` prints plain text and reports no usage.
         Harness::CodexReview => return None,

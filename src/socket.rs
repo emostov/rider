@@ -635,6 +635,11 @@ fn status_json(view: &StatusView) -> Value {
     let projects: Vec<Value> = (view.projects.iter())
         .map(|(project, usage)| json!({"project": project, "usage": usage_json(usage)}))
         .collect();
+    let task_usages: Vec<Value> = (view.task_usages.iter())
+        .map(|entry| {
+            json!({"id": entry.id.0, "project": entry.project, "usage": usage_json(&entry.usage)})
+        })
+        .collect();
     json!({
         "board": board,
         "stopping": stopping,
@@ -645,6 +650,7 @@ fn status_json(view: &StatusView) -> Value {
         "tasks": tasks,
         "usage": usage_json(&view.usage),
         "projects": projects,
+        "task_usages": task_usages,
     })
 }
 
@@ -668,7 +674,6 @@ fn task_json(row: &TaskRow) -> Value {
         "profile": row.profile,
         "age_ms": row.age_millis,
         "branch": row.branch,
-        "usage": usage_json(&row.usage),
     })
 }
 

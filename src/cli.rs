@@ -825,12 +825,15 @@ fn status(config: &Config) -> Result<u8, CliError> {
     let data = client.send("status", &[]).map_err(CliError::Client)?;
     println!("{}", status_line(&data));
     println!("spent {}", usage_text(&data["usage"]));
-    let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
-    let spent = data["projects"].as_array().map_or(&[][..], Vec::as_slice);
-    fn name(value: &serde_json::Value) -> &str {
-        value["project"].as_str().unwrap_or(daemon::SUBTREE)
-    }
-    let mut projects: Vec<&str> = tasks.iter().chain(spent).map(name).collect();
+    let list = |key: &str| data[key].as_array().map_or(&[][..], Vec::as_slice);
+    let (tasks, spent, used) = (list("tasks"), list("projects"), list("task_usages"));
+    let name = |value: &serde_json::Value| -> String {
+        value["project"]
+            .as_str()
+            .unwrap_or(daemon::SUBTREE)
+            .to_string()
+    };
+    let mut projects: Vec<String> = tasks.iter().chain(spent).chain(used).map(name).collect();
     projects.sort_unstable();
     projects.dedup();
     for project in projects {
@@ -838,25 +841,29 @@ fn status(config: &Config) -> Result<u8, CliError> {
             Some(entry) => println!("{project} spent {}", usage_text(&entry["usage"])),
             None => println!("{project}"),
         }
+        let usage_of = |id: &serde_json::Value| {
+            let entry = used.iter().find(|entry| entry["id"] == *id);
+            entry.map_or(String::new(), |entry| {
+                format!(" spent {}", usage_text(&entry["usage"]))
+            })
+        };
         for task in tasks.iter().filter(|task| name(task) == project) {
-            let usage = &task["usage"];
-            let used = ["input", "cache_read", "cache_write", "output"]
-                .iter()
-                .any(|kind| usage[kind].as_u64().is_some_and(|count| count > 0));
-            let spent = if used {
-                format!(" spent {}", usage_text(usage))
-            } else {
-                String::new()
-            };
             println!(
-                "  #{} {} {} {} {} {}{spent}",
+                "  #{} {} {} {} {} {}{}",
                 task["id"],
                 text(&task["state"]),
                 text(&task["role"]),
                 text(&task["profile"]),
                 age(&task["age_ms"]),
                 text(&task["branch"]),
+                usage_of(&task["id"]),
             );
+        }
+        let settled = (used.iter()).filter(|entry| {
+            name(entry) == project && tasks.iter().all(|task| task["id"] != entry["id"])
+        });
+        for entry in settled {
+            println!("  #{}{}", entry["id"], usage_of(&entry["id"]));
         }
     }
     Ok(0)
