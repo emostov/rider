@@ -19,7 +19,6 @@ const HEADS_PREFIX: &str = "refs/heads/";
 // A branch label must still be a safe ref once `HEADS_PREFIX` makes it a full ref.
 const BRANCH_BYTES_MAX: usize = REF_BYTES_MAX - HEADS_PREFIX.len();
 const WORKTREES_DIR: &str = "worktrees";
-/// Upper bound on the projects and on each project's task directories `task_dirs` reads.
 pub const TASK_DIRS_MAX: usize = 1024;
 const PROJECT_FALLBACK: &str = "project";
 /// The label that holds the branch a task's work is on.
@@ -76,7 +75,6 @@ pub enum WorktreeError {
         dir: PathBuf,
         record: Record,
     },
-    /// A directory of worktrees could not be read, or holds more than `TASK_DIRS_MAX`.
     Listing {
         path: PathBuf,
         why: String,
@@ -578,7 +576,6 @@ fn entries(dir: &Path) -> Result<Vec<PathBuf>, WorktreeError> {
     Ok(paths)
 }
 
-/// Every task's directory under `home`'s worktrees whose name is a task id, in path order.
 pub fn task_dirs(home: &Path) -> Result<Vec<(PathBuf, TaskId)>, WorktreeError> {
     assert!(home.is_absolute(), "rider's home is an absolute path");
     let mut found = Vec::new();
@@ -598,7 +595,6 @@ pub fn task_dirs(home: &Path) -> Result<Vec<(PathBuf, TaskId)>, WorktreeError> {
     Ok(found)
 }
 
-/// Whether the checkout at `dir` records that it was made for the board `identity` names.
 pub fn made_for(dir: &Path, identity: &BoardIdentity) -> Result<bool, WorktreeError> {
     assert!(dir.is_absolute());
     let made = recorded_board(dir)?.is_some_and(|found| found == identity.0);
@@ -606,8 +602,6 @@ pub fn made_for(dir: &Path, identity: &BoardIdentity) -> Result<bool, WorktreeEr
     Ok(made)
 }
 
-/// Removes the worktree of a task that ended without completing, only when that is provably
-/// safe; its branch is kept.
 pub fn release_ended(brief: &Brief, view: &TaskView, home: &Path) -> Result<(), WorktreeError> {
     assert!(brief.id == view.id);
     let dir = dir_for(brief, home);

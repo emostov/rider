@@ -146,7 +146,7 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// List the worktrees of failed and canceled tasks; --yes removes each one that is safe.
+    /// List the worktrees of ended tasks; --yes removes each one that is safe.
     ///
     /// A worktree with changes, off its branch or mid-operation is kept and its thread says
     /// why. No branch is ever deleted.
@@ -488,11 +488,15 @@ fn clean(config: &Config, yes: bool) -> Result<u8, CliError> {
                 continue;
             }
         };
-        let state = match view.state {
-            TaskState::Failed => "failed",
-            TaskState::Canceled => "canceled",
-            _ => continue,
-        };
+        let state = socket::state_name(view.state);
+        let ended = matches!(
+            view.state,
+            TaskState::Completed | TaskState::Failed | TaskState::Canceled
+        );
+        if !ended {
+            println!("kept #{} {shown}: its task is {state}", id.0);
+            continue;
+        }
         let brief = match parse_brief(&view) {
             Ok(mut brief) => {
                 brief.role = roles::role_in_repo(brief.role, &brief.repo);

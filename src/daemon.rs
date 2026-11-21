@@ -36,7 +36,7 @@ use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
 use crate::run_task::{
     Attempt, Env, IdentityUnknown, Judgement, Prepared, RunError, board_identity_at_start,
-    judge_attempt, launch_agent, prepare_attempt, settle_attempt,
+    judge_attempt, launch_agent, prepare_attempt, release_if_canceled, settle_attempt,
 };
 use crate::settle::Verdict;
 use crate::socket::{self, SOCKET_FILE, Socket};
@@ -1127,6 +1127,12 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, attempt: &Attempt) -> Input 
     let _ = fs::remove_file(&ack);
     let _ = fs::remove_file(&pid_file);
     let _ = shared.recorder.send(Recorded::Ended(task));
+    release_if_canceled(
+        task,
+        &shared.paths.home,
+        &shared.board(DAEMON_PROFILE),
+        attempt,
+    );
     Input {
         event: Event::AgentExited(run),
         extra: Extra::Launched(launched),

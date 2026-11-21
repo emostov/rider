@@ -269,14 +269,13 @@ task of its own.
 `vb tasks needs` replaces what a task waits for: name all of them. `vb tasks cancel <id>
 "<reason>" --as lead-fable-5-2` drops a task that is no longer wanted.
 
-Worktrees are large, mostly the Rust `target/` directory, so remove one once nothing will
-use it again. Rider removes a task's worktree when the task completes, and keeps it when
-the task fails or blocks so a retry can reuse it. When you cancel a task, or give up on a
-failed one, run `rider clean` to list the worktrees of failed and canceled tasks, then
-`rider clean --yes` to remove each one that is safe to remove. It keeps a worktree with
-modified or untracked files, off its branch or mid-operation, and says why in the task's
-thread: then tell the owner rather than forcing. It never deletes a branch. A completed task
-whose thread says "Kept the worktree" is the same case once its changes are understood.
+Worktrees are large, mostly the Rust `target/` directory. Rider removes a task's worktree,
+build output included, when the task completes, fails or is canceled, and keeps it when it is
+not safe to remove: modified or untracked files, off its branch, or an operation in progress.
+The task's thread then says "Kept the worktree" and why. About every hour of a run, run
+`rider clean --yes`: it removes each worktree of an ended task that is safe to remove now,
+never touches one of an open task, and prints what it kept and why. Never `--force`, never
+delete a branch: tell the owner about a kept worktree whose changes nobody understands.
 
 A branch moves after children were cut from it only when an `onto` task completes on it.
 The `behind` field of that task's `rider-result@2` record names the children whose branches

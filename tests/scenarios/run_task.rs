@@ -86,7 +86,7 @@ fn a_task_whose_branch_label_names_another_branch_is_blocked_and_the_label_kept(
 }
 
 #[test]
-fn a_failed_attempt_counts_its_attempt_and_replies_with_its_log_keeping_the_worktree() {
+fn a_failed_attempt_counts_its_attempt_replies_with_its_log_and_removes_its_clean_worktree() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
@@ -104,7 +104,12 @@ fn a_failed_attempt_counts_its_attempt_and_replies_with_its_log_keeping_the_work
     let log = world.home.join("logs").join(&task).join("2.jsonl");
     let log = format!("The whole log: {}", log.display());
     assert!(text.contains(&log), "{text}");
-    assert!(worktree_dir(&world, &task).exists());
+    then_the_worktree_is_removed(&world, &task);
+    let branch = task_label(&world, &task, "branch").expect("the task has a branch label");
+    assert!(
+        branches(&world).contains(&branch),
+        "branch {branch} is kept"
+    );
 }
 
 #[test]

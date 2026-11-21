@@ -999,72 +999,66 @@ fn a_task_whose_heading_is_all_punctuation_gets_the_fallback_branch_name() {
     );
 }
 
-fn given_tasks_that_ended_without_completing(world: &mut World) -> [String; 3] {
-    let plans = [
-        Behaviour::ExitNonZero,
-        Behaviour::LeaveUncommitted,
-        Behaviour::Block,
-    ];
-    let tasks = plans.map(|plan| {
-        let task = when_the_lead_creates(world, &an_implement_task(world, "Add the work."));
-        given_the_agent_will(world, &task, &[plan]);
-        task
-    });
-    let ids: Vec<&str> = tasks.iter().map(String::as_str).collect();
-    let (states, exit) = when_the_daemon_runs_until_settled(world, &ids);
-    assert_eq!(exit, Some(0));
-    assert_eq!(states, vec!["failed", "failed", "blocked"]);
-    world.vb_lead(
-        &["tasks", "cancel", &tasks[2], "superseded", "--json"],
-        None,
+#[test]
+fn a_failed_tasks_dirty_worktree_is_kept_and_its_thread_says_why() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(states, vec!["failed".to_string()]);
+    let dir = worktree_dir(&world, &task);
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    then_a_reply_holds(
+        &world,
+        &task,
+        &format!("Kept the worktree at {}", dir.display()),
     );
-    tasks
 }
 
 #[test]
-fn rider_clean_lists_the_worktrees_of_failed_and_canceled_tasks_and_removes_none() {
+fn rider_clean_yes_removes_a_cleaned_up_worktree_with_its_ignored_build_output() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
-    let tasks = given_tasks_that_ended_without_completing(&mut world);
-
-    let output = when_rider_runs(&world, &["clean"]);
-
-    assert_eq!(output.code, Some(0), "{output:?}");
-    let listed: Vec<String> = [(0, "failed"), (1, "failed"), (2, "canceled")]
-        .map(|(index, state)| {
-            let dir = worktree_dir(&world, &tasks[index]);
-            format!("#{} {state} {}", tasks[index], dir.display())
-        })
-        .to_vec();
-    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), listed);
-    assert!(tasks.iter().all(|task| worktree_dir(&world, task).exists()));
-}
-
-#[test]
-fn rider_clean_yes_removes_clean_worktrees_of_ended_tasks_and_keeps_a_dirty_one() {
-    let Some(mut world) = given_a_board_and_a_repository() else {
-        return;
-    };
-    let tasks = given_tasks_that_ended_without_completing(&mut world);
-    let before = branches(&world);
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::LeaveUncommitted]);
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+    assert_eq!(states, vec!["failed".to_string()]);
+    let dir = worktree_dir(&world, &task);
+    fs::remove_file(dir.join(format!("uncommitted-{task}.txt"))).expect("remove the file");
+    fs::create_dir_all(dir.join(".git-ignored-target")).expect("create the build output");
+    let exclude = git_in(&world, &dir, &["rev-parse", "--git-path", "info/exclude"]);
+    let exclude = dir.join(exclude);
+    fs::create_dir_all(exclude.parent().expect("a parent")).expect("create info");
+    fs::write(&exclude, ".git-ignored-target/\n").expect("ignore the build output");
+    fs::write(dir.join(".git-ignored-target").join("big.o"), "x").expect("write output");
 
     let output = when_rider_runs(&world, &["clean", "--yes"]);
 
     assert_eq!(output.code, Some(0), "{output:?}");
-    then_the_worktree_is_removed(&world, &tasks[0]);
-    then_the_worktree_is_removed(&world, &tasks[2]);
-    assert_eq!(branches(&world), before);
-    let dirty = worktree_dir(&world, &tasks[1]);
-    let left = dirty.join(format!("uncommitted-{}.txt", tasks[1]));
-    assert_eq!(
-        fs::read_to_string(left).ok(),
-        Some("left behind\n".to_string())
-    );
-    let kept = format!("Kept the worktree at {}", dirty.display());
-    then_a_reply_holds(&world, &tasks[1], &kept);
-    assert!(
-        output.stdout.contains(&format!("kept #{}", tasks[1])),
-        "{output:?}"
-    );
+    then_the_worktree_is_removed(&world, &task);
+    let removed = format!("removed #{task} {}", dir.display());
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![removed]);
+}
+
+#[test]
+fn rider_clean_yes_keeps_an_open_tasks_worktree_and_says_why() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Block]);
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+    assert_eq!(states, vec!["blocked".to_string()]);
+
+    let output = when_rider_runs(&world, &["clean", "--yes"]);
+
+    let dir = worktree_dir(&world, &task);
+    assert!(dir.is_dir(), "the worktree {} is kept", dir.display());
+    let kept = format!("kept #{task} {}: its task is blocked", dir.display());
+    assert_eq!(output.stdout.lines().collect::<Vec<_>>(), vec![kept]);
 }

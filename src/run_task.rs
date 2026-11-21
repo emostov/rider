@@ -407,7 +407,10 @@ pub fn settle_attempt(
             complete(id, env, board, attempt, result, work)?
         }
         (Verdict::Complete { .. }, None) => panic!("a completion always has inspected work"),
-        (Verdict::Fail { reason }, _) => fail(id, board, attempt, reason)?,
+        (Verdict::Fail { reason }, _) => {
+            fail(id, board, attempt, reason)?;
+            release_or_note(id, &env.home, board, &attempt.checkout, &attempt.brief.repo);
+        }
         (Verdict::LeaveBlocked, _) => {}
     }
     Ok(())
@@ -1030,25 +1033,43 @@ fn complete(
     {
         let _ = board.reply(id, &record);
     }
-    if let Err(error) = worktree::release(&attempt.checkout, &attempt.brief.repo, &env.home) {
-        let why = match error {
-            WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
-            other => other.to_string(),
-        };
-        let dir = attempt.checkout.dir.display();
-        // The warning comes before git's reason, which may be long enough to be cut short.
-        let held = git::current_branch(&attempt.checkout.dir).ok().flatten();
-        let note = match held {
-            Some(branch) => format!(
-                "Kept the worktree at {dir}, so branch {branch} stays checked out there: tasks \
-                 working `onto` it will block as branch_busy until a person removes or fixes \
-                 the worktree at {dir}. It was kept because {why}."
-            ),
-            None => format!("Kept the worktree at {dir}: {why}."),
-        };
-        let _ = board.reply(id, &one_line(&note));
-    }
+    release_or_note(id, &env.home, board, &attempt.checkout, &attempt.brief.repo);
     Ok(())
+}
+
+fn release_or_note(id: TaskId, home: &Path, board: &dyn Board, checkout: &Checkout, repo: &Path) {
+    assert!(home.is_absolute() && repo.is_absolute());
+    let Err(error) = worktree::release(checkout, repo, home) else {
+        return;
+    };
+    let why = match error {
+        WorktreeError::NotReleasable { reason, .. } => reason.to_string(),
+        other => other.to_string(),
+    };
+    let dir = checkout.dir.display();
+    // The warning comes before git's reason, which may be long enough to be cut short.
+    let held = git::current_branch(&checkout.dir).ok().flatten();
+    let note = match held {
+        Some(branch) => format!(
+            "Kept the worktree at {dir}, so branch {branch} stays checked out there: tasks \
+             working `onto` it will block as branch_busy until a person removes or fixes \
+             the worktree at {dir}. It was kept because {why}."
+        ),
+        None => format!("Kept the worktree at {dir}: {why}."),
+    };
+    assert!(!note.is_empty());
+    let _ = board.reply(id, &one_line(&note));
+}
+
+pub fn release_if_canceled(id: TaskId, home: &Path, board: &dyn Board, attempt: &Attempt) {
+    assert!(attempt.brief.id == id);
+    assert!(home.is_absolute());
+    if board
+        .read_task(id)
+        .is_ok_and(|view| view.state == TaskState::Canceled)
+    {
+        release_or_note(id, home, board, &attempt.checkout, &attempt.brief.repo);
+    }
 }
 
 // A branch's tasks are those labelled with it in the completing task's channel and repository,
