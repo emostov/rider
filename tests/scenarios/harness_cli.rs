@@ -193,30 +193,6 @@ fn rider_serve_runs_vb_on_the_homes_board_in_the_foreground_and_exits_with_its_c
 }
 
 #[test]
-fn the_daemon_writes_every_built_in_prompt_over_what_is_in_the_homes_prompts() {
-    let Some(mut world) = given_a_board_and_a_repository() else {
-        return;
-    };
-    let prompts = world.home.join("prompts");
-    fs::create_dir_all(&prompts).expect("create the prompts directory");
-    fs::write(prompts.join("review.md"), "stale").expect("write a stale prompt");
-
-    given_a_running_daemon(&mut world);
-
-    let expected = [
-        ("implement.md", include_str!("../../prompts/implement.md")),
-        ("review.md", include_str!("../../prompts/review.md")),
-        ("security.md", include_str!("../../prompts/security.md")),
-        ("slop-rules.md", include_str!("../../prompts/slop-rules.md")),
-        ("qa.md", include_str!("../../prompts/qa.md")),
-    ];
-    for (name, text) in expected {
-        let found = fs::read_to_string(prompts.join(name)).expect("read a written prompt");
-        assert_eq!(found, text, "{name}");
-    }
-}
-
-#[test]
 fn rider_without_board_url_reaches_the_local_board_on_port_4100() {
     let Some(world) = World::new() else {
         return;

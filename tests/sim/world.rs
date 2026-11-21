@@ -49,6 +49,9 @@ const BOARD_RESTART_FAILS_EVERY: u32 = 2;
 const BOARD_DEAD_MINUTES_MAX: u64 = 12;
 /// Upper bound on how far past one lease a clock jump lands.
 const JUMP_PAST_LEASE_MAX: u64 = 30 * MINUTE;
+const WORK_CHANNEL: &str = "work/sim";
+const QUEUE_CHANNEL: &str = "queue";
+const QUEUED_EVERY: u32 = 5;
 
 /// The newest version of one task the core was told, by cursor.
 #[derive(Debug)]
@@ -60,6 +63,7 @@ struct Told {
 
 struct FakeTask {
     id: TaskId,
+    channel: &'static str,
     state: TaskState,
     labels: Vec<(String, String)>,
     epoch: u64,
@@ -118,6 +122,7 @@ pub struct World {
     rng: fastrand::Rng,
     /// Draws which tasks work `onto` another, apart from `rng` so the other draws stay put.
     onto_rng: fastrand::Rng,
+    queue_rng: fastrand::Rng,
     config: Config,
     core: State,
     now: Timestamp,
@@ -209,6 +214,7 @@ impl World {
         World {
             rng: fastrand::Rng::with_seed(seed),
             onto_rng: fastrand::Rng::with_seed(!seed),
+            queue_rng: fastrand::Rng::with_seed(seed.rotate_left(32)),
             core: State::new(config.clone(), now),
             config,
             now,
@@ -608,8 +614,10 @@ impl World {
             let branch = BRANCHES[self.rng.usize(0..BRANCHES.len())];
             labels.push(("branch".to_string(), branch.to_string()));
         }
+        let queued = self.queue_rng.u32(0..QUEUED_EVERY) == 0;
         self.tasks.push(FakeTask {
             id,
+            channel: if queued { QUEUE_CHANNEL } else { WORK_CHANNEL },
             state: TaskState::Ready,
             labels,
             epoch: 0,
@@ -716,7 +724,7 @@ impl World {
             cursor: Cursor(self.cursor),
             kind,
             task: task.id,
-            channel: "work/sim".to_string(),
+            channel: task.channel.to_string(),
             labels: task.labels.clone(),
             state: Some(task.state),
             actor: None,
@@ -1274,7 +1282,7 @@ impl World {
                     }),
                     version: Cursor(fake.version),
                 },
-                channel: "work/sim".to_string(),
+                channel: fake.channel.to_string(),
             })
             .collect();
         // The cursor is read before the pages, so events may land between the two.
@@ -1383,6 +1391,11 @@ impl World {
                     self.log.entry(*run).or_default().profile = Some(profile.clone());
                     if blocked {
                         return Err(format!("invariant 9: {action:?} while down or stopping"));
+                    }
+                    let channel = self.tasks.iter().find(|fake| fake.id == *task);
+                    let channel = channel.map(|fake| fake.channel);
+                    if channel != Some(WORK_CHANNEL) {
+                        return Err(format!("invariant 12: {action:?} claims in {channel:?}"));
                     }
                     if self.refused.contains(&task.0) {
                         return Err(format!(
