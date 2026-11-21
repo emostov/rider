@@ -875,6 +875,68 @@ fn a_task_labelled_with_the_removed_polish_role_is_left_unclaimed_as_an_unknown_
 }
 
 #[test]
+fn a_task_of_a_role_turned_off_in_rider_toml_is_blocked_naming_the_setting_without_an_agent() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.light]\nenabled = false\n");
+    let new = an_implement_task(&world, "Add the work.").role("light");
+    let task = when_the_lead_creates(&world, &new);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["blocked".to_string()], Some(0)));
+    let reason = "Change the `role` label from \"light\": the role is turned off by \
+                  `enabled = false` under [roles.light] in rider.toml.";
+    let block = Some(("invalid_brief".to_string(), reason.to_string()));
+    assert_eq!(task_block(&world, &task), block);
+    assert_eq!(agent_runs(&world), vec![]);
+}
+
+#[test]
+fn rider_config_shows_a_built_in_role_turned_off() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[roles.security]\nenabled = false\n");
+
+    let output = when_rider_runs(&world, &["config"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let default = include_str!("rider-config-default.toml");
+    let header = "[roles.security]\n";
+    let expected = default.replacen(header, &format!("{header}enabled = false\n"), 1);
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn a_rider_toml_role_named_like_the_lead_is_refused_naming_the_role() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    for label in ["lead", "lead-x"] {
+        let toml = format!(
+            r#"[roles.{label}]
+harness = "claude"
+model = "claude-lead-model"
+title = "{label}"
+model_name = "Lead Model"
+model_slug = "lead-model"
+prompt = "implement"
+commits = true
+"#
+        );
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config"]);
+
+        assert_eq!(output.code, Some(1), "{output:?}");
+        let field = format!("roles.{label} is reserved");
+        assert!(output.stderr.contains(&field), "{output:?}");
+    }
+}
+
+#[test]
 fn rider_config_for_a_repository_prints_its_merged_role_table() {
     let Some(world) = given_a_board_and_a_repository() else {
         return;

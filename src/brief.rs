@@ -43,6 +43,7 @@ pub struct Brief {
 pub enum BriefError {
     NoRole,
     UnknownRole(String),
+    RoleOff(&'static str),
     NoRepo,
     RepoNotAbsolute(String),
     /// The repo path, or the reason it could not be checked.
@@ -86,6 +87,11 @@ impl fmt::Display for BriefError {
                 f,
                 "Change the `role` label from {value:?} to one of implement, light, \
                  review, security or qa."
+            ),
+            BriefError::RoleOff(role) => write!(
+                f,
+                "Change the `role` label from {role:?}: the role is turned off by \
+                 `enabled = false` under [roles.{role}] in rider.toml."
             ),
             BriefError::NoRepo => write!(
                 f,
@@ -168,6 +174,9 @@ pub fn parse_brief(view: &TaskView) -> Result<Brief, BriefError> {
     );
     let role = label(view, "role").ok_or(BriefError::NoRole)?;
     let role = role_from_label(role).ok_or_else(|| BriefError::UnknownRole(echo(role)))?;
+    if !role.enabled {
+        return Err(BriefError::RoleOff(role.label));
+    }
     let repo = parse_repo(label(view, "repo"))?;
     let base = parse_id_label(view, "base")?;
     let onto = parse_id_label(view, "onto")?;

@@ -20,7 +20,9 @@ channel while the rest of the work goes on.
 
 **The swarm** is the `rider up` daemon. It runs agents in roles you configure in
 `<rider home>/rider.toml`. Each role sets its agents' model and prompt and how many replicas run
-at once. `rider config` prints the settings in effect: the built-in roles and limits with the
+at once. You can change a built-in role, add your own, or turn a built-in role off with
+`enabled = false` under `[roles.<name>]`; Rider then blocks a task labelled with that role.
+`rider config` prints the settings in effect: the built-in roles and limits with the
 file's over them. Rider spawns agents through `claude` (Claude Code) or `codex` (Codex CLI),
 chosen per role with `harness` in `rider.toml`; each must be installed and signed in
 for the roles that use it. A role may list `skills = ["<name>", ...]`; its

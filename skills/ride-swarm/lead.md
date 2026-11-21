@@ -156,6 +156,10 @@ These rules are yours to keep. Rider does not check them:
 - `security` is one task per stack, and for any task you judge sensitive: `of=<the top
   task>`, `needs` every unfinished task on the stack. Name the range in the brief, such as
   `main..HEAD`.
+- A role turned off in `rider.toml` (`enabled = false`; `rider config` shows it) runs no
+  agents, and Rider blocks a task labelled with it. When a review role such as `review`,
+  `native-review` or `security` is off, skip that review step: create no task for it and judge
+  the PR on the reviews that remain.
 - Merge each PR to main as soon as it is green and reviewed, and cut the next work from main.
   Never stack more than two PRs.
 - `qa` is optional, for a change a person can observe: CLI behaviour, a PR flow, a UI. It
