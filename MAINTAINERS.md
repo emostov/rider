@@ -54,5 +54,5 @@ Bump `version` in `Cargo.toml`, merge it to `main`, then tag the merge commit `v
 Rider is early and still developing basic features. The built-in roles and their models are
 in `src/roles.rs`; `rider config` prints them with your `rider.toml` over them. A role's
 `prompt` may name a file of your own instead of a built-in prompt. When the daemon starts, it
-registers Rider's board schemas (`rider-result@2`, `rider-finding@1`) on a board that lacks
+registers Rider's board schemas (`rider-result@3`, `rider-finding@1`) on a board that lacks
 them. A `prompts/` directory an older Rider wrote under `<rider home>` is no longer read.

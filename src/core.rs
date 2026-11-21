@@ -47,6 +47,8 @@ pub const PROJECTS_MAX: usize = 64;
 pub const TASK_USAGES_MAX: usize = TASKS_MAX;
 /// Upper bound on the closed tasks the core remembers until a snapshot covers their closing.
 pub const CLOSED_MAX: usize = TASKS_MAX;
+pub const WAITING_MAX: usize = TASKS_MAX;
+const OF_CHAIN_MAX: usize = 16;
 /// How many feed restarts in a row are allowed before the board counts as down.
 pub const FEED_RESTARTS_MAX: u8 = 10;
 /// How long a feed must stay up, without delivering an event, for its loss not to count as
@@ -169,6 +171,7 @@ pub struct Task {
     pub branch: Option<String>,
     /// The task whose branch this one continues, from its `onto` label.
     pub onto: Option<TaskId>,
+    pub of: Option<TaskId>,
     /// The project the task's channel names under `work/`, if it names one.
     pub project: Option<String>,
     /// The task's board version: the cursor of the newest event this was learned from.
@@ -424,6 +427,10 @@ pub enum Event {
         kind: String,
         reason: String,
     },
+    PrepareWaiting {
+        run: RunId,
+        of: TaskId,
+    },
     AgentExited(RunId),
     /// A `StopAgent` was carried out; the agent's exit is reported separately.
     StopDone(RunId),
@@ -525,6 +532,7 @@ pub struct State {
     tasks: Vec<Task>,
     /// Each untracked task with the cursor it was last seen at.
     untracked: Vec<(TaskId, Cursor)>,
+    waiting: Vec<(TaskId, TaskId)>,
     /// The newest cursor at which an untracked task went uncounted.
     untracked_overflow: Option<Cursor>,
     /// When the last listing left tasks out: a lower bound on the untracked tasks.
@@ -576,6 +584,7 @@ impl State {
             config,
             tasks: Vec::new(),
             untracked: Vec::new(),
+            waiting: Vec::new(),
             untracked_overflow: None,
             left_out: None,
             closed: Vec::new(),
@@ -789,6 +798,7 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
                 begin_settle(state, index, Settlement::Block { kind, reason }, actions);
             }
         }
+        Event::PrepareWaiting { run, of } => prepare_waiting(state, run, of, actions),
         Event::AgentExited(run) => on_agent_exited(state, run, actions),
         Event::StopDone(_) => {}
         Event::Judged {
@@ -1140,6 +1150,11 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
     if version.or(closed_at.map(|(_, at)| *at)) >= Some(feed.cursor) {
         return;
     }
+    let done = matches!(task_state, TaskState::Completed | TaskState::Canceled);
+    let relabeled = feed.kind == EventKind::LabelsChanged || is_closed(task_state);
+    state
+        .waiting
+        .retain(|(task, of)| !(relabeled && *task == feed.task) && !(done && *of == feed.task));
     if is_closed(task_state) {
         match index {
             Some(index) => _ = state.tasks.remove(index),
@@ -1154,7 +1169,8 @@ fn track_feed(state: &mut State, feed: &BoardEvent) {
         state: task_state,
         role: role_of(&state.config, &feed.labels),
         branch: label(&feed.labels, "branch"),
-        onto: onto_of(&feed.labels),
+        onto: id_label(&feed.labels, "onto"),
+        of: id_label(&feed.labels, "of"),
         project: project_of(&feed.channel),
         seen: feed.cursor,
         claim_refused: false,
@@ -1271,6 +1287,7 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
     }
     state.closed.retain(|(_, at)| *at > cursor);
     state.untracked.retain(|(_, at)| *at > cursor);
+    state.waiting.clear();
     if state.untracked_overflow.is_some_and(|at| at <= cursor) {
         state.untracked_overflow = None;
     }
@@ -1317,7 +1334,8 @@ fn reconcile(state: &mut State, tasks: &[ListedTask], cursor: Cursor, left_out: 
                 state: view.state,
                 role: role_of(&state.config, &view.labels),
                 branch: label(&view.labels, "branch"),
-                onto: onto_of(&view.labels),
+                onto: id_label(&view.labels, "onto"),
+                of: id_label(&view.labels, "of"),
                 project: project_of(channel),
                 seen: view.version,
                 claim_refused: false,
@@ -1354,10 +1372,10 @@ fn label(labels: &[(String, String)], key: &str) -> Option<String> {
     found.map(|(_, value)| value.clone())
 }
 
-// A malformed `onto` is left to preparation, which blocks the task as an invalid brief.
-fn onto_of(labels: &[(String, String)]) -> Option<TaskId> {
+fn id_label(labels: &[(String, String)], key: &str) -> Option<TaskId> {
     assert!(labels.len() <= LABELS_MAX);
-    let value = label(labels, "onto")?;
+    assert!(key == "onto" || key == "of");
+    let value = label(labels, key)?;
     let digits = value.strip_prefix('#').unwrap_or(&value);
     digits.parse::<u64>().ok().map(TaskId)
 }
@@ -1977,6 +1995,56 @@ fn resume_held(state: &mut State, tasks: &[ListedTask], actions: &mut Vec<Action
 
 /// The oldest claimable task, its role, and the lowest free slot of that role; a task of a
 /// building role is claimable only while fewer than `builders_max` building runs exist.
+fn held_by_of(state: &State, task: &Task) -> bool {
+    let Some(of) = task.of else {
+        return false;
+    };
+    let open = |id: TaskId| {
+        state.tasks.iter().any(|other| other.id == id)
+            || state.untracked.iter().any(|(other, _)| *other == id)
+    };
+    let mut next = of;
+    for _ in 0..OF_CHAIN_MAX {
+        if next == task.id {
+            return false;
+        }
+        let after = state.tasks.iter().find(|other| other.id == next);
+        match after.and_then(|after| after.of) {
+            Some(after) => next = after,
+            None => break,
+        }
+    }
+    assert!(of != task.id);
+    open(of)
+}
+
+fn prepare_waiting(state: &mut State, run: RunId, of: TaskId, actions: &mut Vec<Action>) {
+    let Some(index) = run_in(state, run, Phase::Preparing) else {
+        return;
+    };
+    let task = state.runs[index].task;
+    assert!(
+        task != of,
+        "preparation blocks a task whose `of` label names itself"
+    );
+    if state.waiting.len() == WAITING_MAX {
+        let reason = format!(
+            "Rider holds {WAITING_MAX} tasks waiting for their `of` task already; unblock this \
+             task once task #{} is done.",
+            of.0
+        );
+        let settlement = Settlement::Block {
+            kind: "rider_error".to_string(),
+            reason,
+        };
+        begin_settle(state, index, settlement, actions);
+        return;
+    }
+    state.waiting.push((task, of));
+    begin_settle(state, index, Settlement::Release, actions);
+    assert!(state.waiting.len() <= WAITING_MAX);
+}
+
 fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
     let roles = &state.config.roles;
     let builders = state.runs.iter().filter(|run| roles[run.role].builds);
@@ -1997,7 +2065,8 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
                 || task.onto == Some(run.task)
                 || (task.onto.is_some() && closing(run) && run.branch.is_some())
         });
-        if task.state != TaskState::Ready || taken {
+        let waiting = state.waiting.iter().any(|(id, _)| *id == task.id);
+        if task.state != TaskState::Ready || taken || waiting || held_by_of(state, task) {
             continue;
         }
         let slots = state.config.roles[role].slots;
