@@ -9,7 +9,7 @@ use crate::world::World;
 const HEAD: &str = "1111111111111111111111111111111111111111";
 const MAIN_COMMIT: &str = "2222222222222222222222222222222222222222";
 const PR_URL: &str = "https://github.com/acme/widgets/pull/";
-const HEADER: &str = " #  KIND     TURN    STATE      AGE  NEXT           PR";
+const HEADER: &str = "  #  KIND     TURN    STATE       AGE  NEXT           PR";
 const CARD: &str = "Decide the cache key.\nEither the tenant or the session.";
 
 fn given_a_queue_toml(world: &World, repo: &str) {
@@ -117,12 +117,12 @@ fn given_the_example_queue(world: &World) -> String {
 fn expected_items(decision: &str) -> String {
     format!(
         "{HEADER}
- 1  decide   owner   open        2h  decide         decisions #{decision}
- 2  review   owner   approve     3h  approve        {PR_URL}412
- 3  respond  owner   2 threads   1d  post-drafts    {PR_URL}398
- 4  review   owner   concerns    5h  read-findings  {PR_URL}431
- -  review   agents  preparing  12m  -              {PR_URL}440
- -  review   author  waiting     2d  -              {PR_URL}377
+  1  decide   owner   open         2h  decide         decisions #{decision}
+  2  review   owner   approve      3h  approve        {PR_URL}412
+  3  respond  owner   2 threads    1d  post-drafts    {PR_URL}398
+  4  review   owner   concerns     5h  read-findings  {PR_URL}431
+  -  review   agents  preparing   12m  -              {PR_URL}440
+  -  review   author  waiting      2d  -              {PR_URL}377
 
 {CARD}
 "
@@ -197,9 +197,10 @@ fn rider_queue_json_prints_every_item_with_every_label_in_order() {
     assert_eq!(output.code, Some(0), "{output:?}");
     let items: Value = serde_json::from_str(&output.stdout).expect("rider queue --json is JSON");
     let item = |id: &str, rank: Value, labels: &[(String, String)]| {
-        let labels: serde_json::Map<String, Value> = (labels.iter())
+        let mut labels: serde_json::Map<String, Value> = (labels.iter())
             .map(|(key, value)| (key.clone(), Value::String(value.clone())))
             .collect();
+        labels.insert("board.task".to_string(), Value::from("ready"));
         serde_json::json!({
             "id": id.parse::<u64>().expect("an id"),
             "channel": "queue",
@@ -234,14 +235,28 @@ fn rider_queue_prints_an_item_with_a_malformed_label_as_invalid_naming_the_key()
         .filter(|(key, _)| key != "prep")
         .collect();
     let unprepared = given_an_item(&world, &with(unprepared, "source", "mine"));
+    let no_task = with(
+        an_owner_item(399, "review", &ago(60), "none", "approve"),
+        "prep",
+        "missing-task-id",
+    );
+    let no_task = given_an_item(&world, &no_task);
+    let no_commit = with(
+        an_owner_item(400, "review", &ago(60), "none", "approve"),
+        "head",
+        "main",
+    );
+    let no_commit = given_an_item(&world, &no_commit);
 
     let output = when_rider_runs(&world, &["queue"]);
 
     assert_eq!(output.code, Some(0), "{output:?}");
     let expected = format!(
         "{HEADER}
- !  invalid #{bad}: label kind \"bogus\" is not review, respond or unblock
- !  invalid #{unprepared}: label prep is missing
+  !  invalid #{bad}: label kind \"bogus\" is not review, respond or unblock
+  !  invalid #{unprepared}: label prep is missing
+  !  invalid #{no_task}: label prep \"missing-task-id\" is not a task id
+  !  invalid #{no_commit}: label head \"main\" is not a commit id
 
 daemon not running
 "
@@ -284,6 +299,168 @@ fn rider_queue_without_an_opted_in_repository_exits_1_with_the_toml_to_add() {
         "no repository is opted in to the queue; add to {}:\n\
          [repo.\"/path/to/checkout\"]\nqueue = true\n",
         world.home.join("queue.toml").display()
+    );
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn rider_queue_ranks_by_pin_then_tier_whatever_the_creation_order() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo_label().to_string();
+    given_a_queue_toml(&world, &repo);
+    given_an_item(
+        &world,
+        &an_owner_item(1, "review", &ago(9 * 3600), "none", "read-findings"),
+    );
+    let respond = an_owner_item(2, "respond", &ago(3600), "none", "post-drafts");
+    given_an_item(
+        &world,
+        &with(with(respond, "threads", "1"), "source", "mine"),
+    );
+    let follow_up = an_owner_item(3, "review", &ago(60), "approve", "approve");
+    given_an_item(&world, &with(follow_up, "seen", HEAD));
+    let pinned = an_owner_item(4, "review", &ago(60), "concerns", "read-findings");
+    given_an_item(&world, &with(pinned, "pin", "1"));
+
+    let output = when_rider_runs(&world, &["queue"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let links: Vec<&str> = (output.stdout.lines())
+        .filter(|line| line.starts_with("  ") && line.contains(PR_URL))
+        .filter_map(|line| line.rsplit('/').next())
+        .collect();
+    assert_eq!(links, vec!["4", "3", "2", "1"], "{output:?}");
+}
+
+#[test]
+fn rider_queue_holds_a_stacked_item_back_until_its_prerequisite_reaches_the_owner() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo_label().to_string();
+    given_a_queue_toml(&world, &repo);
+    let preparing = with(
+        an_owner_item(10, "review", &ago(60), "none", "read-findings"),
+        "turn",
+        "agents",
+    );
+    let preparing = given_an_item(&world, &preparing);
+    let stacked = given_an_item(
+        &world,
+        &an_owner_item(11, "review", &ago(3600), "approve", "approve"),
+    );
+    world.vb_lead(&["tasks", "needs", &stacked, &preparing], None);
+
+    let output = when_rider_runs(&world, &["queue"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = format!(
+        "{HEADER}
+  -  review   owner   stacked      1h  -              {PR_URL}11
+  -  review   agents  preparing    1m  -              {PR_URL}10
+
+daemon not running
+"
+    );
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn rider_queue_prints_the_items_when_the_daemon_drops_the_status_request() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo_label().to_string();
+    given_a_queue_toml(&world, &repo);
+    given_an_item(
+        &world,
+        &an_owner_item(5, "review", &ago(60), "concerns", "read-findings"),
+    );
+    let listener = std::os::unix::net::UnixListener::bind(world.home.join("rider.sock"))
+        .expect("bind a socket at rider.sock");
+    let dropper = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept the status request");
+        drop(stream);
+    });
+
+    let output = when_rider_runs(&world, &["queue"]);
+
+    dropper.join().expect("the socket thread ends");
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = format!(
+        "{HEADER}
+  1  review   owner   concerns     1m  read-findings  {PR_URL}5
+
+Review a pull request of acme.
+
+running work unavailable: the daemon did not answer
+"
+    );
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn rider_queue_keeps_its_columns_for_three_digit_ranks_and_many_threads() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo_label().to_string();
+    given_a_queue_toml(&world, &repo);
+    let respond = an_owner_item(1000, "respond", &ago(7200), "none", "post-drafts");
+    given_an_item(
+        &world,
+        &with(with(respond, "threads", "12"), "source", "mine"),
+    );
+    for n in 0..100 {
+        given_an_item(
+            &world,
+            &an_owner_item(n, "review", &ago(60), "none", "approve"),
+        );
+    }
+
+    let output = when_rider_runs(&world, &["queue"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let lines: Vec<&str> = output.stdout.lines().collect();
+    let column = HEADER.find("PR").expect("a PR column");
+    let rows: Vec<&&str> = (lines.iter())
+        .filter(|line| line.contains(PR_URL))
+        .collect();
+    assert_eq!(rows.len(), 101, "{output:?}");
+    let shifted: Vec<&&&str> = (rows.iter())
+        .filter(|row| row.find(PR_URL) != Some(column))
+        .collect();
+    assert_eq!(shifted, Vec::<&&&str>::new());
+    let respond_row = format!("  1  respond  owner   9+ threads   2h  post-drafts    {PR_URL}1000");
+    assert_eq!(lines.get(1), Some(&respond_row.as_str()));
+    assert!(lines[101].starts_with("101  review"), "{output:?}");
+}
+
+#[test]
+fn rider_queue_reports_a_second_open_task_for_one_pr_as_invalid() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let repo = world.repo_label().to_string();
+    given_a_queue_toml(&world, &repo);
+    let item = an_owner_item(13, "review", &ago(60), "concerns", "read-findings");
+    let first = given_an_item(&world, &item);
+    let second = given_an_item(&world, &item);
+
+    let output = when_rider_runs(&world, &["queue"]);
+
+    assert_eq!(output.code, Some(0), "{output:?}");
+    let expected = format!(
+        "{HEADER}
+  1  review   owner   concerns     1m  read-findings  {PR_URL}13
+  !  invalid #{second}: label pr \"acme/widgets#13\" is also on #{first}
+
+Review a pull request of acme.
+
+daemon not running
+"
     );
     assert_eq!(output.stdout, expected);
 }
