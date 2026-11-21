@@ -60,7 +60,22 @@ const CLAIM_LEASE: &str = "1h";
 /// Failure reasons that mean a claim found nothing, not that it went wrong.
 const CLAIM_EMPTY_REASONS: [&str; 2] = ["timeout", "nothing_ready"];
 /// The first word of every command `vb` is run with.
-const VERBS: [&str; 5] = ["read", "tasks", "label", "reply", "post"];
+const VERBS: [&str; 6] = ["read", "tasks", "label", "reply", "post", "schemas"];
+pub const RIDER_SCHEMAS: [(&str, &str); 3] = [
+    (
+        "rider-result@2",
+        include_str!("../skills/ride-swarm/schemas/rider-result@2.json"),
+    ),
+    (
+        "rider-finding@1",
+        include_str!("../skills/ride-swarm/schemas/rider-finding.json"),
+    ),
+    (
+        "rider-github@1",
+        include_str!("../skills/ride-swarm/schemas/rider-github@1.json"),
+    ),
+];
+const SCHEMAS_LISTED_MAX: usize = 1024;
 /// The number of global arguments: `--json --url <url> --as <profile>`.
 const GLOBAL_ARGS_LEN: usize = 5;
 /// The longest decimal ID that fits a `u64`.
@@ -143,6 +158,21 @@ pub struct Listing {
     pub cursor: Cursor,
     /// The listed tasks past `TASKS_MAX`, which the listing does not return.
     pub left_out: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Amendment {
+    pub id: Cursor,
+    pub profile: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    pub state: TaskState,
+    pub epoch: u64,
+    pub cursor: Cursor,
+    pub amendments: Vec<Amendment>,
 }
 
 #[derive(Debug)]
@@ -285,6 +315,9 @@ pub trait Board {
     ) -> Result<Listing, BoardError>;
     /// The `rider-finding` replies in task `id`'s thread whose severity is `blocking`.
     fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError>;
+    fn thread(&self, id: TaskId) -> Result<Thread, BoardError>;
+    fn schema_ids(&self) -> Result<Vec<String>, BoardError>;
+    fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError>;
     fn create_task(&self, task: &NewTask) -> Result<TaskId, BoardError>;
 }
 
@@ -294,6 +327,19 @@ pub struct NewTask<'a> {
     pub labels: &'a [(&'a str, &'a str)],
     pub needs: Option<TaskId>,
     pub key: &'a str,
+}
+
+pub fn register_schemas(board: &dyn Board) -> Result<Vec<&'static str>, BoardError> {
+    let known = board.schema_ids()?;
+    let mut registered = Vec::with_capacity(RIDER_SCHEMAS.len());
+    for (id, json) in RIDER_SCHEMAS {
+        if !known.iter().any(|known| known == id) {
+            board.create_schema(id, json)?;
+            registered.push(id);
+        }
+    }
+    assert!(registered.len() <= RIDER_SCHEMAS.len());
+    Ok(registered)
 }
 
 /// Reaches the board by running `vb`, one process per call.
@@ -372,6 +418,11 @@ enum Command<'a> {
         labels: &'a [(&'a str, &'a str)],
         needs: Option<TaskId>,
         key: &'a str,
+    },
+    Schemas,
+    CreateSchema {
+        id: &'a str,
+        json: &'a str,
     },
 }
 
@@ -530,6 +581,11 @@ fn command_words(command: &Command) -> (Vec<String>, Option<String>) {
             }
             (words, None)
         }
+        Command::Schemas => (to_strings(&["schemas", "list"]), None),
+        // The schema's JSON goes on stdin; `--file -` tells `vb` to read it there.
+        Command::CreateSchema { id, .. } => {
+            (to_strings(&["schemas", "create", id, "--file", "-"]), None)
+        }
     };
     assert!(
         VERBS.contains(&words[0].as_str()),
@@ -560,13 +616,21 @@ fn command_args(command: &Command, url: &str, profile: &str) -> Vec<String> {
     args
 }
 
-/// The text `command` sends on stdin, if any. Only a reply does: it may span many lines.
+/// The text `command` sends on stdin, if any: a reply's text or a schema's JSON, either of
+/// which may span many lines.
 fn command_stdin<'a>(command: &Command<'a>) -> Option<&'a str> {
     let stdin = match *command {
         Command::Reply { text, .. } | Command::Create { text, .. } => Some(text),
+        Command::CreateSchema { json, .. } => Some(json),
         _ => None,
     };
-    assert!(stdin.is_none() || matches!(command, Command::Reply { .. } | Command::Create { .. }));
+    assert!(
+        stdin.is_none()
+            || matches!(
+                command,
+                Command::Reply { .. } | Command::Create { .. } | Command::CreateSchema { .. }
+            )
+    );
     stdin
 }
 
@@ -589,6 +653,8 @@ fn command_limit(command: &Command) -> (&'static str, u32) {
         Command::Fail { .. } => ("tasks fail", 0),
         Command::Block { .. } => ("tasks block", 0),
         Command::Create { .. } => ("tasks create", 0),
+        Command::Schemas => ("schemas list", 0),
+        Command::CreateSchema { .. } => ("schemas create", 0),
     };
     assert!(
         wait_seconds <= WAIT_SECONDS_MAX,
@@ -610,7 +676,9 @@ fn expected_write(command: &Command) -> Option<(&'static str, TaskId)> {
         | Command::Channel { .. }
         | Command::PostRoot { .. }
         | Command::Create { .. }
-        | Command::List { .. } => None,
+        | Command::List { .. }
+        | Command::Schemas
+        | Command::CreateSchema { .. } => None,
         Command::Release { id } => Some(("released", id)),
         Command::Label { id, .. } => Some(("labeled", id)),
         Command::Reply { id, .. } | Command::Post { id, .. } => Some(("posted", id)),
@@ -698,6 +766,44 @@ struct WireRead {
     message: WireMessage,
 }
 
+#[derive(Deserialize)]
+struct WireTaskThread {
+    message: WireMessage,
+    replies: Vec<WireTextReply>,
+    cursor: String,
+}
+
+#[derive(Deserialize)]
+struct WireThreadAuthors {
+    message: WireAuthoredTask,
+}
+
+#[derive(Deserialize)]
+struct WireAuthoredTask {
+    by: WireBy,
+    task: WireOwnedTask,
+}
+
+#[derive(Deserialize)]
+struct WireOwnedTask {
+    owner: String,
+}
+
+#[derive(Deserialize)]
+struct WireTextReply {
+    id: String,
+    text: String,
+    by: WireBy,
+}
+
+#[derive(Deserialize)]
+struct WireBy {
+    actor: String,
+    principal: String,
+    #[serde(deserialize_with = "nullable")]
+    profile: Option<String>,
+}
+
 /// The replies of `vb read <id> --json`, each with its structured blocks.
 #[derive(Deserialize)]
 struct WireReplies {
@@ -779,6 +885,16 @@ struct WireTaskRef {
 struct WireMessageRef {
     id: String,
     re: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireSchemas {
+    schemas: Vec<WireSchema>,
+}
+
+#[derive(Deserialize)]
+struct WireSchema {
+    id: String,
 }
 
 /// A write's output: `{task, outcome}` or `{message, outcome}`.
@@ -975,6 +1091,50 @@ pub fn parse_blocking_findings(json: &str) -> Result<usize, BoardError> {
     }
     assert!(blocking <= OUTPUT_BYTES_MAX);
     Ok(blocking)
+}
+
+pub fn parse_thread(id: TaskId, json: &str) -> Result<Thread, BoardError> {
+    let thread: WireTaskThread = parse(json)?;
+    let authors: WireThreadAuthors = parse(json)?;
+    let (owner, creator) = (authors.message.task.owner, authors.message.by.actor);
+    if owner.is_empty() || creator.is_empty() {
+        return Err(BoardError::Parse(
+            "a task without its owner or creator".into(),
+        ));
+    }
+    if thread.replies.len() > REPLIES_MAX {
+        let count = thread.replies.len();
+        return Err(BoardError::Parse(format!(
+            "a thread of {count} replies, over {REPLIES_MAX}"
+        )));
+    }
+    let view = view_from_wire(thread.message)?;
+    if view.id != id {
+        return Err(BoardError::Parse(format!(
+            "asked for {id:?}, read {:?}",
+            view.id
+        )));
+    }
+    let cursor = Cursor(parse_id_text(&thread.cursor)?.0);
+    let mut amendments: Vec<Amendment> = Vec::new();
+    for reply in thread.replies {
+        let by = &reply.by;
+        // The board verifies `actor` and `principal`; a profile is only a name its login picks.
+        let amends = by.principal == owner && (by.actor == owner || by.actor == creator);
+        if !amends {
+            continue;
+        }
+        let id = Cursor(parse_id_text(&reply.id)?.0);
+        let (profile, text) = (reply.by.profile, reply.text);
+        amendments.push(Amendment { id, profile, text });
+    }
+    assert!(amendments.len() <= REPLIES_MAX);
+    Ok(Thread {
+        state: view.state,
+        epoch: view.epoch,
+        cursor,
+        amendments,
+    })
 }
 
 /// The claimed task from the output of a successful `vb tasks claim --json`.
@@ -1570,6 +1730,31 @@ impl Board for VbCli {
         }
         parse_blocking_findings(&json)
     }
+
+    fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
+        parse_thread(id, &self.read(&Command::Read { id })?)
+    }
+
+    fn schema_ids(&self) -> Result<Vec<String>, BoardError> {
+        let listed: WireSchemas = parse(&self.read(&Command::Schemas)?)?;
+        if listed.schemas.len() > SCHEMAS_LISTED_MAX {
+            return Err(BoardError::Parse(format!(
+                "more than {SCHEMAS_LISTED_MAX} schemas listed"
+            )));
+        }
+        let ids: Vec<String> = listed.schemas.into_iter().map(|schema| schema.id).collect();
+        assert!(ids.len() <= SCHEMAS_LISTED_MAX);
+        Ok(ids)
+    }
+
+    fn create_schema(&self, id: &str, json: &str) -> Result<(), BoardError> {
+        assert!(
+            id.contains('@') && !id.starts_with('-'),
+            "a schema is name@version"
+        );
+        assert!(!json.is_empty() && json.len() <= OUTPUT_BYTES_MAX);
+        self.read(&Command::CreateSchema { id, json }).map(drop)
+    }
 }
 
 impl VbCli {
@@ -1643,7 +1828,7 @@ pub mod testing {
     use std::collections::VecDeque;
 
     use super::{
-        Board, BoardError, ListedTask, Listing, TaskId, TaskState, TaskView, check_message,
+        Board, BoardError, ListedTask, Listing, TaskId, TaskState, TaskView, Thread, check_message,
     };
     use crate::feed::Cursor;
 
@@ -1777,6 +1962,15 @@ pub mod testing {
             Ok("rider board 00000000000000000000000000000000".to_string())
         }
 
+        fn schema_ids(&self) -> Result<Vec<String>, BoardError> {
+            self.record("schema_ids".to_string())?;
+            Ok(Vec::new())
+        }
+
+        fn create_schema(&self, id: &str, _: &str) -> Result<(), BoardError> {
+            self.record(format!("create_schema {id}"))
+        }
+
         fn list_open(&self, subtree: &str) -> Result<Listing, BoardError> {
             self.record(format!("list_open {subtree}"))?;
             let closed = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
@@ -1816,6 +2010,18 @@ pub mod testing {
 
         fn blocking_findings(&self, id: TaskId) -> Result<usize, BoardError> {
             self.read_task(id).map(|_| 0)
+        }
+
+        fn thread(&self, id: TaskId) -> Result<Thread, BoardError> {
+            let view = self.read_task(id)?;
+            let (state, epoch, cursor) = (view.state, view.epoch, view.version);
+            let amendments = Vec::new();
+            Ok(Thread {
+                state,
+                epoch,
+                cursor,
+                amendments,
+            })
         }
     }
 }

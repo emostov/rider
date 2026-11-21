@@ -3,6 +3,7 @@
 
 mod board_feed;
 mod brief_settle;
+mod codex_review;
 #[expect(
     dead_code,
     reason = "behaviours and readers for the scenarios still to come"
@@ -10,7 +11,11 @@ mod brief_settle;
 mod fake_agent;
 mod github;
 mod harness_cli;
+mod queue;
+mod queue_unclaimed;
+mod review_pr;
 mod run_task;
+mod skills;
 mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
@@ -663,22 +668,114 @@ fn an_unknown_field_in_rider_toml_stops_the_daemon_naming_the_field() {
 }
 
 #[test]
-fn a_user_prompt_at_a_built_in_prompts_path_is_refused_naming_the_path() {
-    let Some(world) = given_a_board_and_a_repository() else {
+fn a_user_prompt_under_an_old_prompts_directory_is_used_and_left_as_it_is() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
         return;
     };
     let prompts = world.home.join("prompts");
     fs::create_dir_all(&prompts).expect("create the prompts directory");
-    fs::write(prompts.join("review.md"), "My own review prompt.\n").expect("write a prompt");
-    given_a_rider_toml(&world, "[roles.review]\nprompt = \"prompts/review.md\"\n");
+    fs::write(prompts.join("implement.md"), "My own implement prompt.\n").expect("write it");
+    given_a_rider_toml(
+        &world,
+        "[roles.implement]\nprompt = \"prompts/implement.md\"\n",
+    );
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
 
-    let output = when_rider_runs(&world, &["daemon"]);
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(
+        sent.starts_with("My own implement prompt.\n\n# Task "),
+        "{sent}"
+    );
+    let kept = fs::read_to_string(prompts.join("implement.md")).expect("read the prompt");
+    assert_eq!(kept, "My own implement prompt.\n");
+}
+
+#[test]
+fn a_worker_gets_its_built_in_prompt_from_the_binary_and_rider_writes_no_prompt_files() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let built_in = include_str!("../../prompts/implement.md").trim_end();
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(sent.starts_with(&format!("{built_in}\n\n")), "{sent}");
+    assert!(!world.home.join("prompts").exists());
+}
+
+#[test]
+fn the_implement_prompt_carries_the_slop_rules_and_names_no_rules_file() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let rules = include_str!("../../prompts/slop-rules.md").trim_end();
+    let sent = agent_prompt(&world, &task, 0);
+    assert!(sent.contains(rules), "{sent}");
+    assert!(!sent.contains("prompts/slop-rules.md"), "{sent}");
+}
+
+#[test]
+fn rider_daemon_registers_its_schemas_on_a_fresh_board_before_claiming() {
+    let Some(mut world) = given_a_fresh_board_and_a_repository() else {
+        return;
+    };
+    let calls = world.root.join("vb-calls");
+    given_vb_records_its_calls(&world, &calls);
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    assert_eq!(
+        rider_schemas_on_the_board(&world),
+        rider_schemas_in_the_source()
+    );
+    assert_eq!(task_records(&world, &task, "rider-result").len(), 1);
+    let calls = fs::read_to_string(&calls).expect("read the vb calls");
+    let calls: Vec<&str> = calls.lines().collect();
+    let first = |call: &str| calls.iter().position(|line| *line == call);
+    let (create, claim) = (first("schemas create"), first("tasks claim"));
+    assert!(
+        create
+            .zip(claim)
+            .is_some_and(|(create, claim)| create < claim),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn rider_up_reports_a_refused_schema_registration_and_the_daemon_log() {
+    let Some(world) = given_a_fresh_board_and_a_repository() else {
+        return;
+    };
+    given_vb_refuses_to_create_schemas(&world);
+    when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+
+    let output = when_rider_runs(&world, &["up"]);
 
     assert_eq!(output.code, Some(1), "{output:?}");
-    assert!(output.stderr.contains("roles.review.prompt"), "{output:?}");
-    assert!(output.stderr.contains("prompts/review.md"), "{output:?}");
-    let kept = fs::read_to_string(prompts.join("review.md")).expect("read the prompt");
-    assert_eq!(kept, "My own review prompt.\n");
+    assert!(
+        output.stderr.contains("could not register Rider's schemas"),
+        "{output:?}"
+    );
+    assert!(output.stderr.contains("schemas refused"), "{output:?}");
+    let log = world.home.join("daemon.log");
+    assert!(
+        output.stderr.contains(&log.display().to_string()),
+        "{output:?}"
+    );
+    assert_eq!(tasks_in_state(&world, "ready").len(), 1);
 }
 
 #[test]
@@ -882,6 +979,49 @@ fn rider_config_for_a_repository_prints_its_merged_role_table() {
         "skills = [\"polish-branch\"]\n",
     );
     assert_eq!(merged.stdout, merged_expected);
+}
+
+#[test]
+fn rider_config_for_a_repository_that_opts_into_the_queue_prints_it() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(
+        &world,
+        &format!("[repo.\"{}\"]\nqueue = true\n", world.repo_label()),
+    );
+
+    let plain = when_rider_runs(&world, &["config"]);
+    let queued = when_rider_runs(&world, &["config", "--repo", world.repo_label()]);
+
+    assert_eq!(plain.code, Some(0), "{plain:?}");
+    assert_eq!(queued.code, Some(0), "{queued:?}");
+    let default = include_str!("rider-config-default.toml");
+    assert_eq!(plain.stdout, default);
+    let section = format!("\n[repo.\"{}\"]\nqueue = true\n", world.repo_label());
+    assert_eq!(queued.stdout, format!("{default}{section}"));
+}
+
+#[test]
+fn rider_config_refuses_a_queue_value_other_than_true_naming_the_field() {
+    let Some(world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let field = format!("repo.\"{}\".queue", world.repo_label());
+
+    for value in ["false", "\"true\"", "\"yes\"", "1"] {
+        let toml = format!("[repo.\"{}\"]\nqueue = {value}\n", world.repo_label());
+        given_a_rider_toml(&world, &toml);
+
+        let output = when_rider_runs(&world, &["config", "--repo", world.repo_label()]);
+
+        assert_eq!(output.code, Some(1), "{value}: {output:?}");
+        assert!(output.stderr.contains(&field), "{value}: {output:?}");
+        assert!(
+            output.stderr.contains("must be true"),
+            "{value}: {output:?}"
+        );
+    }
 }
 
 /// `table` with `from` replaced by `to` inside the `[roles.<role>]` section.
@@ -2377,6 +2517,7 @@ const LOG_POLL_MILLIS: u64 = 50;
 /// The board's shortest lease, with time for it to notice the lapse.
 const LEASE_LAPSE_SECONDS_MAX: u64 = 90;
 const LEASE_POLL_MILLIS: u64 = 500;
+const RESUME_SECONDS: u64 = 3;
 
 #[test]
 fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_worktree() {
@@ -2409,6 +2550,192 @@ fn a_daemon_that_crashes_while_its_agent_runs_resumes_the_claim_in_the_same_work
     assert_eq!(task_label(&world, &task, "attempt"), None);
     when_the_daemon_is_sent_sigterm(&world);
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
+fn an_onto_task_completes_after_a_daemon_crash_between_complete_and_worktree_release() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
+    let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
+    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_a_running_daemon(&mut world);
+    when_the_file_exists(&world, &posted);
+    when_the_daemon_crashes(&mut world);
+    fs::write(&release, "").expect("release the held post");
+    assert_eq!(task_state(&world, &built), "completed");
+
+    given_a_running_daemon(&mut world);
+    let states = when_the_tasks_settle(&world, &[&fix]);
+
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["completed"], "{}", world.daemon_log());
+    assert_eq!(agent_runs_for(&world, &fix).len(), 1);
+    then_the_worktree_is_removed(&world, &built);
+}
+
+#[test]
+fn a_worktree_left_by_a_crash_that_another_board_made_is_kept_and_the_onto_task_blocks() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let fix = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    given_the_agent_will(&world, &fix, &[Behaviour::Commit]);
+    let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
+    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_a_running_daemon(&mut world);
+    when_the_file_exists(&world, &posted);
+    when_the_daemon_crashes(&mut world);
+    fs::write(&release, "").expect("release the held post");
+    let left = worktree_dir(&world, &built);
+    let git_dir = world.git(&left, &["rev-parse", "--absolute-git-dir"]);
+    fs::write(
+        Path::new(git_dir.stdout.trim()).join(".rider-board"),
+        "another board",
+    )
+    .expect("mark the worktree as another board's");
+
+    given_a_running_daemon(&mut world);
+    let states = when_the_tasks_settle(&world, &[&fix]);
+
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["blocked"], "{}", world.daemon_log());
+    assert!(left.exists(), "the other board's worktree was removed");
+}
+
+#[test]
+fn an_onto_task_completes_after_a_crash_left_a_later_fix_holding_the_branch() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &built, &[Behaviour::Commit]);
+    given_a_running_daemon(&mut world);
+    assert_eq!(when_the_tasks_settle(&world, &[&built]), vec!["completed"]);
+    let first = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix the work.", &built, &built, false),
+    );
+    let second = when_the_lead_creates(
+        &world,
+        &a_fix(&world, "Fix it again.", &built, &first, false),
+    );
+    given_the_agent_will(&world, &first, &[Behaviour::Commit]);
+    given_the_agent_will(&world, &second, &[Behaviour::Commit]);
+    let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
+    given_vb_waits_for_the_result_post(&world, &first, &posted, &release);
+    when_the_file_exists(&world, &posted);
+    when_the_daemon_crashes(&mut world);
+    fs::write(&release, "").expect("release the held post");
+    assert_eq!(task_state(&world, &first), "completed");
+
+    given_a_running_daemon(&mut world);
+    let states = when_the_tasks_settle(&world, &[&second]);
+
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(states, vec!["completed"], "{}", world.daemon_log());
+    then_the_worktree_is_removed(&world, &first);
+}
+
+#[test]
+fn a_second_restart_within_the_lease_leaves_an_unidentified_live_agent_s_task_alone() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::Commit]);
+    given_a_running_daemon(&mut world);
+    let leftover = when_the_agent_has_started(&world, &task);
+    when_agents_json_names(&world, leftover.pid);
+    when_the_daemon_crashes(&mut world);
+    fs::remove_file(world.home.join("agents.json")).expect("remove agents.json");
+    let ack = world.home.join("agents").join(format!("{task}.ack"));
+    fs::remove_file(&ack).expect("remove the acknowledgement");
+    let left = format!("leaving #{task} to its lease");
+
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows(&world, &left);
+    let pid_file = world.home.join("agents").join(format!("{task}.pid"));
+    assert!(
+        !pid_file.exists(),
+        "a new attempt's pid file names the leftover agent"
+    );
+    when_the_daemon_crashes(&mut world);
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows_twice(&world, &left);
+    thread::sleep(Duration::from_secs(RESUME_SECONDS));
+
+    let runs = agent_runs_for(&world, &task);
+    assert!(is_alive(leftover.pid), "the leftover agent was stopped");
+    world.release_agent(&task);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(runs.len(), 1, "{}", world.daemon_log());
+    assert!(when_the_process_ends_within(leftover.pid, 10));
+}
+
+#[test]
+fn a_second_restart_within_the_lease_resumes_nothing_when_the_pid_files_cannot_be_read() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::Hold, Behaviour::Commit]);
+    given_a_running_daemon(&mut world);
+    let leftover = when_the_agent_has_started(&world, &task);
+    when_agents_json_names(&world, leftover.pid);
+    when_the_daemon_crashes(&mut world);
+    fs::write(world.home.join("agents.json"), "{").expect("corrupt agents.json");
+    fs::write(world.home.join("agents").join("bad.pid"), "1").expect("add a bad pid file");
+    let left = "leaving every held claim to its lease";
+
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows(&world, left);
+    when_the_daemon_crashes(&mut world);
+    given_a_running_daemon(&mut world);
+    when_the_daemon_log_shows_twice(&world, left);
+    thread::sleep(Duration::from_secs(RESUME_SECONDS));
+
+    let runs = agent_runs_for(&world, &task);
+    assert!(is_alive(leftover.pid), "the leftover agent was stopped");
+    world.release_agent(&task);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+    assert_eq!(runs.len(), 1, "{}", world.daemon_log());
+    assert!(when_the_process_ends_within(leftover.pid, 10));
+}
+
+fn when_the_daemon_log_shows_twice(world: &World, text: &str) {
+    let log = world.home.join("daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(SETTLE_SECONDS_MAX);
+    while fs::read_to_string(&log)
+        .unwrap_or_default()
+        .matches(text)
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon log never showed {text} twice:\n{}",
+            world.daemon_log()
+        );
+        thread::sleep(Duration::from_millis(LOG_POLL_MILLIS));
+    }
 }
 
 #[test]
@@ -2556,12 +2883,15 @@ fn an_event_the_lead_caused_does_not_end_the_wait() {
         return;
     };
     let held = when_the_lead_creates(&world, &NewTask::new("Hold this part back."));
+    let held_too = when_the_lead_creates(&world, &NewTask::new("Hold this part back too."));
     let done = when_the_lead_creates(&world, &NewTask::new("Write this part."));
     given_the_lead_has_waited(&world);
     when_a_worker_claims(&world, "w-1", &done);
 
     let wait = when_rider_wait_starts(&world, &["--timeout", "1"]);
     world.vb_lead(&["tasks", "block", &held, "held by the lead"], None);
+    let legacy = world.vb_as("lead-legacy", &["tasks", "block", &held_too, "held"], None);
+    assert_eq!(legacy.code, Some(0), "{legacy:?}");
     when_the_worker_completes(&world, "w-1", &done);
     let output = then_rider_wait_ends(wait);
 
