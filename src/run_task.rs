@@ -68,6 +68,8 @@ const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the Claude session id of its latest completed attempt on one line,
 // then the repository it ran in.
 const SESSION_FILE: &str = "session";
+const RESULT_FILE: &str = "result.json";
+pub const RESULT_FILE_BYTES_MAX: u64 = 64 * 1024;
 const SESSION_FILE_BYTES_MAX: usize = 4096;
 const RESUMABLE_ROLES: [&str; 2] = ["implement", "light"];
 const DELIVERY_NOTE: &str = "These replies were posted in your task's thread while you worked. \
@@ -154,6 +156,15 @@ struct ResultRecord<'a> {
     summary: &'a str,
 }
 
+#[derive(Serialize)]
+struct Settlement<'a> {
+    repo: &'a str,
+    branch: Option<&'a str>,
+    head: &'a str,
+    summary: &'a str,
+    base: Option<&'a str>,
+}
+
 struct Evidence {
     clean: bool,
     on_branch: bool,
@@ -186,7 +197,7 @@ pub fn run_task(
         });
     }
     let launched = attempt.launch(board, launch);
-    let judgement = judge_attempt(id, board, &attempt, launched)?;
+    let judgement = judge_attempt(id, board, &attempt, &launched)?;
     settle_attempt(id, env, board, &attempt, &judgement)?;
     Ok(Ran::Settled(judgement.verdict))
 }
@@ -445,13 +456,14 @@ pub fn prepare_attempt(id: TaskId, env: &Env, board: &dyn Board) -> Result<Prepa
     let identity = board_identity(&env.board_url, board)?;
     let attempt = match prepare(brief, failed, start, env, board, &identity) {
         Ok(attempt) => attempt,
-        Err(block) => return Ok(block.prepared()),
+        Err(Unprepared::Blocked(block)) => return Ok(block.prepared()),
+        Err(Unprepared::CallFailed(error)) => return Err(RunError::Board(error)),
     };
     if let Some(branch) = &attempt.checkout.branch {
         if let Some(block) = label_branch(id, board, &view, branch)? {
             return Ok(block.prepared());
         }
-        if !attempt.retry && start_label.is_none() {
+        if start_label.is_none() && (attempt.failed == 0 || !attempt.retry) {
             board.set_label(id, START_LABEL, &attempt.checkout.start_head)?;
         }
     }
@@ -522,7 +534,7 @@ pub fn judge_attempt(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<Judgement, RunError> {
     if let Some(fresh) = attempt.fallback.as_ref()
         && attempt.fresh_log.get().is_some()
@@ -661,10 +673,10 @@ fn unneeded_on_branch(
         .tasks
         .iter()
         .map(|listed| &listed.view)
-        .filter(|task| task.id != view.id && in_repo(task, &brief.repo))
+        .filter(|task| task.id != view.id)
         .collect();
     let mut targets: Vec<TaskId> = vec![onto];
-    for task in &open {
+    for task in open.iter().filter(|task| in_repo(task, &brief.repo)) {
         let target = label(task, BRANCH_LABEL)
             .is_none()
             .then(|| parse_id_label(task, "onto").ok().flatten())
@@ -695,8 +707,9 @@ fn unneeded_on_branch(
         let inherited = works_onto
             .and_then(branch_of)
             .and_then(|(_, b)| b.as_deref());
-        own.or(inherited) == Some(branch.as_str())
-            || own.is_none() && works_onto.is_some_and(|id| members.contains(&id))
+        in_repo(task, &brief.repo)
+            && (own.or(inherited) == Some(branch.as_str())
+                || own.is_none() && works_onto.is_some_and(|id| members.contains(&id)))
     });
     let after = closure(&open, view.id, |task, members| {
         task.needs.iter().any(|need| members.contains(need))
@@ -752,7 +765,7 @@ fn prepare(
     env: &Env,
     board: &dyn Board,
     identity: &BoardIdentity,
-) -> Result<Attempt, Block> {
+) -> Result<Attempt, Unprepared> {
     assert!(failed < u16::from(ATTEMPTS_MAX));
     let dir = worktree::dir_for(&brief, &env.home);
     // `prepare` reuses anything at the path as found, so its presence marks a retry.
@@ -790,8 +803,13 @@ fn prepare(
         }),
         None => None,
     };
-    let checkout = worktree::prepare(&brief, board, &env.home, identity);
-    let checkout = checkout.map_err(|error| worktree_block(&error))?;
+    let checkout = match worktree::prepare(&brief, board, &env.home, identity) {
+        Ok(checkout) => checkout,
+        Err(WorktreeError::Board(error)) if error.call_failed() => {
+            return Err(Unprepared::CallFailed(error));
+        }
+        Err(error) => return Err(worktree_block(&error).into()),
+    };
     assert!(checkout.dir == dir);
     let log = log_path(&env.home, brief.id, failed + 1);
     assert!(log.is_absolute());
@@ -814,6 +832,17 @@ fn prepare(
         fresh_log: OnceLock::new(),
         stopped: AtomicBool::new(false),
     })
+}
+
+enum Unprepared {
+    Blocked(Block),
+    CallFailed(BoardError),
+}
+
+impl From<Block> for Unprepared {
+    fn from(block: Block) -> Unprepared {
+        Unprepared::Blocked(block)
+    }
 }
 
 fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
@@ -868,6 +897,13 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);
     Ok(session)
+}
+
+pub fn result_path(home: &Path, id: TaskId) -> PathBuf {
+    assert!(home.is_absolute());
+    let path = home.join(LOGS_DIR).join(id.0.to_string()).join(RESULT_FILE);
+    assert!(path.starts_with(home));
+    path
 }
 
 fn session_path(home: &Path, id: TaskId) -> PathBuf {
@@ -1077,7 +1113,7 @@ fn inspect(
     id: TaskId,
     board: &dyn Board,
     attempt: &Attempt,
-    launched: Result<Exit, HarnessError>,
+    launched: &Result<Exit, HarnessError>,
 ) -> Result<(Verdict, Option<Work>), RunError> {
     let fail = |reason: String| (Verdict::Fail { reason }, None);
     let state_after = board.read_task(id)?.state;
@@ -1088,7 +1124,7 @@ fn inspect(
         other => return Err(RunError::LostClaim(other)),
     }
     let exit = match launched {
-        Ok(exit) => exit,
+        Ok(exit) => *exit,
         Err(error) => return Ok(fail(error.to_string())),
     };
     let evidence = match evidence(attempt) {
@@ -1224,6 +1260,26 @@ fn complete(
         let _ = board.reply(id, &one_line(&note));
     }
     // The record and the note below only inform; losing them must not undo finished work.
+    let settlement = attempt.brief.repo.to_str().map(|repo| Settlement {
+        repo,
+        branch: record.branch,
+        head: record.head,
+        summary: record.summary,
+        base: attempt.checkout.base.as_deref(),
+    });
+    let path = result_path(&env.home, id);
+    let written = match settlement.map(|settlement| serde_json::to_string(&settlement)) {
+        Some(Ok(json)) => fs::write(&path, json).map_err(|error| error.to_string()),
+        Some(Err(error)) => Err(error.to_string()),
+        None => Err("the repository path is not UTF-8".to_string()),
+    };
+    if let Err(error) = written {
+        let note = format!(
+            "Rider could not record the result in {}: {error}.",
+            path.display()
+        );
+        let _ = board.reply(id, &one_line(&note));
+    }
     if let Ok(record) = serde_json::to_string(&record)
         && board.post_structured(id, RESULT_SCHEMA, &record).is_err()
     {
