@@ -134,7 +134,12 @@ These rules are yours to keep. Rider does not check them:
   effective value. Size tasks well inside that.
 - Sizing: changes that each take under about ten minutes and touch the same files go in one
   task, not several.
-- Review policy: each pull request gets one holistic `review` of its whole diff. Each
+- Review policy: each pull request gets two holistic reviews of its whole diff, run in
+  parallel, both `of=<the PR's top task>`: a `review` (`codex exec`: runs the tests and
+  mutation-tests coverage) and a `quick-review` (`codex review`: reads the diff). Then one fix
+  task for the blocking findings of both. After that fix, a `final-review` (Mythos 5.2, may run
+  tests) of the whole PR is the backstop; its blocking findings get one more fix task. Each
+
   `implement` task (design judgment) gets its own `review` task with `of` set to it, and three
   or four specific things to attack. A `light` task, a fix task for a finding, and a mechanical
   change get no review task of their own: the PR's holistic review covers them, and you read
@@ -143,7 +148,9 @@ These rules are yours to keep. Rider does not check them:
   earlier fixes on the branch are included.
 - Blocking means a failure reachable in normal operation, a leak of processes, files or claims,
   or a security hole. A finding that needs a rare combination is non-blocking.
-- At most two review rounds per piece of work. After the second review, either accept the piece
+- At most two review rounds per piece of work: for a PR, the parallel `review` and
+  `quick-review` pair is the first round and the `final-review` the second. After the second
+  review, either accept the piece
   and record the remaining findings in the project's deferred-work thread, or change the approach.
   Never start a third fix-and-review round on the same piece unchanged.
 - Only a blocking finding gets a fix task: `role=implement` (or `light`), `onto=<the

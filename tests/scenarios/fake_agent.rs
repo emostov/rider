@@ -1,4 +1,4 @@
-//! Fake `claude` and `codex` scripts that play a scripted worker, one behaviour per attempt.
+//! Fake `claude` and `codex` (also as `codex review`) scripts that play a scripted worker, one behaviour per attempt.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -127,6 +127,7 @@ fn script() -> String {
 world="${WORLD_VAR}"
 task="$BOARD_TASK"
 harness=$(basename "$0")
+[ "$harness" = codex ] && [ "$1" = review ] && harness=codex-review
 runs="$world/{RUNS_FILE}"
 attempt=$( (grep "^start $task " "$runs" 2>/dev/null || true) | wc -l | tr -d ' ')
 plan="$world/{BEHAVIOURS_DIR}/$task"
@@ -135,6 +136,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+[ "$harness" = codex-review ] && cat > "$world/{ARGS_DIR}/$task-$attempt.stdin"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -152,7 +154,10 @@ done
 [ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
 report() {{
-  if [ "$harness" = codex ]; then
+  if [ "$harness" = codex-review ]; then
+    printf 'OpenAI Codex v0.0.0\n--------\ncodex\n%s\n' "$summary" >&2
+    echo "$summary"
+  elif [ "$harness" = codex ]; then
     echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
     echo '{{"type":"turn.started"}}'
     item='"item":{{"id":"item_0","type":"agent_message","text":"'"$summary"'"}}'
@@ -231,6 +236,12 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
     assert!(path.is_file());
 }
 
+/// What attempt `attempt` of `task`, started as `codex review`, read from its standard input.
+pub fn stdin(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.stdin"));
+    fs::read_to_string(&path).expect("read an agent's standard input")
+}
+
 /// The arguments attempt `attempt` of `task` was started with, one per line.
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
@@ -267,7 +278,7 @@ pub struct Run {
     pub task: String,
     pub attempt: u32,
     pub pid: u32,
-    /// `claude` or `codex`.
+    /// `claude`, `codex`, or `codex-review`.
     pub harness: String,
     pub behaviour: String,
     pub dir: PathBuf,

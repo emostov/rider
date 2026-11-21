@@ -1,7 +1,12 @@
 //! `harness::run` against `fake_agent`, a stand-in for a real agent CLI.
 
-use rider::harness::{CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS, run};
+use rider::harness::{
+    CommandLine, Exit, HarnessError, Io, KILL_GRACE_SECONDS, last_message, run,
+    stream_reports_failure,
+};
+use rider::roles::Harness;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tempfile::{Builder, TempDir};
@@ -28,7 +33,18 @@ fn fake(args: &[&str]) -> CommandLine {
         program: env!("CARGO_BIN_EXE_fake_agent").to_string(),
         args: args.iter().map(|a| a.to_string()).collect(),
         env: Vec::new(),
+        io: Io::Stream,
     }
+}
+
+#[test]
+fn the_recorded_codex_review_output_is_its_final_text() {
+    let log = Path::new("fixtures/harness/codex-review.txt");
+    let recorded = fs::read_to_string(log).unwrap();
+    let text = last_message(&Harness::CodexReview, log).unwrap();
+    assert_eq!(text, recorded.trim());
+    assert!(text.starts_with("The new function returns the wrong number of items"));
+    assert!(!stream_reports_failure(&Harness::CodexReview, log));
 }
 
 #[test]

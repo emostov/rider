@@ -1,6 +1,7 @@
 //! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
+mod codex_review;
 #[expect(
     dead_code,
     reason = "behaviours and readers for the scenarios still to come"
