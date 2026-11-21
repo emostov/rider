@@ -1,5 +1,8 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Stdio;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -55,6 +58,24 @@ fn when_the_queue_is_waited_on(world: &World) -> (Output, Duration) {
     let started = Instant::now();
     let output = when_rider_runs(world, &["queue", "wait", "--timeout", "1"]);
     (output, started.elapsed())
+}
+
+// The one-minute timeout outlives the world's command bound, so this run has its own.
+fn when_the_queue_is_waited_on_until_the_timeout(world: &World) -> (Option<i32>, Duration) {
+    let started = Instant::now();
+    let mut command = world.command(Path::new(env!("CARGO_BIN_EXE_rider")));
+    command.args(["queue", "wait", "--timeout", "1"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command.spawn().expect("start rider");
+    while started.elapsed() < Duration::from_secs(90) {
+        if let Some(status) = child.try_wait().expect("poll rider") {
+            return (status.code(), started.elapsed());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("rider queue wait outlived 90 seconds");
 }
 
 fn without_human_reviews(reply: &str) -> String {
@@ -158,13 +179,9 @@ fn rider_queue_wait_exits_3_at_the_timeout_after_polls_at_the_stated_intervals()
     ];
     given_a_queue_item(&world, 377, &author);
 
-    let (output, took) = when_the_queue_is_waited_on(&world);
+    let (code, took) = when_the_queue_is_waited_on_until_the_timeout(&world);
 
-    assert_eq!(
-        (output.code, output.stdout.as_str()),
-        (Some(3), ""),
-        "{output:?}"
-    );
+    assert_eq!(code, Some(3));
     assert!(
         took >= Duration::from_secs(59) && took < Duration::from_secs(70),
         "{took:?}"

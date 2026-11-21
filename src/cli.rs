@@ -26,6 +26,7 @@ use crate::feed::{
 };
 use crate::harness::LOG_BYTES_MAX;
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
+use crate::queue_wait::{self, WaitError};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
 use crate::skills::{self, InstallDir, Outcome, Report, SKILLS, SkillsError};
@@ -101,6 +102,24 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// What `rider queue` does instead of printing the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum QueueAction {
+    /// Block until a packet comment, a new PR head or a PR comment differs from the labels.
+    ///
+    /// Exits 3, printing nothing, when the timeout passes first.
+    Wait {
+        /// The most minutes to wait.
+        #[arg(
+            long,
+            value_name = "MINUTES",
+            default_value_t = WAIT_MINUTES_DEFAULT,
+            value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
+        )]
+        timeout: u32,
+    },
+}
+
 /// One command to run.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -127,6 +146,8 @@ pub enum Command {
         /// Print the items with every label as JSON.
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        action: Option<QueueAction>,
     },
     /// Print the newest attempt's log of a task; -f follows it until the agent exits.
     Logs {
@@ -399,6 +420,7 @@ pub enum CliError {
     /// SIGTERM or SIGINT stopped `rider wait` before it had anything to print.
     Interrupted,
     Queue(QueueError),
+    QueueWait(WaitError),
     Skills(SkillsError),
     /// `rider skills install` left these skill directories as they were.
     SkillsRefused(usize),
@@ -428,6 +450,7 @@ impl fmt::Display for CliError {
             }
             CliError::Interrupted => write!(f, "stopped by a signal"),
             CliError::Queue(error) => write!(f, "{error}"),
+            CliError::QueueWait(error) => write!(f, "{error}"),
             CliError::Skills(error) => write!(f, "{error}"),
             CliError::SkillsRefused(count) => {
                 write!(f, "{count} skills were not installed; see the lines above")
@@ -461,7 +484,11 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
         Command::Down { now } => down(config, *now),
         Command::Status => status(config),
         Command::Agents => agents(config),
-        Command::Queue { json } => queue(config, *json),
+        Command::Queue { json, action: None } => queue(config, *json),
+        Command::Queue {
+            action: Some(QueueAction::Wait { timeout }),
+            ..
+        } => queue_wait(config, *timeout),
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),
@@ -869,7 +896,8 @@ fn task_row(task: &serde_json::Value) -> String {
     )
 }
 
-fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
+// The queue's board client, or `None` after printing the hint when no repository opted in.
+fn queue_board(config: &Config) -> Result<Option<VbCli>, CliError> {
     let repos = queue::opted_in(&config.home).map_err(CliError::Queue)?;
     if repos.is_empty() {
         let path = config.home.join(STAND_IN_FILE);
@@ -878,12 +906,38 @@ fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
             path.display()
         ));
         say("[repo.\"/path/to/checkout\"]\nqueue = true");
-        return Ok(1);
+        return Ok(None);
     }
-    let board = VbCli {
+    Ok(Some(VbCli {
         vb: config.vb_dir().join("vb"),
         url: config.board_url.clone(),
         profile: QUEUE_PROFILE.to_string(),
+    }))
+}
+
+fn queue_wait(config: &Config, minutes: u32) -> Result<u8, CliError> {
+    assert!(minutes <= WAIT_MINUTES_MAX);
+    let deadline = Instant::now() + Duration::from_secs(u64::from(minutes) * 60);
+    let Some(board) = queue_board(config)? else {
+        return Ok(1);
+    };
+    let listing = open_tasks(&board, QUEUE_CHANNEL).map_err(CliError::Board)?;
+    if listing.tasks.len().saturating_add(listing.left_out) > QUEUE_ITEMS_MAX {
+        return Err(CliError::Queue(QueueError::TooManyItems));
+    }
+    let watches = queue_wait::watches(&listing.tasks).map_err(CliError::QueueWait)?;
+    let lines = queue_wait::wait(&queue_wait::Cli, &watches, deadline);
+    let lines = lines.map_err(CliError::QueueWait)?;
+    if lines.is_empty() {
+        return Ok(3);
+    }
+    lines.iter().for_each(|line| say(line));
+    Ok(0)
+}
+
+fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
+    let Some(board) = queue_board(config)? else {
+        return Ok(1);
     };
     let listings = thread::scope(|scope| {
         let reads: Vec<_> = [QUEUE_CHANNEL, DECISIONS]
