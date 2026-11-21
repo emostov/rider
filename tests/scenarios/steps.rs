@@ -825,11 +825,28 @@ exec '{}' "$@"
 /// waits, up to `HELD_TENTHS_MAX` tenths of a second, until `release` exists.
 pub fn given_vb_waits_for(world: &World, word: &str, marker: &Path, release: &Path) {
     assert!(!word.is_empty() && !word.contains(['\'', ' ']));
+    given_vb_waits_on(world, &format!("*\" {word} \"*"), marker, release);
+}
+
+/// Given the result post of `task` touches `marker` and then waits like `given_vb_waits_for`.
+pub fn given_vb_waits_for_the_result_post(
+    world: &World,
+    task: &str,
+    marker: &Path,
+    release: &Path,
+) {
+    assert!(task.bytes().all(|b| b.is_ascii_digit()));
+    let pattern = format!("*\" post {task} --schema rider-result@2 \"*");
+    given_vb_waits_on(world, &pattern, marker, release);
+}
+
+fn given_vb_waits_on(world: &World, pattern: &str, marker: &Path, release: &Path) {
+    assert!(!pattern.contains('\''));
     let real = fs::read_link(&world.vb).expect("the Board CLI is a link");
     fs::remove_file(&world.vb).expect("remove the Board CLI link");
     let script = format!(
         r#"#!/bin/sh
-case " $* " in *" {word} "*)
+case " $* " in {pattern})
   : > '{}'
   n=0
   while [ ! -e '{}' ] && [ $n -lt {HELD_TENTHS_MAX} ]; do sleep 0.1; n=$((n + 1)); done;;
