@@ -1,6 +1,8 @@
 //! Black-box scenarios: the real `rider daemon` against a real board, a scratch repository, and
 //! fake agents, each written as Given / When / Then.
 
+mod board_feed;
+mod brief_settle;
 #[expect(
     dead_code,
     reason = "behaviours and readers for the scenarios still to come"
@@ -9,6 +11,7 @@ mod fake_agent;
 mod socket;
 #[expect(dead_code, reason = "steps for the scenarios still to come")]
 mod steps;
+mod worktree_git;
 mod world;
 
 use std::fs;
@@ -2031,6 +2034,32 @@ fn rider_up_starts_the_daemon_in_the_background_and_rider_down_stops_it() {
     let after = when_rider_runs(&world, &["status"]);
     assert_eq!(after.code, Some(1), "{after:?}");
     assert!(after.stderr.contains("not running"), "{after:?}");
+}
+
+#[test]
+fn a_client_that_sends_requests_without_reading_is_sent_whole_lines_ending_in_lagged() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_running_daemon(&mut world);
+    let mut slow = given_a_client_on_the_daemon_socket(&world);
+
+    let sent = when_the_client_sends_status_requests_without_reading(&mut slow);
+    let status = when_rider_runs(&world, &["status"]);
+    let lines = then_the_client_reads_to_the_end(&slow);
+
+    assert_eq!(status.code, Some(0), "{status:?}");
+    assert!(status.stdout.contains("board up"), "{status:?}");
+    let last = lines
+        .last()
+        .expect("the daemon sent the lagging client a line");
+    assert_eq!(last["ok"], json!(false), "{last}");
+    assert_eq!(last["error"]["code"], json!("lagged"), "{last}");
+    let answered = u64::try_from(lines.len()).expect("a line count fits in u64");
+    assert!(answered <= sent, "{answered} lines for {sent} requests");
+    let after = when_rider_runs(&world, &["status"]);
+    assert_eq!(after.code, Some(0), "{after:?}");
+    assert!(after.stdout.contains("board up"), "{after:?}");
 }
 
 #[test]

@@ -438,10 +438,16 @@ fn label_branch(
 }
 
 /// Runs an agent's command for one attempt within rider's time and log limits.
-pub fn launch_agent(cmd: &CommandLine, dir: &Path, log: &Path) -> Result<Exit, HarnessError> {
+pub fn launch_agent(
+    cmd: &CommandLine,
+    dir: &Path,
+    log: &Path,
+    seconds_max: u64,
+) -> Result<Exit, HarnessError> {
     assert!(dir.is_absolute() && log.is_absolute());
     assert!(!cmd.program.is_empty());
-    harness::run(cmd, dir, log, ATTEMPT_SECONDS_MAX, LOG_BYTES_MAX)
+    assert!(seconds_max > 0 && seconds_max <= ATTEMPT_SECONDS_MAX);
+    harness::run(cmd, dir, log, seconds_max, LOG_BYTES_MAX)
 }
 
 fn validate(view: &TaskView, attempts: u8) -> Result<(Brief, u16), Block> {

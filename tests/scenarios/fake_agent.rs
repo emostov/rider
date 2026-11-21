@@ -54,6 +54,39 @@ pub enum Behaviour {
     /// Like `RefuseResume`, but once it has reported the refusal it holds like `Hold` before
     /// it exits 1.
     RefuseResumeThenHold,
+    /// Commits like `Commit` and reports `dashed_summary(task)`, as JSON-escaped text.
+    CommitDashedSummary,
+    /// Prints `TALK_LINES` lines of `talk_line(n)` and exits `FAIL_EXIT_CODE`.
+    FailTalkingLong,
+    /// Kills itself with SIGKILL.
+    ExitOnSignal,
+    /// Commits like `Commit`, then reports a failed result and exits 0.
+    CommitReportingFailure,
+    /// Commits like `Commit` and exits 0 without reporting anything.
+    CommitSilently,
+    /// Commits like `Commit`, then reports a result of only whitespace.
+    CommitReportingBlank,
+    /// Checks out a new branch `elsewhere-<task>`, then commits like `Commit`.
+    LeaveBranch,
+    /// Blocks its own task like `Block`, then exits `FAIL_EXIT_CODE`.
+    BlockThenExitNonZero,
+    /// Commits like `Commit`, then points a new branch `shared-<task>` at that commit.
+    CommitShared,
+    /// Holds like `Hold`, then reports success having committed nothing.
+    HoldThenNothing,
+}
+
+pub const TALK_LINES: usize = 300;
+pub const TALK_LINE_PAD: usize = 250;
+pub const SUMMARY_WORDS: usize = 200;
+
+pub fn talk_line(n: usize) -> String {
+    format!("-é{n} {}", "x".repeat(TALK_LINE_PAD))
+}
+
+pub fn dashed_summary(task: &str) -> String {
+    let words: String = (0..SUMMARY_WORDS).map(|n| format!(" é{n}")).collect();
+    format!("-first  line\n\t-task {task}{words}")
 }
 
 impl Behaviour {
@@ -73,6 +106,16 @@ impl Behaviour {
             Behaviour::DropEarlier => "drop-earlier",
             Behaviour::RebaseOntoMain => "rebase-onto-main",
             Behaviour::RefuseResumeThenHold => "refuse-resume-then-hold",
+            Behaviour::CommitDashedSummary => "commit-dashed-summary",
+            Behaviour::FailTalkingLong => "fail-talking-long",
+            Behaviour::ExitOnSignal => "exit-on-signal",
+            Behaviour::CommitReportingFailure => "commit-reporting-failure",
+            Behaviour::CommitSilently => "commit-silently",
+            Behaviour::CommitReportingBlank => "commit-reporting-blank",
+            Behaviour::LeaveBranch => "leave-branch",
+            Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
+            Behaviour::CommitShared => "commit-shared",
+            Behaviour::HoldThenNothing => "hold-then-nothing",
         }
     }
 }
@@ -122,6 +165,7 @@ fn script() -> String {
     let steps = HOLD_SECONDS_MAX * HOLD_STEPS_PER_SECOND;
     let fail = FAIL_EXIT_CODE;
     let slow = SLOW_SECONDS;
+    let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -135,6 +179,7 @@ behaviour=$(sed -n "$((attempt + 1))p" "$plan" 2>/dev/null)
 [ -n "$behaviour" ] || behaviour=commit
 echo "start $task $attempt $$ $harness $behaviour $(pwd)" >> "$runs"
 printf '%s\n' "$@" > "$world/{ARGS_DIR}/$task-$attempt.all"
+env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p' | sort > "$world/{ARGS_DIR}/$task-$attempt.git-env"
 trap 'echo "end $task $attempt $$" >> "$runs"' EXIT
 session="fake-$task-$attempt"
 resumed=""
@@ -188,6 +233,16 @@ case "$behaviour" in
   leave-uncommitted) echo "left behind" > "uncommitted-$task.txt" ;;
   block) vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1 ;;
   exit-non-zero) exit {fail} ;;
+  commit-dashed-summary)
+    commit || exit 1
+    summary='-first  line\\n\\t-task '"$task"
+    n=0
+    while [ $n -lt {words} ]; do summary="$summary é$n"; n=$((n + 1)); done ;;
+  fail-talking-long)
+    pad=$(printf '%{pad}s' '' | tr " " x)
+    n=0
+    while [ $n -lt {lines} ]; do printf -- '-é%s %s\n' $n "$pad"; n=$((n + 1)); done
+    exit {fail} ;;
   refuse-resume|refuse-resume-slowly|refuse-resume-then-hold)
     [ "$behaviour" = refuse-resume-slowly ] && sleep {slow}
     if [ -n "$resumed" ]; then
@@ -198,11 +253,24 @@ case "$behaviour" in
       exit 1
     fi
     commit || exit 1 ;;
+  hold-then-nothing) hold ;;
   hold|hold-ignoring-term|hold-talking)
     [ "$behaviour" = hold-ignoring-term ] && trap '' TERM
     [ "$behaviour" = hold-talking ] && echo '{{"type":"fake","text":"holding task '"$task"'"}}'
     hold
     commit || exit 1 ;;
+  exit-on-signal) kill -KILL $$ ;;
+  commit-reporting-failure)
+    commit || exit 1
+    echo '{{"type":"result","subtype":"error_during_execution","is_error":true}}'
+    exit 0 ;;
+  commit-silently) commit || exit 1; exit 0 ;;
+  commit-reporting-blank) commit || exit 1; summary="  " ;;
+  leave-branch) git checkout -q -b "elsewhere-$task" && commit || exit 1 ;;
+  commit-shared) commit && git branch "shared-$task" || exit 1 ;;
+  block-then-exit-non-zero)
+    vb tasks block "$task" --kind needs_input -- "{BLOCK_QUESTION}" || exit 1
+    exit {fail} ;;
   *) echo "unknown behaviour $behaviour" >&2; exit 97 ;;
 esac
 report
@@ -235,6 +303,15 @@ pub fn plan(world: &Path, task: &str, plan: &[Behaviour]) {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+/// The names of the `GIT_*` variables attempt `attempt` of `task` was started with.
+pub fn git_env(world: &Path, task: &str, attempt: u32) -> Vec<String> {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.git-env"));
+    let text = fs::read_to_string(&path).expect("read an agent's git environment");
+    text.lines().map(str::to_string).collect()
 }
 
 /// The commit and the branch ref, `None` when detached, that attempt `attempt` of `task`

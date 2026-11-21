@@ -66,6 +66,11 @@ const LOG_POLLS_MAX: u64 = u64::MAX;
 const WRITERS_MAX: usize = 4 * CLIENTS_MAX;
 /// How long one send to a client may block before the client is dropped.
 const WRITE_MILLIS_MAX: u64 = 10_000;
+/// Upper bound on the input read and dropped from a client before its socket closes.
+const DRAIN_BYTES_MAX: usize = 1024 * 1024;
+const DRAIN_CHUNK_BYTES: usize = 16 * 1024;
+/// Upper bound on the time spent dropping a client's input before its socket closes.
+const DRAIN_MILLIS_MAX: u64 = 2000;
 
 /// Hands a socket event to the core; false once the core has gone.
 pub type Sink = Arc<dyn Fn(Event) -> bool + Send + Sync>;
@@ -189,7 +194,11 @@ fn accept(listener: &UnixListener, clients: &Arc<Mutex<Clients>>, logs: &Path, s
             drop(guard);
             let line = error_line(None, "busy", "too many clients are connected");
             let _ = stream.set_nonblocking(true);
-            let _ = (&stream).write_all(line.as_bytes());
+            if (&stream).write_all(line.as_bytes()).is_ok()
+                && stream.shutdown(Shutdown::Write).is_ok()
+            {
+                drain(&stream);
+            }
             continue;
         }
         let timeout = Some(Duration::from_millis(WRITE_MILLIS_MAX));
@@ -253,6 +262,7 @@ fn read_requests(stream: UnixStream, id: ClientId, clients: &Mutex<Clients>, sin
             Ok(_) if bytes.len() > REQUEST_BYTES_MAX => {
                 let message = format!("a request is at most {REQUEST_BYTES_MAX} bytes");
                 refuse(clients, id, None, &message);
+                lock(clients).slots.retain(|slot| slot.id != id);
                 break;
             }
             Ok(_) => {}
@@ -424,10 +434,39 @@ fn write_replies(
     }
     // Every line before it went whole, so the `lagged` error does too, unless the send
     // times out.
-    if let Some(line) = lagged.get() {
-        let _ = stream.write_all(line.as_bytes());
+    let last = lagged
+        .get()
+        .is_none_or(|line| stream.write_all(line.as_bytes()).is_ok());
+    if last && stream.shutdown(Shutdown::Write).is_ok() {
+        drain(&stream);
     }
     hang_up(&stream);
+}
+
+// Linux resets a Unix socket closed with unread input: the peer's read then fails with
+// ECONNRESET in place of the end of stream. So a client's input is read and dropped, within
+// bounds, before its socket is closed; a nonblocking stream gives up only what has arrived.
+fn drain(mut stream: &UnixStream) {
+    let deadline = Instant::now() + Duration::from_millis(DRAIN_MILLIS_MAX);
+    let mut buffer = vec![0; DRAIN_CHUNK_BYTES];
+    let mut drained: usize = 0;
+    for _ in 0..DRAIN_BYTES_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || drained >= DRAIN_BYTES_MAX {
+            break;
+        }
+        if stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                assert!(read <= buffer.len());
+                drained = drained.saturating_add(read);
+            }
+        }
+    }
+    assert!(drained <= DRAIN_BYTES_MAX.saturating_add(DRAIN_CHUNK_BYTES));
 }
 
 // Shuts both directions down, ending any read or send blocked on the socket.

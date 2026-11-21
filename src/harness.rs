@@ -2,6 +2,7 @@
 //! reads its final message back from the recorded stream.
 
 use crate::board::one_line;
+use crate::git;
 use crate::roles::{AGENTS_MAX, Harness, RoleSpec};
 use process_wrap::std::{ChildWrapper, CommandWrap, ProcessGroup};
 use rustix::process::Signal;
@@ -472,6 +473,9 @@ fn spawn(cmd: &CommandLine, dir: &Path) -> Result<Box<dyn ChildWrapper>, Harness
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for name in git::ENV_REMOVED {
+        process.env_remove(name);
+    }
     let spawned = CommandWrap::from(process)
         .wrap(ProcessGroup::leader())
         .spawn();
