@@ -33,6 +33,7 @@ use crate::worktree::{self, BRANCH_LABEL, BoardIdentity, Checkout, WorktreeError
 
 pub const DELIVERY_ROUNDS_MAX: u8 = 3;
 const UNTRUSTED_DIR: &str = "untrusted";
+const UNTRUSTED_MARK: &str = "untrusted";
 const NO_WORKTREE_HEAD: &str = "none";
 const UNTRUSTED_NOTE: &str = "This task is untrusted: you work in a scratch directory that is \
                               not a git repository, and Rider gives you no worktree. Read the \
@@ -882,7 +883,10 @@ fn prepare(
             cmd.env.extend([
                 ("GIT_CEILING_DIRECTORIES".to_string(), ceiling),
                 ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-                ("GIT_CONFIG_KEY_0".to_string(), "safe.bareRepository".to_string()),
+                (
+                    "GIT_CONFIG_KEY_0".to_string(),
+                    "safe.bareRepository".to_string(),
+                ),
                 ("GIT_CONFIG_VALUE_0".to_string(), "explicit".to_string()),
             ]);
         }
@@ -992,7 +996,19 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
         "codex" => Harness::Codex,
         _ => return Err(malformed()),
     };
+    let (session, untrusted) = match session.split_once(' ') {
+        None => (session, false),
+        Some((session, UNTRUSTED_MARK)) => (session, true),
+        Some(_) => return Err(malformed()),
+    };
     let session = SessionId::parse(session).ok_or_else(malformed)?;
+    if untrusted && !brief.untrusted {
+        return Err(format!(
+            "task #{}'s session was recorded by an untrusted task, and this task is not \
+             untrusted",
+            onto.0
+        ));
+    }
     if harness != brief.role.harness {
         return Err(format!(
             "task #{}'s session was recorded by {}, and role {} runs {}",
@@ -1056,7 +1072,16 @@ fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
     };
     assert!(word.len() <= HARNESS_WORD_BYTES_MAX);
     // A repository the file cannot hold is not recorded, so nothing resumes into it.
-    let room = SESSION_FILE_BYTES_MAX - HARNESS_WORD_BYTES_MAX - SESSION_BYTES_MAX - 3;
+    let room = SESSION_FILE_BYTES_MAX
+        - HARNESS_WORD_BYTES_MAX
+        - SESSION_BYTES_MAX
+        - UNTRUSTED_MARK.len()
+        - 4;
+    let mark = if attempt.brief.untrusted {
+        format!(" {UNTRUSTED_MARK}")
+    } else {
+        String::new()
+    };
     let fits = |repo: &&str| repo.len() < room;
     let repo = attempt
         .brief
@@ -1065,9 +1090,10 @@ fn record_session(attempt: &Attempt, home: &Path) -> Result<(), String> {
         .filter(|repo| !repo.contains('\n'))
         .filter(fits);
     let written = match (&session, repo) {
-        (Some(session), Some(repo)) => {
-            fs::write(&path, format!("{word} {}\n{repo}\n", session.as_str()))
-        }
+        (Some(session), Some(repo)) => fs::write(
+            &path,
+            format!("{word} {}{mark}\n{repo}\n", session.as_str()),
+        ),
         (None, _) | (_, None) => match fs::remove_file(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             other => other,

@@ -204,6 +204,41 @@ fn a_review_onto_another_task_without_resume_is_blocked_as_an_invalid_brief() {
     );
 }
 
+#[test]
+fn a_trusted_review_onto_an_untrusted_review_starts_fresh_and_says_why() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let built = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    let untrusted = NewTask::new("Review the pull request.")
+        .label("repo", world.repo_label())
+        .label("untrusted", "1")
+        .role("review");
+    let untrusted = when_the_lead_creates(&world, &untrusted);
+    given_the_agent_will(&world, &untrusted, &[Behaviour::CommitNothing]);
+    let follow_up = a_review(&world, "Check the requests were addressed.", &built)
+        .label("onto", &untrusted)
+        .label("resume", "1")
+        .needs(&untrusted);
+    let follow_up = when_the_lead_creates(&world, &follow_up);
+    given_the_agent_will(&world, &follow_up, &[Behaviour::CommitNothing]);
+
+    let tasks = [built.as_str(), untrusted.as_str(), follow_up.as_str()];
+    let (states, _) = when_the_daemon_runs_until_settled(&mut world, &tasks);
+
+    assert_eq!(states, vec!["completed".to_string(); 3]);
+    let dir = worktree_dir(&world, &follow_up);
+    assert_eq!(
+        fake_agent::options(&world.root, &follow_up, 0),
+        codex_options(&dir)
+    );
+    let note = format!(
+        "Starting a fresh session despite `resume=1`: task #{untrusted}'s session was recorded \
+         by an untrusted task, and this task is not untrusted."
+    );
+    assert!(replies(&world, &follow_up).contains(&note), "{note}");
+}
+
 /// A review of task `of` in the world's repository, once that task is done.
 fn a_review(world: &World, text: &str, of: &str) -> NewTask {
     NewTask::new(text)
