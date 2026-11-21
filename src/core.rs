@@ -413,6 +413,8 @@ pub enum Event {
     },
     /// A renewal or fenced write was refused because the claim is no longer held.
     ClaimLost(RunId),
+    /// A closing write, `Settle` or `Release`, was refused because the claim is no longer held.
+    CloseLost(RunId),
     /// A closing write, `Settle` or `Release`, succeeded.
     Settled(RunId),
     /// A board call timed out or could not connect.
@@ -769,7 +771,11 @@ fn apply(state: &mut State, event: Event, actions: &mut Vec<Action>) {
                 entry.lease_until = entry.lease_until.max(until);
             }
         }
-        Event::ClaimLost(run) => {
+        Event::ClaimLost(run) | Event::CloseLost(run) => {
+            let index = state.run_index(run);
+            if let (Some(index), Event::CloseLost(_)) = (index, &event) {
+                state.runs[index].settling = false;
+            }
             state.pending_claims.retain(|pending| pending.run != run);
             if let Some(index) = state.run_index(run) {
                 abandon(state, index, actions);
@@ -1629,6 +1635,10 @@ fn send_stop(entry: &mut Run, actions: &mut Vec<Action>) {
     actions.push(Action::StopAgent { run, task });
 }
 
+fn closing(run: &Run) -> bool {
+    run.phase == Phase::Settling || (run.phase == Phase::Abandoning && run.settling)
+}
+
 fn holds_claim(phase: Phase) -> bool {
     !matches!(phase, Phase::Claiming | Phase::Abandoning)
 }
@@ -1863,7 +1873,7 @@ fn next_claimable(state: &State) -> Option<(usize, usize, u8)> {
             run.task == task.id
                 || (task.branch.is_some() && run.branch == task.branch)
                 || task.onto == Some(run.task)
-                || (task.onto.is_some() && run.phase == Phase::Settling && run.branch.is_some())
+                || (task.onto.is_some() && closing(run) && run.branch.is_some())
         });
         if task.state != TaskState::Ready || taken {
             continue;

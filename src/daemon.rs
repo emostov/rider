@@ -1271,7 +1271,7 @@ fn settle(shared: &Shared, run: RunId, task: TaskId, profile: &str, close: Close
         Ok(()) => Event::Settled(run),
         Err(RunError::Board(error)) if call_failed(&error) => Event::BoardFailed(Call::Settle(run)),
         Err(RunError::Board(BoardError::ClaimLost { .. }) | RunError::LostClaim(_)) => {
-            Event::ClaimLost(run)
+            Event::CloseLost(run)
         }
         Err(RunError::Board(_)) => Event::BoardFailed(Call::Settle(run)),
     };
@@ -1385,7 +1385,7 @@ impl Board for Guarded<'_> {
 fn release(shared: &Shared, run: RunId, task: TaskId, profile: &str) -> Input {
     let event = match shared.board(profile).release(task) {
         Ok(()) => Event::Settled(run),
-        Err(BoardError::ClaimLost { .. }) => Event::ClaimLost(run),
+        Err(BoardError::ClaimLost { .. }) => Event::CloseLost(run),
         Err(_) => Event::BoardFailed(Call::Release(run)),
     };
     Input::plain(event)
