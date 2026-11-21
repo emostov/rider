@@ -1,6 +1,8 @@
 //! `rider daemon`: the core driven by the board's feed, a timer, signals and worker threads.
 
 use std::cell::Cell;
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -35,6 +37,7 @@ use crate::core::{
     LEFTOVERS_MAX, PidFile, RunId, Settlement, State, Stopping, Unaccounted,
 };
 use crate::feed::{Cursor, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop};
+use crate::git;
 use crate::harness::{ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, KILL_GRACE_SECONDS};
 use crate::reap;
 use crate::roles::{AGENTS_MAX, RoleSpec};
@@ -43,7 +46,9 @@ use crate::run_task::{
     judge_attempt, launch_agent, prepare_attempt, settle_attempt,
 };
 use crate::settle::Verdict;
-use crate::socket::{self, SOCKET_FILE, Socket, SocketPath};
+#[cfg(target_os = "macos")]
+use crate::socket::SOCKET_FILE;
+use crate::socket::{self, Socket, SocketPath};
 
 /// Upper bound on the events waiting for the core; sources block when it is full.
 pub const EVENT_QUEUE_MAX: usize = 1024;
@@ -148,8 +153,9 @@ exec "$@""#;
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 #[cfg(target_os = "macos")]
 const PROGRAMS: [&str; 4] = ["git", "node", "npm", "sh"];
-#[cfg(target_os = "macos")]
 const PATH_DIRS_MAX: usize = 256;
+#[cfg(target_os = "macos")]
+const DENIED_MAX: usize = 4096;
 #[cfg(target_os = "macos")]
 const PROMPTS_DIR: &str = "prompts";
 #[cfg(target_os = "macos")]
@@ -157,8 +163,6 @@ const SANDBOX_REFUSED_EXIT: i32 = 71;
 #[cfg(target_os = "macos")]
 const SANDBOX_PROBE: &str =
     "(version 1)\n(allow default)\n(deny file-write* (literal \"/var/empty/rider-probe\"))\n";
-#[cfg(target_os = "macos")]
-const HOME_DEPTH_MAX: usize = 64;
 #[cfg(target_os = "macos")]
 const CONTROL_FILES: [&str; 7] = [
     SOCKET_FILE,
@@ -205,6 +209,7 @@ pub enum DaemonError {
     /// The board's identity could not be read at start-up.
     Identity(IdentityUnknown),
     Schemas(BoardError),
+    Confine(String),
 }
 
 impl fmt::Display for DaemonError {
@@ -222,6 +227,7 @@ impl fmt::Display for DaemonError {
             DaemonError::JobsFull => write!(f, "more than {JOBS_QUEUED_MAX} actions waited"),
             DaemonError::QueueClosed => write!(f, "the daemon's event queue closed"),
             DaemonError::Setting(message) => write!(f, "{TEST_MILLIS_VAR}: {message}"),
+            DaemonError::Confine(message) => write!(f, "cannot confine git: {message}"),
             DaemonError::NotAFile(path) => write!(f, "{} is not a regular file", path.display()),
             DaemonError::Identity(error) => write!(f, "{error}"),
             DaemonError::Schemas(error) => {
@@ -537,6 +543,10 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let sink: socket::Sink = Arc::new(move |event| send(&sink_events, event));
     let socket = socket::listen(&paths.socket, paths.home.join(LOGS_DIR), sink)
         .map_err(io_error("listen on", paths.socket.path()))?;
+    let confine = confines_agents(&log);
+    if confine {
+        confine_git(&paths)?;
+    }
     let shared = Arc::new(Shared {
         paths,
         events,
@@ -544,7 +554,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
         lease_millis,
         grace_millis: timing.grace_millis,
         runner_seconds: timing.runner_millis / 1000,
-        confine: confines_agents(&log),
+        confine,
         attempts: limits.attempts,
         feed: Mutex::new(FeedSlot::default()),
         served: Mutex::new(ServedSlot::default()),
@@ -1168,7 +1178,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
         if confine {
-            args.extend(confinement(&home, &vb)?);
+            args.extend(confinement(&home, &vb, false)?);
         }
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
@@ -1202,10 +1212,12 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
 // macOS still ships the deprecated sandbox-exec. Every process a confined agent starts,
 // detached or in a group of its own, inherits the profile and cannot leave it.
 #[cfg(target_os = "macos")]
-fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
-    let unusable = |why: String| HarnessError::Spawn(format!("cannot confine the agent: {why}"));
-    let home = fs::canonicalize(home)
-        .map_err(|error| unusable(format!("resolve {}: {error}", home.display())))?;
+fn confinement(home: &Path, vb: &Path, offline: bool) -> Result<Vec<String>, HarnessError> {
+    let unusable = |why: String| HarnessError::Spawn(format!("cannot confine: {why}"));
+    let resolve = |path: &Path| {
+        fs::canonicalize(path)
+            .map_err(|error| unusable(format!("resolve {}: {error}", path.display())))
+    };
     let quote = |path: &Path| match path.to_str() {
         Some(text) if !text.contains(['"', '\\']) && !text.contains(char::is_control) => {
             Ok(format!("\"{text}\""))
@@ -1215,53 +1227,31 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
             path.display()
         ))),
     };
-    if home.components().count() > HOME_DEPTH_MAX {
-        return Err(unusable(format!("{} is too deep", home.display())));
+    let home = resolve(home)?;
+    let vb = resolve(vb)?;
+    let (literals, subpaths) = denied_writes(&home, &vb);
+    if literals.len() + subpaths.len() > DENIED_MAX {
+        return Err(unusable(format!("more than {DENIED_MAX} paths to deny")));
     }
-    let vb = fs::canonicalize(vb)
-        .map_err(|error| unusable(format!("resolve {}: {error}", vb.display())))?;
-    let programs = daemon_programs();
-    let capacity = HOME_DEPTH_MAX + 2 * CONTROL_FILES.len() + PROGRAMS.len() + 10;
-    let mut denied = Vec::with_capacity(capacity);
-    for dir in home.ancestors() {
-        denied.push(format!("(literal {})", quote(dir)?));
+    let mut denied = Vec::with_capacity(literals.len() + subpaths.len());
+    for path in &literals {
+        denied.push(format!("(literal {})", quote(path)?));
     }
-    for name in CONTROL_FILES {
-        let staged = format!("{name}{STAGED_SUFFIX}");
-        denied.push(format!("(literal {})", quote(&home.join(name))?));
-        denied.push(format!("(literal {})", quote(&home.join(staged))?));
-    }
-    let staged_config = format!("{CONFIG_FILE}{STAGED_SUFFIX}");
-    for file in [
-        vb.as_path(),
-        &home.join(CONFIG_FILE),
-        &home.join(staged_config),
-    ] {
-        denied.push(format!("(literal {})", quote(file)?));
-    }
-    for program in &programs {
-        denied.push(format!("(literal {})", quote(program)?));
-    }
-    let staging = quote(&home.join(socket::BIND_DIR))?;
-    for name in [
-        AGENTS_DIR,
-        LOGS_DIR,
-        NODE_DIR,
-        PROMPTS_DIR,
-        socket::BIND_DIR,
-    ] {
-        denied.push(format!("(subpath {})", quote(&home.join(name))?));
+    for path in &subpaths {
+        denied.push(format!("(subpath {})", quote(path)?));
     }
     let socket = quote(&home.join(SOCKET_FILE))?;
+    let staging = quote(&home.join(socket::BIND_DIR))?;
+    let network = if offline { "(deny network*)\n" } else { "" };
     let profile = format!(
         "(version 1)\n(allow default)\n\
          (deny signal)\n(allow signal (target same-sandbox))\n\
+         (deny lsopen)\n(deny appleevent-send)\n{network}\
          (deny network-outbound (remote unix-socket (path-literal {socket})))\n\
          (deny network-outbound (remote unix-socket (subpath {staging})))\n\
          (deny file-write* {})\n",
         denied.join(" ")
     );
-    assert!(denied.len() <= capacity);
     assert!(denied.len() > 2 * CONTROL_FILES.len() && profile.contains(&socket));
     Ok(vec![
         SANDBOX_EXEC.to_string(),
@@ -1271,24 +1261,70 @@ fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
     ])
 }
 
+// What the daemon trusts: its control files and config, every directory on PATH, and the
+// install directory of each program it runs; the ancestors of each are literals, so none can
+// be renamed and replaced by a link.
 #[cfg(target_os = "macos")]
-fn daemon_programs() -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = std::env::current_exe().into_iter().collect();
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path).take(PATH_DIRS_MAX).collect();
-    for program in PROGRAMS {
-        let first = dirs
-            .iter()
-            .map(|dir| dir.join(program))
-            .find(|file| file.is_file());
-        found.extend(first);
-    }
-    let found: Vec<PathBuf> = found
-        .iter()
-        .filter_map(|file| fs::canonicalize(file).ok())
+fn denied_writes(home: &Path, vb: &Path) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
+    assert!(home.is_absolute() && vb.is_absolute());
+    let mut subpaths: BTreeSet<PathBuf> = [AGENTS_DIR, LOGS_DIR, NODE_DIR, PROMPTS_DIR]
+        .into_iter()
+        .chain([socket::BIND_DIR])
+        .map(|name| home.join(name))
         .collect();
-    assert!(found.len() <= PROGRAMS.len() + 1);
-    found
+    let mut literals: BTreeSet<PathBuf> = BTreeSet::new();
+    for name in CONTROL_FILES.into_iter().chain([CONFIG_FILE]) {
+        literals.insert(home.join(name));
+        literals.insert(home.join(format!("{name}{STAGED_SUFFIX}")));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        .take(PATH_DIRS_MAX)
+        .filter(|dir| dir.is_absolute())
+        .collect();
+    let programs = PROGRAMS.iter().filter_map(|program| {
+        dirs.iter()
+            .map(|dir| dir.join(program))
+            .find(|f| f.is_file())
+    });
+    let programs = programs
+        .chain(std::env::current_exe())
+        .chain([vb.to_path_buf()]);
+    let installs = programs.filter_map(|file| Some(fs::canonicalize(file).ok()?.parent()?.into()));
+    let resolved = dirs.iter().filter_map(|dir| fs::canonicalize(dir).ok());
+    let trusted: Vec<PathBuf> = dirs
+        .iter()
+        .cloned()
+        .chain(resolved)
+        .chain(installs)
+        .collect();
+    let trusted = trusted.into_iter().filter(|dir| !home.starts_with(dir));
+    for dir in trusted.chain([home.to_path_buf()]) {
+        literals.extend(dir.ancestors().skip(1).map(Path::to_path_buf));
+        if dir != home {
+            subpaths.insert(dir);
+        }
+    }
+    literals.insert(home.to_path_buf());
+    assert!(!subpaths.contains(home));
+    (literals, subpaths)
+}
+
+fn confine_git(paths: &Paths) -> Result<(), DaemonError> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let program = std::env::split_paths(&path)
+        .take(PATH_DIRS_MAX)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|file| file.is_file());
+    let program = program.ok_or_else(|| DaemonError::Confine("no git on PATH".to_string()))?;
+    let sandbox = confinement(&paths.home, &paths.vb, true)
+        .map_err(|error| DaemonError::Confine(error.to_string()))?;
+    assert!(program.is_absolute());
+    if !git::confine(program, sandbox) {
+        return Err(DaemonError::Confine("git is already confined".to_string()));
+    }
+    Ok(())
 }
 
 // sandbox-exec exits 71, printing `sandbox_apply: Operation not permitted`, when the process
@@ -1319,8 +1355,9 @@ fn confines_agents(log: &Log) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
+fn confinement(home: &Path, vb: &Path, offline: bool) -> Result<Vec<String>, HarnessError> {
     assert!(home.is_absolute() && !vb.as_os_str().is_empty());
+    let _ = offline;
     Ok(Vec::new())
 }
 

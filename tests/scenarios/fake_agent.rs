@@ -23,8 +23,11 @@ pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
 pub const PR_REF: &str = "refs/rider/pr/412";
-pub const TRIED_WRITES: &str =
-    "agents.json.new cursor.new board.json.new node/probe .b/probe rider.toml prompts";
+pub const ESCAPE_EQUALS: &str = "escape-equals";
+pub const ESCAPE_NESTED: &str = "escape-nested";
+pub const ESCAPE_PROMISOR: &str = "escape-promisor";
+pub const ESCAPE_OPEN: &str = "escape-open";
+pub const TRIED_WRITES: &str = "agents.json.new cursor.new board.json.new node/probe .b/probe rider.toml prompts ../tools/probe";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +120,9 @@ pub enum Behaviour {
     TryWrites,
     SignalDaemonDetached,
     PlantFsmonitor,
+    PlantFilters,
+    PlantPromisor,
+    OpenApp,
     ReportDecision,
     HoldAttempt,
     MergePr,
@@ -180,6 +186,9 @@ impl Behaviour {
             Behaviour::TryWrites => "try-writes",
             Behaviour::SignalDaemonDetached => "signal-daemon-detached",
             Behaviour::PlantFsmonitor => "plant-fsmonitor",
+            Behaviour::PlantFilters => "plant-filters",
+            Behaviour::PlantPromisor => "plant-promisor",
+            Behaviour::OpenApp => "open-app",
             Behaviour::ReportDecision => "report-decision",
             Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
@@ -378,6 +387,42 @@ case "$behaviour" in
       sleep 0.1
     done
     commit || exit 1 ;;
+  plant-filters)
+    escaped="$world/rider-home/agents"
+    printf 'hi\n' > f.txt
+    printf '* filter=a=b\n' > .gitattributes
+    git init -q sub && printf 'hi\n' > sub/g.txt && printf '* filter=evil\n' > sub/.git/info/attributes \
+      && git -C sub add g.txt && git -C sub commit -q -m Sub || exit 1
+    git add f.txt .gitattributes sub 2>/dev/null && git commit -q -m Filtered || exit 1
+    git config 'filter.a=b.clean' "sh -c ': > $escaped/{ESCAPE_EQUALS}; cat'" \
+      && git -C sub config filter.evil.clean "sh -c ': > $escaped/{ESCAPE_NESTED}; cat'" || exit 1
+    sleep 1
+    printf 'hi\n' > f.txt
+    printf 'hi\n' > sub/g.txt ;;
+  plant-promisor)
+    escaped="$world/rider-home/agents"
+    commit || exit 1
+    git config extensions.partialClone evil && git config remote.evil.promisor true \
+      && git config remote.evil.url "$(pwd)" \
+      && git config remote.evil.uploadpack \
+        "sh -c ': > $escaped/{ESCAPE_PROMISOR}; git-upload-pack \"\$@\"' sh" || exit 1
+    absent=$( {{
+      printf 'tree 1234567890123456789012345678901234567890\nparent %s\n' "$(git rev-parse HEAD)"
+      printf 'author t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\nx\n'
+    }} | git hash-object -t commit -w --stdin --literally) && git update-ref HEAD "$absent" || exit 1 ;;
+  open-app)
+    app="$world/{ARGS_DIR}/$task-$attempt.app"
+    mkdir -p "$app/Contents/MacOS"
+    {{
+      printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n'
+      printf '<key>CFBundleExecutable</key><string>esc</string>\n'
+      printf '<key>LSBackgroundOnly</key><true/></dict></plist>\n'
+    }} > "$app/Contents/Info.plist"
+    printf '#!/bin/sh\n: > "%s"\n' "$world/rider-home/agents/{ESCAPE_OPEN}" > "$app/Contents/MacOS/esc"
+    chmod +x "$app/Contents/MacOS/esc"
+    /usr/bin/open -g -j -n "$app" > "$app.out" 2>&1; echo "$?" > "$app.code"
+    sleep 2
+    commit || exit 1 ;;
   plant-fsmonitor)
     planted="$world/{ARGS_DIR}/$task-$attempt.fsmonitor"
     printf '#!/bin/sh\n: > "%s.ran"\n' "$planted" > "$planted"
@@ -494,6 +539,21 @@ pub fn fsmonitor_ran(world: &Path, task: &str, attempt: u32) -> bool {
         .join(format!("{task}-{attempt}.fsmonitor"));
     assert!(planted.exists(), "the agent planted its fsmonitor");
     planted.with_extension("fsmonitor.ran").exists()
+}
+
+pub fn escaped(world: &Path, marker: &str) -> bool {
+    world.join("rider-home/agents").join(marker).exists()
+}
+
+pub fn opened(world: &Path, task: &str, attempt: u32) -> (String, String) {
+    let read = |end: &str| {
+        let path = world
+            .join(ARGS_DIR)
+            .join(format!("{task}-{attempt}.app.{end}"));
+        fs::read_to_string(&path).expect("read what open recorded")
+    };
+    let (code, output) = (read("code"), read("out"));
+    (code.trim().to_string(), output)
 }
 
 pub fn tried_writes(world: &Path, task: &str, attempt: u32) -> String {

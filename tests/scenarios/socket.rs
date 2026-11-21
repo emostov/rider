@@ -634,3 +634,58 @@ fn given_a_log(world: &World, task: &str, text: &str) {
     fs::create_dir_all(&dir).expect("create the task's log directory");
     fs::write(dir.join("1.jsonl"), text).expect("write the log");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn filters_an_agent_plants_in_its_repository_and_a_nested_one_never_run_outside_its_sandbox() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantFilters]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(exit, Some(0), "{}", world.daemon_log());
+    assert_eq!(states.len(), 1);
+    let escaped = [fake_agent::ESCAPE_EQUALS, fake_agent::ESCAPE_NESTED]
+        .map(|marker| fake_agent::escaped(&world.root, marker));
+    assert_eq!(escaped, [false, false]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_promisor_remote_an_agent_plants_never_runs_its_uploadpack_outside_its_sandbox() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_a_rider_toml(&world, "[limits]\nattempts = 1\n");
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::PlantPromisor]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!(exit, Some(0), "{}", world.daemon_log());
+    assert_eq!(states.len(), 1);
+    assert!(!fake_agent::escaped(
+        &world.root,
+        fake_agent::ESCAPE_PROMISOR
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_cannot_open_an_app_it_wrote_to_leave_its_sandbox() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::OpenApp]);
+
+    let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &[&task]);
+
+    assert_eq!((states, exit), (vec!["completed".to_string()], Some(0)));
+    let (code, output) = fake_agent::opened(&world.root, &task, 0);
+    assert_ne!(code, "0", "{output}");
+    assert!(!fake_agent::escaped(&world.root, fake_agent::ESCAPE_OPEN));
+}
