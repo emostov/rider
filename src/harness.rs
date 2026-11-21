@@ -168,13 +168,17 @@ impl SessionId {
     }
 }
 
-/// The command line that runs `spec` on `prompt` in `dir`, continuing session `resume` of
-/// `spec`'s harness when given; the prompt is last, after `--`.
+#[derive(Debug, Clone, Copy)]
+pub enum Resume<'a> {
+    Fork(&'a SessionId),
+    InPlace(&'a SessionId),
+}
+
 pub fn command_for(
     spec: &RoleSpec,
     prompt: &str,
     dir: &Path,
-    resume: Option<&SessionId>,
+    resume: Option<Resume>,
 ) -> Result<CommandLine, HarnessError> {
     assert!(!spec.model.is_empty() && !spec.model.starts_with('-'));
     assert!(dir.is_absolute(), "agents run in absolute worktrees");
@@ -239,12 +243,16 @@ pub fn command_for(
     };
     match (spec.harness, resume) {
         // Without `--fork-session` Claude appends to the resumed session in place.
-        (Harness::Claude, Some(session)) => {
+        (Harness::Claude, Some(Resume::Fork(session))) => {
             args.extend(["--resume", &session.0, "--fork-session", "--", prompt]);
         }
+        (Harness::Claude, Some(Resume::InPlace(session))) => {
+            args.extend(["--resume", &session.0, "--", prompt]);
+        }
         (Harness::Claude, None) => args.extend(["--", prompt]),
-        // `codex exec resume` has no `-C`: it runs in the child's working directory.
-        (Harness::Codex, Some(session)) => {
+        // `codex exec resume` has no `-C` and no fork: it runs in the child's working
+        // directory and continues the session in place.
+        (Harness::Codex, Some(Resume::Fork(session) | Resume::InPlace(session))) => {
             args.insert(1, "resume");
             args.extend(["--", &session.0, prompt]);
         }
