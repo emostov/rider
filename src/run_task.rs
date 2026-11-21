@@ -848,6 +848,15 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
         ));
     }
     let onto = brief.onto.ok_or("the task has no `onto` label")?;
+    recorded_session(home, onto, &brief.repo)
+}
+
+pub(crate) fn recorded_session(
+    home: &Path,
+    onto: TaskId,
+    wanted: &Path,
+) -> Result<SessionId, String> {
+    assert!(home.is_absolute() && wanted.is_absolute());
     let path = session_path(home, onto);
     let mut text = String::new();
     let read = File::open(&path).and_then(|file| {
@@ -875,12 +884,12 @@ fn resume_session(brief: &Brief, home: &Path) -> Result<SessionId, String> {
     let repo = repo.strip_suffix('\n').filter(|repo| !repo.is_empty());
     let repo = Path::new(repo.ok_or_else(malformed)?);
     let session = SessionId::parse(session).ok_or_else(malformed)?;
-    if repo != brief.repo {
+    if repo != wanted {
         return Err(format!(
             "task #{}'s session was recorded in repository {}, not this task's {}",
             onto.0,
             repo.display(),
-            brief.repo.display()
+            wanted.display()
         ));
     }
     assert!(session.as_str().len() <= SESSION_BYTES_MAX);

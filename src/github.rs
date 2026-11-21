@@ -14,7 +14,7 @@ use crate::brief::label;
 use crate::core::TASKS_MAX;
 use crate::git::{self, ENV_REMOVED, Group};
 use crate::roles::ROLES;
-use crate::run_task::{RESUMABLE_ROLES, session_path};
+use crate::run_task::{RESUMABLE_ROLES, recorded_session};
 use crate::worktree::BRANCH_LABEL;
 
 pub const WATCH_LABEL: &str = "github";
@@ -257,7 +257,9 @@ fn round(board: &dyn Board, home: &Path, log: &dyn Fn(&str)) -> Result<usize, Wa
             branch,
             running,
             dead: &dead,
-            resumable: RESUMABLE_ROLES.contains(&role) && session_path(home, task).is_file(),
+            resumable: RESUMABLE_ROLES.contains(&role)
+                && Path::new(repo).is_absolute()
+                && recorded_session(home, task, Path::new(repo)).is_ok(),
         };
         if !watched.repo.is_absolute() {
             continue;

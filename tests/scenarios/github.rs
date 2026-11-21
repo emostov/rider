@@ -464,3 +464,20 @@ fn a_github_off_label_on_the_task_ends_the_watch() {
         Vec::<Value>::new()
     );
 }
+
+#[test]
+fn a_ci_failure_whose_owner_session_is_malformed_goes_to_the_lead() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-pending.json", "pulls-comments-empty.json");
+    let task = given_a_completed_task(&mut world);
+    let session = world.home.join("logs").join(&task).join("session");
+    fs::write(&session, "not a session\n").expect("overwrite the recorded session");
+
+    given_gh_prints(&world, "pr-list-failed.json", "pulls-comments-empty.json");
+    let records = when_records_reach(&world, &task, 1);
+
+    assert_eq!(records, vec![failed_record("lead")]);
+    then_no_fix_was_queued(&world, &task);
+}
