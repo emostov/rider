@@ -58,6 +58,42 @@ fn an_implement_task_completes_with_its_commit_and_a_result_record() {
 }
 
 #[test]
+fn the_usage_an_agent_reports_is_in_its_result_record_and_in_rider_status() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add one work file."));
+    given_the_agent_will(&world, &task, &[Behaviour::CommitReportingUsage]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+    let status = when_rider_runs(&world, &["status"]);
+
+    assert_eq!(states, vec!["completed".to_string()]);
+    let records = task_records(&world, &task, "rider-result");
+    let usage = json!({
+        "input": 4,
+        "cache_write": 20,
+        "cache_read": 300,
+        "output": 50,
+        "cost_usd": fake_agent::COST_USD,
+    });
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["usage"], usage);
+    let spent = "4 in, 300 cache read, 20 cache write, 50 out, $0.25";
+    let lines: Vec<&str> = status.stdout.lines().collect();
+    assert_eq!(
+        lines.get(1),
+        Some(&format!("spent {spent}").as_str()),
+        "{status:?}"
+    );
+    let project = format!("{PROJECT} spent {spent}");
+    assert!(lines.contains(&project.as_str()), "{status:?}");
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
+#[test]
 fn a_fix_that_moves_a_branch_names_the_stacked_task_left_behind_in_its_result_record() {
     let Some(mut world) = given_a_board_and_a_repository() else {
         return;
@@ -1043,7 +1079,7 @@ fn a_task_onto_one_that_is_still_settling_waits_for_its_worktree_and_completes()
     // released, so the fix is ready while the branch is still checked out. Only the result
     // post is held: the daemon posts the board's identity before it follows.
     let (posted, release) = (world.root.join("posted"), world.root.join("release-post"));
-    given_vb_waits_for(&world, "rider-result@2", &posted, &release);
+    given_vb_waits_for(&world, "rider-result@3", &posted, &release);
     given_a_running_daemon(&mut world);
     when_the_file_exists(&world, &posted);
     when_the_task_is(&world, &fix, "ready");

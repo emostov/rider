@@ -20,7 +20,7 @@ use crate::daemon::SUBTREE;
 use crate::git::{self, GitError};
 use crate::harness::{
     self, ATTEMPT_SECONDS_MAX, CommandLine, Exit, HarnessError, LOG_BYTES_MAX, PROMPT_BYTES_MAX,
-    SESSION_BYTES_MAX, SessionId, command_for,
+    SESSION_BYTES_MAX, SessionId, Usage, command_for,
 };
 use crate::roles::{Harness, RoleSpec, role_in_repo};
 use crate::settle::{Outcome, Verdict, judge};
@@ -33,7 +33,7 @@ pub const ATTEMPTS_DEFAULT: u8 = 3;
 const _: () = assert!(ATTEMPTS_DEFAULT > 0 && ATTEMPTS_DEFAULT <= ATTEMPTS_MAX);
 /// Upper bound on the bytes read from the end of a failed attempt's log.
 pub const LOG_TAIL_BYTES_MAX: u64 = 16 * 1024;
-/// Upper bound on the stacked tasks checked when a branch moves, as `rider-result@2` allows.
+/// Upper bound on the stacked tasks checked when a branch moves, as `rider-result@3` allows.
 pub const STACKED_CHECKS_MAX: usize = 64;
 /// Upper bound on the tasks of one branch whose stacked tasks are looked for when it moves.
 pub const BRANCH_TASKS_MAX: usize = 32;
@@ -56,7 +56,7 @@ const ATTEMPT_LABEL: &str = "attempt";
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
-const RESULT_SCHEMA: &str = "rider-result@2";
+const RESULT_SCHEMA: &str = "rider-result@3";
 const NO_OUTPUT: &str = "(no output)";
 const LOGS_DIR: &str = "logs";
 // Beside a task's logs: the Claude session id of its latest completed attempt on one line,
@@ -140,6 +140,17 @@ struct ResultRecord<'a> {
     commits: u64,
     head: &'a str,
     summary: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageRecord>,
+}
+
+#[derive(Serialize)]
+struct UsageRecord {
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+    cost_usd: Option<f64>,
 }
 
 struct Evidence {
@@ -261,6 +272,8 @@ pub enum Prepared {
 /// How an attempt's agent did, judged from its exit, its log and its worktree.
 pub struct Judgement {
     pub verdict: Verdict,
+    /// What the judged agent run reported it used, if it reported anything.
+    pub usage: Option<Usage>,
     work: Option<Work>,
 }
 
@@ -270,6 +283,7 @@ impl Judgement {
         assert!(matches!(verdict, Verdict::Fail { .. }));
         let judgement = Judgement {
             verdict,
+            usage: None,
             work: None,
         };
         assert!(judgement.work.is_none());
@@ -390,7 +404,13 @@ pub fn judge_attempt(
     }
     let (verdict, work) = inspect(id, board, attempt, launched)?;
     assert!(!matches!(verdict, Verdict::Complete { .. }) || work.is_some());
-    Ok(Judgement { verdict, work })
+    let role = attempt.brief.role;
+    let usage = harness::usage(&role.harness, role.model, attempt.log());
+    Ok(Judgement {
+        verdict,
+        usage,
+        work,
+    })
 }
 
 /// Writes a judged attempt to the board: completes or fails the task, or leaves it blocked.
@@ -404,7 +424,7 @@ pub fn settle_attempt(
     assert!(attempt.brief.id == id);
     match (&judgement.verdict, &judgement.work) {
         (Verdict::Complete { result }, Some(work)) => {
-            complete(id, env, board, attempt, result, work)?
+            complete(id, env, board, attempt, result, work, judgement.usage)?
         }
         (Verdict::Complete { .. }, None) => panic!("a completion always has inspected work"),
         (Verdict::Fail { reason }, _) => fail(id, board, attempt, reason)?,
@@ -987,6 +1007,7 @@ fn complete(
     attempt: &Attempt,
     result: &str,
     work: &Work,
+    usage: Option<Usage>,
 ) -> Result<(), RunError> {
     assert!(
         !result.trim().is_empty(),
@@ -1018,6 +1039,13 @@ fn complete(
         commits: work.commits,
         head: &work.head,
         summary,
+        usage: usage.map(|usage| UsageRecord {
+            input: usage.input,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            output: usage.output,
+            cost_usd: (!usage.unpriced).then(|| usage.cost_micros as f64 / 1e6),
+        }),
     };
     if let Err(error) = record_session(attempt, &env.home) {
         let note = format!("Rider could not record the agent's session: {error}.");

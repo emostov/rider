@@ -1,0 +1,86 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "branch",
+    "head",
+    "commits",
+    "summary",
+    "behind"
+  ],
+  "properties": {
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The branch the task worked on, or null when it worked on none"
+    },
+    "head": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The commit the worktree was at when the attempt ended"
+    },
+    "commits": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Commits the attempt added to the branch"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The worker's final message, which is also the task's result"
+    },
+    "behind": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "description": "Tasks cut from this task's branch, directly or through another task on it, whose own branch does not contain head; empty when none are behind"
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "cache_read",
+        "cache_write",
+        "output",
+        "cost_usd"
+      ],
+      "description": "What the agent's harness reported the attempt used; absent when it reported nothing",
+      "properties": {
+        "input": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Input tokens not read from or written to the cache"
+        },
+        "cache_read": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Input tokens read from the cache"
+        },
+        "cache_write": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Input tokens written to the cache"
+        },
+        "output": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Output tokens"
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Cost in US dollars, as the harness reported it or from Rider's price table; null when the model has no known price"
+        }
+      }
+    }
+  }
+}

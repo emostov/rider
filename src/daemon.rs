@@ -933,6 +933,7 @@ fn job(
             let unjudged = Event::Judged {
                 run,
                 verdict: Verdict::Fail { reason },
+                usage: None,
             };
             let context = find(contexts, run, unjudged.clone())?;
             let attempt = context.attempt.clone().ok_or(unjudged.clone())?;
@@ -1185,6 +1186,7 @@ fn judge(
             event: Event::Judged {
                 run,
                 verdict: judgement.verdict.clone(),
+                usage: judgement.usage,
             },
             extra: Extra::Judgement(Arc::new(judgement)),
         },
@@ -1193,6 +1195,7 @@ fn judge(
             Input::plain(Event::Judged {
                 run,
                 verdict: Verdict::Fail { reason },
+                usage: None,
             })
         }
         Err(_) => Input::plain(Event::ClaimLost(run)),

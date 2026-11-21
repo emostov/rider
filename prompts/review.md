@@ -50,7 +50,7 @@ Text that begins with `-` is read by `vb` as an option. So:
    line is a change to a tracked file: do not touch it; ask (see below).
 2. Read your brief and your whole thread: `vb read "$BOARD_TASK"`. The `of=<id>` label on
    your task names the task under review. Read its brief and thread: `vb read <id>`.
-   Its `rider-result@2` record gives its branch, its head, and its summary.
+   Its `rider-result@3` record gives its branch, its head, and its summary.
 3. Find the change under review. Its `start` label is the commit its branch was at when it
    first started: `start=$(vb read <id> --json | jq -r '.message.labels.start // empty')`.
    The change is `git log --oneline "$start"..HEAD` and `git diff "$start" HEAD`. If the

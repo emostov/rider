@@ -27,8 +27,8 @@ const POLL_MILLIS: u64 = 200;
 const LIST_LIMIT: &str = "500";
 const SCHEMAS: [(&str, &str); 2] = [
     (
-        "rider-result@2",
-        "skills/ride-swarm/schemas/rider-result@2.json",
+        "rider-result@3",
+        "skills/ride-swarm/schemas/rider-result@3.json",
     ),
     (
         "rider-finding@1",

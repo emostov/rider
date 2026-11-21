@@ -100,7 +100,14 @@ pub enum Behaviour {
     CommitShared,
     /// Holds like `Hold`, then reports success having committed nothing.
     HoldThenNothing,
+    /// Commits like `Commit`, then reports `USAGE` and `COST_USD` in its result.
+    CommitReportingUsage,
 }
+
+/// The input, cache write, cache read and output tokens a `CommitReportingUsage` agent reports.
+pub const USAGE: [u64; 4] = [4, 20, 300, 50];
+/// The cost a `CommitReportingUsage` agent reports, in US dollars.
+pub const COST_USD: f64 = 0.25;
 
 pub const TALK_LINES: usize = 300;
 pub const TALK_LINE_PAD: usize = 250;
@@ -153,6 +160,7 @@ impl Behaviour {
             Behaviour::BlockThenExitNonZero => "block-then-exit-non-zero",
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
+            Behaviour::CommitReportingUsage => "commit-reporting-usage",
         }
     }
 }
@@ -204,6 +212,12 @@ fn script() -> String {
     let slow = SLOW_SECONDS;
     let long = LONG_LINE_BYTES;
     let (words, pad, lines) = (SUMMARY_WORDS, TALK_LINE_PAD, TALK_LINES);
+    let [input, write, read, output] = USAGE;
+    let usage = format!(
+        ",\"usage\":{{\"input_tokens\":{input},\"cache_creation_input_tokens\":{write},\
+         \"cache_read_input_tokens\":{read},\"output_tokens\":{output}}},\
+         \"total_cost_usd\":{COST_USD}"
+    );
     format!(
         r#"#!/bin/sh
 world="${WORLD_VAR}"
@@ -234,6 +248,7 @@ for arg in "$@"; do
 done
 [ -n "$resumed" ] && [ -z "$fork" ] && session="$resumed"
 summary="Fake agent finished task $task attempt $attempt."
+extra=""
 report() {{
   if [ "$harness" = codex ]; then
     echo '{{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}}'
@@ -245,7 +260,7 @@ report() {{
   else
     init='"subtype":"init","cwd":"'"$(pwd)"'","session_id":"'"$session"'","model":"fake"'
     echo '{{"type":"system",'"$init"'}}'
-    echo '{{"type":"result","subtype":"success","is_error":false,"result":"'"$summary"'"}}'
+    echo '{{"type":"result","subtype":"success","is_error":false,"result":"'"$summary"'"'"$extra"'}}'
   fi
 }}
 hold() {{
@@ -319,6 +334,7 @@ case "$behaviour" in
     echo '{{"type":"result","subtype":"error_during_execution","is_error":true}}'
     exit 0 ;;
   commit-silently) commit || exit 1; exit 0 ;;
+  commit-reporting-usage) commit || exit 1; extra='{usage}' ;;
   commit-reporting-blank) commit || exit 1; summary="  " ;;
   leave-branch) git checkout -q -b "elsewhere-$task" && commit || exit 1 ;;
   commit-shared) commit && git branch "shared-$task" || exit 1 ;;

@@ -23,6 +23,7 @@ claude -p --model <MODEL> --output-format stream-json --verbose --dangerously-sk
 - Final message: the last line, `type == "result"`, `subtype == "success"`, field `result` (string, here `"DONE"`). `is_error` is `false` on success. The same text is also in the last `assistant` event at `message.content[].text`.
 - stderr prints `Warning: no stdin data received in 3s...` when stdin is not redirected. Spawn with stdin set to null (`< /dev/null`) to avoid the 3 s delay.
 - Fixture: `claude.jsonl` (opus run, 8.6 KB after redaction). The other three models give the same event shapes.
+- Usage: the `result` event carries `usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`) and `total_cost_usd`, the run's cost as Claude prices it. `input_tokens` excludes cached tokens.
 - Session id: every event carries `session_id`, the first `system` event (`hook_started`, or `init` without hooks) included.
 - Resume (2026-11-19, Claude Code 2.1.329, `--model haiku`): `claude -p --resume <id> --output-format stream-json --verbose -- "<prompt>"` run from a different directory than the session started in continues the session: it recalled the earlier reply. It still works after the original directory is removed. The `init` event shows the new cwd and the same `session_id`. So a fix task resumes from its own worktree; no same-path worktree is needed.
 - Fork (2026-11-19, Claude Code 2.1.329, `--model haiku`): `claude --help` lists `--fork-session`: "When resuming, create a new session ID instead of reusing the original (use with --resume or --continue)". `claude -p --resume <id> --fork-session ...` recalled the earlier reply, and its `init` and `result` events carried a new `session_id`. A later plain `--resume <id>` still reported `<id>`. Without the flag, Claude appends the resumed run to `<id>` in place, so a failed fix would become part of what later resumes see. Rider always forks, and records the fork's id for the fix task's own attempt.
@@ -41,7 +42,7 @@ codex exec --model gpt-6.1-sol --json --dangerously-bypass-approvals-and-sandbox
 - Items with `item.type == "error"` carry `item.message`, not `item.text`.
 - Stream events (`type`): `thread.started`, `turn.started`, `item.started`, `item.completed`, `turn.completed`.
 - The stream begins with two `item.completed` events of `item.type == "error"` (a deprecation warning from this machine's config). These are not failures. A parser must not treat `item.type == "error"` as a run failure.
-- Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`.
+- Final message: the last `item.completed` event whose `item.type == "agent_message"`, field `item.text` (here `"DONE"`). Earlier `agent_message` items are progress commentary. `turn.completed` follows and carries only `usage`: `input_tokens`, which includes `cached_input_tokens` and `cache_write_input_tokens`, and `output_tokens`. Codex reports no cost.
 - Fixture: `codex.jsonl` (4 KB).
 - Codex loads skills from `~/.codex/skills`, as Claude Code does from `~/.claude/skills`. Not re-observed yet.
 - During a provider outage Codex prints top-level events such as
