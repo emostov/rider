@@ -36,6 +36,7 @@ use crate::feed::{
 use crate::git::{self, GitError};
 use crate::harness::LOG_BYTES_MAX;
 use crate::queue::{self, QUEUE_CHANNEL, QUEUE_ITEMS_MAX, QueueError, STAND_IN_FILE};
+use crate::queue_files::{self, FilesError};
 use crate::queue_wait::{self, WaitError};
 use crate::reap::{self, ReapError, Stopped};
 use crate::roles::{self, RoleSpec};
@@ -166,6 +167,17 @@ pub enum QueueAction {
         item: TaskId,
         #[arg(value_name = "COMMIT", value_parser = parse_commit)]
         commit: Option<String>,
+    },
+    /// Write a pull request's diff and changed files, as plain files, for an untrusted review.
+    Files {
+        #[arg(value_name = "ITEM", value_parser = parse_task_id)]
+        item: TaskId,
+        #[arg(value_name = "PR", value_parser = parse_pull)]
+        pull: (String, u64),
+        #[arg(value_name = "BASE", value_parser = parse_commit)]
+        base: String,
+        #[arg(value_name = "HEAD", value_parser = parse_commit)]
+        head: String,
     },
 }
 
@@ -299,6 +311,7 @@ pub enum UsageError {
     EmptyUrl,
     BadName(String),
     BadCommit(String),
+    BadPull(String),
 }
 
 impl fmt::Display for UsageError {
@@ -313,6 +326,9 @@ impl fmt::Display for UsageError {
             UsageError::EmptyUrl => write!(f, "a board URL is empty"),
             UsageError::BadCommit(text) => {
                 write!(f, "{text:?} is not a commit id: use all 40 hex digits")
+            }
+            UsageError::BadPull(text) => {
+                write!(f, "{text:?} is not a pull request: use <owner>/<name>#<n>")
             }
             UsageError::BadName(text) => write!(
                 f,
@@ -349,6 +365,11 @@ fn parse_commit(text: &str) -> Result<String, UsageError> {
         return Ok(text.to_string());
     }
     Err(UsageError::BadCommit(text.to_string()))
+}
+
+fn parse_pull(text: &str) -> Result<(String, u64), UsageError> {
+    let parsed = queue_wait::parse_pr(text).map(|(repo, number)| (repo.to_string(), number));
+    parsed.ok_or_else(|| UsageError::BadPull(text.to_string()))
 }
 
 fn parse_task_id(text: &str) -> Result<TaskId, UsageError> {
@@ -511,6 +532,7 @@ pub enum CliError {
     NotInstalled(String),
     Queue(QueueError),
     QueueWait(WaitError),
+    QueueFiles(FilesError),
     Skills(SkillsError),
     /// `rider skills install` left these skill directories as they were.
     SkillsRefused(usize),
@@ -555,6 +577,7 @@ impl fmt::Display for CliError {
             CliError::NotInstalled(why) => write!(f, "could not install the Board CLI: {why}"),
             CliError::Queue(error) => write!(f, "{error}"),
             CliError::QueueWait(error) => write!(f, "{error}"),
+            CliError::QueueFiles(error) => write!(f, "{error}"),
             CliError::Skills(error) => write!(f, "{error}"),
             CliError::SkillsRefused(count) => {
                 write!(f, "{count} skills were not installed; see the lines above")
@@ -597,6 +620,21 @@ pub fn execute(command: &Command, config: &Config) -> Result<u8, CliError> {
             action: Some(QueueAction::Reviewed { item, commit }),
             ..
         } => queue_reviewed(config, *item, commit.as_deref()),
+        Command::Queue {
+            action:
+                Some(QueueAction::Files {
+                    item,
+                    pull,
+                    base,
+                    head,
+                }),
+            ..
+        } => {
+            let (repo, number) = pull;
+            let fetched = queue_files::fetch(&config.home, *item, repo, *number, base, head);
+            say(&fetched.map_err(CliError::QueueFiles)?.display().to_string());
+            Ok(0)
+        }
         Command::Logs { id, follow } => logs(config, *id, *follow),
         Command::Kill { id } => kill(config, *id),
         Command::Config { repo } => print_config(config, repo.as_deref()),

@@ -178,7 +178,7 @@ impl Sources for Cli {
     }
 }
 
-fn run(program: &'static str, args: &[&str], deadline: Instant) -> Result<Vec<u8>, WaitError> {
+pub fn run(program: &'static str, args: &[&str], deadline: Instant) -> Result<Vec<u8>, WaitError> {
     assert!(!args.is_empty());
     let spawn_error = |error: std::io::Error| WaitError::Spawn {
         program,
@@ -269,7 +269,7 @@ fn checked<'a, T>(
     })
 }
 
-fn parse_pr(value: &str) -> Option<(&str, u64)> {
+pub fn parse_pr(value: &str) -> Option<(&str, u64)> {
     let part = |part: &str| {
         !part.is_empty()
             && !part.starts_with('-')

@@ -12,6 +12,7 @@ mod fake_agent;
 mod harness_cli;
 mod pr;
 mod queue;
+mod queue_files;
 mod queue_unclaimed;
 mod queue_wait;
 mod resume_review;
