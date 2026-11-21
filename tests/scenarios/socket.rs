@@ -238,6 +238,27 @@ fn a_detached_child_of_an_agent_is_refused_the_socket_and_cannot_stop_rider() {
     assert_eq!(then_the_daemon_exits(&mut world), Some(0));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_cannot_write_the_daemons_staging_files_or_its_board_cli_install() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    let task = when_the_lead_creates(&world, &an_implement_task(&world, "Add the work."));
+    given_the_agent_will(&world, &task, &[Behaviour::TryWrites]);
+    given_a_running_daemon(&mut world);
+
+    let states = when_the_tasks_settle(&world, &[&task]);
+
+    assert_eq!(states, ["completed"], "{}", world.daemon_log());
+    let expected: String = (fake_agent::TRIED_WRITES.split(' '))
+        .map(|name| format!("{name} refused\n"))
+        .collect();
+    assert_eq!(fake_agent::tried_writes(&world.root, &task, 0), expected);
+    when_the_daemon_is_sent_sigterm(&world);
+    assert_eq!(then_the_daemon_exits(&mut world), Some(0));
+}
+
 fn given_a_log(world: &World, task: &str, text: &str) {
     let dir = world.home.join("logs").join(task);
     fs::create_dir_all(&dir).expect("create the task's log directory");

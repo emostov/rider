@@ -23,6 +23,7 @@ pub const LONG_LINE_BYTES: u64 = 40_000;
 /// How long a slow agent works before it acts.
 pub const SLOW_SECONDS: u64 = 35;
 pub const PR_REF: &str = "refs/rider/pr/412";
+pub const TRIED_WRITES: &str = "agents.json.new cursor.new board.json.new node/probe";
 
 /// What a fake agent does in one attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,7 @@ pub enum Behaviour {
     /// Runs `rider down --now` in a child of its own process group, waits for that child to
     /// record its exit code and output, then commits like `Commit`.
     StopRiderDetached,
+    TryWrites,
     ReportDecision,
     HoldAttempt,
     MergePr,
@@ -172,6 +174,7 @@ impl Behaviour {
             Behaviour::CommitShared => "commit-shared",
             Behaviour::HoldThenNothing => "hold-then-nothing",
             Behaviour::StopRiderDetached => "stop-rider-detached",
+            Behaviour::TryWrites => "try-writes",
             Behaviour::ReportDecision => "report-decision",
             Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
@@ -370,6 +373,15 @@ case "$behaviour" in
       sleep 0.1
     done
     commit || exit 1 ;;
+  try-writes)
+    for name in {TRIED_WRITES}; do
+      if ( : > "$world/rider-home/$name" ) 2>/dev/null; then
+        rm -f "$world/rider-home/$name"; echo "$name written"
+      else
+        echo "$name refused"
+      fi
+    done > "$world/{ARGS_DIR}/$task-$attempt.writes"
+    commit || exit 1 ;;
   hold-attempt)
     step=0
     while [ ! -e "$world/{RELEASES_DIR}/$task-$attempt" ]; do
@@ -440,6 +452,13 @@ pub fn stdin(world: &Path, task: &str, attempt: u32) -> String {
 pub fn args(world: &Path, task: &str, attempt: u32) -> String {
     let path = world.join(ARGS_DIR).join(format!("{task}-{attempt}.all"));
     fs::read_to_string(&path).expect("read an agent's arguments")
+}
+
+pub fn tried_writes(world: &Path, task: &str, attempt: u32) -> String {
+    let path = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.writes"));
+    fs::read_to_string(&path).expect("read what the agent tried to write")
 }
 
 /// The exit code and output of the `rider down --now` that attempt `attempt` of `task` started

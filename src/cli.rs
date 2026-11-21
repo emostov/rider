@@ -27,7 +27,7 @@ use signal_hook::iterator::Signals;
 
 use crate::board::{self, Board, BoardError, Listing, NEEDS_MAX, TaskId, VbCli};
 use crate::config::{self, ConfigFileError, Limits};
-use crate::daemon::{self, DaemonError, Paths};
+use crate::daemon::{self, DaemonError, NODE_DIR, Paths};
 use crate::feed::{
     BoardEvent, Cursor, EventKind, FeedError, FeedEvent, FeedItem, FeedReader, FeedStop,
 };
@@ -66,7 +66,6 @@ pub const PROMPTS: [(&str, &str); 6] = [
 const DEFAULT_BOARD_URL: &str = "http://127.0.0.1:4100/api/board";
 const HOME_DEFAULT_DIR: &str = ".rider";
 const BOARD_DIR: &str = "board";
-const NODE_DIR: &str = "node";
 /// The Board CLI rider installs under its home when it finds none there, every package locked.
 const BOARD_PACKAGE: [(&str, &str); 2] = [
     ("package.json", include_str!("../board-cli/package.json")),

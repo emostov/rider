@@ -91,6 +91,7 @@ const BOARD_POLLS_MAX: u64 = u64::MAX;
 /// How long a board the daemon started is given to end after SIGTERM before SIGKILL.
 const BOARD_STOP_MILLIS_MAX: u64 = 10_000;
 const AGENTS_DIR: &str = "agents";
+const STAGED_SUFFIX: &str = ".new";
 const LEFT_EXTENSION: &str = "left";
 /// The directory under the Rider home holding each task's attempt logs.
 pub const LOGS_DIR: &str = "logs";
@@ -153,6 +154,8 @@ const CONTROL_FILES: [&str; 7] = [
 ];
 
 /// Where the daemon's files are and how it reaches the board and its agents.
+pub const NODE_DIR: &str = "node";
+
 pub struct Paths {
     pub home: PathBuf,
     pub vb: PathBuf,
@@ -1136,11 +1139,12 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
     let ack_text = ack.to_string_lossy().into_owned();
     let runner_seconds = shared.runner_seconds;
     let home = shared.paths.home.clone();
+    let vb = shared.paths.vb.clone();
     // A stale acknowledgement must never release a new agent whose pid happens to match it.
     let _ = fs::remove_file(&ack);
     let launch = move |cmd: &CommandLine, dir: &Path, log: &Path| {
         let mut args = vec!["-c".to_string(), PID_WRAPPER.to_string(), "sh".to_string()];
-        args.extend(confinement(&home)?);
+        args.extend(confinement(&home, &vb)?);
         args.push(cmd.program.clone());
         args.extend(cmd.args.iter().cloned());
         let mut env = cmd.env.clone();
@@ -1171,7 +1175,7 @@ fn spawn(shared: &Shared, run: RunId, task: TaskId, profile: &str, attempt: &Att
 // macOS still ships the deprecated sandbox-exec. Every process a confined agent starts,
 // detached or in a group of its own, inherits the profile and cannot leave it.
 #[cfg(target_os = "macos")]
-fn confinement(home: &Path) -> Result<Vec<String>, HarnessError> {
+fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
     let unusable = |why: String| HarnessError::Spawn(format!("cannot confine the agent: {why}"));
     let home = fs::canonicalize(home)
         .map_err(|error| unusable(format!("resolve {}: {error}", home.display())))?;
@@ -1187,14 +1191,19 @@ fn confinement(home: &Path) -> Result<Vec<String>, HarnessError> {
     if home.components().count() > HOME_DEPTH_MAX {
         return Err(unusable(format!("{} is too deep", home.display())));
     }
-    let mut denied = Vec::with_capacity(HOME_DEPTH_MAX + CONTROL_FILES.len() + 2);
+    let vb = fs::canonicalize(vb)
+        .map_err(|error| unusable(format!("resolve {}: {error}", vb.display())))?;
+    let mut denied = Vec::with_capacity(HOME_DEPTH_MAX + 2 * CONTROL_FILES.len() + 4);
     for dir in home.ancestors() {
         denied.push(format!("(literal {})", quote(dir)?));
     }
     for name in CONTROL_FILES {
+        let staged = format!("{name}{STAGED_SUFFIX}");
         denied.push(format!("(literal {})", quote(&home.join(name))?));
+        denied.push(format!("(literal {})", quote(&home.join(staged))?));
     }
-    for name in [AGENTS_DIR, LOGS_DIR] {
+    denied.push(format!("(literal {})", quote(&vb)?));
+    for name in [AGENTS_DIR, LOGS_DIR, NODE_DIR] {
         denied.push(format!("(subpath {})", quote(&home.join(name))?));
     }
     let socket = quote(&home.join(SOCKET_FILE))?;
@@ -1204,7 +1213,7 @@ fn confinement(home: &Path) -> Result<Vec<String>, HarnessError> {
          (deny file-write* {})\n",
         denied.join(" ")
     );
-    assert!(denied.len() > CONTROL_FILES.len() && profile.contains(&socket));
+    assert!(denied.len() > 2 * CONTROL_FILES.len() && profile.contains(&socket));
     Ok(vec![
         SANDBOX_EXEC.to_string(),
         "-p".to_string(),
@@ -1214,8 +1223,8 @@ fn confinement(home: &Path) -> Result<Vec<String>, HarnessError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn confinement(home: &Path) -> Result<Vec<String>, HarnessError> {
-    assert!(home.is_absolute());
+fn confinement(home: &Path, vb: &Path) -> Result<Vec<String>, HarnessError> {
+    assert!(home.is_absolute() && !vb.as_os_str().is_empty());
     Ok(Vec::new())
 }
 
@@ -1753,7 +1762,7 @@ enum Recorded {
 /// Writes `bytes` to `path` by renaming a finished file beside it over it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".new");
+    name.push(STAGED_SUFFIX);
     let staged = path.with_file_name(name);
     assert!(staged != path);
     fs::write(&staged, bytes)?;
