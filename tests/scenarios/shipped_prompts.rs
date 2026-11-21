@@ -72,11 +72,12 @@ fn each_roles_agent_gets_a_short_prompt_with_its_rules_and_no_way_to_settle_its_
     let review = a_task_checking(&world, &built, "review");
     let security = a_task_checking(&world, &built, "security");
     let qa = a_task_checking(&world, &built, "qa");
-    let tasks = [built.as_str(), &review, &security, &qa];
+    let native = a_task_checking(&world, &built, "native-review");
+    let tasks = [built.as_str(), &review, &security, &qa, &native];
 
     let (states, exit) = when_the_daemon_runs_until_settled(&mut world, &tasks);
 
-    assert_eq!((states, exit), (vec!["completed".to_string(); 4], Some(0)));
+    assert_eq!((states, exit), (vec!["completed".to_string(); 5], Some(0)));
     let restack = [
         "Do not write unit tests, and do not add tests that call internal functions",
         "the task has the labels `onto` and `restack=1`",
@@ -99,12 +100,16 @@ fn each_roles_agent_gets_a_short_prompt_with_its_rules_and_no_way_to_settle_its_
         unit_tests,
     ];
     then_the_prompt_has(&agent_prompt(&world, &review, 0), "review", &review_rules);
+    let native = fake_agent::stdin(&world.root, &native, 0);
+    then_the_prompt_has(&native, "native-review", &review_rules);
     let isolated = [
-        "Copy the repository\n   to `scratch=$(mktemp -d)`",
-        "Never give it real credentials, tokens, keys, or the owner's\n   configuration",
-        "It may reach only localhost.",
-        "Put a time\n   limit on every command and service you start",
-        "do not run it: review that part from the source",
+        "run branch code only in isolation; building counts as running.",
+        "Copy the repository to `scratch=$(mktemp -d)`",
+        "Never give it real credentials, tokens, keys, or the\n   owner's configuration.",
+        "It may reach only localhost, so build offline",
+        "Time-limit and stop every\n   command and service you start.",
+        "they do not contain hostile\n   code, which runs as the owner.",
+        "If a probe cannot be isolated, review it from the source.",
     ];
     let security_rules: Vec<&str> = reviewer.iter().chain(&isolated).copied().collect();
     then_the_prompt_has(

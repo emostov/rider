@@ -63,18 +63,18 @@ Never post a secret, token, or key you find. Name the file and line instead.
    `git merge-base --is-ancestor "$start" HEAD` fails, the branch was rewritten: ask for it.
 4. Reply with your plan: the trust boundaries in the change and the probe you will run on each.
 5. Attack the change, starting with the brief's points. Do not stop at reading: build and run
-   the code to probe it, but run code from the branch only in isolation. Copy the repository
-   to `scratch=$(mktemp -d)` and work there, with `HOME`, `XDG_*` and any state directory
-   pointed inside `$scratch`. Never give it real credentials, tokens, keys, or the owner's
-   configuration; unset them from its environment. It may reach only localhost. Put a time
-   limit on every command and service you start, and stop each one before you finish. If you
-   cannot isolate a probe this way, do not run it: review that part from the source and say so.
-   In `$scratch`, feed it hostile inputs, write throwaway exploits, start a scratch board or git
+   the code to probe it, but run branch code only in isolation; building counts as running.
+   Copy the repository to `scratch=$(mktemp -d)` and work there, with `HOME`, `XDG_*` and any
+   state directory inside `$scratch`. Never give it real credentials, tokens, keys, or the
+   owner's configuration. It may reach only localhost, so build offline from existing package
+   caches (for Rust: `CARGO_HOME` at the real one, and `--offline`). Time-limit and stop every
+   command and service you start. These rules reduce accidents; they do not contain hostile
+   code, which runs as the owner. If a probe cannot be isolated, review it from the source.
+   In `$scratch`, feed it hostile inputs and throwaway exploits, with a scratch board or git
    repository when the change talks to one. Try the attack rather than argue it from the code.
    - Trust boundaries: what comes from outside (users, files, the network, other processes,
      the board, environment variables) and where the code starts trusting it.
-   - Input handling: parsing, paths, injection into shells, queries, or other CLIs, sizes
-     and counts without bounds.
+   - Input handling: parsing, paths, injection into shells, queries or CLIs, unbounded sizes.
    - Secrets: tokens or keys in code, logs, errors, debug output, or test fixtures.
    - Privilege: what runs with more access than it needs, and what a caller can make it do.
    A finding needs evidence: a command, an input, or a line of code that shows it. A
