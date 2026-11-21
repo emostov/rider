@@ -323,7 +323,9 @@ impl FeedReader {
             "only a kill reaps the child"
         );
         let killed = kill_group(self.child.as_mut());
-        *group = None;
+        if killed.is_ok() || matches!(self.child.try_wait(), Ok(Some(_))) {
+            *group = None;
+        }
         killed
     }
 
@@ -333,7 +335,7 @@ impl FeedReader {
         assert!(!self.ended);
         self.killed = Some(Instant::now());
         let killed = self.kill_group();
-        assert!(lock(&self.group).is_none(), "no kill is sent twice");
+        assert!(killed.is_err() || lock(&self.group).is_none());
         killed.map_err(|error| FeedError::Kill(error.to_string()))
     }
 
@@ -356,9 +358,9 @@ impl FeedReader {
 
 impl Drop for FeedReader {
     fn drop(&mut self) {
-        // A kill reaps the leader even when the group refused the signal, so its id may
-        // already name another group: only a group never killed is signalled here.
-        if self.killed.is_none() {
+        // A reaped leader's id may already name another group: only a group whose leader is
+        // still unreaped is signalled here.
+        if lock(&self.group).is_some() {
             // Nothing more can be done about a group that cannot be signalled.
             let _ = self.kill_group();
         }
