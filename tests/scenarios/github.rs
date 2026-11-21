@@ -548,3 +548,16 @@ fn the_owner_is_the_task_that_last_worked_on_the_branch() {
         Vec::<Value>::new()
     );
 }
+
+#[test]
+fn a_commit_status_from_an_external_ci_counts_with_the_check_runs() {
+    let Some(mut world) = given_a_board_and_a_repository() else {
+        return;
+    };
+    given_gh_prints(&world, "pr-list-status.json", "pulls-comments-empty.json");
+    let task = given_a_settled_task(&mut world, Behaviour::CommitThenFail, "failed");
+
+    let records = when_records_reach(&world, &task, 1);
+
+    assert_eq!(records, vec![failed_record("lead")]);
+}

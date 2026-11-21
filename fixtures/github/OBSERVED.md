@@ -29,3 +29,7 @@ bodies and ids replaced with `example/repo`, `reviewer`, `commenter` and short n
   `permission` on the repository: `admin`, `maintain`, `write`, `triage`, `read` or `none`. A
   user with no access to a public repository is reported as `read`, not as an error.
   `permission-write.json` and `permission-read.json` are redacted to their first fields.
+- `statusCheckRollup` also holds a `StatusContext` for each commit status an external CI posts:
+  `__typename` `StatusContext`, `context`, `state` (`SUCCESS`, `FAILURE`, `ERROR`, `PENDING`,
+  `EXPECTED`) and `targetUrl`, with no `status` or `conclusion`. `pr-list-status.json` is
+  `pr-list-failed.json` with one such entry, its context and URL redacted.

@@ -84,16 +84,49 @@ struct WirePr {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireCheck {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    conclusion: String,
-    #[serde(default)]
-    details_url: String,
+#[serde(tag = "__typename")]
+enum WireCheck {
+    #[serde(rename_all = "camelCase")]
+    CheckRun {
+        name: String,
+        status: String,
+        #[serde(default)]
+        conclusion: String,
+        #[serde(default)]
+        details_url: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    StatusContext {
+        context: String,
+        state: String,
+        #[serde(default)]
+        target_url: String,
+    },
+}
+
+impl WireCheck {
+    fn name(&self) -> &str {
+        match self {
+            WireCheck::CheckRun { name, .. } => name,
+            WireCheck::StatusContext { context, .. } => context,
+        }
+    }
+
+    fn url(&self) -> &str {
+        match self {
+            WireCheck::CheckRun { details_url, .. } => details_url,
+            WireCheck::StatusContext { target_url, .. } => target_url,
+        }
+    }
+
+    fn done(&self) -> bool {
+        match self {
+            WireCheck::CheckRun { status, .. } => status == "COMPLETED",
+            WireCheck::StatusContext { state, .. } => {
+                !matches!(state.as_str(), "PENDING" | "EXPECTED")
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -466,7 +499,7 @@ fn ci_brief(watched: &Watched, pr: &WirePr) -> Result<String, WatchError> {
         .status_check_rollup
         .iter()
         .find(|check| is_failure(check));
-    let (job, url) = failed.map_or(("", ""), |check| (check.name.as_str(), &check.details_url));
+    let (job, url) = failed.map_or(("", ""), |check| (check.name(), check.url()));
     let tail = match url.rsplit_once("/job/") {
         Some((_, id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
             let args = ["run", "view", "--job", id, "--log-failed"];
@@ -582,8 +615,8 @@ fn checks_change(pr: &WirePr) -> Option<Change> {
     let mut record = json!({"kind": "checks", "pr": number, "head": head, "state": state,
         "url": pr.url});
     if let Some(check) = failed {
-        record["job"] = json!(excerpt(&check.name));
-        record["url"] = json!(check.details_url);
+        record["job"] = json!(excerpt(check.name()));
+        record["url"] = json!(check.url());
     }
     let fix = (checks == Checks::Failed).then_some(Fix::Ci);
     Some(Change {
@@ -614,14 +647,17 @@ fn change_brief(author: &str, url: &str, place: &str, body: &str) -> String {
 }
 
 fn is_failure(check: &WireCheck) -> bool {
-    matches!(
-        check.conclusion.as_str(),
-        "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
-    )
+    match check {
+        WireCheck::CheckRun { conclusion, .. } => matches!(
+            conclusion.as_str(),
+            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+        ),
+        WireCheck::StatusContext { state, .. } => matches!(state.as_str(), "FAILURE" | "ERROR"),
+    }
 }
 
 fn checks_state(checks: &[WireCheck]) -> Checks {
-    if checks.is_empty() || checks.iter().any(|check| check.status != "COMPLETED") {
+    if checks.is_empty() || checks.iter().any(|check| !check.done()) {
         return Checks::Pending;
     }
     if checks.iter().any(is_failure) {
