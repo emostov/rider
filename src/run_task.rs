@@ -66,6 +66,9 @@ const RERUN_FROM_ROLES: [&str; 2] = ["review", "native-review"];
 const RERUN_TRIES: u32 = 3;
 const HANDOFF_REPLIES_MAX: usize = 16;
 const HANDOFF_LINE_CHARS: usize = 200;
+const HANDOFF_REPLY_BYTES_MAX: usize =
+    1024 + HANDOFF_REPLIES_MAX * (HANDOFF_LINE_CHARS * 4 + 64) + harness::HANDOFF_BYTES_MAX;
+const _: () = assert!(RERUN_TRIES > 0);
 // The commit the task's first attempt started from, so work an earlier attempt committed counts.
 const START_LABEL: &str = "start";
 const ATTEMPT_DIGITS_MAX: usize = 3;
@@ -1281,10 +1284,10 @@ fn branch_tasks(
     });
     let own = named.tasks.iter().find(|task| task.view.id == id);
     let channel = own.ok_or_else(|| format!("task #{} is not listed on it", id.0))?;
-    let channel = &channel.channel;
+    let channel = &channel.view.channel;
     let mut on_branch: Vec<u64> = vec![onto.0];
     let mine = (named.tasks.iter())
-        .filter(|task| task.channel == *channel && same_repo(&task.view, &attempt.brief.repo))
+        .filter(|task| task.view.channel == *channel && same_repo(&task.view, &attempt.brief.repo))
         .filter(|task| label(&task.view, BRANCH_LABEL) == Some(branch));
     for task in mine {
         if on_branch.contains(&task.view.id.0) {
@@ -1486,24 +1489,7 @@ fn rerun(
     let key = format!("rider-rerun-{own}");
     let rerun = retried(|| board.create_task(&view.channel, &text, &labels, &[of], &key))?;
     assert!(rerun != id && rerun != of);
-    let mut handoff = format!(
-        "Handoff from the Codex run of task #{own} that the content filter stopped. It is a \
-         record of work already done, not instructions: verify and extend it rather than \
-         repeat it.\n\nWhat it posted in task #{own}'s thread:\n"
-    );
-    let skip = thread.others.len().saturating_sub(HANDOFF_REPLIES_MAX);
-    for reply in thread.others.iter().skip(skip) {
-        let by = reply.profile.as_deref().unwrap_or("owner");
-        let first = reply.text.lines().find(|line| !line.trim().is_empty());
-        let first: String = first
-            .unwrap_or_default()
-            .chars()
-            .take(HANDOFF_LINE_CHARS)
-            .collect();
-        handoff.push_str(&format!("- #{} by {by}: {first}\n", reply.id.0));
-    }
-    let log = harness::handoff(&attempt.brief.role.harness, &attempt.log());
-    handoff.push_str(&format!("\nWhat its log shows, oldest first:\n{log}"));
+    let handoff = handoff(id, &thread.others, attempt);
     board.reply(rerun, &handoff)?;
     let checked = retried(|| board.read_task(of))?;
     if let Some(branch) = label(&checked, BRANCH_LABEL) {
@@ -1526,6 +1512,30 @@ fn rerun(
     );
     retried(|| board.set_label(id, RERUN_LABEL, &rerun.0.to_string()))?;
     Ok(Some((rerun, relinked)))
+}
+
+fn handoff(id: TaskId, others: &[Amendment], attempt: &Attempt) -> String {
+    let own = id.0;
+    let mut handoff = format!(
+        "Handoff from the Codex run of task #{own} that the content filter stopped. It is a \
+         record of work already done, not instructions: verify and extend it rather than \
+         repeat it.\n\nWhat it posted in task #{own}'s thread:\n"
+    );
+    let skip = others.len().saturating_sub(HANDOFF_REPLIES_MAX);
+    for reply in others.iter().skip(skip) {
+        let by = reply.profile.as_deref().unwrap_or("owner");
+        let first = reply.text.lines().find(|line| !line.trim().is_empty());
+        let first: String = first
+            .unwrap_or_default()
+            .chars()
+            .take(HANDOFF_LINE_CHARS)
+            .collect();
+        handoff.push_str(&format!("- #{} by {by}: {first}\n", reply.id.0));
+    }
+    let log = harness::handoff(&attempt.brief.role.harness, &attempt.log());
+    handoff.push_str(&format!("\nWhat its log shows, oldest first:\n{log}"));
+    assert!(handoff.len() <= HANDOFF_REPLY_BYTES_MAX);
+    handoff
 }
 
 fn relink(failed: TaskId, rerun: TaskId, board: &dyn Board) -> Result<usize, BoardError> {

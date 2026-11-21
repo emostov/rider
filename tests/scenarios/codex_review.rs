@@ -76,6 +76,8 @@ fn a_native_review_whose_codex_review_exits_non_zero_fails() {
 
     assert_eq!(states, vec!["completed", "failed"]);
     assert_eq!(exit, Some(0));
+    assert_eq!(task_label(&world, &review, "rerun"), None);
+    assert_eq!(reruns_on_the_board(&world), Vec::new());
     assert_eq!(agent_runs_for(&world, &review)[0].harness, "codex-review");
     assert_eq!(
         task_records(&world, &review, "rider-result"),

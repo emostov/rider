@@ -139,11 +139,9 @@ pub struct TaskView {
     pub version: Cursor,
 }
 
-/// A task as a listing shows it, with the channel it is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedTask {
     pub view: TaskView,
-    pub channel: String,
 }
 
 /// One page of a listing and the cursor the board printed with it.
@@ -1208,8 +1206,7 @@ pub fn parse_task_list(json: &str) -> Result<TaskPage, BoardError> {
     let tasks: Result<Vec<ListedTask>, BoardError> = (listing.tasks.into_iter())
         .map(|listed| {
             let view = view_from_wire(listed.message.message)?;
-            let channel = view.channel.clone();
-            Ok(ListedTask { view, channel })
+            Ok(ListedTask { view })
         })
         .collect();
     let tasks = tasks?;
@@ -2021,10 +2018,7 @@ pub mod testing {
             let closed = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
             let tasks = self.tasks.borrow();
             let open = tasks.iter().filter(|task| !closed.contains(&task.state));
-            let listed = open.map(|view| ListedTask {
-                view: view.clone(),
-                channel: "work/fake".into(),
-            });
+            let listed = open.map(|view| ListedTask { view: view.clone() });
             Ok(Listing {
                 tasks: listed.collect(),
                 cursor: Cursor(0),
@@ -2042,10 +2036,7 @@ pub mod testing {
             let labelled = tasks.iter().filter(|task| {
                 (task.labels.iter()).any(|(k, v)| k == key && values.contains(&v.as_str()))
             });
-            let listed = labelled.map(|view| ListedTask {
-                view: view.clone(),
-                channel: "work/fake".into(),
-            });
+            let listed = labelled.map(|view| ListedTask { view: view.clone() });
             Ok(Listing {
                 tasks: listed.collect(),
                 cursor: Cursor(0),

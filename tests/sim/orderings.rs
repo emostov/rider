@@ -188,7 +188,6 @@ fn listed(
             }),
             version: Cursor(1),
         },
-        channel: "work/sim".to_string(),
     }
 }
 

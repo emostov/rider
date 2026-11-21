@@ -1266,7 +1266,7 @@ impl World {
             .map(|fake| ListedTask {
                 view: TaskView {
                     id: fake.id,
-                    channel: "work/sim".to_string(),
+                    channel: fake.channel.to_string(),
                     text: String::new(),
                     state: fake.state,
                     labels: fake.labels.clone(),
@@ -1278,7 +1278,6 @@ impl World {
                     }),
                     version: Cursor(fake.version),
                 },
-                channel: fake.channel.to_string(),
             })
             .collect();
         // The cursor is read before the pages, so events may land between the two.
