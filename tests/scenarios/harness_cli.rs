@@ -446,8 +446,10 @@ fn a_failed_install_shows_a_bounded_part_of_npms_output() {
     };
     let home = world.root.join("loud-home");
     let npm_dir = world.root.join("npm");
-    let loud = "head -c 2000000 /dev/zero | tr '\\0' x\nhead -c 2000000 /dev/zero | tr '\\0' y >&2\n\
-                rm -r \"$3/node_modules\"\nexit 9";
+    let loud = r#"head -c 2000000 /dev/zero | tr '\0' x
+head -c 2000000 /dev/zero | tr '\0' y >&2
+rm -r "$3/node_modules"
+exit 9"#;
     given_a_fake_npm_in(&npm_dir, &world.root.join("npm-args"), loud);
     let path = format!("{}:{}", npm_dir.display(), world.child_path());
 
