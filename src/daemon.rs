@@ -489,7 +489,7 @@ pub fn run(paths: Paths, roles: &[RoleSpec], limits: Limits) -> Result<u8, Daemo
     let (jobs, queued) = sync_channel::<Job>(JOBS_QUEUED_MAX);
     let lease_millis = timing.lease_millis;
     let log = Log::start(&paths.home.join(LOG_FILE))?;
-    let unaccounted = stop_leftovers(&paths.home, timing.grace_millis, &log);
+    let unaccounted = stop_leftovers(&paths.home, &timing, &log);
     let saved_cursor = read_cursor(&paths.home, &log);
     let recorder = start_recorder(paths.home.clone())?;
     match reap::find_leaks(&paths.board_url) {
@@ -1851,7 +1851,7 @@ fn read_pid_files(home: &Path) -> Result<Vec<PidFile>, String> {
         }
         let stem = path.file_stem().and_then(|stem| stem.to_str());
         let Some(task) = stem.and_then(|stem| stem.parse::<u64>().ok()).map(TaskId) else {
-            return Err(format!("{} names no task", path.display()));
+            continue;
         };
         let group = agent_group(&path).map(|group| group.as_raw_nonzero().get());
         let acked = (extension == Some("pid")).then(|| read_ack(&ack_file(&path)));
@@ -1873,7 +1873,8 @@ fn read_ack(path: &Path) -> Option<(i32, u64)> {
 
 /// Stops each agent a crashed daemon left running, only a group whose leader started when a
 /// record says, so a reused pid is never signalled; returns the tasks to leave to their leases.
-fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
+fn stop_leftovers(home: &Path, timing: &Timing, log: &Log) -> Unaccounted {
+    let grace_millis = timing.grace_millis;
     assert!(grace_millis > 0);
     let records = read_agents(home)
         .inspect_err(|error| log.write(&format!("could not read {AGENTS_FILE}: {error}")))
@@ -1929,7 +1930,7 @@ fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
             }
         }
     }
-    clear_agents(home, &recovery.unaccounted, log);
+    clear_agents(home, &recovery.unaccounted, timing.lease_millis, log);
     assert!(groups.len() <= LEFTOVERS_MAX);
     recovery.unaccounted
 }
@@ -1937,7 +1938,9 @@ fn stop_leftovers(home: &Path, grace_millis: u64, log: &Log) -> Unaccounted {
 // Removes the agents file and every pid, left and ack file, which name no agent of this daemon,
 // but keeps the pid file of an unaccounted task as its left file, apart from the pid file a new
 // attempt writes, which the next start reads while that agent may live.
-fn clear_agents(home: &Path, unaccounted: &Unaccounted, log: &Log) {
+fn clear_agents(home: &Path, unaccounted: &Unaccounted, lease_millis: u64, log: &Log) {
+    assert!(lease_millis > 0);
+    let lease = Duration::from_millis(lease_millis);
     let agents = home.join(AGENTS_FILE);
     if let Err(error) = fs::remove_file(&agents)
         && error.kind() != io::ErrorKind::NotFound
@@ -1957,9 +1960,25 @@ fn clear_agents(home: &Path, unaccounted: &Unaccounted, log: &Log) {
             Unaccounted::Tasks(tasks) => task.is_some_and(|task| tasks.contains(&TaskId(task))),
         };
         let extension = path.extension().and_then(|extension| extension.to_str());
+        let lapsed = || {
+            let age = entry.metadata().and_then(|meta| meta.modified()).ok();
+            let age = age.and_then(|modified| modified.elapsed().ok());
+            age.is_some_and(|age| age > lease) && agent_group(&path).is_none()
+        };
         let removed = match extension {
             Some("ack") => fs::remove_file(&path),
+            Some("pid" | LEFT_EXTENSION) if task.is_none() => {
+                log.write(&format!("removing {}: it names no task", path.display()));
+                fs::remove_file(&path)
+            }
             Some("pid" | LEFT_EXTENSION) if !kept => fs::remove_file(&path),
+            Some(LEFT_EXTENSION) if lapsed() => {
+                let shown = path.display();
+                log.write(&format!(
+                    "removing {shown}: it names no group and its lease lapsed"
+                ));
+                fs::remove_file(&path)
+            }
             Some("pid") if task.is_some() => fs::rename(&path, path.with_extension(LEFT_EXTENSION)),
             _ => Ok(()),
         };
