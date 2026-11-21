@@ -45,6 +45,27 @@ pub const ENV_REMOVED: [&str; 8] = [
     "GIT_PREFIX",
 ];
 const WORKTREE_LIST: [&str; 4] = ["worktree", "list", "--porcelain", "-z"];
+// An agent can write the repository's config, so every setting that makes git run a command
+// is overridden: `-c` outranks every config file.
+const SAFE_CONFIG: [&str; 7] = [
+    "core.fsmonitor=false",
+    "core.hooksPath=/dev/null",
+    "core.pager=cat",
+    "core.sshCommand=false",
+    "core.editor=false",
+    "log.showSignature=false",
+    "gpg.program=false",
+];
+const FILTER_COMMANDS: [&str; 3] = ["clean", "smudge", "process"];
+const FILTER_KEYS_MAX: usize = 64;
+const FILTER_KEYS: [&str; 6] = [
+    "config",
+    "--null",
+    "--name-only",
+    "--get-regexp",
+    "--",
+    r"^filter\..*\.(clean|smudge|process)$",
+];
 
 #[derive(Debug)]
 pub enum GitError {
@@ -290,14 +311,26 @@ fn collect(child: &mut dyn ChildWrapper, args: &str, limit: Duration) -> Result<
     Ok(output)
 }
 
-fn command(dir: &Path, args: &[&OsStr]) -> Process {
-    assert!(!args.is_empty(), "every git run names a command");
-    assert!(args.len() <= ARGS_MAX);
+pub fn hardened() -> Process {
     let mut command = Process::new("git");
-    command.arg("-C").arg(dir).args(args);
+    for setting in SAFE_CONFIG {
+        command.arg("-c").arg(setting);
+    }
     for name in ENV_REMOVED {
         command.env_remove(name);
     }
+    assert!(command.get_args().count() == 2 * SAFE_CONFIG.len());
+    command
+}
+
+fn command(dir: &Path, args: &[&OsStr], filters: &[String]) -> Process {
+    assert!(!args.is_empty(), "every git run names a command");
+    assert!(args.len() <= ARGS_MAX && filters.len() <= FILTER_KEYS_MAX);
+    let mut command = hardened();
+    for key in filters {
+        command.arg("-c").arg(format!("{key}=false"));
+    }
+    command.arg("-C").arg(dir).args(args);
     command
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -357,11 +390,38 @@ fn run(dir: &Path, args: &[&OsStr]) -> Result<Output, GitError> {
 fn run_fed(dir: &Path, args: &[&OsStr], input: Option<Vec<u8>>) -> Result<Output, GitError> {
     assert!(dir.is_absolute(), "git runs in absolute directories");
     let line = shown(args);
-    let mut process = command(dir, args);
+    let filters = filter_keys(dir)?;
+    let mut process = command(dir, args, &filters);
     if input.is_some() {
         process.stdin(Stdio::piped());
     }
     spawn_and_collect(process, &line, GIT_DEADLINE, input)
+}
+
+// Filter drivers have names of the config's choosing, so each one it defines is found first.
+fn filter_keys(dir: &Path) -> Result<Vec<String>, GitError> {
+    let args = FILTER_KEYS.map(OsStr::new);
+    let output = spawn_and_collect(command(dir, &args, &[]), &shown(&args), GIT_DEADLINE, None)?;
+    match output.code {
+        Some(0) => {}
+        Some(1) if output.stdout.is_empty() => return Ok(Vec::new()),
+        _ => return Err(exit_error(&args, &output)),
+    }
+    let mut keys = Vec::new();
+    for key in output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|key| !key.is_empty())
+    {
+        let key = std::str::from_utf8(key).map_err(|_| parse_error(&args, &output.stdout))?;
+        let command = key.rsplit('.').next().unwrap_or_default();
+        if keys.len() == FILTER_KEYS_MAX || !FILTER_COMMANDS.contains(&command) {
+            return Err(parse_error(&args, &output.stdout));
+        }
+        keys.push(key.to_string());
+    }
+    assert!(keys.len() <= FILTER_KEYS_MAX);
+    Ok(keys)
 }
 
 fn exit_error(args: &[&OsStr], output: &Output) -> GitError {
@@ -852,7 +912,7 @@ pub mod testing {
     // Config from the environment outranks repository config and may sign commits or run hooks.
     fn test_git(dir: &Path, args: &[&str]) -> Output {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-        let mut process = command(dir, &args);
+        let mut process = command(dir, &args, &[]);
         process.env_remove("GIT_CONFIG_COUNT");
         process.env_remove("GIT_CONFIG_PARAMETERS");
         spawn_and_collect(process, &shown(&args), super::GIT_DEADLINE, None).unwrap()

@@ -115,6 +115,7 @@ pub enum Behaviour {
     StopRiderDetached,
     TryWrites,
     SignalDaemonDetached,
+    PlantFsmonitor,
     ReportDecision,
     HoldAttempt,
     MergePr,
@@ -177,6 +178,7 @@ impl Behaviour {
             Behaviour::StopRiderDetached => "stop-rider-detached",
             Behaviour::TryWrites => "try-writes",
             Behaviour::SignalDaemonDetached => "signal-daemon-detached",
+            Behaviour::PlantFsmonitor => "plant-fsmonitor",
             Behaviour::ReportDecision => "report-decision",
             Behaviour::HoldAttempt => "hold-attempt",
             Behaviour::MergePr => "merge-pr",
@@ -375,6 +377,11 @@ case "$behaviour" in
       sleep 0.1
     done
     commit || exit 1 ;;
+  plant-fsmonitor)
+    planted="$world/{ARGS_DIR}/$task-$attempt.fsmonitor"
+    printf '#!/bin/sh\n: > "%s.ran"\n' "$planted" > "$planted"
+    chmod +x "$planted"
+    commit && git config core.fsmonitor "$planted" || exit 1 ;;
   signal-daemon-detached)
     signalled="$world/{ARGS_DIR}/$task-$attempt.signal"
     daemon=$(awk '{{print $2}}' "$world/rider-home/daemon.lock")
@@ -478,6 +485,14 @@ pub fn detached_signal(world: &Path, task: &str, attempt: u32) -> (String, Strin
     };
     let (code, output) = (read("code"), read("out"));
     (code.trim().to_string(), output)
+}
+
+pub fn fsmonitor_ran(world: &Path, task: &str, attempt: u32) -> bool {
+    let planted = world
+        .join(ARGS_DIR)
+        .join(format!("{task}-{attempt}.fsmonitor"));
+    assert!(planted.exists(), "the agent planted its fsmonitor");
+    planted.with_extension("fsmonitor.ran").exists()
 }
 
 pub fn tried_writes(world: &Path, task: &str, attempt: u32) -> String {
