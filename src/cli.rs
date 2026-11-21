@@ -769,7 +769,7 @@ fn queue(config: &Config, json: bool) -> Result<u8, CliError> {
     }
     let mut lines = view.lines;
     lines.push(String::new());
-    lines.extend(running(config)?);
+    lines.extend(running(config));
     let mut out = io::stdout().lock();
     let written = lines.iter().try_for_each(|line| writeln!(out, "{line}"));
     written
@@ -794,17 +794,19 @@ fn open_tasks(board: &VbCli, channel: &str) -> Result<Listing, BoardError> {
     }
 }
 
-fn running(config: &Config) -> Result<Vec<String>, CliError> {
+fn running(config: &Config) -> Vec<String> {
     let Ok(mut client) = Client::connect(&config.home) else {
-        return Ok(vec!["daemon not running".to_string()]);
+        return vec!["daemon not running".to_string()];
     };
-    let data = client.send("status", &[]).map_err(CliError::Client)?;
+    let Ok(data) = client.send("status", &[]) else {
+        return vec!["running work unavailable: the daemon did not answer".to_string()];
+    };
     let mut lines = vec![format!("running {} of {}", data["running"], data["limit"])];
     let tasks = data["tasks"].as_array().map_or(&[][..], Vec::as_slice);
     let claimed = tasks.iter().filter(|task| task["state"] == "claimed");
     lines.extend(claimed.map(task_row));
     assert!(!lines.is_empty());
-    Ok(lines)
+    lines
 }
 
 fn agents(config: &Config) -> Result<u8, CliError> {
