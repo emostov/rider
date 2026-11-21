@@ -9,7 +9,7 @@ Rider runs one agent per task, each in its own git worktree, with a model picked
 
 ## Feature highlights
 
-- **Ride a swarm to a goal.** Say "ride a swarm to <goal>" in a coding-agent session. The
+- **Ride a swarm to a goal.** Say `ride a swarm to <goal>` in a coding-agent session. The
   goal can be one feature, many features at once, a milestone, or a list of GitHub issues.
   The `ride-swarm` skill makes the session the lead, and the lead starts the daemon with
   `rider up`.
@@ -26,12 +26,14 @@ Rider runs one agent per task, each in its own git worktree, with a model picked
   limits. A `[repo."<absolute path>".roles.<role>]` table sets the skills a role runs for
   that repository's tasks only. `rider config --repo <path>` prints what those tasks see.
 - **Ship finished work as PRs.** Ask the lead to ship the stack. The `ship-swarm` skill opens
-  pull requests, as drafts if you choose, gets CI green and answers review threads. The first
-  time, it asks how you like its loops to run and saves the answers in
+  pull requests, as drafts if you choose, gets CI green and answers review threads. The lead
+  merges a PR only when its CI is green and its review is done; Rider never pushes or merges
+  by itself. The first time, it asks how you like its loops to run and saves the answers in
   `<rider home>/ship.toml`.
 - **Skills and prompts built into the binary.** The skills and the roles' prompts ship inside
-  `rider`, so they always match it. `rider skills install` writes the skills into your
-  agent's skills directory and keeps them up to date when a newer `rider` runs.
+  `rider`, so they always match it. `rider skills install --into ~/.claude/skills` (Claude
+  Code) or `--into ~/.codex/skills` (Codex) writes the skills where your agent reads them. Rider
+  updates those installs when a newer `rider up`, `rider daemon` or `rider skills install` runs.
 - **Coming: an owner review queue.** Milestone 5 adds `rider queue`, a queue for triaging
   reviews of other people's PRs and following up on feedback on your own PRs. It is not on
   `main` yet.
@@ -52,8 +54,8 @@ for Claude Code or `~/.codex/skills` for Codex.
 
 ## Quickstart
 
-Rider needs Rust, Node 22, and `claude` or `codex` on `PATH`, signed in for the roles that
-use them.
+The `ride-swarm` skill needs Rust, Node 22, `jq`, and both `claude` and `codex` on `PATH`,
+each signed in. It stops and names any that is missing.
 
 Open a coding-agent session in a terminal you keep open and say "ride a swarm to <goal>".
 The lead starts the daemon with `rider up`, plans the goal into tasks on the board, and

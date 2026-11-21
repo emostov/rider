@@ -22,6 +22,10 @@ Everything is under `<rider home>`: `~/.rider`, or `$RIDER_HOME` when it is set.
 
 ## Troubleshooting
 
+The `vb` commands below reach the local board with `BOARD_URL`
+(`http://127.0.0.1:4100/api/board` by default); the Board CLI is under
+`<rider home>/node/node_modules/.bin`.
+
 - **`rider status` says the daemon is not running.** Run `rider up`. If it does not start,
   `daemon.log` says why: an error in `rider.toml` names the field and the file.
 - **`rider daemon` exits saying `daemon.lock` is held.** Another daemon runs on the same
