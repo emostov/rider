@@ -38,9 +38,13 @@ pub const REAP_URLS_MAX: usize = 8;
 /// Upper bound on the arguments rider looks at, after the program name: the longest command.
 pub const ARGS_MAX: usize = 2 * REAP_URLS_MAX + 2;
 /// Every role's prompt file and the files they read, once each, built into the binary.
-pub const PROMPTS: [(&str, &str); 5] = [
+pub const PROMPTS: [(&str, &str); 6] = [
     ("implement.md", include_str!("../prompts/implement.md")),
     ("review.md", include_str!("../prompts/review.md")),
+    (
+        "native-review.md",
+        include_str!("../prompts/native-review.md"),
+    ),
     ("security.md", include_str!("../prompts/security.md")),
     ("slop-rules.md", include_str!("../prompts/slop-rules.md")),
     ("qa.md", include_str!("../prompts/qa.md")),

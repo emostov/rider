@@ -141,8 +141,10 @@ These rules are yours to keep. Rider does not check them:
   work is going on; the PR's holistic review covers every task and fix on the branch, and you
   read each diff. A review's brief names the range itself, `git diff <base branch>...HEAD`,
   and says what to attack. The end-of-PR flow: two holistic reviews of the whole diff, run in
-  parallel, both `of=<the PR's top task>`: a `review` (`codex exec`: runs the tests and
-  mutation-tests coverage) and a `native-review` (`codex review`: reads the diff). Then one fix
+  parallel, both `of=<the PR's top task>`: a `review` (`codex exec`: correctness and coverage; runs the tests and
+  mutation-tests coverage) and a `native-review` (`codex review`: reads the diff; correctness
+  plus simpler APIs and faster code, reported as non-blocking findings). Turn the worthwhile
+  non-blocking perf or API findings into tasks or deferred-work thread entries as you judge. Then one fix
   task for the blocking findings of both. After that fix, a `final-review` (Mythos 5.2, may run
   tests) of the whole PR is the backstop; it is a general review, not security-only, and its
   blocking findings get one more fix task. `security` stays for sensitive branches.

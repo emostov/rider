@@ -47,6 +47,7 @@ approval_policy="never"
         prompt.starts_with("# You review another task's work\n"),
         "{prompt}"
     );
+    assert!(prompt.contains("## Simpler and faster\n"), "{prompt}");
     assert!(
         prompt.contains("Review the work: git diff main...HEAD."),
         "{prompt}"

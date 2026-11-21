@@ -108,7 +108,7 @@ pub const ROLES: [RoleSpec; 7] = [
         model_slug: "sol-6-2",
         slots: AGENTS_MAX,
         pool_slots: 8,
-        prompt_file: "review.md",
+        prompt_file: "native-review.md",
         skills: &[],
     },
     RoleSpec {
