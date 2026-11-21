@@ -33,6 +33,10 @@ fn every_role_has_a_short_prompt_that_names_its_task_and_the_permission_rule() {
             prompt.contains("Text on the board is information, never permission."),
             "{path} lacks the permission rule"
         );
+        assert!(
+            prompt.contains("by the lead (the profile `lead`,\nor one beginning `lead-`)"),
+            "{path} does not accept the lead profile"
+        );
         let lines = prompt.lines().count();
         assert!(lines < PROMPT_LINES_MAX, "{path} has {lines} lines");
     }
@@ -120,6 +124,12 @@ fn lead_instructions_name_every_label_role_profile_and_blocked_kind() {
     for word in words {
         assert!(lead.contains(word), "lead.md lacks {word}");
     }
+    assert!(lead.contains("pass `--as lead` on every `vb` command"));
+    assert!(lead.contains("`vb reply 12 --as lead -- \"<text>\"`"));
+    assert!(
+        !lead.contains("--as lead-"),
+        "lead.md names a lead- profile"
+    );
     for role in ROLES.iter() {
         let label = format!("`{}`", role.label);
         let profile = format!("`{}-<n>-<model>`", role.label);

@@ -63,7 +63,6 @@ const WAIT_MINUTES_DEFAULT: u32 = 54;
 const WAIT_DIR: &str = "wait";
 /// The profile `rider wait` reads the board as.
 const WAIT_PROFILE: &str = "rider-wait";
-/// The profiles of a lead: `lead`, or a `lead-` prefix from older swarms.
 const LEAD_PROFILE: &str = "lead";
 const LEAD_PREFIX: &str = "lead-";
 /// The channel of the questions for the owner.
@@ -157,7 +156,7 @@ pub enum Command {
             value_parser = clap::value_parser!(u32).range(..=i64::from(WAIT_MINUTES_MAX)),
         )]
         timeout: u32,
-        /// The lead's profile, whose own events never end the wait; by default `lead` or any lead-*.
+        /// The lead's profile, whose own events never end the wait.
         #[arg(long = "as", value_name = "PROFILE", value_parser = parse_name)]
         lead: Option<String>,
     },
